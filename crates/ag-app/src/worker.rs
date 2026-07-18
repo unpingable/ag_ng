@@ -27,7 +27,9 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
-use crate::config::{FilesystemNodeCustodyV1, WorkerLauncherConfigV1, WorkerProfileConfigV1};
+use crate::config::{
+    FilesystemNodeCustodyV1, WorkerCandidateEffectV1, WorkerLauncherConfigV1, WorkerProfileConfigV1,
+};
 
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ADMITTED_INPUTS: usize = 8;
@@ -1007,6 +1009,7 @@ fn validate_review(
     }
     if profile.profile_id.is_empty()
         || profile.profile_id.as_bytes().contains(&0)
+        || profile.candidate_semantic_type != profile.candidate_effect.semantic_type()
         || launcher.sandbox_identity.build_identity.is_some()
         || profile.executable_identity.build_identity.is_some()
         || profile.fixed_arguments.len() > 64
@@ -1682,9 +1685,13 @@ fn launch_profile_digest(
     struct LaunchBinding<'a> {
         schema: &'static str,
         security_profile: SecurityProfileV1,
+        project: &'a str,
         sandbox: &'a ExecutableIdentityV1,
         worker: &'a ExecutableIdentityV1,
         argv: &'a [String],
+        candidate_effect: WorkerCandidateEffectV1,
+        candidate_target: &'a str,
+        candidate_semantic_type: &'a str,
         runtime: RuntimeObservation<'a>,
         workspace_root: &'a FilesystemNodeCustodyV1,
         workspace: &'a Digest,
@@ -1711,9 +1718,13 @@ fn launch_profile_digest(
     Digest::from_serializable(&LaunchBinding {
         schema: "ag.worker-launch-profile/v1",
         security_profile,
+        project: &profile.project,
         sandbox: &launcher.sandbox_identity,
         worker: &profile.executable_identity,
         argv,
+        candidate_effect: profile.candidate_effect,
+        candidate_target: &profile.candidate_target,
+        candidate_semantic_type: &profile.candidate_semantic_type,
         runtime: RuntimeObservation {
             roots: observed_runtime,
             synthetic_lib: "usr/lib",
@@ -1800,8 +1811,9 @@ mod tests {
                 executable: worker.clone(),
                 executable_identity: executable_identity(&worker),
                 fixed_arguments: arguments.iter().map(|value| (*value).to_owned()).collect(),
-                managed_file_target: "fixture.target".to_owned(),
-                candidate_semantic_type: "fixture".to_owned(),
+                candidate_effect: WorkerCandidateEffectV1::ManagedFilePut,
+                candidate_target: "fixture.target".to_owned(),
+                candidate_semantic_type: "managed_file_content_v1".to_owned(),
                 timeout_ms: 2_000,
                 output_budget_bytes: 1024,
             }],

@@ -10,6 +10,7 @@ use ag_app::api::{
 };
 use ag_app::config::{EffectdConfigV1, LoadedConfigV1, load_config_with_identity};
 use ag_app::effectd::{EffectBrokerV1, LinuxManagedEffectRunnerV1, configured_catalog_identity};
+use ag_app::managed_pointer::{ManagedPointerError, ManagedPointerRuntimeV1};
 use ag_app::rpc_auth::{
     RpcPeerEnrollmentV1, RpcReplayGuardV1, RpcSignerV1, SystemRpcClockV1, VerifiedRpcPrincipalV1,
 };
@@ -67,6 +68,7 @@ fn main() -> anyhow::Result<()> {
     config.validate()?;
     let catalog_identity = configured_catalog_identity(&config.targets)?;
     if arguments.check_config {
+        validate_managed_pointer_runtime(&config)?;
         info!(path = %arguments.config.display(), "configuration is valid");
         return Ok(());
     }
@@ -215,6 +217,11 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_managed_pointer_runtime(config: &EffectdConfigV1) -> Result<(), ManagedPointerError> {
+    let _runtime = ManagedPointerRuntimeV1::from_config(config)?;
+    Ok(())
+}
+
 fn run_admin_listener(
     listener: &std::os::unix::net::UnixListener,
     codec: FrameCodec,
@@ -281,5 +288,69 @@ fn run_admin_listener(
             }
             Err(_) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    use ag_app::config::EffectTargetConfigV1;
+    use ag_app::managed_pointer::managed_pointer_launch_profile_identity;
+
+    use super::*;
+
+    #[test]
+    fn check_config_runtime_validation_rejects_a_symlinked_git_helper() {
+        let directory = tempfile::tempdir().expect("temporary root");
+        let allowed_root = directory.path().join("allowed");
+        let repository = allowed_root.join("repository.git");
+        let staging_root = directory.path().join("staging");
+        fs::create_dir(&allowed_root).expect("allowed root");
+        fs::create_dir(&staging_root).expect("staging root");
+
+        let helper = PathBuf::from("/usr/bin/git");
+        let helper_executable = Digest::hash_bytes(&fs::read(&helper).expect("Git bytes"));
+        let profile_identity =
+            Digest::hash_domain("ag-security-profile-identity-v1", b"development");
+        let helper_launch_profile =
+            managed_pointer_launch_profile_identity(&profile_identity, &helper_executable)
+                .expect("launch profile");
+
+        let mut config: EffectdConfigV1 =
+            toml::from_str(include_str!("../../../../config/effectd.example.toml"))
+                .expect("effectd example");
+        config.security_profile = "development".to_owned();
+        config.targets = vec![EffectTargetConfigV1::ManagedPointer {
+            id: "repository.main".to_owned(),
+            allowed_root,
+            repository,
+            reference: "refs/heads/main".to_owned(),
+            repository_identity: Digest::hash_bytes(b"repository identity"),
+            uid: 1000,
+            gid: 1000,
+            staging_root,
+            promotion_ttl_ms: 60_000,
+            helper: helper.clone(),
+            helper_executable: helper_executable.clone(),
+            helper_launch_profile,
+        }];
+        config.validate().expect("structurally valid target");
+        configured_catalog_identity(&config.targets).expect("catalogued direct helper");
+        validate_managed_pointer_runtime(&config).expect("runtime-pinned direct helper");
+
+        let helper_link = directory.path().join("git-link");
+        symlink(&helper, &helper_link).expect("helper symlink");
+        let EffectTargetConfigV1::ManagedPointer { helper, .. } = &mut config.targets[0] else {
+            unreachable!("fixture is a managed pointer")
+        };
+        *helper = helper_link;
+        config
+            .validate()
+            .expect("structural validation deliberately does not open helpers");
+        configured_catalog_identity(&config.targets)
+            .expect("catalog byte check alone follows the helper symlink");
+        assert!(validate_managed_pointer_runtime(&config).is_err());
     }
 }

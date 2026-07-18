@@ -10,6 +10,8 @@ use std::io::{self, Cursor};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use base64::Engine as _;
+
 use ag_app::worker::{FIRST_WORKER_INPUT_DESCRIPTOR, receive_worker_activation};
 use ag_app::worker_protocol::{
     CANDIDATE_BOOTSTRAP_PURPOSE, CANDIDATE_INGRESS_CREDENTIAL_PURPOSE, read_worker_bootstrap,
@@ -44,6 +46,22 @@ fn parse_fixed_plan(
             semantic_override: None,
             delay_before_emit: None,
         },
+        "--emit-base64" => {
+            let encoded = arguments
+                .next()
+                .ok_or("fixture worker requires one fixed base64 candidate argument")?;
+            let candidate = base64::engine::general_purpose::STANDARD.decode(&encoded)?;
+            if candidate.is_empty()
+                || base64::engine::general_purpose::STANDARD.encode(&candidate) != encoded
+            {
+                return Err("fixture worker candidate was not canonical padded base64".into());
+            }
+            FixturePlanV1 {
+                candidate,
+                semantic_override: None,
+                delay_before_emit: None,
+            }
+        }
         "--emit-semantic" => FixturePlanV1 {
             semantic_override: Some(
                 arguments

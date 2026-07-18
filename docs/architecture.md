@@ -28,12 +28,13 @@ references; its projections are never ratification inputs.
 - Durable burn-before-effect and reconciliation without automatic retry.
 
 The current executable vertical slices are exact human ratification, managed
-regular-file effects with broker-owned reconciliation, and a development-only
-offline generic-worker ingress. Provider ingress, production-qualified worker
-containment, admitted check launch, bounded mandates, managed-pointer
-promotion, and typed systemd D-Bus backends remain fail-closed release
-blockers; listing them above defines the v1 target and is not a present support
-claim.
+regular-file effects with broker-owned reconciliation, a development-only
+offline generic-worker ingress, and development-qualified managed-ref
+promotion. Provider ingress, production-qualified worker containment,
+admitted check launch, bounded mandates, typed systemd D-Bus backends, and
+production qualification of managed-pointer execution remain fail-closed
+release blockers; listing them above defines the v1 target and is not a
+production support claim.
 
 ## Development worker ingress
 
@@ -95,8 +96,78 @@ Production and high-assurance configuration fail closed because the current
 Bubblewrap launch has not earned host sandbox attestation, packaged lifecycle,
 or distribution qualification. It is not the future systemd/DynamicUser
 wrapper design and does not implement checks, provider-specific adapters,
-multi-worker orchestration, managed-pointer promotion, host mandates, or
-systemd effects.
+multi-worker orchestration, host mandates, or systemd effects.
+
+## Development managed-pointer promotion
+
+The implemented code-promotion path closes one development lifecycle without
+giving either the worker or `agd` write access to the governed target:
+
+```text
+authenticated worker candidate Git bundle
+-> agd reconstructs the reviewed effect family and target
+-> ag-effectd admits the artifact and observes the managed ref
+-> ag-effectd compiles and persists the canonical proposal
+-> an independent human principal ratifies those exact broker-owned bytes
+-> reversible preparation and a durable commit-may-proceed checkpoint
+-> exact managed-ref compare-and-swap under the configured target owner
+-> independent tree readback and a receipt or reconciliation requirement
+```
+
+The worker profile fixes `git_bundle_promotion_v1` and an opaque target ID.
+The candidate is a strict, self-contained Git bundle v2 with one advertised
+`refs/heads/ag-candidate`, no prerequisite lines, and no gitlinks. Its candidate
+commit must have exactly one parent: the broker-observed commit currently named
+by the managed ref. Candidate bytes remain proposal material; the worker cannot
+name the destination repository or ref, construct canonical bytes, ratify the
+proposal, or execute the promotion.
+
+`ag-effectd` derives a proposal-scoped, single-use operation ID and binds the
+activation domain and epoch, catalog and security-profile identities, expiry,
+artifact and normalized pack digests, allowed root, repository and Git-directory
+device/inode observations, repository identity and owner, exact ref, expected
+base commit and tree, candidate commit and post-tree, staging root, and exact
+Git executable and launch profile. The target is re-opened and every binding is
+revalidated before mutation. Dirty, relocated, substituted, wrong-owner,
+checked-out, stale-base, expired, or already-consumed targets refuse.
+
+The ratifier is not predicted inside the pre-ratification proposal, which would
+make the digest circular. The signed authorization, durable authority burn, and
+one-shot attempt instead bind that exact canonical proposal to the
+broker-reconstructed ratifier principal. Principal-chain independence from the
+proposer is checked before any preparation or mutation.
+
+The closed Git adapter runs an exact retained-descriptor executable with fixed
+plumbing operations, an empty and rebuilt environment, isolated Git
+configuration, disabled hooks and interactive helpers, and all Git protocols
+disabled. Reversible candidate validation occurs in broker-owned staging
+outside the governed repository. Preparation imports and durably syncs the
+exact pack as unreachable objects under the configured target UID/GID, proves
+the ref is still at the exact prestate, and only then emits the checkpoint.
+The commit side changes only the configured ref by compare-and-swap. Success is
+issued only after the ref and resulting tree are independently observed at the
+ratified poststate.
+
+Authority is burned before preparation. `ag-effectd` durably records that
+reversible preparation is complete before entering the externally visible ref boundary.
+A known pre-boundary failure with an exact unchanged prestate is terminal and
+cannot be retried with the consumed operation. An ambiguous boundary becomes
+reconciliation-required; automatic retry is forbidden. Reconciliation
+independently classifies the live target as exact prestate (`not_applied`),
+exact poststate (`applied`), or neither (`foreign`).
+
+Version 1 manages one existing, descriptor-validated loose ref in a bare
+repository or a ref that is not checked out in any attached worktree. A target
+available only through `packed-refs` refuses. It deliberately refuses a
+checked-out managed ref and does not update an index or working tree. There is
+no hidden checkout synchronization, direct-checkout mode, generic Git command
+effect, promoter daemon, provider adapter, check launcher, host mandate, or
+systemd effect in this slice.
+
+This is a development-qualified managed-ref CAS claim, not a production
+deployment claim. The activation/upgrade ceremony, effective systemd sandbox
+parity, target-owner capability packaging, host sandbox attestation, Git and
+distribution qualification, and power-loss matrix remain open release gates.
 
 BreakGlass, direct checkout, arbitrary privileged commands, hostile
 multi-tenancy, public TCP APIs, and compatibility aliases are intentionally

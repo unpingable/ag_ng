@@ -36,7 +36,7 @@ use crate::api::{
     ProposalIngressProofV1, WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1,
     WorkerCandidateRequestV1, WorkerCandidateSourceProofV1, worker_candidate_ingress_proof_digest,
 };
-use crate::config::AgdConfigV1;
+use crate::config::{AgdConfigV1, WorkerCandidateEffectV1};
 use crate::peer::signed_principal_chain;
 use crate::rpc_auth::{
     EphemeralRpcPrivateKeyV1, RpcKeyIdV1, RpcPeerEnrollmentV1, RpcPeerKeyPolicyV1,
@@ -1232,10 +1232,10 @@ impl AgdCoreV1 {
         })
     }
 
-    /// Maps one durably accepted candidate through a single reviewed
-    /// managed-file target and commits the native four-family judgment used by
-    /// the normal proposal path. Target selection is policy input; worker
-    /// bytes cannot name or alter it.
+    /// Maps one durably accepted candidate through a single reviewed closed
+    /// effect and commits the native four-family judgment used by the normal
+    /// proposal path. Effect family and target selection are policy inputs;
+    /// worker bytes cannot name or alter either value.
     ///
     /// # Errors
     ///
@@ -1278,7 +1278,19 @@ impl AgdCoreV1 {
             self.rpc_signer.principal(),
             principal,
         )?;
-        let target = TargetId::parse(profile.managed_file_target.clone())?;
+        let target = TargetId::parse(profile.candidate_target.clone())?;
+        let effect = match profile.candidate_effect {
+            WorkerCandidateEffectV1::ManagedFilePut => EffectIntentV1::ManagedFilePut {
+                target,
+                content: candidate.content.clone(),
+            },
+            WorkerCandidateEffectV1::ManagedPointerPromotion => {
+                EffectIntentV1::ManagedPointerPromotion {
+                    target,
+                    artifact: candidate.content.clone(),
+                }
+            }
+        };
         let mut intent = ProposalIntentV1 {
             schema: EFFECT_SCHEMA_V1.to_owned(),
             intent_id: worker_intent_id(&record.spec.session, &candidate.custody_record),
@@ -1292,10 +1304,7 @@ impl AgdCoreV1 {
                 candidate.custody_record.as_str().as_bytes(),
             ),
             admitted_artifacts: BTreeSet::from([candidate.content.clone()]),
-            effects: vec![EffectIntentV1::ManagedFilePut {
-                target,
-                content: candidate.content.clone(),
-            }],
+            effects: vec![effect],
         };
         let subject = intent.judgment_subject_digest()?;
         let evaluation = worker_effect_evaluation(

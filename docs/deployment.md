@@ -163,9 +163,53 @@ socket; proposer commands connect only to agd.
 
 Effectd accepts only opaque target IDs from `ProposalIntentV1`. Root-owned
 configuration resolves an ID to one closed target definition. For a managed
-pointer, “pinned helper” means the digest of exact executable bytes plus the
-digest of its fixed argv, environment, descriptor, namespace, resource, and
-seccomp launch profile—not a pathname.
+pointer, “pinned helper” means the digest of exact Git executable bytes plus
+the digest of the built-in fixed operation, argv, environment, descriptor, and
+security-profile contract—not a pathname or an operator-supplied command.
+
+The development-qualified managed-pointer target also names one normalized
+repository strictly beneath an allowed root, one exact `refs/heads/` ref, the
+repository identity, expected non-root owner UID/GID, a broker-controlled
+staging root outside the allowed target root, a bounded promotion lifetime,
+and the pinned Git identities. The candidate semantic is exactly
+`git_bundle_promotion_v1`. The candidate itself is a strict, self-contained Git
+bundle v2 with one `refs/heads/ag-candidate`, no prerequisites, one commit whose
+sole parent is the live base, and no gitlinks. The target repository is not
+selected from candidate bytes.
+
+Effectd stages and inspects the bundle outside the governed repository, then
+compiles canonical bytes that bind the exact artifact and pack, base commit and
+tree, candidate commit and post-tree, target ref, repository and Git-directory
+device/inode observations, repository identity and owner, activation/catalog/
+profile identities, exact Git executable/launch profile, expiry, and a
+proposal-scoped single-use operation ID. An independently authenticated human
+ratifier sees and ratifies those effectd-owned bytes on the admin socket. The
+ratifier is necessarily absent from the proposal it has not yet ratified; the
+signed authorization, durable burn, and one-shot attempt bind the exact
+proposal to the broker-reconstructed independent ratifier principal before
+preparation begins.
+
+After durable authority burn, effectd performs reversible preparation: the
+closed adapter re-opens and revalidates the target, drops the Git subprocess to
+the configured target owner, imports and durably syncs the exact staged pack as
+unreachable objects, and proves the managed ref remains at the exact prestate.
+Effectd then persists a commit-may-proceed checkpoint, after which the adapter
+compare-and-swaps only the configured ref. It clears and rebuilds the
+environment, bypasses implicit `PATH`, isolates
+Git configuration, disables hooks and interactive helpers, and disables Git
+protocols. It issues success only after independently reading back the exact
+post-ref and tree. Ambiguity at the commit boundary requires reconciliation;
+it is never converted into success or a safe automatic retry. Reconciliation
+distinguishes exact prestate, exact poststate, and foreign state.
+
+Version 1 supports one existing, descriptor-validated loose ref in a bare
+repository or a managed ref not checked out in any attached worktree. A target
+available only through `packed-refs`, a dirty non-bare repository, or a
+checked-out target ref refuses. Promotion does not update an index or working
+tree and there is no hidden checkout synchronization or direct-checkout
+compatibility mode. A site that needs a live checkout must perform that
+synchronization through a future, separately specified governed effect; it
+must not point this effect at the live branch and assume Git will update files.
 
 Every configured repository or managed-file parent also appears in an
 effectd unit drop-in as `ReadWritePaths=`. Before readiness, effectd must compare
@@ -178,6 +222,14 @@ The base effectd unit is networkless and has no shell or generic command
 surface. A target drop-in may add filesystem access only; it must not add an IP
 address family, network namespace access, shell, interpreter, broad capability,
 or writable executable search path.
+
+The checked-in effectd unit already grants `CAP_CHOWN` for its closed target
+custody operations, but it does not grant the `CAP_SETUID`/`CAP_SETGID` needed
+to enter a configured non-root target owner. Managed-pointer execution
+therefore fails closed under the packaged unit. Do not broaden that unit ad
+hoc: the exact target-owner capability set, effective `ReadWritePaths`
+comparison, executable access, and staging/target mount layout require review
+and qualification before this development slice is production deployable.
 
 ## Provider credentials and custody
 
@@ -237,9 +289,11 @@ provider socket directly to a group.
 
 The current implementation has one development-only offline worker path. A
 root-owned `agd` configuration defines a closed profile ID, exact executable
-bytes, fixed argv, semantic type, managed-file target mapping, runtime limit,
-and output budget. The caller selects the profile ID only. `agd` creates an
-independent proposal workspace, durably mints the bound
+bytes, fixed argv, semantic type, candidate effect family and target mapping,
+runtime limit, and output budget. The candidate may be managed-file content or
+the exact managed-pointer Git bundle described above; the caller and worker
+cannot switch the configured family or target. The caller selects the profile
+ID only. `agd` creates an independent proposal workspace, durably mints the bound
 `WorkerSessionPrincipal`, and launches the executable under Bubblewrap with an
 empty ambient environment, a private network namespace, read-only `/usr`, and
 the proposal workspace as its only writable host-filesystem bind. There is no

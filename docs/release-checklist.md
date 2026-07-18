@@ -9,8 +9,11 @@ start, or passing crate test does not override the gates below.
 
 Known blockers in the current tree include:
 
-- managed-file execution is wired, but the pinned managed-pointer helper and
-  typed systemd D-Bus backends are deliberately unavailable;
+- managed-file execution and a development-qualified managed-ref CAS path are
+  wired, but typed systemd D-Bus backends remain deliberately unavailable;
+  managed-pointer production activation is still blocked on effective-unit
+  sandbox parity, target-owner capability packaging, host/Git qualification,
+  and the power-loss matrix;
 - offline three-writer-fence coordination, sealed SQLite/object capture,
   hostile coherence validation, atomic local publication, and immutable
   evidence restore exist, but there is no live cross-daemon coordinator,
@@ -110,6 +113,14 @@ worktrees, and classic command/API/database compatibility are out of scope.
 
 ## Authority-membrane gates
 
+The development managed-pointer slice exercises exact bundle custody,
+broker-owned canonicalization, independent exact ratification, target-owner
+managed-ref CAS, verified poststate, single-use consumption, and explicit
+reconciliation. It supports only an existing loose ref in a bare repository or
+a loose managed ref not checked out in any attached worktree. A packed-ref-only
+target refuses. It does not synchronize a live worktree and does not close the
+production gates below.
+
 - [ ] `agd` can submit only intent plus admitted artifact references; only
   effectd compiles and persists canonical proposal bytes.
 - [ ] `agctl effect show` and ratification submission terminate directly at
@@ -129,15 +140,31 @@ worktrees, and classic command/API/database compatibility are out of scope.
   effect.
 - [ ] Ratification burns durably before execution; timeout/crash/uncertain
   external outcome becomes indeterminate/reconciliation and never auto-retry.
+- [ ] Managed-pointer promotion admits only the exact self-contained Git
+  bundle contract and binds its artifact/pack, base and post trees, repository
+  and Git-directory device/inode identity, owner, ref, catalog/profile, pinned
+  Git executable/launch profile, expiry, and one-shot operation ID into the
+  broker-owned proposal.
+- [ ] The promotion adapter runs only fixed Git plumbing under the target
+  owner with isolated configuration, no hooks/filters/helpers/protocols or
+  implicit `PATH`; it revalidates immediately before mutation and issues
+  success only after independent ref/tree readback.
+- [ ] A durable commit-may-proceed checkpoint precedes the ref CAS. Crash and
+  power-loss specimens prove known unchanged failure before that boundary and
+  reconciliation-required uncertainty at an ambiguous boundary; live
+  observation distinguishes exact `not_applied`, exact `applied`, and
+  `foreign` state without automatic retry.
 
 ## Worker and provider gates
 
 The development Bubblewrap slice exercises fixed-profile launch, authenticated
 candidate custody, durable transient-principal binding, terminal tombstones,
 checked process cleanup, typed refusals, and broker-owned canonical
-compilation. It does not close any production gate
-below; those gates require the production wrapper, sandbox/host attestation,
-provider relation, and full qualification matrix.
+compilation. A reviewed profile may now classify candidate material as the
+exact managed-pointer Git bundle contract, but the worker still cannot choose
+the target or acquire promotion authority. Neither development slice closes
+any production gate below; those gates require the production wrapper,
+sandbox/host attestation, provider relation, and full qualification matrix.
 
 - [ ] Worker source/artifact/delta custody uses independent repositories or
   snapshots and contains no governed target mount or hidden checkout sync.

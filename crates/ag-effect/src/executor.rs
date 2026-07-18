@@ -17,7 +17,9 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{CanonicalEffectV1, SystemdUnitActionV1};
+use crate::{
+    CanonicalEffectV1, GitObjectFormatV1, MANAGED_POINTER_PROMOTION_SCHEMA_V1, SystemdUnitActionV1,
+};
 
 /// Canonical schema emitted for terminal execution receipts.
 pub const EXECUTION_RECEIPT_SCHEMA_V1: &str = "ag.effect.execution-receipt/v1";
@@ -37,6 +39,7 @@ pub struct BurnedExecutionPermitV1 {
     authorization: Digest,
     attempt: Digest,
     effect_index: u32,
+    preparation_checkpoint: Option<Digest>,
 }
 
 impl BurnedExecutionPermitV1 {
@@ -53,6 +56,26 @@ impl BurnedExecutionPermitV1 {
             authorization,
             attempt,
             effect_index,
+            preparation_checkpoint: None,
+        }
+    }
+
+    /// Builds the one-shot commit permit for a promotion whose reversible
+    /// preparation checkpoint was durably persisted before commit was armed.
+    #[must_use]
+    pub fn from_durable_preparation(
+        proposal: Digest,
+        authorization: Digest,
+        attempt: Digest,
+        effect_index: u32,
+        preparation_checkpoint: Digest,
+    ) -> Self {
+        Self {
+            proposal,
+            authorization,
+            attempt,
+            effect_index,
+            preparation_checkpoint: Some(preparation_checkpoint),
         }
     }
 }
@@ -163,34 +186,168 @@ pub struct PinnedHelperIdentityV1 {
     pub launch_profile: Digest,
 }
 
-/// Exact request understood by the managed-pointer helper.
+/// Exact reversible preparation request understood by the managed-pointer helper.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PointerPreparationRequestV1 {
+    /// Exact managed-promotion schema.
+    pub schema: String,
+    /// Broker-derived single-use operation identity.
+    pub operation_id: Digest,
+    /// Descriptor-opened allowed target root.
+    pub allowed_root: String,
+    /// Repository path beneath the allowed root.
+    pub repository: String,
+    /// Exact non-checked-out managed ref.
+    pub reference: String,
+    /// Expected repository configuration/object-format identity.
+    pub repository_identity: Digest,
+    /// Expected repository device.
+    pub repository_device: u64,
+    /// Expected repository inode.
+    pub repository_inode: u64,
+    /// Expected Git-directory device.
+    pub git_directory_device: u64,
+    /// Expected Git-directory inode.
+    pub git_directory_inode: u64,
+    /// Target owner UID under which mutation is permitted.
+    pub uid: u32,
+    /// Target owner GID under which mutation is permitted.
+    pub gid: u32,
+    /// Broker-owned staging root outside the repository.
+    pub staging_root: String,
+    /// Exact admitted candidate bundle.
+    pub artifact: Digest,
+    /// Exact normalized candidate pack.
+    pub candidate_pack_digest: Digest,
+    /// Closed Git object format.
+    pub object_format: GitObjectFormatV1,
+    /// Expected current commit.
+    pub expected_object: String,
+    /// Expected current tree.
+    pub expected_tree: String,
+    /// Candidate commit to install.
+    pub new_object: String,
+    /// Expected tree reached by the candidate commit.
+    pub expected_post_tree: String,
+    /// Exclusive broker-clock expiry.
+    pub expires_unix_ms: u64,
+}
+
+/// Exact helper evidence returned after reversible preparation and object import.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PointerPreparationSuccessV1 {
+    /// Digest of the complete canonical preparation request.
+    pub request_digest: Digest,
+    /// Exact operation prepared.
+    pub operation_id: Digest,
+    /// Candidate artifact consumed.
+    pub artifact: Digest,
+    /// Normalized candidate pack imported under target-owner custody.
+    pub candidate_pack_digest: Digest,
+    /// Current commit revalidated before preparation.
+    pub current_object: String,
+    /// Current tree revalidated before preparation.
+    pub current_tree: String,
+    /// Candidate commit proven present after object import.
+    pub candidate_object: String,
+    /// Candidate tree proven present after object import.
+    pub candidate_tree: String,
+    /// Durable checkpoint that must be burned before ref CAS.
+    pub preparation_checkpoint: Digest,
+    /// Exact object-import evidence retained by the broker.
+    pub evidence: Digest,
+}
+
+/// Exact request understood by the managed-pointer commit helper.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointerCasRequestV1 {
-    /// Canonically resolved repository.
+    /// Exact managed-promotion schema.
+    pub schema: String,
+    /// Broker-derived single-use operation identity.
+    pub operation_id: Digest,
+    /// Durable reversible-preparation checkpoint.
+    pub preparation_checkpoint: Digest,
+    /// Descriptor-opened allowed target root.
+    pub allowed_root: String,
+    /// Canonically resolved repository beneath the allowed root.
     pub repository: String,
     /// Exact reference name.
     pub reference: String,
     /// Expected repository/object-format identity.
     pub repository_identity: Digest,
-    /// Expected current object, including absence.
-    pub expected_object: Option<String>,
-    /// Exact new object.
+    /// Exact descriptor-bound repository layout and prestate identity.
+    pub prestate_identity: Digest,
+    /// Expected repository device.
+    pub repository_device: u64,
+    /// Expected repository inode.
+    pub repository_inode: u64,
+    /// Expected Git-directory device.
+    pub git_directory_device: u64,
+    /// Expected Git-directory inode.
+    pub git_directory_inode: u64,
+    /// Target owner UID under which mutation is permitted.
+    pub uid: u32,
+    /// Target owner GID under which mutation is permitted.
+    pub gid: u32,
+    /// Broker-owned staging root containing the prepared operation.
+    pub staging_root: String,
+    /// Exact admitted candidate bundle.
+    pub artifact: Digest,
+    /// Exact normalized candidate pack.
+    pub candidate_pack_digest: Digest,
+    /// Closed Git object format.
+    pub object_format: GitObjectFormatV1,
+    /// Expected current commit.
+    pub expected_object: String,
+    /// Expected current tree.
+    pub expected_tree: String,
+    /// Exact candidate commit.
     pub new_object: String,
+    /// Expected tree reached by the candidate commit.
+    pub expected_post_tree: String,
+    /// Exclusive broker-clock expiry.
+    pub expires_unix_ms: u64,
 }
 
 /// Helper evidence after a successful pointer compare-and-swap.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointerCasSuccessV1 {
+    /// Digest of the complete canonical compare-and-swap request.
+    pub request_digest: Digest,
+    /// Exact operation which crossed the ref boundary.
+    pub operation_id: Digest,
+    /// Durable preparation checkpoint consumed by the helper.
+    pub preparation_checkpoint: Digest,
     /// Repository identity actually checked by the helper.
     pub repository_identity: Digest,
+    /// Repository layout and prestate identity actually checked by the helper.
+    pub prestate_identity: Digest,
+    /// Repository device checked by the helper.
+    pub repository_device: u64,
+    /// Repository inode checked by the helper.
+    pub repository_inode: u64,
+    /// Git-directory device checked by the helper.
+    pub git_directory_device: u64,
+    /// Git-directory inode checked by the helper.
+    pub git_directory_inode: u64,
+    /// Exact candidate pack consumed by the operation.
+    pub candidate_pack_digest: Digest,
     /// Old object actually compared by the helper.
-    pub previous_object: Option<String>,
+    pub previous_object: String,
+    /// Old tree independently observed by the helper.
+    pub previous_tree: String,
     /// New object actually installed by the helper.
     pub installed_object: String,
-    /// Durable helper receipt in broker custody.
+    /// New tree independently observed after ref CAS.
+    pub installed_tree: String,
+    /// Durable ref-CAS evidence in broker custody.
     pub evidence: Digest,
+    /// Independent poststate-read evidence in broker custody.
+    pub poststate_evidence: Digest,
 }
 
 /// Independently pinned, closed managed-pointer capability.
@@ -198,6 +355,15 @@ pub trait PinnedPointerHelperV1: Send + Sync {
     /// Opens and hashes the exact helper executable and launch profile without
     /// invoking it.
     fn identity(&self) -> CapabilityOutcomeV1<PinnedHelperIdentityV1>;
+
+    /// Stages and imports only the exact candidate objects while the managed
+    /// ref remains unchanged. Candidate bytes arrive through this typed call,
+    /// never through a pathname, environment, or argv field.
+    fn prepare(
+        &self,
+        request: &PointerPreparationRequestV1,
+        artifact: &[u8],
+    ) -> CapabilityOutcomeV1<PointerPreparationSuccessV1>;
 
     /// Performs exactly one Git-reference compare-and-swap. No arbitrary argv,
     /// environment, command, ref glob, or repository discovery is accepted.
@@ -401,12 +567,24 @@ pub enum EffectSuccessV1 {
     },
     /// Managed-pointer helper compare-and-swap.
     ManagedPointerPromotion {
+        /// Broker-derived operation identity.
+        operation_id: Digest,
+        /// Exact normalized candidate pack.
+        candidate_pack_digest: Digest,
+        /// Durable preparation checkpoint consumed before CAS.
+        preparation_checkpoint: Digest,
         /// Previous pointer value.
-        previous_object: Option<String>,
+        previous_object: String,
+        /// Previous tree value.
+        previous_tree: String,
         /// Installed pointer value.
         installed_object: String,
-        /// Durable helper receipt.
+        /// Installed tree value.
+        installed_tree: String,
+        /// Durable helper CAS receipt.
         evidence: Digest,
+        /// Independent poststate observation receipt.
+        poststate_evidence: Digest,
     },
     /// Typed systemd unit operation.
     SystemdUnit {
@@ -514,6 +692,10 @@ pub enum ExecutionPhaseV1 {
     PrestateCheck,
     /// Staging content under broker-only ownership and permissions.
     Staging,
+    /// Reversible managed-pointer bundle validation and staging.
+    PromotionPreparation,
+    /// Import of immutable candidate objects before the managed ref is armed.
+    PromotionObjectImport,
     /// Atomic rename or compare-and-swap.
     Commit,
     /// Transfer of a committed managed file to its final owner and mode.
@@ -526,6 +708,8 @@ pub enum ExecutionPhaseV1 {
     HelperIdentity,
     /// Managed-pointer helper invocation.
     PointerCas,
+    /// Independent managed-pointer ref and tree verification after CAS.
+    PromotionPoststateVerification,
     /// Typed systemd D-Bus operation.
     SystemdDbus,
 }
@@ -566,6 +750,150 @@ impl<'a> EffectExecutorV1<'a> {
         self
     }
 
+    /// Performs only the reversible preparation portion of one canonical
+    /// managed-pointer effect. The returned checkpoint is data until the
+    /// broker durably transitions `Preparing` through `CommitMayProceed`.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn prepare_pointer(
+        &self,
+        effect: &CanonicalEffectV1,
+    ) -> CapabilityOutcomeV1<PointerPreparationSuccessV1> {
+        let CanonicalEffectV1::ManagedPointerPromotion {
+            schema,
+            operation_id,
+            allowed_root,
+            repository,
+            reference,
+            repository_identity,
+            repository_device,
+            repository_inode,
+            git_directory_device,
+            git_directory_inode,
+            uid,
+            gid,
+            staging_root,
+            artifact,
+            candidate_pack_digest,
+            object_format,
+            expected_object,
+            expected_tree,
+            new_object,
+            expected_post_tree,
+            expires_unix_ms,
+            helper_executable,
+            helper_launch_profile,
+            ..
+        } = effect
+        else {
+            return CapabilityOutcomeV1::Failed(CapabilityFailureV1 {
+                code: "not_managed_pointer_promotion".to_owned(),
+                detail: "promotion preparation received another effect family".to_owned(),
+                evidence: None,
+            });
+        };
+        if schema != MANAGED_POINTER_PROMOTION_SCHEMA_V1 {
+            return CapabilityOutcomeV1::Failed(CapabilityFailureV1 {
+                code: "promotion_schema_mismatch".to_owned(),
+                detail: "canonical effect names an unsupported promotion contract".to_owned(),
+                evidence: None,
+            });
+        }
+
+        let bytes = match self.artifacts.load(artifact) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return CapabilityOutcomeV1::Failed(CapabilityFailureV1 {
+                    code: error.code,
+                    detail: error.detail,
+                    evidence: None,
+                });
+            }
+        };
+        if Digest::hash_bytes(&bytes) != *artifact {
+            return CapabilityOutcomeV1::Failed(CapabilityFailureV1 {
+                code: "artifact_digest_mismatch".to_owned(),
+                detail: "artifact source returned bytes outside canonical custody".to_owned(),
+                evidence: None,
+            });
+        }
+        match self.pointer_helper.identity() {
+            CapabilityOutcomeV1::Succeeded(identity)
+                if identity.executable == *helper_executable
+                    && identity.launch_profile == *helper_launch_profile => {}
+            CapabilityOutcomeV1::Succeeded(_) => {
+                return CapabilityOutcomeV1::Failed(CapabilityFailureV1 {
+                    code: "helper_identity_mismatch".to_owned(),
+                    detail: "opened helper bytes or profile differ from canonical proposal"
+                        .to_owned(),
+                    evidence: None,
+                });
+            }
+            CapabilityOutcomeV1::Failed(error) => return CapabilityOutcomeV1::Failed(error),
+            CapabilityOutcomeV1::Indeterminate(error) => {
+                return CapabilityOutcomeV1::Indeterminate(error);
+            }
+        }
+
+        let request = PointerPreparationRequestV1 {
+            schema: schema.clone(),
+            operation_id: operation_id.clone(),
+            allowed_root: allowed_root.clone(),
+            repository: repository.clone(),
+            reference: reference.clone(),
+            repository_identity: repository_identity.clone(),
+            repository_device: *repository_device,
+            repository_inode: *repository_inode,
+            git_directory_device: *git_directory_device,
+            git_directory_inode: *git_directory_inode,
+            uid: *uid,
+            gid: *gid,
+            staging_root: staging_root.clone(),
+            artifact: artifact.clone(),
+            candidate_pack_digest: candidate_pack_digest.clone(),
+            object_format: *object_format,
+            expected_object: expected_object.clone(),
+            expected_tree: expected_tree.clone(),
+            new_object: new_object.clone(),
+            expected_post_tree: expected_post_tree.clone(),
+            expires_unix_ms: *expires_unix_ms,
+        };
+        let request_digest = match Digest::from_serializable(&request) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return CapabilityOutcomeV1::Failed(CapabilityFailureV1 {
+                    code: "preparation_request_canonicalization_failed".to_owned(),
+                    detail: error.to_string(),
+                    evidence: None,
+                });
+            }
+        };
+        match self.pointer_helper.prepare(&request, &bytes) {
+            CapabilityOutcomeV1::Succeeded(result)
+                if result.request_digest == request_digest
+                    && result.operation_id == *operation_id
+                    && result.artifact == *artifact
+                    && result.candidate_pack_digest == *candidate_pack_digest
+                    && result.current_object == *expected_object
+                    && result.current_tree == *expected_tree
+                    && result.candidate_object == *new_object
+                    && result.candidate_tree == *expected_post_tree =>
+            {
+                CapabilityOutcomeV1::Succeeded(result)
+            }
+            CapabilityOutcomeV1::Succeeded(result) => {
+                CapabilityOutcomeV1::Indeterminate(CapabilityIndeterminateV1 {
+                    code: "preparation_contract_violation".to_owned(),
+                    detail: "helper preparation evidence contradicts canonical promotion"
+                        .to_owned(),
+                    evidence: Some(result.evidence),
+                })
+            }
+            CapabilityOutcomeV1::Failed(error) => CapabilityOutcomeV1::Failed(error),
+            CapabilityOutcomeV1::Indeterminate(error) => CapabilityOutcomeV1::Indeterminate(error),
+        }
+    }
+
     /// Consumes one already-burned permit and returns a terminal typed receipt.
     /// There is no automatic retry path. An indeterminate receipt requires
     /// reconciliation, never reinvocation.
@@ -575,64 +903,60 @@ impl<'a> EffectExecutorV1<'a> {
         permit: BurnedExecutionPermitV1,
         effect: &CanonicalEffectV1,
     ) -> ExecutionReceiptV1 {
-        let outcome = match effect {
-            CanonicalEffectV1::ManagedFilePut {
-                path,
-                expected_content,
-                content,
-                mode,
-                uid,
-                gid,
-                ..
-            } => self.execute_file_put(
-                &permit,
-                path,
-                expected_content.as_ref(),
-                content,
-                *mode,
-                *uid,
-                *gid,
-            ),
-            CanonicalEffectV1::ManagedFileDelete {
-                path,
-                expected_content,
-                ..
-            } => self.execute_file_delete(&permit, path, expected_content),
-            CanonicalEffectV1::ManagedPointerPromotion {
-                repository,
-                reference,
-                expected_object,
-                new_object,
-                repository_identity,
-                helper_executable,
-                helper_launch_profile,
-                ..
-            } => self.execute_pointer(
-                repository,
-                reference,
-                expected_object.as_ref(),
-                new_object,
-                repository_identity,
-                helper_executable,
-                helper_launch_profile,
-            ),
-            CanonicalEffectV1::SystemdUnit {
-                unit,
-                action,
-                expected_active_state,
-                expected_unit_file_state,
-                ..
-            } => self.execute_systemd_unit(
-                unit,
-                *action,
-                expected_active_state,
-                expected_unit_file_state,
-            ),
-            CanonicalEffectV1::SystemdManagerReload {
-                machine_identity,
-                expected_generation,
-                ..
-            } => self.execute_systemd_manager(machine_identity, *expected_generation),
+        let promotion = matches!(effect, CanonicalEffectV1::ManagedPointerPromotion { .. });
+        let checkpoint_binding_valid = promotion == permit.preparation_checkpoint.is_some();
+        let outcome = if checkpoint_binding_valid {
+            match effect {
+                CanonicalEffectV1::ManagedFilePut {
+                    path,
+                    expected_content,
+                    content,
+                    mode,
+                    uid,
+                    gid,
+                    ..
+                } => self.execute_file_put(
+                    &permit,
+                    path,
+                    expected_content.as_ref(),
+                    content,
+                    *mode,
+                    *uid,
+                    *gid,
+                ),
+                CanonicalEffectV1::ManagedFileDelete {
+                    path,
+                    expected_content,
+                    ..
+                } => self.execute_file_delete(&permit, path, expected_content),
+                CanonicalEffectV1::ManagedPointerPromotion { .. } => {
+                    self.execute_pointer(&permit, effect)
+                }
+                CanonicalEffectV1::SystemdUnit {
+                    unit,
+                    action,
+                    expected_active_state,
+                    expected_unit_file_state,
+                    ..
+                } => self.execute_systemd_unit(
+                    unit,
+                    *action,
+                    expected_active_state,
+                    expected_unit_file_state,
+                ),
+                CanonicalEffectV1::SystemdManagerReload {
+                    machine_identity,
+                    expected_generation,
+                    ..
+                } => self.execute_systemd_manager(machine_identity, *expected_generation),
+            }
+        } else {
+            failure(
+                ExecutionFailureCodeV1::BackendRejected,
+                ExecutionPhaseV1::ReceiptValidation,
+                "execution permit preparation checkpoint does not match effect family",
+                None,
+            )
         };
 
         ExecutionReceiptV1 {
@@ -877,6 +1201,7 @@ impl<'a> EffectExecutorV1<'a> {
         })
     }
 
+    #[allow(clippy::result_large_err)]
     fn finalize_committed_file(
         &self,
         staged: &StagedFile,
@@ -1055,17 +1380,63 @@ impl<'a> EffectExecutorV1<'a> {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn execute_pointer(
         &self,
-        repository: &str,
-        reference: &str,
-        expected_object: Option<&String>,
-        new_object: &str,
-        repository_identity: &Digest,
-        expected_executable: &Digest,
-        expected_launch_profile: &Digest,
+        permit: &BurnedExecutionPermitV1,
+        effect: &CanonicalEffectV1,
     ) -> ExecutionOutcomeV1 {
+        let CanonicalEffectV1::ManagedPointerPromotion {
+            schema,
+            operation_id,
+            allowed_root,
+            repository,
+            reference,
+            repository_identity,
+            prestate_identity,
+            repository_device,
+            repository_inode,
+            git_directory_device,
+            git_directory_inode,
+            uid,
+            gid,
+            staging_root,
+            artifact,
+            candidate_pack_digest,
+            object_format,
+            expected_object,
+            expected_tree,
+            new_object,
+            expected_post_tree,
+            expires_unix_ms,
+            helper_executable,
+            helper_launch_profile,
+            ..
+        } = effect
+        else {
+            return failure(
+                ExecutionFailureCodeV1::BackendRejected,
+                ExecutionPhaseV1::ReceiptValidation,
+                "pointer executor received another effect family",
+                None,
+            );
+        };
+        if schema != MANAGED_POINTER_PROMOTION_SCHEMA_V1 {
+            return failure(
+                ExecutionFailureCodeV1::BackendRejected,
+                ExecutionPhaseV1::ReceiptValidation,
+                "canonical effect names an unsupported promotion contract",
+                None,
+            );
+        }
+        let Some(preparation_checkpoint) = permit.preparation_checkpoint.as_ref() else {
+            return failure(
+                ExecutionFailureCodeV1::BackendRejected,
+                ExecutionPhaseV1::ReceiptValidation,
+                "promotion commit lacks a durable preparation checkpoint",
+                None,
+            );
+        };
         let identity = match self.pointer_helper.identity() {
             CapabilityOutcomeV1::Succeeded(identity) => identity,
             CapabilityOutcomeV1::Failed(error) => {
@@ -1087,8 +1458,8 @@ impl<'a> EffectExecutorV1<'a> {
                 );
             }
         };
-        if identity.executable != *expected_executable
-            || identity.launch_profile != *expected_launch_profile
+        if identity.executable != *helper_executable
+            || identity.launch_profile != *helper_launch_profile
         {
             return failure(
                 ExecutionFailureCodeV1::HelperIdentityMismatch,
@@ -1099,27 +1470,73 @@ impl<'a> EffectExecutorV1<'a> {
         }
 
         let request = PointerCasRequestV1 {
-            repository: repository.to_owned(),
-            reference: reference.to_owned(),
+            schema: schema.clone(),
+            operation_id: operation_id.clone(),
+            preparation_checkpoint: preparation_checkpoint.clone(),
+            allowed_root: allowed_root.clone(),
+            repository: repository.clone(),
+            reference: reference.clone(),
             repository_identity: repository_identity.clone(),
-            expected_object: expected_object.cloned(),
-            new_object: new_object.to_owned(),
+            prestate_identity: prestate_identity.clone(),
+            repository_device: *repository_device,
+            repository_inode: *repository_inode,
+            git_directory_device: *git_directory_device,
+            git_directory_inode: *git_directory_inode,
+            uid: *uid,
+            gid: *gid,
+            staging_root: staging_root.clone(),
+            artifact: artifact.clone(),
+            candidate_pack_digest: candidate_pack_digest.clone(),
+            object_format: *object_format,
+            expected_object: expected_object.clone(),
+            expected_tree: expected_tree.clone(),
+            new_object: new_object.clone(),
+            expected_post_tree: expected_post_tree.clone(),
+            expires_unix_ms: *expires_unix_ms,
+        };
+        let request_digest = match Digest::from_serializable(&request) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return failure(
+                    ExecutionFailureCodeV1::BackendRejected,
+                    ExecutionPhaseV1::ReceiptValidation,
+                    error.to_string(),
+                    None,
+                );
+            }
         };
         match self.pointer_helper.compare_and_swap(&request) {
             CapabilityOutcomeV1::Succeeded(result)
-                if result.repository_identity == *repository_identity
-                    && result.previous_object.as_ref() == expected_object
-                    && result.installed_object == new_object =>
+                if result.request_digest == request_digest
+                    && result.operation_id == *operation_id
+                    && result.preparation_checkpoint == *preparation_checkpoint
+                    && result.repository_identity == *repository_identity
+                    && result.prestate_identity == *prestate_identity
+                    && result.repository_device == *repository_device
+                    && result.repository_inode == *repository_inode
+                    && result.git_directory_device == *git_directory_device
+                    && result.git_directory_inode == *git_directory_inode
+                    && result.candidate_pack_digest == *candidate_pack_digest
+                    && result.previous_object == *expected_object
+                    && result.previous_tree == *expected_tree
+                    && result.installed_object == *new_object
+                    && result.installed_tree == *expected_post_tree =>
             {
                 success(EffectSuccessV1::ManagedPointerPromotion {
+                    operation_id: operation_id.clone(),
+                    candidate_pack_digest: candidate_pack_digest.clone(),
+                    preparation_checkpoint: preparation_checkpoint.clone(),
                     previous_object: result.previous_object,
+                    previous_tree: result.previous_tree,
                     installed_object: result.installed_object,
+                    installed_tree: result.installed_tree,
                     evidence: result.evidence,
+                    poststate_evidence: result.poststate_evidence,
                 })
             }
             CapabilityOutcomeV1::Succeeded(result) => indeterminate(
                 ExecutionIndeterminateCodeV1::BackendContractViolation,
-                ExecutionPhaseV1::PointerCas,
+                ExecutionPhaseV1::PromotionPoststateVerification,
                 "helper success evidence contradicts the exact CAS request",
                 Some(result.evidence),
             ),
@@ -1923,11 +2340,111 @@ mod tests {
             panic!("pointer helper must not be invoked by a file effect")
         }
 
+        fn prepare(
+            &self,
+            _request: &PointerPreparationRequestV1,
+            _artifact: &[u8],
+        ) -> CapabilityOutcomeV1<PointerPreparationSuccessV1> {
+            panic!("pointer helper must not be invoked by a file effect")
+        }
+
         fn compare_and_swap(
             &self,
             _request: &PointerCasRequestV1,
         ) -> CapabilityOutcomeV1<PointerCasSuccessV1> {
             panic!("pointer helper must not be invoked by a file effect")
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PointerContradictionV1 {
+        None,
+        PreparationRequest,
+        CasRequest,
+        PrestateIdentity,
+        Poststate,
+    }
+
+    struct ExactPointer {
+        executable: Digest,
+        launch_profile: Digest,
+        contradiction: PointerContradictionV1,
+    }
+
+    impl PinnedPointerHelperV1 for ExactPointer {
+        fn identity(&self) -> CapabilityOutcomeV1<PinnedHelperIdentityV1> {
+            CapabilityOutcomeV1::Succeeded(PinnedHelperIdentityV1 {
+                executable: self.executable.clone(),
+                launch_profile: self.launch_profile.clone(),
+            })
+        }
+
+        fn prepare(
+            &self,
+            request: &PointerPreparationRequestV1,
+            artifact: &[u8],
+        ) -> CapabilityOutcomeV1<PointerPreparationSuccessV1> {
+            if Digest::hash_bytes(artifact) != request.artifact {
+                return CapabilityOutcomeV1::Failed(CapabilityFailureV1 {
+                    code: "fixture_artifact_mismatch".to_owned(),
+                    detail: "fixture received different artifact bytes".to_owned(),
+                    evidence: None,
+                });
+            }
+            CapabilityOutcomeV1::Succeeded(PointerPreparationSuccessV1 {
+                request_digest: if self.contradiction == PointerContradictionV1::PreparationRequest
+                {
+                    Digest::hash_bytes(b"different preparation request")
+                } else {
+                    Digest::from_serializable(request).expect("canonical request")
+                },
+                operation_id: request.operation_id.clone(),
+                artifact: request.artifact.clone(),
+                candidate_pack_digest: request.candidate_pack_digest.clone(),
+                current_object: request.expected_object.clone(),
+                current_tree: request.expected_tree.clone(),
+                candidate_object: request.new_object.clone(),
+                candidate_tree: request.expected_post_tree.clone(),
+                preparation_checkpoint: Digest::hash_bytes(b"preparation-checkpoint"),
+                evidence: Digest::hash_bytes(b"object-import-evidence"),
+            })
+        }
+
+        fn compare_and_swap(
+            &self,
+            request: &PointerCasRequestV1,
+        ) -> CapabilityOutcomeV1<PointerCasSuccessV1> {
+            CapabilityOutcomeV1::Succeeded(PointerCasSuccessV1 {
+                request_digest: if self.contradiction == PointerContradictionV1::CasRequest {
+                    Digest::hash_bytes(b"different CAS request")
+                } else {
+                    Digest::from_serializable(request).expect("canonical request")
+                },
+                operation_id: request.operation_id.clone(),
+                preparation_checkpoint: request.preparation_checkpoint.clone(),
+                repository_identity: request.repository_identity.clone(),
+                prestate_identity: if self.contradiction == PointerContradictionV1::PrestateIdentity
+                {
+                    Digest::hash_bytes(b"different prestate layout identity")
+                } else {
+                    request.prestate_identity.clone()
+                },
+                repository_device: request.repository_device,
+                repository_inode: request.repository_inode,
+                git_directory_device: request.git_directory_device,
+                git_directory_inode: request.git_directory_inode,
+                candidate_pack_digest: request.candidate_pack_digest.clone(),
+                previous_object: request.expected_object.clone(),
+                previous_tree: request.expected_tree.clone(),
+                installed_object: request.new_object.clone(),
+                installed_tree: if self.contradiction == PointerContradictionV1::Poststate {
+                    "f".repeat(request.expected_post_tree.len())
+                } else {
+                    request.expected_post_tree.clone()
+                },
+                evidence: Digest::hash_bytes(b"ref-cas-evidence"),
+                poststate_evidence: Digest::hash_bytes(b"poststate-evidence"),
+            })
         }
     }
 
@@ -2010,6 +2527,36 @@ mod tests {
         }
     }
 
+    fn pointer_promotion(artifact: Digest) -> CanonicalEffectV1 {
+        CanonicalEffectV1::ManagedPointerPromotion {
+            schema: MANAGED_POINTER_PROMOTION_SCHEMA_V1.to_owned(),
+            operation_id: Digest::hash_bytes(b"operation"),
+            target: TargetId::parse("release.main").expect("target"),
+            allowed_root: "/srv/governed".to_owned(),
+            repository: "service.git".to_owned(),
+            reference: "refs/heads/main".to_owned(),
+            repository_identity: Digest::hash_bytes(b"repository"),
+            prestate_identity: Digest::hash_bytes(b"prestate-layout-identity"),
+            repository_device: 8,
+            repository_inode: 101,
+            git_directory_device: 8,
+            git_directory_inode: 102,
+            uid: 1200,
+            gid: 1200,
+            staging_root: "/var/lib/ag-effectd/promotion-stage".to_owned(),
+            artifact,
+            candidate_pack_digest: Digest::hash_bytes(b"normalized-pack"),
+            object_format: GitObjectFormatV1::Sha1,
+            expected_object: "1".repeat(40),
+            expected_tree: "2".repeat(40),
+            new_object: "3".repeat(40),
+            expected_post_tree: "4".repeat(40),
+            expires_unix_ms: 20_000,
+            helper_executable: Digest::hash_bytes(b"helper-executable"),
+            helper_launch_profile: Digest::hash_bytes(b"helper-profile"),
+        }
+    }
+
     #[test]
     fn runner_receipt_must_bind_every_permit_field_and_exact_effect() {
         let effect = CanonicalEffectV1::SystemdManagerReload {
@@ -2040,6 +2587,202 @@ mod tests {
         assert!(matches!(
             receipt.verify_bindings(&proposal, &authorization, &attempt, 1, &effect),
             Err(ExecutionReceiptError::BindingMismatch)
+        ));
+    }
+
+    #[test]
+    fn managed_pointer_requires_durable_preparation_and_validates_poststate() {
+        let bytes = b"exact git bundle".to_vec();
+        let artifact = Digest::hash_bytes(&bytes);
+        let source = OneArtifact {
+            digest: artifact.clone(),
+            bytes,
+        };
+        let effect = pointer_promotion(artifact);
+        let exact = ExactPointer {
+            executable: Digest::hash_bytes(b"helper-executable"),
+            launch_profile: Digest::hash_bytes(b"helper-profile"),
+            contradiction: PointerContradictionV1::None,
+        };
+        let executor = EffectExecutorV1::new(
+            &source,
+            &exact,
+            &UnusedSystemd,
+            ManagedFilePolicyV1::default(),
+        );
+        let preparation = match executor.prepare_pointer(&effect) {
+            CapabilityOutcomeV1::Succeeded(preparation) => preparation,
+            other => panic!("unexpected preparation result: {other:?}"),
+        };
+        let receipt = executor.execute_once(
+            BurnedExecutionPermitV1::from_durable_preparation(
+                Digest::hash_bytes(b"proposal"),
+                Digest::hash_bytes(b"authorization"),
+                Digest::hash_bytes(b"attempt"),
+                0,
+                preparation.preparation_checkpoint.clone(),
+            ),
+            &effect,
+        );
+        assert!(matches!(
+            receipt.outcome,
+            ExecutionOutcomeV1::Succeeded {
+                success: EffectSuccessV1::ManagedPointerPromotion { .. }
+            }
+        ));
+
+        let without_checkpoint = executor.execute_once(permit(b"missing-checkpoint"), &effect);
+        assert!(matches!(
+            without_checkpoint.outcome,
+            ExecutionOutcomeV1::Failed {
+                failure: ExecutionFailureV1 {
+                    phase: ExecutionPhaseV1::ReceiptValidation,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn contradictory_pointer_poststate_or_prestate_identity_is_indeterminate_never_success() {
+        let bytes = b"exact git bundle".to_vec();
+        let artifact = Digest::hash_bytes(&bytes);
+        let source = OneArtifact {
+            digest: artifact.clone(),
+            bytes,
+        };
+        let effect = pointer_promotion(artifact);
+        let contradicting = ExactPointer {
+            executable: Digest::hash_bytes(b"helper-executable"),
+            launch_profile: Digest::hash_bytes(b"helper-profile"),
+            contradiction: PointerContradictionV1::Poststate,
+        };
+        let executor = EffectExecutorV1::new(
+            &source,
+            &contradicting,
+            &UnusedSystemd,
+            ManagedFilePolicyV1::default(),
+        );
+        let checkpoint = match executor.prepare_pointer(&effect) {
+            CapabilityOutcomeV1::Succeeded(preparation) => preparation.preparation_checkpoint,
+            other => panic!("unexpected preparation result: {other:?}"),
+        };
+        let receipt = executor.execute_once(
+            BurnedExecutionPermitV1::from_durable_preparation(
+                Digest::hash_bytes(b"proposal"),
+                Digest::hash_bytes(b"authorization"),
+                Digest::hash_bytes(b"attempt"),
+                0,
+                checkpoint,
+            ),
+            &effect,
+        );
+        assert!(matches!(
+            receipt.outcome,
+            ExecutionOutcomeV1::Indeterminate {
+                envelope: ExecutionIndeterminateV1 {
+                    code: ExecutionIndeterminateCodeV1::BackendContractViolation,
+                    phase: ExecutionPhaseV1::PromotionPoststateVerification,
+                    ..
+                }
+            }
+        ));
+
+        let contradicting_prestate = ExactPointer {
+            executable: Digest::hash_bytes(b"helper-executable"),
+            launch_profile: Digest::hash_bytes(b"helper-profile"),
+            contradiction: PointerContradictionV1::PrestateIdentity,
+        };
+        let executor = EffectExecutorV1::new(
+            &source,
+            &contradicting_prestate,
+            &UnusedSystemd,
+            ManagedFilePolicyV1::default(),
+        );
+        let checkpoint = match executor.prepare_pointer(&effect) {
+            CapabilityOutcomeV1::Succeeded(preparation) => preparation.preparation_checkpoint,
+            other => panic!("unexpected preparation result: {other:?}"),
+        };
+        let receipt = executor.execute_once(
+            BurnedExecutionPermitV1::from_durable_preparation(
+                Digest::hash_bytes(b"proposal"),
+                Digest::hash_bytes(b"authorization"),
+                Digest::hash_bytes(b"attempt-with-wrong-prestate-identity"),
+                0,
+                checkpoint,
+            ),
+            &effect,
+        );
+        assert!(matches!(
+            receipt.outcome,
+            ExecutionOutcomeV1::Indeterminate {
+                envelope: ExecutionIndeterminateV1 {
+                    code: ExecutionIndeterminateCodeV1::BackendContractViolation,
+                    phase: ExecutionPhaseV1::PromotionPoststateVerification,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn pointer_helper_success_must_bind_the_complete_typed_request() {
+        let bytes = b"exact git bundle".to_vec();
+        let artifact = Digest::hash_bytes(&bytes);
+        let source = OneArtifact {
+            digest: artifact.clone(),
+            bytes,
+        };
+        let effect = pointer_promotion(artifact);
+        let contradicting_preparation = ExactPointer {
+            executable: Digest::hash_bytes(b"helper-executable"),
+            launch_profile: Digest::hash_bytes(b"helper-profile"),
+            contradiction: PointerContradictionV1::PreparationRequest,
+        };
+        let executor = EffectExecutorV1::new(
+            &source,
+            &contradicting_preparation,
+            &UnusedSystemd,
+            ManagedFilePolicyV1::default(),
+        );
+        assert!(matches!(
+            executor.prepare_pointer(&effect),
+            CapabilityOutcomeV1::Indeterminate(CapabilityIndeterminateV1 { .. })
+        ));
+
+        let contradicting_cas = ExactPointer {
+            executable: Digest::hash_bytes(b"helper-executable"),
+            launch_profile: Digest::hash_bytes(b"helper-profile"),
+            contradiction: PointerContradictionV1::CasRequest,
+        };
+        let executor = EffectExecutorV1::new(
+            &source,
+            &contradicting_cas,
+            &UnusedSystemd,
+            ManagedFilePolicyV1::default(),
+        );
+        let checkpoint = match executor.prepare_pointer(&effect) {
+            CapabilityOutcomeV1::Succeeded(preparation) => preparation.preparation_checkpoint,
+            other => panic!("unexpected preparation result: {other:?}"),
+        };
+        let receipt = executor.execute_once(
+            BurnedExecutionPermitV1::from_durable_preparation(
+                Digest::hash_bytes(b"proposal"),
+                Digest::hash_bytes(b"authorization"),
+                Digest::hash_bytes(b"attempt"),
+                0,
+                checkpoint,
+            ),
+            &effect,
+        );
+        assert!(matches!(
+            receipt.outcome,
+            ExecutionOutcomeV1::Indeterminate {
+                envelope: ExecutionIndeterminateV1 {
+                    code: ExecutionIndeterminateCodeV1::BackendContractViolation,
+                    ..
+                }
+            }
         ));
     }
 

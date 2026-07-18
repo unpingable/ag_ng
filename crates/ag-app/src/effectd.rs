@@ -8,11 +8,11 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ag_effect::{
-    CanonicalEffectV1, EFFECT_SCHEMA_V1, EffectCatalogV1, EffectCompilerV1, EffectError,
-    ProposalEventV1, ProposalIntentV1, ProposalStateV1, RECONCILIATION_EVIDENCE_SCHEMA_V1,
-    RECONCILIATION_RECORD_SCHEMA_V1, RatificationV1, ReconciliationClassificationV1,
-    ReconciliationEvidenceV1, ReconciliationRecordV1, TargetDefinitionV1, TargetId,
-    TargetObservationV1,
+    CanonicalEffectV1, EFFECT_CATALOG_SCHEMA_V1, EFFECT_SCHEMA_V1, EffectCatalogV1,
+    EffectCompilerV1, EffectError, EffectFamilyV1, ProposalEventV1, ProposalIntentV1,
+    ProposalStateV1, RECONCILIATION_EVIDENCE_SCHEMA_V1, RECONCILIATION_RECORD_SCHEMA_V1,
+    RatificationV1, ReconciliationClassificationV1, ReconciliationEvidenceV1,
+    ReconciliationRecordV1, TargetDefinitionV1, TargetId, TargetObservationV1,
 };
 use ag_primitives::{
     AuthorityDomain, Digest, Epoch, PrincipalChainNodeV1, PrincipalChainV1, PrincipalKindV1,
@@ -33,6 +33,10 @@ use crate::api::{
 #[cfg(test)]
 use crate::api::{ProposalIngressProofV1, WorkerCandidateIngressProofV1};
 use crate::config::{EffectTargetConfigV1, EffectdConfigV1, PeerPolicyV1};
+use crate::managed_pointer::{
+    ManagedPointerCommitEvidenceV1, ManagedPointerCommitResultV1, ManagedPointerError,
+    ManagedPointerPoststateEvidenceV1, ManagedPointerRuntimeV1,
+};
 use crate::peer::signed_principal_chain;
 use crate::rpc_auth::{
     RpcReplayGuardV1, VerifiedRpcPrincipalV1, candidate_ingress_key_identity,
@@ -45,7 +49,8 @@ use ag_effect::executor::{
     CapabilityOutcomeV1, EXECUTION_RECEIPT_SCHEMA_V1, EffectExecutorV1,
     ExecutionIndeterminateCodeV1, ExecutionIndeterminateV1, ExecutionOutcomeV1, ExecutionPhaseV1,
     ExecutionReceiptV1, ManagedFilePolicyV1, PinnedHelperIdentityV1, PinnedPointerHelperV1,
-    PointerCasRequestV1, PointerCasSuccessV1, SystemdDbusBackendV1, SystemdManagerReloadRequestV1,
+    PointerCasRequestV1, PointerCasSuccessV1, PointerPreparationRequestV1,
+    PointerPreparationSuccessV1, SystemdDbusBackendV1, SystemdManagerReloadRequestV1,
     SystemdManagerReloadSuccessV1, SystemdUnitRequestV1, SystemdUnitSuccessV1,
 };
 
@@ -324,6 +329,18 @@ impl PinnedPointerHelperV1 for UnavailablePointerHelperV1 {
         })
     }
 
+    fn prepare(
+        &self,
+        _request: &PointerPreparationRequestV1,
+        _artifact: &[u8],
+    ) -> CapabilityOutcomeV1<PointerPreparationSuccessV1> {
+        CapabilityOutcomeV1::Failed(CapabilityFailureV1 {
+            code: "pinned_helper_unavailable".to_owned(),
+            detail: "no deployment pointer helper adapter is installed".to_owned(),
+            evidence: None,
+        })
+    }
+
     fn compare_and_swap(
         &self,
         _request: &PointerCasRequestV1,
@@ -376,6 +393,7 @@ pub struct EffectBrokerV1<R> {
     store: Store,
     compiler: EffectCompilerV1,
     catalog_identity: Digest,
+    security_profile_identity: Digest,
     targets: BTreeMap<TargetId, EffectTargetConfigV1>,
     authority_domain: AuthorityDomain,
     epoch: Epoch,
@@ -389,6 +407,7 @@ pub struct EffectBrokerV1<R> {
     development_authority_bypass: bool,
     activation_ready: bool,
     challenges: BTreeMap<String, ChallengeV1>,
+    pointer_runtime: ManagedPointerRuntimeV1,
     runner: R,
 }
 
@@ -413,10 +432,16 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         if &catalog_identity != activated_catalog_identity {
             return Err(BrokerError::CatalogIdentityMismatch);
         }
+        let pointer_runtime = ManagedPointerRuntimeV1::from_config(config)?;
+        let profile_identity = security_profile_identity(&config.security_profile);
+        if pointer_runtime.security_profile_identity() != &profile_identity {
+            return Err(BrokerError::SecurityProfileIdentityMismatch);
+        }
         let mut broker = Self {
             store,
-            compiler: EffectCompilerV1::new(catalog),
+            compiler: EffectCompilerV1::new(catalog, profile_identity.clone()),
             catalog_identity,
+            security_profile_identity: profile_identity,
             targets,
             authority_domain,
             epoch,
@@ -433,6 +458,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             // disabled until that proof is installed.
             activation_ready: false,
             challenges: BTreeMap::new(),
+            pointer_runtime,
             runner,
         };
         broker.store.verify_chain()?;
@@ -587,6 +613,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             &intent,
             &authenticated_proposer,
             governor_authentication,
+            now_u64()?,
             &observations,
         ) {
             Ok(canonical) => canonical,
@@ -966,6 +993,14 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         }
         let loaded = self.load_proposal_with_revision(proposal)?;
         loaded.state.canonical.verify_digest()?;
+        let effect = loaded.state.canonical.body().effects[0].clone();
+        if let CanonicalEffectV1::ManagedPointerPromotion {
+            expires_unix_ms, ..
+        } = &effect
+            && now_u64()? >= *expires_unix_ms
+        {
+            return Err(BrokerError::PromotionExpired);
+        }
         let ratifier = signed_principal_chain(
             peer,
             &self.admin_policy,
@@ -995,6 +1030,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             .apply(ProposalEventV1::BurnAuthorization {
                 proposal: proposal.to_owned(),
                 authorization: authorization_digest.clone(),
+                family: effect.family(),
             })?;
         let mut record = BrokerProposalRecordV1 {
             state,
@@ -1013,111 +1049,246 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             &proposal,
             uuid::Uuid::new_v4().to_string(),
         ))?;
-        record.state = record.state.apply(ProposalEventV1::BeginExecution {
-            attempt: attempt.clone(),
-        })?;
         record.execution_attempt = Some(attempt.clone());
-        revision = self.persist_record(&record, revision, "effect-execution.began.v1", &attempt)?;
-
-        let mut steps = Vec::with_capacity(record.canonical.body().effects.len());
-        for (index, effect) in record.canonical.body().effects.clone().iter().enumerate() {
-            let effect_index = u32::try_from(index).map_err(|_| BrokerError::PlanTooLarge)?;
-            let mut execution_receipt = self.runner.execute_once(
-                &self.store,
-                proposal,
-                &authorization_digest,
-                &attempt,
-                effect_index,
-                effect,
-            );
-            if execution_receipt
-                .verify_bindings(
-                    proposal,
-                    &authorization_digest,
-                    &attempt,
-                    effect_index,
-                    effect,
-                )
-                .is_err()
-            {
-                execution_receipt = ExecutionReceiptV1 {
-                    schema: EXECUTION_RECEIPT_SCHEMA_V1.to_owned(),
-                    proposal: proposal.clone(),
-                    authorization: authorization_digest.clone(),
-                    attempt: attempt.clone(),
-                    effect_index,
-                    effect: effect.clone(),
-                    outcome: ExecutionOutcomeV1::Indeterminate {
-                        envelope: ExecutionIndeterminateV1 {
-                            code: ExecutionIndeterminateCodeV1::BackendOutcomeUnknown,
-                            phase: ExecutionPhaseV1::ReceiptValidation,
-                            detail:
-                                "effect runner returned a receipt for another authority context"
-                                    .to_owned(),
-                            source_code: Some("runner_contract_violation".to_owned()),
-                            evidence: None,
-                        },
-                    },
-                };
-            }
-            let step_digest = execution_receipt
-                .digest()
-                .map_err(|error| BrokerError::Corrupt(error.to_string()))?;
-            let outcome = match &execution_receipt.outcome {
-                ExecutionOutcomeV1::Succeeded { .. } => BrokerStepOutcomeV1::Succeeded {
-                    receipt: step_digest.clone(),
-                },
-                ExecutionOutcomeV1::Failed { .. } => BrokerStepOutcomeV1::Failed {
-                    receipt: step_digest.clone(),
-                },
-                ExecutionOutcomeV1::Indeterminate { .. } => BrokerStepOutcomeV1::Indeterminate {
-                    envelope: step_digest.clone(),
-                },
-            };
-            record.step_receipts.push(step_digest);
+        if effect.family() == EffectFamilyV1::CodePromotion {
+            record.state = record.state.apply(ProposalEventV1::BeginPreparation {
+                attempt: attempt.clone(),
+            })?;
             revision = self.persist_record(
                 &record,
                 revision,
-                "effect-execution.step-terminal.v1",
-                &execution_receipt,
+                "effect-promotion.preparation-began.v1",
+                &attempt,
             )?;
-            let terminal = !matches!(outcome, BrokerStepOutcomeV1::Succeeded { .. });
-            steps.push(outcome);
-            if terminal {
-                break;
-            }
+            let context = crate::managed_pointer::ManagedPointerExecutionContextV1 {
+                proposal: proposal.clone(),
+                authorization: authorization_digest.clone(),
+                attempt: attempt.clone(),
+                effect_index: 0,
+            };
+            let prepared = match self.pointer_runtime.prepare_from_store(
+                &self.store,
+                context,
+                &effect,
+                self.max_artifact_bytes,
+                now_u64()?,
+            ) {
+                Ok(prepared) => prepared,
+                Err(receipt) => {
+                    let receipt = enforce_receipt_bindings(
+                        receipt,
+                        proposal,
+                        &authorization_digest,
+                        &attempt,
+                        0,
+                        &effect,
+                    );
+                    return self.finish_preparation_failure(record, revision, receipt);
+                }
+            };
+            let checkpoint = prepared.checkpoint.clone();
+            record.state = record.state.apply(ProposalEventV1::CommitMayProceed {
+                checkpoint: checkpoint.clone(),
+            })?;
+            revision = self.persist_record(
+                &record,
+                revision,
+                "effect-promotion.commit-armed.v1",
+                &prepared.evidence,
+            )?;
+            let ManagedPointerCommitResultV1 {
+                receipt,
+                commit_evidence,
+                poststate_evidence,
+            } = self.pointer_runtime.commit(prepared, now_u64()?);
+            let mut receipt = enforce_receipt_bindings(
+                receipt,
+                proposal,
+                &authorization_digest,
+                &attempt,
+                0,
+                &effect,
+            );
+            enforce_managed_pointer_evidence_bindings(
+                &mut receipt,
+                commit_evidence.as_ref(),
+                poststate_evidence.as_ref(),
+            );
+            return self.finish_execution(
+                record,
+                revision,
+                &receipt,
+                commit_evidence.as_ref(),
+                poststate_evidence.as_ref(),
+            );
         }
-        let receipt = Digest::from_serializable(&(
-            "ag.effect.composite-execution-receipt/v1",
-            &proposal,
+
+        record.state = record.state.apply(ProposalEventV1::BeginExecution {
+            attempt: attempt.clone(),
+        })?;
+        revision = self.persist_record(&record, revision, "effect-execution.began.v1", &attempt)?;
+        let receipt = self.runner.execute_once(
+            &self.store,
+            proposal,
+            &authorization_digest,
             &attempt,
-            &steps,
-        ))?;
-        let event = if steps
-            .iter()
-            .all(|step| matches!(step, BrokerStepOutcomeV1::Succeeded { .. }))
-            && steps.len() == record.canonical.body().effects.len()
-        {
-            ProposalEventV1::ExecutionSucceeded {
-                receipt: receipt.clone(),
+            0,
+            &effect,
+        );
+        let receipt = enforce_receipt_bindings(
+            receipt,
+            proposal,
+            &authorization_digest,
+            &attempt,
+            0,
+            &effect,
+        );
+        self.finish_execution(record, revision, &receipt, None, None)
+    }
+
+    fn finish_preparation_failure(
+        &mut self,
+        mut record: BrokerProposalRecordV1,
+        revision: u64,
+        mut execution_receipt: ExecutionReceiptV1,
+    ) -> Result<EffectAdminResponseV1, BrokerError> {
+        if matches!(
+            execution_receipt.outcome,
+            ExecutionOutcomeV1::Succeeded { .. }
+        ) {
+            execution_receipt.outcome = ExecutionOutcomeV1::Indeterminate {
+                envelope: ExecutionIndeterminateV1 {
+                    code: ExecutionIndeterminateCodeV1::BackendContractViolation,
+                    phase: ExecutionPhaseV1::ReceiptValidation,
+                    detail: "promotion preparation returned success as a terminal failure"
+                        .to_owned(),
+                    source_code: Some("preparation_contract_violation".to_owned()),
+                    evidence: None,
+                },
+            };
+        }
+        let step_digest = execution_receipt
+            .digest()
+            .map_err(|error| BrokerError::Corrupt(error.to_string()))?;
+        record.step_receipts.push(step_digest);
+        let attempt = record.execution_attempt.as_ref().ok_or_else(|| {
+            BrokerError::Corrupt("preparation failure is missing its attempt".to_owned())
+        })?;
+        let (terminal, event) = match &execution_receipt.outcome {
+            ExecutionOutcomeV1::Failed { .. } => {
+                let terminal = composite_execution_receipt(
+                    record.canonical.digest(),
+                    attempt,
+                    &record.step_receipts,
+                    CompositeTerminalV1::Failed,
+                )?;
+                (
+                    terminal.clone(),
+                    ProposalEventV1::PreparationFailed { receipt: terminal },
+                )
             }
-        } else if steps
-            .last()
-            .is_some_and(|step| matches!(step, BrokerStepOutcomeV1::Failed { .. }))
-        {
-            ProposalEventV1::ExecutionFailed {
-                receipt: receipt.clone(),
+            ExecutionOutcomeV1::Indeterminate { .. } => {
+                let terminal = composite_execution_receipt(
+                    record.canonical.digest(),
+                    attempt,
+                    &record.step_receipts,
+                    CompositeTerminalV1::Indeterminate,
+                )?;
+                (
+                    terminal.clone(),
+                    ProposalEventV1::PreparationIndeterminate { envelope: terminal },
+                )
             }
-        } else {
-            ProposalEventV1::ExecutionIndeterminate {
-                envelope: receipt.clone(),
-            }
+            ExecutionOutcomeV1::Succeeded { .. } => unreachable!("normalized above"),
         };
         record.state = record.state.apply(event)?;
-        record.terminal_receipt = Some(receipt.clone());
-        self.persist_record(&record, revision, "effect-execution.terminal.v1", &steps)?;
+        record.terminal_receipt = Some(terminal.clone());
+        self.persist_record(
+            &record,
+            revision,
+            "effect-promotion.preparation-terminal.v1",
+            &execution_receipt,
+        )?;
         Ok(EffectAdminResponseV1::ExecutionReceipt {
-            receipt,
+            receipt: terminal,
+            terminal_state: proposal_state_name(&record.state).to_owned(),
+        })
+    }
+
+    fn finish_execution(
+        &mut self,
+        mut record: BrokerProposalRecordV1,
+        mut revision: u64,
+        execution_receipt: &ExecutionReceiptV1,
+        pointer_commit_evidence: Option<&ManagedPointerCommitEvidenceV1>,
+        pointer_poststate_evidence: Option<&ManagedPointerPoststateEvidenceV1>,
+    ) -> Result<EffectAdminResponseV1, BrokerError> {
+        let step_digest = execution_receipt
+            .digest()
+            .map_err(|error| BrokerError::Corrupt(error.to_string()))?;
+        let terminal_kind = match &execution_receipt.outcome {
+            ExecutionOutcomeV1::Succeeded { .. } => CompositeTerminalV1::Succeeded,
+            ExecutionOutcomeV1::Failed { .. } => CompositeTerminalV1::Failed,
+            ExecutionOutcomeV1::Indeterminate { .. } => CompositeTerminalV1::Indeterminate,
+        };
+        record.step_receipts.push(step_digest);
+        revision = if pointer_commit_evidence.is_some() || pointer_poststate_evidence.is_some() {
+            #[derive(Serialize)]
+            struct PointerStepEventV1<'a> {
+                schema: &'static str,
+                receipt: &'a ExecutionReceiptV1,
+                commit_evidence: Option<&'a ManagedPointerCommitEvidenceV1>,
+                poststate_evidence: Option<&'a ManagedPointerPoststateEvidenceV1>,
+            }
+            self.persist_record(
+                &record,
+                revision,
+                "effect-promotion.step-terminal.v1",
+                &PointerStepEventV1 {
+                    schema: "ag.effect.managed-pointer-step-event/v1",
+                    receipt: execution_receipt,
+                    commit_evidence: pointer_commit_evidence,
+                    poststate_evidence: pointer_poststate_evidence,
+                },
+            )?
+        } else {
+            self.persist_record(
+                &record,
+                revision,
+                "effect-execution.step-terminal.v1",
+                execution_receipt,
+            )?
+        };
+        let attempt = record.execution_attempt.as_ref().ok_or_else(|| {
+            BrokerError::Corrupt("terminal execution is missing its attempt".to_owned())
+        })?;
+        let terminal = composite_execution_receipt(
+            record.canonical.digest(),
+            attempt,
+            &record.step_receipts,
+            terminal_kind,
+        )?;
+        let event = match terminal_kind {
+            CompositeTerminalV1::Succeeded => ProposalEventV1::ExecutionSucceeded {
+                receipt: terminal.clone(),
+            },
+            CompositeTerminalV1::Failed => ProposalEventV1::ExecutionFailed {
+                receipt: terminal.clone(),
+            },
+            CompositeTerminalV1::Indeterminate => ProposalEventV1::ExecutionIndeterminate {
+                envelope: terminal.clone(),
+            },
+        };
+        record.state = record.state.apply(event)?;
+        record.terminal_receipt = Some(terminal.clone());
+        self.persist_record(
+            &record,
+            revision,
+            "effect-execution.terminal.v1",
+            execution_receipt,
+        )?;
+        Ok(EffectAdminResponseV1::ExecutionReceipt {
+            receipt: terminal,
             terminal_state: proposal_state_name(&record.state).to_owned(),
         })
     }
@@ -1223,9 +1394,20 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                     observe_file(path, self.max_artifact_bytes)?
                 }
                 EffectTargetConfigV1::ManagedPointer { .. } => {
-                    return Err(BrokerError::Observation(
-                        "managed-pointer pinned observer is not installed".to_owned(),
-                    ));
+                    let ag_effect::EffectIntentV1::ManagedPointerPromotion { artifact, .. } =
+                        effect
+                    else {
+                        return Err(BrokerError::Observation(
+                            "managed-pointer catalog entry received another effect family"
+                                .to_owned(),
+                        ));
+                    };
+                    self.pointer_runtime.observe_candidate_from_store(
+                        &self.store,
+                        target,
+                        artifact,
+                        self.max_artifact_bytes,
+                    )?
                 }
                 EffectTargetConfigV1::SystemdUnit { .. }
                 | EffectTargetConfigV1::SystemdManager { .. } => {
@@ -1272,21 +1454,29 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                 // check and can never redirect this observation.
                 observe_file(Path::new(path), self.max_artifact_bytes)
             }
-            CanonicalEffectV1::ManagedPointerPromotion { .. }
-            | CanonicalEffectV1::SystemdUnit { .. }
+            CanonicalEffectV1::ManagedPointerPromotion { .. } => {
+                Ok(self.pointer_runtime.observe_canonical(effect)?)
+            }
+            CanonicalEffectV1::SystemdUnit { .. }
             | CanonicalEffectV1::SystemdManagerReload { .. } => Err(BrokerError::Observation(
                 "reconciliation observer is unavailable for this target family".to_owned(),
             )),
         }
     }
 
+    // Admission deliberately compares the complete typed effect against the
+    // active catalog in one place so no binding can be skipped by dispatch.
+    #[allow(clippy::too_many_lines)]
     fn validate_catalog_admission(
         &self,
         proposal: &ag_effect::CanonicalEffectProposalV1,
     ) -> Result<(), BrokerError> {
-        if proposal.body().catalog_identity != self.catalog_identity {
+        if proposal.body().catalog_schema != EFFECT_CATALOG_SCHEMA_V1
+            || proposal.body().catalog_identity != self.catalog_identity
+            || proposal.body().security_profile_identity != self.security_profile_identity
+        {
             return Err(BrokerError::Observation(
-                "canonical proposal catalog identity is not active".to_owned(),
+                "canonical proposal catalog or security-profile identity is not active".to_owned(),
             ));
         }
         for effect in &proposal.body().effects {
@@ -1296,25 +1486,48 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             let admitted = match (effect, configured) {
                 (
                     CanonicalEffectV1::ManagedPointerPromotion {
+                        allowed_root,
                         repository,
                         reference,
                         repository_identity,
+                        uid,
+                        gid,
+                        staging_root,
+                        expires_unix_ms,
                         helper_executable,
                         helper_launch_profile,
                         ..
                     },
                     EffectTargetConfigV1::ManagedPointer {
+                        allowed_root: configured_allowed_root,
                         repository: configured_repository,
                         reference: configured_reference,
                         repository_identity: configured_repository_identity,
+                        uid: target_user_id,
+                        gid: target_group_id,
+                        staging_root: configured_staging_root,
+                        promotion_ttl_ms,
                         helper_executable: configured_helper_executable,
                         helper_launch_profile: configured_helper_launch_profile,
                         ..
                     },
                 ) => {
-                    repository == &utf8_path(configured_repository)?
+                    let configured_expiry = proposal
+                        .body()
+                        .compiled_at_unix_ms
+                        .checked_add(*promotion_ttl_ms);
+                    allowed_root == &utf8_path(configured_allowed_root)?
+                        && repository
+                            == &repository_relative_path(
+                                configured_allowed_root,
+                                configured_repository,
+                            )?
                         && reference == configured_reference
                         && repository_identity == configured_repository_identity
+                        && uid == target_user_id
+                        && gid == target_group_id
+                        && staging_root == &utf8_path(configured_staging_root)?
+                        && configured_expiry.as_ref() == Some(expires_unix_ms)
                         && helper_executable == configured_helper_executable
                         && helper_launch_profile == configured_helper_launch_profile
                 }
@@ -1453,6 +1666,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
 
     fn ready_proposal_count(&self) -> Result<usize, BrokerError> {
         let mut count = 0_usize;
+        let observed_at = now_u64()?;
         let mut cursor = None;
         loop {
             let page = self
@@ -1464,7 +1678,24 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             cursor = page.last().cloned();
             for entity in page {
                 let record = self.load_proposal_entity_with_revision(&entity)?;
-                if matches!(record.state.state, ProposalStateV1::Ready { .. }) {
+                let expired_promotion =
+                    record
+                        .state
+                        .canonical
+                        .body()
+                        .effects
+                        .first()
+                        .is_some_and(|effect| {
+                            matches!(
+                                effect,
+                                CanonicalEffectV1::ManagedPointerPromotion {
+                                    expires_unix_ms,
+                                    ..
+                                } if observed_at >= *expires_unix_ms
+                            )
+                        });
+                if matches!(record.state.state, ProposalStateV1::Ready { .. }) && !expired_promotion
+                {
                     count += 1;
                     if count >= self.max_ready_proposals as usize {
                         return Ok(count);
@@ -1474,6 +1705,9 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         }
     }
 
+    // Recovery keeps the state-machine cases adjacent to make every restart
+    // transition auditable as a single exhaustive ceremony.
+    #[allow(clippy::too_many_lines)]
     fn recover_incomplete_attempts(&mut self) -> Result<(), BrokerError> {
         if self.store.active_backup_cut()?.is_some() {
             return Ok(());
@@ -1489,6 +1723,103 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             cursor = page.last().cloned();
             for entity in page {
                 let loaded = self.load_proposal_entity_with_revision(&entity)?;
+                if let ProposalStateV1::Preparing { proposal, attempt } = &loaded.state.state {
+                    let proposal = proposal.clone();
+                    let attempt = attempt.clone();
+                    let effect = &loaded.state.canonical.body().effects[0];
+                    let authorization = loaded
+                        .state
+                        .authorization
+                        .as_ref()
+                        .map(Digest::from_serializable)
+                        .transpose()?
+                        .ok_or_else(|| {
+                            BrokerError::Corrupt(
+                                "preparing promotion is missing authorization custody".to_owned(),
+                            )
+                        })?;
+                    let observation = self.pointer_runtime.observe_canonical(effect);
+                    let known_prestate = observation.as_ref().is_ok_and(|observed| {
+                        classify_reconciliation(effect, observed).is_ok_and(|classification| {
+                            classification == ReconciliationClassificationV1::NotApplied
+                        })
+                    });
+                    let observation_evidence = observation
+                        .as_ref()
+                        .ok()
+                        .map(Digest::from_serializable)
+                        .transpose()?;
+                    let outcome = if known_prestate {
+                        ExecutionOutcomeV1::Failed {
+                            failure: ag_effect::executor::ExecutionFailureV1 {
+                                code: ag_effect::executor::ExecutionFailureCodeV1::BackendRejected,
+                                phase: ExecutionPhaseV1::PromotionPreparation,
+                                detail: "restart proved the managed ref remained at the exact ratified prestate"
+                                    .to_owned(),
+                                source_code: Some("preparation_abandoned_on_restart".to_owned()),
+                                evidence: observation_evidence,
+                            },
+                        }
+                    } else {
+                        ExecutionOutcomeV1::Indeterminate {
+                            envelope: ExecutionIndeterminateV1 {
+                                code: ExecutionIndeterminateCodeV1::BackendOutcomeUnknown,
+                                phase: ExecutionPhaseV1::PromotionPreparation,
+                                detail: "restart could not prove an unchanged promotion prestate"
+                                    .to_owned(),
+                                source_code: Some("preparation_restart_unresolved".to_owned()),
+                                evidence: observation_evidence,
+                            },
+                        }
+                    };
+                    let execution_receipt = ExecutionReceiptV1 {
+                        schema: EXECUTION_RECEIPT_SCHEMA_V1.to_owned(),
+                        proposal: proposal.clone(),
+                        authorization,
+                        attempt: attempt.clone(),
+                        effect_index: 0,
+                        effect: effect.clone(),
+                        outcome,
+                    };
+                    let step = execution_receipt
+                        .digest()
+                        .map_err(|error| BrokerError::Corrupt(error.to_string()))?;
+                    let terminal_kind = if known_prestate {
+                        CompositeTerminalV1::Failed
+                    } else {
+                        CompositeTerminalV1::Indeterminate
+                    };
+                    let mut record = loaded.state;
+                    record.step_receipts.push(step);
+                    let terminal = composite_execution_receipt(
+                        &proposal,
+                        &attempt,
+                        &record.step_receipts,
+                        terminal_kind,
+                    )?;
+                    let event = if known_prestate {
+                        ProposalEventV1::PreparationAbandoned {
+                            receipt: terminal.clone(),
+                        }
+                    } else {
+                        ProposalEventV1::PreparationIndeterminate {
+                            envelope: terminal.clone(),
+                        }
+                    };
+                    record.state = record.state.apply(event)?;
+                    record.terminal_receipt = Some(terminal);
+                    self.persist_record(
+                        &record,
+                        loaded.revision,
+                        if known_prestate {
+                            "effect-promotion.restart-proven-unchanged.v1"
+                        } else {
+                            "effect-promotion.restart-indeterminate.v1"
+                        },
+                        &execution_receipt,
+                    )?;
+                    continue;
+                }
                 let event = match &loaded.state.state {
                     ProposalStateV1::AuthorizationBurned { proposal, .. } => {
                         let receipt = Digest::from_serializable(&(
@@ -1504,7 +1835,9 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                             "effect-execution.abandoned-before-begin.v1",
                         ))
                     }
-                    ProposalStateV1::Executing { proposal, attempt } => {
+                    ProposalStateV1::Executing {
+                        proposal, attempt, ..
+                    } => {
                         let envelope = restart_reconciliation_envelope(
                             proposal,
                             attempt,
@@ -1604,6 +1937,13 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             "canonical proposal is outside the broker authority context",
         )?;
         require_record_invariant(
+            record.canonical.body().catalog_schema == EFFECT_CATALOG_SCHEMA_V1
+                && record.canonical.body().catalog_identity == self.catalog_identity
+                && record.canonical.body().security_profile_identity
+                    == self.security_profile_identity,
+            "canonical proposal is outside the active catalog or security profile",
+        )?;
+        require_record_invariant(
             record.canonical.body().effects.len() == 1,
             "canonical proposal does not contain exactly one effect",
         )?;
@@ -1668,6 +2008,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             ProposalStateV1::AuthorizationBurned {
                 proposal,
                 authorization,
+                family,
             } => {
                 require_record_invariant(
                     proposal == record.canonical.digest()
@@ -1681,12 +2022,39 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                         && record.reconciliation.is_none(),
                     "burned lifecycle contains execution residue",
                 )?;
+                require_record_invariant(
+                    record.canonical.body().effects[0].family() == *family,
+                    "burned lifecycle names another effect family",
+                )?;
             }
-            ProposalStateV1::Executing { proposal, attempt } => {
+            ProposalStateV1::Preparing { proposal, attempt } => {
                 require_record_invariant(
                     proposal == record.canonical.digest()
                         && record.authorization.is_some()
-                        && record.execution_attempt.as_ref() == Some(attempt),
+                        && record.execution_attempt.as_ref() == Some(attempt)
+                        && record.canonical.body().effects[0].family()
+                            == EffectFamilyV1::CodePromotion,
+                    "preparing lifecycle does not bind one code-promotion attempt",
+                )?;
+                require_record_invariant(
+                    record.terminal_receipt.is_none()
+                        && record.step_receipts.is_empty()
+                        && record.reconciliation.is_none(),
+                    "preparing lifecycle contains terminal execution residue",
+                )?;
+            }
+            ProposalStateV1::Executing {
+                proposal,
+                attempt,
+                preparation_checkpoint,
+            } => {
+                let is_promotion =
+                    record.canonical.body().effects[0].family() == EffectFamilyV1::CodePromotion;
+                require_record_invariant(
+                    proposal == record.canonical.digest()
+                        && record.authorization.is_some()
+                        && record.execution_attempt.as_ref() == Some(attempt)
+                        && preparation_checkpoint.is_some() == is_promotion,
                     "executing lifecycle does not bind proposal, authority, and attempt",
                 )?;
                 require_record_invariant(
@@ -1974,9 +2342,14 @@ fn build_catalog(
         let (id_text, definition) = match target {
             EffectTargetConfigV1::ManagedPointer {
                 id,
+                allowed_root,
                 repository,
                 reference,
                 repository_identity,
+                uid,
+                gid,
+                staging_root,
+                promotion_ttl_ms,
                 helper,
                 helper_executable,
                 helper_launch_profile,
@@ -1989,9 +2362,14 @@ fn build_catalog(
                 (
                     id,
                     TargetDefinitionV1::ManagedPointer {
-                        repository: utf8_path(repository)?,
+                        allowed_root: utf8_path(allowed_root)?,
+                        repository: repository_relative_path(allowed_root, repository)?,
                         reference: reference.clone(),
                         repository_identity: repository_identity.clone(),
+                        uid: *uid,
+                        gid: *gid,
+                        staging_root: utf8_path(staging_root)?,
+                        promotion_ttl_ms: *promotion_ttl_ms,
                         helper_executable: helper_executable.clone(),
                         helper_launch_profile: helper_launch_profile.clone(),
                     },
@@ -2032,8 +2410,15 @@ fn build_catalog(
             return Err(BrokerError::DuplicateTarget(id_text.clone()));
         }
     }
-    let identity = Digest::from_serializable(&targets)?;
-    Ok((EffectCatalogV1 { identity, targets }, source))
+    let identity = Digest::from_serializable(&(EFFECT_CATALOG_SCHEMA_V1, &targets))?;
+    Ok((
+        EffectCatalogV1 {
+            schema: EFFECT_CATALOG_SCHEMA_V1.to_owned(),
+            identity,
+            targets,
+        },
+        source,
+    ))
 }
 
 /// Computes the exact compiler catalog identity after applying the same target
@@ -2128,11 +2513,81 @@ fn rustix_io_error(error: rustix::io::Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error.raw_os_error())
 }
 
+// This exhaustive match is the authority boundary between observed state and
+// operator reconciliation; keeping all effect families together prevents a
+// permissive default from creeping in.
+#[allow(clippy::too_many_lines)]
 fn classify_reconciliation(
     effect: &CanonicalEffectV1,
     observation: &TargetObservationV1,
 ) -> Result<ReconciliationClassificationV1, BrokerError> {
     match (effect, observation) {
+        (
+            CanonicalEffectV1::ManagedPointerPromotion {
+                repository_identity,
+                prestate_identity,
+                repository_device,
+                repository_inode,
+                git_directory_device,
+                git_directory_inode,
+                uid,
+                gid,
+                candidate_pack_digest,
+                object_format,
+                expected_object,
+                expected_tree,
+                new_object,
+                expected_post_tree,
+                ..
+            },
+            TargetObservationV1::ManagedPointer {
+                current_object,
+                current_tree,
+                candidate_object,
+                candidate_tree,
+                candidate_parent,
+                candidate_pack_digest: observed_pack,
+                object_format: observed_format,
+                repository_identity: observed_identity,
+                prestate_identity: observed_prestate_identity,
+                repository_device: observed_repository_device,
+                repository_inode: observed_repository_inode,
+                git_directory_device: observed_git_device,
+                git_directory_inode: observed_git_inode,
+                repository_uid,
+                repository_gid,
+                clean,
+                reference_checked_out,
+            },
+        ) => {
+            let exact_identity = repository_identity == observed_identity
+                && repository_device == observed_repository_device
+                && repository_inode == observed_repository_inode
+                && git_directory_device == observed_git_device
+                && git_directory_inode == observed_git_inode
+                && uid == repository_uid
+                && gid == repository_gid
+                && candidate_pack_digest == observed_pack
+                && object_format == observed_format
+                && candidate_object == new_object
+                && candidate_tree == expected_post_tree
+                && candidate_parent == expected_object
+                && *clean
+                && !*reference_checked_out;
+            if !exact_identity {
+                return Ok(ReconciliationClassificationV1::Foreign);
+            }
+            if current_object == new_object && current_tree == expected_post_tree {
+                Ok(ReconciliationClassificationV1::Applied)
+            } else if current_object == expected_object
+                && current_tree == expected_tree
+                && prestate_identity == observed_prestate_identity
+            {
+                Ok(ReconciliationClassificationV1::NotApplied)
+            } else {
+                Ok(ReconciliationClassificationV1::Foreign)
+            }
+        }
         (
             CanonicalEffectV1::ManagedFilePut {
                 expected_content: _,
@@ -2191,10 +2646,76 @@ fn effect_record_projection(record: BrokerProposalRecordV1) -> EffectRecordV1 {
     }
 }
 
+fn enforce_receipt_bindings(
+    receipt: ExecutionReceiptV1,
+    proposal: &Digest,
+    authorization: &Digest,
+    attempt: &Digest,
+    effect_index: u32,
+    effect: &CanonicalEffectV1,
+) -> ExecutionReceiptV1 {
+    if receipt
+        .verify_bindings(proposal, authorization, attempt, effect_index, effect)
+        .is_ok()
+    {
+        return receipt;
+    }
+    ExecutionReceiptV1 {
+        schema: EXECUTION_RECEIPT_SCHEMA_V1.to_owned(),
+        proposal: proposal.clone(),
+        authorization: authorization.clone(),
+        attempt: attempt.clone(),
+        effect_index,
+        effect: effect.clone(),
+        outcome: ExecutionOutcomeV1::Indeterminate {
+            envelope: ExecutionIndeterminateV1 {
+                code: ExecutionIndeterminateCodeV1::BackendContractViolation,
+                phase: ExecutionPhaseV1::ReceiptValidation,
+                detail: "effect runner returned a receipt for another authority context".to_owned(),
+                source_code: Some("runner_contract_violation".to_owned()),
+                evidence: None,
+            },
+        },
+    }
+}
+
+fn enforce_managed_pointer_evidence_bindings(
+    receipt: &mut ExecutionReceiptV1,
+    commit: Option<&ManagedPointerCommitEvidenceV1>,
+    poststate: Option<&ManagedPointerPoststateEvidenceV1>,
+) {
+    if !matches!(receipt.outcome, ExecutionOutcomeV1::Succeeded { .. }) {
+        return;
+    }
+    if commit.is_none() || poststate.is_none() {
+        receipt.outcome = ExecutionOutcomeV1::Indeterminate {
+            envelope: ExecutionIndeterminateV1 {
+                code: ExecutionIndeterminateCodeV1::BackendContractViolation,
+                phase: ExecutionPhaseV1::ReceiptValidation,
+                detail: "managed-pointer success lacks complete evidence".to_owned(),
+                source_code: Some("missing_promotion_evidence".to_owned()),
+                evidence: None,
+            },
+        };
+    }
+}
+
 fn utf8_path(path: &Path) -> Result<String, BrokerError> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| BrokerError::Observation("configured path is not UTF-8".to_owned()))
+}
+
+fn repository_relative_path(allowed_root: &Path, repository: &Path) -> Result<String, BrokerError> {
+    let relative = repository.strip_prefix(allowed_root).map_err(|_| {
+        BrokerError::Observation("managed repository is outside its allowed root".to_owned())
+    })?;
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(BrokerError::Observation(
+            "managed repository is not strictly beneath its allowed root".to_owned(),
+        ));
+    }
+    utf8_path(relative)
 }
 
 fn proposal_entity(proposal: &Digest) -> String {
@@ -2321,12 +2842,17 @@ fn proposal_state_name(state: &ProposalStateV1) -> &'static str {
         ProposalStateV1::Refused { .. } => "refused",
         ProposalStateV1::Indeterminate { .. } => "indeterminate",
         ProposalStateV1::AuthorizationBurned { .. } => "authorization_burned",
+        ProposalStateV1::Preparing { .. } => "preparing",
         ProposalStateV1::Executing { .. } => "executing",
         ProposalStateV1::Succeeded { .. } => "succeeded",
         ProposalStateV1::Failed { .. } => "failed",
         ProposalStateV1::ReconciliationRequired { .. } => "reconciliation_required",
         ProposalStateV1::Reconciled { .. } => "reconciled",
     }
+}
+
+fn security_profile_identity(profile: &str) -> Digest {
+    Digest::hash_domain("ag-security-profile-identity-v1", profile.as_bytes())
 }
 
 fn now_u64() -> Result<u64, BrokerError> {
@@ -2352,10 +2878,11 @@ fn broker_api_error<T>(error: &BrokerError) -> ApiResultV1<T> {
         | BrokerError::WorkerSourceBindingMismatch
         | BrokerError::RpcAuthentication(_) => ApiErrorCodeV1::Unauthorized,
         BrokerError::UnsupportedAuthorityFamily => ApiErrorCodeV1::UnsupportedAuthorityFamily,
-        BrokerError::Observation(_) | BrokerError::ActivationNotReady => {
-            ApiErrorCodeV1::Indeterminate
-        }
+        BrokerError::Observation(_)
+        | BrokerError::ManagedPointer(_)
+        | BrokerError::ActivationNotReady => ApiErrorCodeV1::Indeterminate,
         BrokerError::Effect(EffectError::InvalidTransition { .. })
+        | BrokerError::PromotionExpired
         | BrokerError::ReconciliationStateUnresolved
         | BrokerError::ReconciliationNotRequired => ApiErrorCodeV1::Conflict,
         BrokerError::Effect(_)
@@ -2396,6 +2923,9 @@ pub enum BrokerError {
     /// Local observation failed.
     #[error("effect observation failed: {0}")]
     Io(#[from] std::io::Error),
+    /// Closed managed-pointer runtime failed without widening its operation.
+    #[error(transparent)]
+    ManagedPointer(#[from] ManagedPointerError),
     /// Named target is duplicated.
     #[error("duplicate target ID: {0}")]
     DuplicateTarget(String),
@@ -2406,6 +2936,12 @@ pub enum BrokerError {
     /// exact rebuilt catalog.
     #[error("activated effect catalog identity does not match the rebuilt compiler catalog")]
     CatalogIdentityMismatch,
+    /// Runtime and compiler disagree about the exact service sandbox/profile.
+    #[error("managed-pointer runtime security-profile identity mismatch")]
+    SecurityProfileIdentityMismatch,
+    /// Exact promotion authority expired before the independent ratification burn.
+    #[error("managed-pointer proposal expired before ratification")]
+    PromotionExpired,
     /// Broker cannot safely observe a target.
     #[error("target observation indeterminate: {0}")]
     Observation(String),
@@ -3241,6 +3777,7 @@ mod tests {
         hostile_attempt.state = ProposalStateV1::Executing {
             proposal: proposal_digest.clone(),
             attempt: uncertain.execution_attempt.clone().expect("attempt"),
+            preparation_checkpoint: None,
         };
         hostile_attempt.execution_attempt = Some(hostile_digest.clone());
         hostile_attempt.terminal_receipt = None;
@@ -3441,6 +3978,104 @@ mod tests {
         assert_eq!(
             compiler_evaluation_event_kind(true),
             "effect-evaluation.refused.v1"
+        );
+    }
+
+    #[test]
+    fn promotion_reconciliation_distinguishes_pre_post_and_foreign_state() {
+        let identity = Digest::hash_bytes(b"repository-identity");
+        let prestate_identity = Digest::hash_bytes(b"repository-layout-and-prestate");
+        let pack = Digest::hash_bytes(b"candidate-pack");
+        let old_object = "1".repeat(40);
+        let old_tree = "2".repeat(40);
+        let new_object = "3".repeat(40);
+        let new_tree = "4".repeat(40);
+        let effect = CanonicalEffectV1::ManagedPointerPromotion {
+            schema: ag_effect::MANAGED_POINTER_PROMOTION_SCHEMA_V1.to_owned(),
+            operation_id: Digest::hash_bytes(b"operation"),
+            target: TargetId::parse("repository.main").expect("target"),
+            allowed_root: "/srv/git".to_owned(),
+            repository: "repository.git".to_owned(),
+            reference: "refs/heads/main".to_owned(),
+            repository_identity: identity.clone(),
+            prestate_identity: prestate_identity.clone(),
+            repository_device: 11,
+            repository_inode: 12,
+            git_directory_device: 13,
+            git_directory_inode: 14,
+            uid: 1000,
+            gid: 1000,
+            staging_root: "/var/lib/ag-effectd/promotion".to_owned(),
+            artifact: Digest::hash_bytes(b"bundle"),
+            candidate_pack_digest: pack.clone(),
+            object_format: ag_effect::GitObjectFormatV1::Sha1,
+            expected_object: old_object.clone(),
+            expected_tree: old_tree.clone(),
+            new_object: new_object.clone(),
+            expected_post_tree: new_tree.clone(),
+            expires_unix_ms: u64::MAX,
+            helper_executable: Digest::hash_bytes(b"git"),
+            helper_launch_profile: Digest::hash_bytes(b"profile"),
+        };
+        let observation =
+            |current_object: String, current_tree: String| TargetObservationV1::ManagedPointer {
+                current_object,
+                current_tree,
+                candidate_object: new_object.clone(),
+                candidate_tree: new_tree.clone(),
+                candidate_parent: old_object.clone(),
+                candidate_pack_digest: pack.clone(),
+                object_format: ag_effect::GitObjectFormatV1::Sha1,
+                repository_identity: identity.clone(),
+                prestate_identity: prestate_identity.clone(),
+                repository_device: 11,
+                repository_inode: 12,
+                git_directory_device: 13,
+                git_directory_inode: 14,
+                repository_uid: 1000,
+                repository_gid: 1000,
+                clean: true,
+                reference_checked_out: false,
+            };
+        assert_eq!(
+            classify_reconciliation(&effect, &observation(old_object.clone(), old_tree.clone()))
+                .expect("exact prestate"),
+            ReconciliationClassificationV1::NotApplied
+        );
+        assert_eq!(
+            classify_reconciliation(&effect, &observation(new_object.clone(), new_tree.clone()))
+                .expect("exact poststate"),
+            ReconciliationClassificationV1::Applied
+        );
+        assert_eq!(
+            classify_reconciliation(&effect, &observation("5".repeat(40), "6".repeat(40)))
+                .expect("foreign state"),
+            ReconciliationClassificationV1::Foreign
+        );
+        let mut substituted = observation(old_object.clone(), old_tree.clone());
+        let TargetObservationV1::ManagedPointer {
+            repository_inode, ..
+        } = &mut substituted
+        else {
+            unreachable!()
+        };
+        *repository_inode += 1;
+        assert_eq!(
+            classify_reconciliation(&effect, &substituted).expect("substituted target"),
+            ReconciliationClassificationV1::Foreign
+        );
+        let mut substituted_prestate = observation(old_object.clone(), old_tree.clone());
+        let TargetObservationV1::ManagedPointer {
+            prestate_identity, ..
+        } = &mut substituted_prestate
+        else {
+            unreachable!()
+        };
+        *prestate_identity = Digest::hash_bytes(b"same-value-replaced-ref-inode");
+        assert_eq!(
+            classify_reconciliation(&effect, &substituted_prestate)
+                .expect("substituted prestate layout"),
+            ReconciliationClassificationV1::Foreign
         );
     }
 

@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ag_effect::EFFECT_SCHEMA_V1;
 use ag_effect::{CanonicalEffectProposalV1, EffectFamilyV1, RatificationV1, TargetId};
+use ag_effect::{EFFECT_CATALOG_SCHEMA_V1, EFFECT_SCHEMA_V1};
 use ag_primitives::{
     AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, JcsDocument, LaunchProfileIdentityV1,
     PrincipalChainV1, PrincipalId, PrincipalKindV1, PrincipalSeparationPredicateV1,
@@ -515,7 +515,7 @@ impl DerivedPromotionValidatorV1 {
             .verify_digest()
             .map_err(|_| DerivedAuthorityError::ProposalDigestMismatch)?;
         let body = proposal.body();
-        if body.schema != EFFECT_SCHEMA_V1 {
+        if body.schema != EFFECT_SCHEMA_V1 || body.catalog_schema != EFFECT_CATALOG_SCHEMA_V1 {
             return Err(DerivedAuthorityError::ProposalSchemaMismatch);
         }
         if body.authority_domain != scope.authority_domain
@@ -777,8 +777,9 @@ fn digest_value<T: Serialize + ?Sized>(
 #[cfg(test)]
 mod tests {
     use ag_effect::{
-        EFFECT_SCHEMA_V1, EffectCatalogV1, EffectCompilerV1, EffectIntentV1, ProposalIntentV1,
-        TargetDefinitionV1, TargetObservationV1,
+        EFFECT_CATALOG_SCHEMA_V1, EFFECT_SCHEMA_V1, EffectCatalogV1, EffectCompilerV1,
+        EffectIntentV1, GitObjectFormatV1, ProposalIntentV1, TargetDefinitionV1,
+        TargetObservationV1,
     };
     use ag_primitives::{PrincipalChainNodeV1, PrincipalKindV1};
 
@@ -992,9 +993,14 @@ mod tests {
         targets.insert(
             promotion_target.clone(),
             TargetDefinitionV1::ManagedPointer {
-                repository: "/srv/git/repository.git".to_owned(),
+                allowed_root: "/srv/git".to_owned(),
+                repository: "repository.git".to_owned(),
                 reference: "refs/heads/main".to_owned(),
                 repository_identity: digest("repository-identity"),
+                uid: 1000,
+                gid: 1000,
+                staging_root: "/var/lib/ag-effectd/promotion-staging".to_owned(),
+                promotion_ttl_ms: 1_000,
                 helper_executable: digest("promotion-helper"),
                 helper_launch_profile: digest("promotion-helper-profile"),
             },
@@ -1008,14 +1014,19 @@ mod tests {
                 gid: 0,
             },
         );
-        let compiler = EffectCompilerV1::new(EffectCatalogV1 {
-            identity: catalog_identity.clone(),
-            targets,
-        });
+        let compiler = EffectCompilerV1::new(
+            EffectCatalogV1 {
+                schema: EFFECT_CATALOG_SCHEMA_V1.to_owned(),
+                identity: catalog_identity.clone(),
+                targets,
+            },
+            digest("effectd-security-profile"),
+        );
         let content = digest("file-content");
+        let candidate_artifact = digest("candidate-bundle");
         let mut effects = vec![EffectIntentV1::ManagedPointerPromotion {
             target: promotion_target.clone(),
-            new_object: "a".repeat(40),
+            artifact: candidate_artifact.clone(),
         }];
         if include_host_effect {
             effects.push(EffectIntentV1::ManagedFilePut {
@@ -1030,15 +1041,30 @@ mod tests {
             epoch: epoch(),
             proposer: proposer_chain(),
             judgment: digest("admission-judgment"),
-            admitted_artifacts: BTreeSet::from([content]),
+            admitted_artifacts: BTreeSet::from([candidate_artifact, content]),
             effects,
         };
         let mut observations = BTreeMap::new();
         observations.insert(
             promotion_target.clone(),
             TargetObservationV1::ManagedPointer {
-                current_object: Some("b".repeat(40)),
+                current_object: "b".repeat(40),
+                current_tree: "c".repeat(40),
+                candidate_object: "d".repeat(40),
+                candidate_tree: "e".repeat(40),
+                candidate_parent: "b".repeat(40),
+                candidate_pack_digest: digest("candidate-pack"),
+                object_format: GitObjectFormatV1::Sha1,
                 repository_identity: digest("repository-identity"),
+                prestate_identity: digest("repository-layout-and-prestate"),
+                repository_device: 11,
+                repository_inode: 12,
+                git_directory_device: 13,
+                git_directory_inode: 14,
+                repository_uid: 1000,
+                repository_gid: 1000,
+                clean: true,
+                reference_checked_out: false,
             },
         );
         observations.insert(
@@ -1054,6 +1080,7 @@ mod tests {
                 &intent,
                 &intent.proposer,
                 digest("signed-governor-source"),
+                125,
                 &observations,
             )
             .unwrap();

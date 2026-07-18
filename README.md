@@ -27,11 +27,21 @@ than recreated after exit or restart. This slice admits exactly one live worker
 at a time; while it is live, `agd` refuses other blocking proposal/launch work
 so deadline supervision cannot be starved.
 
+That development path can now carry one strict, self-contained Git bundle into
+an independently ratified managed-pointer proposal. `ag-effectd` alone derives
+the exact base/post trees and target bindings, durably arms a one-shot commit,
+and compare-and-swaps one configured, existing loose ref that is not checked
+out under the target owner. Success requires independent ref/tree readback;
+ambiguity requires reconciliation. This is a managed-ref lifecycle only: it
+does not synchronize or write a live checkout, and a packed-ref-only target
+refuses.
+
 This is not a production containment claim. `production` and
 `high_assurance` configurations reject the development launcher, and the
 packaged `agd.service` namespace restrictions are not a host for it. Provider
-adapters, managed-pointer promotion, typed systemd effects, admitted check
-launch, and production worker qualification remain pending.
+adapters, typed systemd effects, admitted check launch, production activation
+of managed-pointer execution, and production worker qualification remain
+pending.
 
 See `docs/architecture.md` and `docs/source-baseline.md` for the implementation
 contract and source custody. Operational reviewers should also read

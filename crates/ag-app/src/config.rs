@@ -27,6 +27,9 @@ const PROVIDER_RPC_STRUCTURAL_RESERVE_BYTES: u64 = 128 * 1024;
 const WORKER_RPC_STRUCTURAL_RESERVE_BYTES: u64 = 128 * 1024;
 const PROVIDER_RPC_COMPLETION_MARGIN_MS: u64 = 5_000;
 const PROVIDER_MIN_EVENT_STREAM_BYTES: u64 = 4 * 1024;
+const MAX_PROMOTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
+const MANAGED_FILE_CANDIDATE_SEMANTIC_V1: &str = "managed_file_content_v1";
+const MANAGED_POINTER_CANDIDATE_SEMANTIC_V1: &str = "git_bundle_promotion_v1";
 
 /// Store paths common to every daemon.
 #[derive(Clone, Debug, Deserialize)]
@@ -260,15 +263,40 @@ pub struct WorkerProfileConfigV1 {
     /// Exact arguments following the fixed sandbox executable name. No shell
     /// or implicit `PATH` interpretation occurs.
     pub fixed_arguments: Vec<String>,
-    /// Only managed-file target to which accepted candidate bytes are mapped
-    /// by `agd`; the worker never receives or selects this value.
-    pub managed_file_target: String,
+    /// Closed effect family to which accepted candidate bytes are mapped by
+    /// `agd`; the worker never receives or selects this value.
+    pub candidate_effect: WorkerCandidateEffectV1,
+    /// Only catalog target to which accepted candidate bytes are mapped by
+    /// `agd`; the worker never receives or selects this value.
+    pub candidate_target: String,
     /// Closed semantic label required on the candidate frame.
     pub candidate_semantic_type: String,
     /// Exclusive wall-clock runtime limit.
     pub timeout_ms: u64,
     /// Exact cumulative candidate-output bound.
     pub output_budget_bytes: u64,
+}
+
+/// Closed interpretation of one worker candidate selected by reviewed policy.
+/// This is deliberately not a generic command or caller-selected effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerCandidateEffectV1 {
+    /// Candidate bytes are the complete content of one managed file.
+    ManagedFilePut,
+    /// Candidate bytes are one versioned Git-bundle promotion artifact.
+    ManagedPointerPromotion,
+}
+
+impl WorkerCandidateEffectV1 {
+    /// Returns the only candidate semantic admitted for this closed mapping.
+    #[must_use]
+    pub const fn semantic_type(self) -> &'static str {
+        match self {
+            Self::ManagedFilePut => MANAGED_FILE_CANDIDATE_SEMANTIC_V1,
+            Self::ManagedPointerPromotion => MANAGED_POINTER_CANDIDATE_SEMANTIC_V1,
+        }
+    }
 }
 
 /// `agd` configuration.
@@ -332,17 +360,27 @@ pub enum EffectTargetConfigV1 {
     ManagedPointer {
         /// Opaque catalog ID.
         id: String,
-        /// Canonically resolved repository.
+        /// Root beneath which the repository must resolve.
+        allowed_root: PathBuf,
+        /// Canonically resolved repository strictly beneath `allowed_root`.
         repository: PathBuf,
         /// Exact ref.
         reference: String,
         /// Repository configuration identity.
         repository_identity: Digest,
-        /// Pinned helper path.
+        /// Numeric target owner under which Git mutation executes.
+        uid: u32,
+        /// Numeric target group under which Git mutation executes.
+        gid: u32,
+        /// Broker-controlled root for staging the exact candidate bundle.
+        staging_root: PathBuf,
+        /// Maximum lifetime of broker-compiled promotion authority.
+        promotion_ttl_ms: u64,
+        /// Pinned Git executable used by the closed internal adapter.
         helper: PathBuf,
-        /// Exact helper bytes.
+        /// Exact Git executable bytes.
         helper_executable: Digest,
-        /// Exact fixed argv/environment/seccomp profile.
+        /// Exact fixed Git operation, argv, environment, and descriptor profile.
         helper_launch_profile: Digest,
     },
     /// Managed regular file.
@@ -841,11 +879,13 @@ fn validate_worker_launcher(
     let mut profile_ids = BTreeSet::new();
     for profile in &launcher.profiles {
         validate_absolute(&[&profile.executable])?;
+        let expected_semantic_type = profile.candidate_effect.semantic_type();
         if !valid_policy_token(&profile.profile_id)
             || !profile_ids.insert(profile.profile_id.clone())
             || ProjectId::parse(&profile.project).is_err()
-            || TargetId::parse(profile.managed_file_target.clone()).is_err()
+            || TargetId::parse(profile.candidate_target.clone()).is_err()
             || !valid_policy_token(&profile.candidate_semantic_type)
+            || profile.candidate_semantic_type != expected_semantic_type
             || profile.executable_identity.size == 0
             || profile.fixed_arguments.len() > 64
             || profile.fixed_arguments.iter().any(|argument| {
@@ -877,6 +917,66 @@ fn valid_policy_token(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_managed_git_ref(reference: &str) -> bool {
+    let Some(relative) = reference.strip_prefix("refs/heads/") else {
+        return false;
+    };
+    !relative.is_empty()
+        && reference.len() <= 256
+        && !relative.contains("..")
+        && !relative.contains("@{")
+        && relative.split('/').all(|component| {
+            !component.is_empty()
+                && !component.starts_with('.')
+                && !component.ends_with('.')
+                && !std::path::Path::new(component)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("lock"))
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+}
+
+// Keep every authority-bearing target field explicit at this configuration
+// boundary; hiding them in a loosely validated options bag would be worse.
+#[allow(clippy::too_many_arguments)]
+fn validate_managed_pointer_target(
+    id: &str,
+    allowed_root: &Path,
+    repository: &Path,
+    reference: &str,
+    uid: u32,
+    gid: u32,
+    staging_root: &Path,
+    promotion_ttl_ms: u64,
+    helper: &Path,
+) -> Result<(), ConfigError> {
+    validate_absolute(&[allowed_root, repository, staging_root, helper])?;
+    let repository_relative = repository
+        .strip_prefix(allowed_root)
+        .map_err(|_| ConfigError::UnsafePath(repository.to_owned()))?;
+    if TargetId::parse(id.to_owned()).is_err()
+        || allowed_root == Path::new("/")
+        || repository_relative.as_os_str().is_empty()
+        || staging_root == Path::new("/")
+        || staging_root.starts_with(allowed_root)
+        || repository.starts_with(staging_root)
+        || helper.starts_with(allowed_root)
+        || helper.starts_with(staging_root)
+        || !valid_managed_git_ref(reference)
+        || uid == 0
+        || gid == 0
+        || uid == u32::MAX
+        || gid == u32::MAX
+        || promotion_ttl_ms == 0
+        || promotion_ttl_ms > MAX_PROMOTION_TTL_MS
+    {
+        return Err(ConfigError::InvalidLimit("managed-pointer target"));
+    }
+    Ok(())
 }
 
 impl AgctlConfigV1 {
@@ -1032,9 +1132,28 @@ impl EffectdConfigV1 {
         }
         for target in &self.targets {
             match target {
-                EffectTargetConfigV1::ManagedPointer { .. } => {
-                    return Err(ConfigError::UnsupportedTargetBackend("managed_pointer"));
-                }
+                EffectTargetConfigV1::ManagedPointer {
+                    id,
+                    allowed_root,
+                    repository,
+                    reference,
+                    uid,
+                    gid,
+                    staging_root,
+                    promotion_ttl_ms,
+                    helper,
+                    ..
+                } => validate_managed_pointer_target(
+                    id,
+                    allowed_root,
+                    repository,
+                    reference,
+                    *uid,
+                    *gid,
+                    staging_root,
+                    *promotion_ttl_ms,
+                    helper,
+                )?,
                 EffectTargetConfigV1::ManagedFile { path, mode, .. } => {
                     validate_absolute(&[path])?;
                     if mode & !0o0777 != 0 {
@@ -1286,6 +1405,82 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigError::RpcRootCollision)
+        ));
+    }
+
+    fn managed_pointer_target() -> EffectTargetConfigV1 {
+        EffectTargetConfigV1::ManagedPointer {
+            id: "repository.main".to_owned(),
+            allowed_root: PathBuf::from("/srv/agent-governor/repositories"),
+            repository: PathBuf::from("/srv/agent-governor/repositories/service.git"),
+            reference: "refs/heads/main".to_owned(),
+            repository_identity: Digest::hash_bytes(b"repository identity"),
+            uid: 1000,
+            gid: 1000,
+            staging_root: PathBuf::from("/var/lib/agent-governor/effectd/promotion-stage"),
+            promotion_ttl_ms: 15 * 60 * 1_000,
+            helper: PathBuf::from("/usr/bin/git"),
+            helper_executable: Digest::hash_bytes(b"git executable"),
+            helper_launch_profile: Digest::hash_bytes(b"closed git launch profile"),
+        }
+    }
+
+    #[test]
+    fn managed_pointer_enrollment_is_closed_and_path_bounded() {
+        let mut config: EffectdConfigV1 =
+            toml::from_str(include_str!("../../../config/effectd.example.toml"))
+                .expect("strict effectd example");
+        config.targets.push(managed_pointer_target());
+        config.validate().expect("closed managed-pointer target");
+
+        let mut outside_root = managed_pointer_target();
+        let EffectTargetConfigV1::ManagedPointer { repository, .. } = &mut outside_root else {
+            unreachable!("fixture is a managed pointer")
+        };
+        *repository = PathBuf::from("/srv/other/service.git");
+        config.targets.pop();
+        config.targets.push(outside_root);
+        assert!(matches!(config.validate(), Err(ConfigError::UnsafePath(_))));
+
+        let mut staging_inside_allowed_root = managed_pointer_target();
+        let EffectTargetConfigV1::ManagedPointer { staging_root, .. } =
+            &mut staging_inside_allowed_root
+        else {
+            unreachable!("fixture is a managed pointer")
+        };
+        *staging_root = PathBuf::from("/srv/agent-governor/repositories/promotion-stage");
+        config.targets.pop();
+        config.targets.push(staging_inside_allowed_root);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidLimit("managed-pointer target"))
+        ));
+
+        let mut unsafe_ref = managed_pointer_target();
+        let EffectTargetConfigV1::ManagedPointer { reference, .. } = &mut unsafe_ref else {
+            unreachable!("fixture is a managed pointer")
+        };
+        *reference = "refs/heads/main.lock".to_owned();
+        config.targets.pop();
+        config.targets.push(unsafe_ref);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidLimit("managed-pointer target"))
+        ));
+
+        let mut unbounded = managed_pointer_target();
+        let EffectTargetConfigV1::ManagedPointer {
+            promotion_ttl_ms, ..
+        } = &mut unbounded
+        else {
+            unreachable!("fixture is a managed pointer")
+        };
+        *promotion_ttl_ms = MAX_PROMOTION_TTL_MS + 1;
+        config.targets.pop();
+        config.targets.push(unbounded);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidLimit("managed-pointer target"))
         ));
     }
 
