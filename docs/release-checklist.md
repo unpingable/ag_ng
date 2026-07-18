@@ -7,6 +7,29 @@ protocol, store, session, and effect components under construction, plus a
 reviewable service/package skeleton. A release tag, package, successful unit
 start, or passing crate test does not override the gates below.
 
+## Closed Promotion Loop v1 qualification
+
+The fixed qualification baseline is commit `10b7aa9`. The current environment
+qualifies the existing loop—not production readiness—as follows:
+
+- Implemented: worker candidate custody, broker canonicalization, independent
+  ratification, exact managed-pointer CAS, verified post-state, and durable
+  reconciliation evidence.
+- Deterministic lifecycle tests inject pre-CAS failure and post-CAS ambiguity;
+  recovery distinguishes exact pre-state, exact post-state, and foreign state
+  without guessing, retrying, or minting success.
+- Durable `Preparing` and `Executing` records recover to typed refusal or
+  indeterminate outcomes. Recovery does not recreate principals or consume an
+  operation twice.
+- Hostile tests cover executable, inode/layout, ref, artifact, helper, expiry,
+  replay, ownership, hook/filter, and repository-command substitution.
+
+Explicit qualification gaps are real power-loss/torn-write testing, live
+multi-process daemon restart under the packaged sandbox, package
+install/upgrade/rollback across the support matrix, SQLite/WAL/disk-full/fsync
+fault injection at every store boundary, and Loom-equivalent concurrency
+modeling. These are recorded as gaps rather than simulated claims.
+
 Known blockers in the current tree include:
 
 - managed-file execution and a development-qualified managed-ref CAS path are
