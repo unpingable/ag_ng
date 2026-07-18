@@ -1,0 +1,12 @@
+target/release/agd usr/bin
+target/release/ag-effectd usr/bin
+target/release/ag-providerd usr/bin
+target/release/agctl usr/bin
+target/release/ag-backup usr/bin
+target/release/ag-migrate usr/bin
+packaging/systemd/agd.service usr/lib/systemd/system
+packaging/systemd/ag-effectd.service usr/lib/systemd/system
+packaging/systemd/ag-providerd.service usr/lib/systemd/system
+packaging/systemd/sysusers.d/agent-governor-ng.conf usr/lib/sysusers.d
+packaging/systemd/tmpfiles.d/agent-governor-ng.conf usr/lib/tmpfiles.d
+migration usr/share/doc/agent-governor-ng

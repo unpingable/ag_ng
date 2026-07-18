@@ -1,0 +1,41 @@
+[package]
+name = "ag-providerd"
+description = "Network-capable credential-isolated inference provider for Agent Governor NG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "ag_providerd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ag-providerd"
+path = "src/bin/ag-providerd.rs"
+
+[dependencies]
+ag-app = { path = "../ag-app" }
+ag-primitives = { path = "../ag-primitives" }
+ag-protocol = { path = "../ag-protocol" }
+ag-session = { path = "../ag-session" }
+ag-store = { path = "../ag-store" }
+anyhow.workspace = true
+clap.workspace = true
+nix.workspace = true
+reqwest.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

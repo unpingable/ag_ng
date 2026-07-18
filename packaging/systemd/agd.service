@@ -1,0 +1,61 @@
+[Unit]
+Description=Agent Governor NG judgment and session daemon
+Documentation=file:/usr/share/doc/agent-governor-ng/architecture.md
+After=local-fs.target ag-effectd.service ag-providerd.service
+Requires=ag-effectd.service ag-providerd.service
+ConditionPathExists=/etc/agent-governor/agd.toml
+ConditionPathIsDirectory=/run/agent-governor/agd
+
+[Service]
+# The current binary does not implement sd_notify or watchdog heartbeats.
+Type=exec
+User=ag-governor
+Group=ag-governor
+ExecStartPre=/usr/bin/agd --config /etc/agent-governor/agd.toml --check-config
+ExecStart=/usr/bin/agd --config /etc/agent-governor/agd.toml
+LoadCredentialEncrypted=rpc-ed25519-pkcs8:/etc/credstore.encrypted/agd-rpc-ed25519-pkcs8.cred
+Restart=on-failure
+RestartSec=2s
+KillMode=control-group
+OOMPolicy=stop
+StateDirectory=agent-governor/agd
+StateDirectoryMode=0700
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agd
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+KeyringMode=private
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+LimitNOFILE=4096
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

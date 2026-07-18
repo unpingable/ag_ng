@@ -1,0 +1,70 @@
+[Unit]
+Description=Agent Governor NG privileged exact-effect broker
+Documentation=file:/usr/share/doc/agent-governor-ng/architecture.md
+After=local-fs.target dbus.service
+Before=agd.service
+ConditionPathExists=/etc/agent-governor/effectd.toml
+ConditionPathIsDirectory=/run/agent-governor/effectd/proposal
+ConditionPathIsDirectory=/run/agent-governor/effectd/admin
+
+[Service]
+# The current binary does not implement sd_notify or watchdog heartbeats.
+Type=exec
+User=root
+Group=root
+ExecStartPre=/usr/bin/ag-effectd --config /etc/agent-governor/effectd.toml --check-config
+ExecStart=/usr/bin/ag-effectd --config /etc/agent-governor/effectd.toml
+LoadCredentialEncrypted=rpc-ed25519-pkcs8:/etc/credstore.encrypted/effectd-rpc-ed25519-pkcs8.cred
+Restart=on-failure
+RestartSec=2s
+KillMode=control-group
+OOMPolicy=stop
+StateDirectory=agent-governor/effectd
+StateDirectoryMode=0700
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ag-effectd
+
+NoNewPrivileges=yes
+# These are only the capabilities needed by the closed managed-file/ref
+# vocabulary. In particular, effectd receives no ptrace, network, mount,
+# setuid, setgid, sys_admin, or arbitrary-exec capability.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER
+AmbientCapabilities=
+DevicePolicy=closed
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+KeyringMode=private
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+LimitNOFILE=4096
+TasksMax=128
+
+# Every admitted target root must be repeated in a root-owned local drop-in as
+# ReadWritePaths=. effectd config validation must refuse a target absent from
+# the effective sandbox. This base unit admits only broker-owned state.
+ReadWritePaths=/var/lib/agent-governor/effectd
+
+[Install]
+WantedBy=multi-user.target

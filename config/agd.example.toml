@@ -1,0 +1,91 @@
+# Production-shaped example, not an installable identity document.
+# Replace every UID, GID, digest, enrollment root, and authority identifier
+# from locally measured, root-owned deployment records before installation.
+schema = "ag.config.agd.v1"
+security_profile = "production"
+authority_domain = "example-host.production"
+epoch = "1"
+database = "/var/lib/agent-governor/agd/agd.db"
+object_store = "/var/lib/agent-governor/agd/objects"
+control_socket = "/run/agent-governor/agd/control.sock"
+effectd_proposal_socket = "/run/agent-governor/effectd/proposal/proposal.sock"
+providerd_socket = "/run/agent-governor/providerd/provider.sock"
+
+# Numeric custody values are enrollment data resolved after sysusers/tmpfiles,
+# not portable account defaults. Ancestors are also checked for symlinks.
+[store_custody.database_parent]
+uid = 991
+gid = 991
+mode = 0o700
+
+[store_custody.object_store]
+uid = 991
+gid = 991
+mode = 0o700
+
+[store_custody.database]
+uid = 991
+gid = 991
+mode = 0o600
+
+[store_custody.writer_lock]
+uid = 991
+gid = 991
+mode = 0o600
+
+[control_socket_custody.parent]
+uid = 991
+gid = 994
+mode = 0o2750
+
+[control_socket_custody.node]
+uid = 991
+gid = 994
+mode = 0o660
+
+[rpc_signing_identity]
+principal = "sha256:6111111111111111111111111111111111111111111111111111111111111111"
+key_id = "agd.v1"
+public_key = "ptVL7WK6le_cWbyxf76wk7-gkyAE8dO2_Xt2JfmnfSg"
+private_key_credential = "/run/credentials/agd.service/rpc-ed25519-pkcs8"
+
+# The proposal signer is deliberately independent from the effect-plane
+# inspection/ratifier identity. uid/gid are observations, not identity.
+[proposer_peer]
+role = "proposal_ingress"
+uid = 992
+gid = 992
+executable_identity = "sha256:e111111111111111111111111111111111111111111111111111111111111111"
+cgroup_contains = "ag-proposer.service"
+stable_principal_root = "sha256:c111111111111111111111111111111111111111111111111111111111111111"
+principal_kind = "service"
+
+[proposer_peer.rpc_key]
+principal = "sha256:d111111111111111111111111111111111111111111111111111111111111111"
+key_id = "proposer.v1"
+public_key = "ERERERERERERERERERERERERERERERERERERERERERE"
+maximum_clock_skew_ms = 30000
+
+# This authenticates the live effect broker on outbound local RPC. It does not
+# delegate effect authority to agd.
+[effectd_peer]
+role = "effect_broker"
+uid = 0
+gid = 0
+executable_identity = "sha256:3111111111111111111111111111111111111111111111111111111111111111"
+cgroup_contains = "ag-effectd.service"
+stable_principal_root = "sha256:4111111111111111111111111111111111111111111111111111111111111111"
+principal_kind = "daemon"
+
+[effectd_peer.rpc_key]
+principal = "sha256:4111111111111111111111111111111111111111111111111111111111111111"
+key_id = "effectd.v1"
+public_key = "QhDr60ldHKGyw-8W8f9_0UPDXZ2llDaCjOlKhs-mORs"
+maximum_clock_skew_ms = 30000
+
+[limits]
+max_control_frame_bytes = 1048576
+max_artifact_bytes = 2147483648
+max_active_sessions = 16
+max_session_seconds = 14400
+max_rpc_replay_entries = 4096

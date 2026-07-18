@@ -1,0 +1,16 @@
+[package]
+name = "ag-session"
+description = "Batch-session, worker launch, inference custody, and workspace contracts for Agent Governor NG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ag-primitives = { path = "../ag-primitives" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

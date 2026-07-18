@@ -1,0 +1,64 @@
+[Unit]
+Description=Agent Governor NG inference credential proxy
+Documentation=file:/usr/share/doc/agent-governor-ng/architecture.md
+After=network-online.target
+Before=agd.service
+Wants=network-online.target
+ConditionPathExists=/etc/agent-governor/providerd.toml
+ConditionPathIsDirectory=/run/agent-governor/providerd
+
+[Service]
+# The current binary does not implement sd_notify or watchdog heartbeats.
+Type=exec
+User=ag-provider
+Group=ag-provider
+ExecStartPre=/usr/bin/ag-providerd --config /etc/agent-governor/providerd.toml --check-config
+ExecStart=/usr/bin/ag-providerd --config /etc/agent-governor/providerd.toml
+LoadCredentialEncrypted=rpc-ed25519-pkcs8:/etc/credstore.encrypted/providerd-rpc-ed25519-pkcs8.cred
+Restart=on-failure
+RestartSec=2s
+KillMode=control-group
+OOMPolicy=stop
+StateDirectory=agent-governor/providerd
+StateDirectoryMode=0700
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ag-providerd
+
+# A site drop-in supplies one additional LoadCredentialEncrypted= entry for
+# each configured provider credential_name. Environment variables are not an
+# admitted secret channel.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+KeyringMode=private
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+LimitNOFILE=4096
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

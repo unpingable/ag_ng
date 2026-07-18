@@ -1,0 +1,127 @@
+# Production-shaped example, not an installable authority document.
+# All targets, identities, paths, actions, ownership values, and digests are
+# root-owned enrollment data and must be replaced from local measurements.
+schema = "ag.config.effectd.v1"
+security_profile = "production"
+authority_domain = "example-host.production"
+epoch = "1"
+database = "/var/lib/agent-governor/effectd/effectd.db"
+object_store = "/var/lib/agent-governor/effectd/objects"
+proposal_socket = "/run/agent-governor/effectd/proposal/proposal.sock"
+admin_socket = "/run/agent-governor/effectd/admin/admin.sock"
+
+# The two socket parents are separately enrolled membranes. Their SGID modes
+# establish the only accepted group on each final socket node.
+[store_custody.database_parent]
+uid = 0
+gid = 0
+mode = 0o700
+
+[store_custody.object_store]
+uid = 0
+gid = 0
+mode = 0o700
+
+[store_custody.database]
+uid = 0
+gid = 0
+mode = 0o600
+
+[store_custody.writer_lock]
+uid = 0
+gid = 0
+mode = 0o600
+
+[proposal_socket_custody.parent]
+uid = 0
+gid = 991
+mode = 0o2750
+
+[proposal_socket_custody.node]
+uid = 0
+gid = 991
+mode = 0o660
+
+[admin_socket_custody.parent]
+uid = 0
+gid = 995
+mode = 0o2750
+
+[admin_socket_custody.node]
+uid = 0
+gid = 995
+mode = 0o660
+
+[rpc_signing_identity]
+principal = "sha256:4111111111111111111111111111111111111111111111111111111111111111"
+key_id = "effectd.v1"
+public_key = "QhDr60ldHKGyw-8W8f9_0UPDXZ2llDaCjOlKhs-mORs"
+private_key_credential = "/run/credentials/ag-effectd.service/rpc-ed25519-pkcs8"
+
+[agd_peer]
+role = "governor_proposer"
+uid = 991
+gid = 991
+executable_identity = "sha256:5111111111111111111111111111111111111111111111111111111111111111"
+cgroup_contains = "agd.service"
+stable_principal_root = "sha256:6111111111111111111111111111111111111111111111111111111111111111"
+principal_kind = "daemon"
+
+[agd_peer.rpc_key]
+principal = "sha256:6111111111111111111111111111111111111111111111111111111111111111"
+key_id = "agd.v1"
+public_key = "ptVL7WK6le_cWbyxf76wk7-gkyAE8dO2_Xt2JfmnfSg"
+maximum_clock_skew_ms = 30000
+
+# Effectd verifies the original proposer-to-agd exchange against this
+# independent enrollment. agd cannot replace this lineage with invented bytes.
+[proposer_peer]
+role = "proposal_ingress"
+uid = 992
+gid = 992
+executable_identity = "sha256:e111111111111111111111111111111111111111111111111111111111111111"
+cgroup_contains = "ag-proposer.service"
+stable_principal_root = "sha256:c111111111111111111111111111111111111111111111111111111111111111"
+principal_kind = "service"
+
+[proposer_peer.rpc_key]
+principal = "sha256:d111111111111111111111111111111111111111111111111111111111111111"
+key_id = "proposer.v1"
+public_key = "ERERERERERERERERERERERERERERERERERERERERERE"
+maximum_clock_skew_ms = 30000
+
+# Inspection and ratification terminate on this direct effectd peer policy.
+# Membership in ag-admin only grants filesystem reachability to the socket;
+# this exact live identity check still applies.
+[admin_peer]
+role = "effect_operator"
+uid = 1000
+gid = 1000
+executable_identity = "sha256:7111111111111111111111111111111111111111111111111111111111111111"
+cgroup_contains = "agctl-operator"
+stable_principal_root = "sha256:8111111111111111111111111111111111111111111111111111111111111111"
+principal_kind = "operator"
+
+[admin_peer.rpc_key]
+principal = "sha256:8111111111111111111111111111111111111111111111111111111111111111"
+key_id = "operator.v1"
+public_key = "IPK8hXZ-R5MVtot1ELXq57HO2LSbwcymwyAVX8DwNiA"
+maximum_clock_skew_ms = 30000
+
+[limits]
+max_control_frame_bytes = 1048576
+max_plan_steps = 1
+max_ready_proposals = 1024
+max_artifact_bytes = 2147483648
+max_rpc_replay_entries = 8192
+
+# Intent can name these opaque IDs but cannot supply a path, ref, helper,
+# executable, unit, or allowed action. The unit sandbox must independently
+# admit every repository and managed-file parent through ReadWritePaths=.
+[[targets]]
+kind = "managed_file"
+id = "service-config"
+path = "/etc/example-service/generated.conf"
+mode = 0o640
+uid = 0
+gid = 0

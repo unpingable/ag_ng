@@ -1,0 +1,5 @@
+config/agctl.example.toml
+config/agctl-proposer.example.toml
+config/agd.example.toml
+config/effectd.example.toml
+config/providerd.example.toml

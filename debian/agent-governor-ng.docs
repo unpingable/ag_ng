@@ -1,0 +1,10 @@
+README.md
+docs/architecture.md
+docs/source-baseline.md
+docs/signed-local-rpc.md
+docs/agctl.md
+docs/deployment.md
+docs/backup-restore.md
+docs/release-checklist.md
+docs/migration-m8.md
+packaging/install-manifest.md

@@ -1,0 +1,28 @@
+#!/usr/bin/make -f
+
+export CARGO_TARGET_DIR := $(CURDIR)/target
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	# Cargo.lock is the configuration input; network resolution is forbidden.
+	:
+
+override_dh_auto_build:
+	cargo build --locked --offline --release --workspace
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --locked --offline --workspace --all-targets
+endif
+
+override_dh_auto_install:
+	# dh_install consumes debian/agent-governor-ng.install.
+	:
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
+
+override_dh_missing:
+	dh_missing --fail-missing

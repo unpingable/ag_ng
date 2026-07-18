@@ -1,0 +1,201 @@
+honestly, claude's not going to like this, and you might not either, but I'm still chewing on the idea of ag-ng -- where we actually try porting all of AG into Rust and removing python from the critical path entirely. seems like we're nearing the point where that's actually plausibly required for future work anyway.
+
+Yeah. I don’t dislike it. I dislike the **rewrite-shaped hole in the ground** version of it.
+
+But the underlying claim is getting harder to dismiss:
+
+**AG is no longer merely an orchestration program written in Python. It is becoming an authority-bearing runtime whose mistakes define the security model.**
+
+That changes the language calculus.
+
+Python was entirely defensible when AG was:
+
+* policy scaffolding,
+* playbook machinery,
+* prototype governance,
+* a place to discover the right contracts.
+
+It becomes less comfortable once AG is responsible for:
+
+* exact-byte identity binding,
+* fail-closed witness verification,
+* grant consumption,
+* budget enforcement,
+* process supervision and cancellation,
+* immutable receipt construction,
+* sandbox boundary handling,
+* protocol versioning,
+* replay resistance.
+
+At that point, “we have tests” is still necessary, but the implementation substrate itself keeps offering ambient ways to be slightly wrong: mutable dictionaries, accidental coercions, optional fields turning into fail-open branches, loose byte/string boundaries, exception-driven control flow, monkeypatchable process state. Nothing uniquely evil about Python. It’s just extremely hospitable to representational ambiguity, which is becoming AG’s primary enemy.
+
+The case against `ag-ng` is also real:
+
+1. **A port would initially reduce assurance.**
+   The current AG has accumulated doctrine, scars, and negative tests. Recreating the visible behavior is easy. Recreating all the reasons behind it is not.
+
+2. **Rust can produce beautifully typed incorrectness.**
+   You can encode the wrong authority model with exquisite precision. The approval-binding incident is the obvious warning: the bug was architectural before it was linguistic.
+
+3. **“All of AG” is probably the wrong boundary.**
+   CLI ergonomics, fixture generation, campaign tooling, report rendering, and development harnesses do not become morally superior because they compile to native code.
+
+4. **The two implementations will drift during migration.**
+   Dual-stack periods are where semantics go to breed.
+
+Still, I think the balance may have shifted. The thing I’d endorse is not:
+
+> Rewrite AG in Rust.
+
+It is:
+
+> Define the AG authority kernel precisely enough that it can be independently implemented, then make the Rust implementation the only component allowed on the execution-critical path.
+
+That probably means `ag-ng` owns:
+
+* admission and refusal
+* canonical decoding and validation
+* digest computation
+* grant and witness verification
+* state transitions
+* budget accounting
+* execution supervision
+* receipt emission
+* durable recovery semantics
+
+Python can remain temporarily—or indefinitely—for:
+
+* authoring tools
+* local fixture generation
+* test corpus management
+* human-facing inspection
+* migration adapters
+* non-authoritative convenience commands
+
+The migration should be hostile to cleverness:
+
+### 1. Freeze the semantic surface
+
+Extract the actual AG state machine and wire contracts before writing Rust. Not “document the modules.” Define:
+
+* accepted input bytes,
+* canonicalization rules,
+* state transition rules,
+* refusal taxonomy,
+* emitted receipt bytes,
+* crash/restart behavior,
+* effect boundaries.
+
+The Python implementation becomes a specimen, not the specification.
+
+### 2. Build a differential oracle
+
+Feed both AGs the same corpus and require byte-identical outcomes where the contract says identity matters.
+
+Not merely “same decision.” Same:
+
+* refusal code,
+* state transition,
+* digest,
+* receipt,
+* ordering,
+* spend result.
+
+Every historical bug becomes a permanent cross-implementation specimen.
+
+### 3. Move one authority slice at a time
+
+Start with something narrow and existentially important. Approval binding is almost comically well suited:
+
+```text
+plan_bytes
+witness_bytes
+source_plan_digest assertion
+        ↓
+Approved(plan_ref) | Refused(reason)
+```
+
+Pure, deterministic, byte-sensitive, already heavily tested.
+
+Then grant verification. Then admission. Then budget accounting. Then execution supervision. The daemon shell moves last, after the kernel beneath it is already Rust.
+
+### 4. Make Python incapable, not merely unused
+
+Eventually the Python side should literally lack the secrets, handles, or IPC rights needed to authorize execution. Otherwise “Rust critical path” quietly becomes “Rust advisory library called from Python.”
+
+That is the real fence.
+
+### 5. Do not preserve accidental compatibility
+
+The old API shape is not sacred. Semantic compatibility matters; Python’s historical object model does not. This is an opportunity to kill `Optional[dict[str, Any]]` wherever it has crawled into a load-bearing wall.
+
+My actual verdict:
+
+**`ag-ng` is probably premature as a whole-repo rewrite, but a Rust authority kernel is no longer premature.** In fact, delaying that split much longer may make the eventual migration worse, because each new authority feature deepens Python-specific implementation assumptions.
+
+The trigger is not performance. It is that AG increasingly needs a smaller representational universe than Python naturally gives it.
+
+Claude may object because this violates the usual “don’t rewrite functioning systems” prior. That prior is generally correct. But AG is not merely functioning software anymore. It is becoming the reference monitor for the rest of the constellation.
+
+Reference monitors are exactly where “boring, small, typed, explicit, and difficult to mutate accidentally” stops being language fandom and starts being architecture.
+
+
+I .. may just leave Claude out of the loop entirely. Do this through codex + ag-self-dogfood. Could be good POC. Might still use claude for adversarial testing
+
+That may actually be the cleaner experiment.
+
+Not because Claude is uniquely contaminating, but because **a port built through Codex under AG’s own machinery is a much more interesting claim than “Claude helped us rewrite Claude’s favorite governance system.”** The toolchain becomes part of the specimen.
+
+The role split almost writes itself:
+
+* **Codex:** implementation producer
+* **Current AG:** governor, budgeter, admission boundary, receipt source
+* **Rust AG kernel:** candidate successor
+* **Claude:** external hostile reviewer after the design and artifacts are frozen
+
+That last part matters. Don’t let Claude become the second architect by drip-feeding objections during construction. Give it a sealed review packet and ask it to break the thing. Otherwise it will co-adapt with the design and later certify the conversation it participated in. Familiar problem.
+
+The POC should probably make one narrow claim:
+
+> AG can govern the production of an independently implemented authority component that later displaces the corresponding Python component from the critical path.
+
+Approval binding is still the ideal first specimen. It has:
+
+* exact-byte semantics
+* a small input/output surface
+* known historical failure modes
+* meaningful security consequences
+* enough existing tests to build a differential corpus
+* no legitimate reason to touch the network, filesystem, or clock
+
+The dogfood chain could be:
+
+```text
+campaign packet
+    ↓
+Codex writes Rust verifier
+    ↓
+AG admits build/test actions
+    ↓
+Rust verifier runs historical + generated corpus
+    ↓
+Python/Rust differential comparison
+    ↓
+Claude receives frozen code, contract, corpus, and receipts
+    ↓
+new counterexamples become permanent specimens
+```
+
+The sharp edge is bootstrap honesty. For the first pass, **Python AG remains the trusted governor of the Rust replacement**. That proves governed production and semantic substitution; it does not yet prove that Rust AG can govern its own replacement. Don’t blur those. The later bootstrap ceremony is a separate result:
+
+1. Python AG governs Rust kernel build.
+2. Rust kernel verifies the resulting artifacts.
+3. Rust-governed run reproduces the same result.
+4. Python authority is removed from that slice.
+5. Attempting to invoke the old Python path refuses or is structurally impossible.
+
+That fourth/fifth step is where this stops being “Rust library exists” and becomes an actual critical-path migration.
+
+And yes, keeping Claude out initially may be useful for another reason: **you’ll find out whether AG’s contracts are legible enough to drive implementation without the giant contextual co-author who remembers every prior argument.** If Codex plus packets cannot reconstruct the intended behavior, that’s evidence the specification is still conversational rather than operational.
+
+Which is exactly the kind of failure a self-dogfood POC should expose.

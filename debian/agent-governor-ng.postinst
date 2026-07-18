@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        systemd-sysusers /usr/lib/sysusers.d/agent-governor-ng.conf
+        systemd-tmpfiles --create /usr/lib/tmpfiles.d/agent-governor-ng.conf
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

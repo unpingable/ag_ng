@@ -1,0 +1,31 @@
+# Production-shaped proposal-ingress client. This signer is cryptographically
+# unable to use effectd's inspection/ratification socket. Replace all example
+# identities and keys with measured, root-owned enrollment data.
+schema = "ag.config.agctl.v1"
+security_profile = "production"
+
+[rpc_signing_identity]
+principal = "sha256:d111111111111111111111111111111111111111111111111111111111111111"
+key_id = "proposer.v1"
+public_key = "ERERERERERERERERERERERERERERERERERERERERERE"
+private_key_credential = "/run/credentials/ag-proposer.service/rpc-ed25519-pkcs8"
+
+[command_profile]
+role = "proposer"
+agd_socket = "/run/agent-governor/agd/control.sock"
+max_intent_file_bytes = 983040
+
+[command_profile.agd_peer.rpc_key]
+principal = "sha256:6111111111111111111111111111111111111111111111111111111111111111"
+key_id = "agd.v1"
+public_key = "ptVL7WK6le_cWbyxf76wk7-gkyAE8dO2_Xt2JfmnfSg"
+maximum_clock_skew_ms = 30000
+
+[command_profile.agd_peer.socket_peer]
+mode = "require_uid_gid"
+uid = 991
+gid = 991
+
+[limits]
+max_control_frame_bytes = 1048576
+rpc_replay_capacity = 64

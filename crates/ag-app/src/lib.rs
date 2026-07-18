@@ -1,0 +1,26 @@
+//! Shared daemon and CLI implementation for Agent Governor NG.
+
+pub mod agd;
+pub mod api;
+pub mod config;
+mod custody;
+pub mod derived;
+pub mod doctor;
+pub mod effectd;
+pub mod peer;
+pub mod rpc_auth;
+pub mod runtime;
+pub mod signed_transport;
+pub mod transport;
+
+use tracing_subscriber::EnvFilter;
+
+/// Installs structured logging with a conservative default filter.
+pub fn init_logging(service: &str) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init();
+    tracing::info!(service, "service starting");
+}

@@ -1,0 +1,7 @@
+/target/
+/.cache/
+/.ag-git/
+*.db
+*.db-shm
+*.db-wal
+*.sock

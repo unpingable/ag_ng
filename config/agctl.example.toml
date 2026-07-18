@@ -1,0 +1,32 @@
+# Production-shaped effect-administrator example, not an installable identity
+# document. This signer cannot submit intent to agd. Run agctl in the enrolled
+# effect-admin service/transient-unit context which receives the named Ed25519
+# credential. Replace every identity and key from root-owned local enrollment
+# records before installation.
+schema = "ag.config.agctl.v1"
+security_profile = "production"
+
+[rpc_signing_identity]
+principal = "sha256:8111111111111111111111111111111111111111111111111111111111111111"
+key_id = "operator.v1"
+public_key = "IPK8hXZ-R5MVtot1ELXq57HO2LSbwcymwyAVX8DwNiA"
+private_key_credential = "/run/credentials/agctl-operator.service/rpc-ed25519-pkcs8"
+
+[command_profile]
+role = "effect_admin"
+effectd_admin_socket = "/run/agent-governor/effectd/admin/admin.sock"
+
+[command_profile.effectd_peer.rpc_key]
+principal = "sha256:4111111111111111111111111111111111111111111111111111111111111111"
+key_id = "effectd.v1"
+public_key = "QhDr60ldHKGyw-8W8f9_0UPDXZ2llDaCjOlKhs-mORs"
+maximum_clock_skew_ms = 30000
+
+[command_profile.effectd_peer.socket_peer]
+mode = "require_uid_gid"
+uid = 0
+gid = 0
+
+[limits]
+max_control_frame_bytes = 1048576
+rpc_replay_capacity = 64

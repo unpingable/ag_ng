@@ -1,0 +1,23 @@
+Source: agent-governor-ng
+Section: admin
+Priority: optional
+Maintainer: Agent Governor contributors <maintainers@example.invalid>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo (>= 1.94.0),
+ rustc (>= 1.94.0)
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+
+Package: agent-governor-ng
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ systemd (>= 252)
+Description: governed batch-agent authority membrane
+ Agent Governor NG separates untrusted proposal work, inference credentials,
+ judgment state, human ratification, and a closed privileged effect broker.
+ .
+ This package skeleton does not imply production readiness; consult the
+ installed release checklist before enabling any service.

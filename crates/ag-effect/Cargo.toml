@@ -1,0 +1,21 @@
+[package]
+name = "ag-effect"
+description = "Closed effect vocabulary and durable authorization state machine for Agent Governor NG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ag-primitives = { path = "../ag-primitives" }
+rustix.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

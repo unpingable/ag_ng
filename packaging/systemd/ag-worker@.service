@@ -1,0 +1,63 @@
+[Unit]
+Description=Agent Governor NG contained batch worker %i
+Documentation=file:/usr/share/doc/agent-governor-ng/deployment.md
+After=agd.service
+BindsTo=agd.service
+PartOf=agd.service
+ConditionPathExists=/usr/libexec/agent-governor/ag-worker
+
+[Service]
+Type=exec
+DynamicUser=yes
+ExecStart=/usr/libexec/agent-governor/ag-worker %i
+KillMode=control-group
+OOMPolicy=stop
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+RuntimeMaxSec=4h
+RuntimeDirectory=agent-governor/work/%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ag-worker-%i
+
+# The wrapper resolves %i to a root-owned, one-shot launch record and closes
+# every descriptor not explicitly named by that record before exec. %i is not
+# an argv or executable selection surface.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+DevicePolicy=closed
+PrivateDevices=yes
+PrivateIPC=yes
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+KeyringMode=private
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SocketBindDeny=any
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @keyring @module @mount @obsolete @privileged @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+LimitNOFILE=1024
+TasksMax=256
+MemoryMax=8G
+CPUQuota=400%

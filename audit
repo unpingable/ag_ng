@@ -1,0 +1,330 @@
+Yes. **Template the audit grammar, not the domain model.** Then swap the context bundle.
+
+The reusable move is:
+
+> Hold the artifact or event fixed. Change one surrounding context dimension. Ask which judgments are preserved, revoked, reclassified, or become unanswerable.
+
+That is broadly useful across authority, evidence, policy, identity, freshness, evaluators, provenance, role, and current-vs-historical state.
+
+## The audit template
+
+### 1. Pick the durable object
+
+What remains nominally “the same”?
+
+* receipt
+* finding
+* assertion
+* signature
+* observation
+* plan
+* decision
+* imported packet
+* cached fact
+* completed action
+
+Name its stable identity precisely. Bytes? Digest? Database row? Semantic claim? This matters because “same object” is often where laundering begins.
+
+### 2. Name the judgments
+
+Do not audit vague “validity.” Enumerate the actual predicates:
+
+* authentic
+* admitted
+* historically admissible
+* retrospectively supported
+* currently governing
+* currently usable
+* causally effective
+* operationally spendable
+* suitable as reference/calibration authority
+* renderable as live state
+
+This alone finds bugs. Systems love collapsing six predicates into `valid = true`.
+
+### 3. Define the context bundle
+
+Something like:
+
+```text
+Context =
+  history_cut
+  evidence_view
+  basis_state
+  authority_state
+  policy_version
+  evaluator_version
+  role
+  origin_mode
+  custody_time
+  observation_time
+  identity_resolution
+  compromise_state
+```
+
+Not every audit uses every field. The template supplies slots; the domain chooses which ones are earned.
+
+### 4. Flip one axis at a time
+
+Hold the object fixed and vary:
+
+| Axis        | Example flip                              |
+| ----------- | ----------------------------------------- |
+| Time        | before revocation → after revocation      |
+| Basis       | live → stale / retired / unknown          |
+| Role        | observed subject → calibration reference  |
+| Origin      | observed → synthetic / drill              |
+| Policy      | v1 → corrected v2                         |
+| Evaluator   | old classifier → repaired classifier      |
+| Identity    | old key resolution → corrected resolution |
+| Custody     | original receipt time → later import time |
+| Authority   | currently active → revoked                |
+| History cut | what was known then → what is known now   |
+
+The important discipline: **one-axis ablations first**, then compositional cases after the individual effects are understood.
+
+### 5. Demand paired controls
+
+Each candidate seam needs:
+
+* a positive control where judgment should survive
+* a negative control where judgment should fail or change
+* ideally a missing-cell test where the system currently cannot express the distinction
+
+That is what made the AG drill specimen strong. It was not merely prose; it had demonstrated vs operational consumption with executable controls.
+
+### 6. Classify the result
+
+Every finding should land in one of these buckets:
+
+1. **Invariant** — judgment correctly survives the context change.
+2. **Context-sensitive** — judgment legitimately changes.
+3. **Illicitly portable** — old judgment leaks into the new context.
+4. **Retroactively erased** — current state destroys historical truth.
+5. **Unanswerable** — system lacks custody needed to decide.
+6. **Projection misuse** — cache/current view is being asked to testify historically.
+7. **Predicate collapse** — distinct judgments are represented as one boolean.
+
+That classification is probably the most reusable artifact.
+
+## The thing to flip between domains
+
+You could run the same audit skeleton against:
+
+* **NQ:** finding identity held fixed; flip basis state, time cut, retirement state.
+* **Standing:** receipt held fixed; flip revocation, compromise interval, historical cut.
+* **Labelwatch:** labeler held fixed; flip subject/reference role, resolver state, evaluator version.
+* **AG:** input held fixed; flip observed/drill origin, demonstrated/operational consequence.
+* **Night Shift:** packet held fixed; flip producer freshness, custody freshness, authorization status.
+* **Git/CI:** artifact held fixed; flip branch protection, signer trust, dependency policy, current vulnerability knowledge.
+* **Ops:** metric or alert held fixed; flip topology, maintenance state, source freshness, ownership, suppression policy.
+* **AI evaluation:** output held fixed; flip rubric, model version, judge, system prompt, hidden context, provenance.
+
+Same procedure. Different context vocabulary.
+
+## This probably belongs in the governor/mill
+
+Not as a new service. As a **campaign archetype**:
+
+```text
+Context-Flip Audit
+  inventory objects and judgments
+  identify context dimensions
+  locate real incidents
+  find positive controls
+  perform single-axis flips
+  test compositional flips
+  classify portability failures
+  distinguish bugs from missing query surfaces
+  emit specimen matrix and local repair recommendations
+```
+
+The output should be boring:
+
+* evidence map
+* specimen matrix
+* candidate live gaps
+* non-cases
+* proposed local fixes
+* possible shared doctrine
+* explicit “do not extract” ruling
+
+That last item matters. Otherwise every successful audit becomes a startup pitch.
+
+## The compact audit prompt
+
+```text
+Audit this system for context-sensitive judgments.
+
+For each durable artifact, event, receipt, finding, assertion, or decision:
+
+1. Identify the exact object whose identity persists.
+2. Enumerate the judgments made about it; do not collapse them into generic validity.
+3. Identify context dimensions that may change:
+   history cut, evidence view, basis state, authority state, policy version,
+   evaluator version, role, origin mode, custody time, observation time,
+   identity resolution, compromise state.
+4. Hold the object fixed and flip one context dimension at a time.
+5. Determine whether each judgment:
+   - remains invariant,
+   - legitimately changes,
+   - leaks illicitly from the old context,
+   - is retroactively erased,
+   - becomes unanswerable,
+   - relies on a current-state projection pretending to be history,
+   - or reveals a collapsed predicate.
+6. Find real incidents, implemented controls, plausible live gaps, and non-cases.
+7. Require paired positive and negative controls where possible.
+8. Distinguish:
+   - hot-path bugs,
+   - missing historical query surfaces,
+   - insufficient custody,
+   - and harmless operational caches.
+9. Recommend local repairs first.
+10. Do not propose a shared service or universal format unless multiple cases
+    require the same executable behavior rather than merely similar language.
+```
+
+This is potentially useful as hell because it is not limited to temporal authority. It is really a **judgment portability audit**: under what context changes is a conclusion still entitled to travel?
+
+That is a much larger seam than TPKI, and unlike TPKI, it may cash out as a repeatable instrument rather than another piece of infrastructure.
+
+
+Yeah. **Versioning is where this stops being a clever audit prompt and becomes infrastructure-grade useful.**
+
+Because a new version is itself a context flip:
+
+> Same artifact, same historical events, different code/policy/evaluator/schema. Which judgments changed, and were they entitled to?
+
+That gives you a repeatable release cycle:
+
+1. **Freeze the prior release’s judgments**
+
+   * What did vN call live, valid, governing, admissible, spendable, etc.?
+   * Under what evidence and policy cut?
+
+2. **Run vN+1 against the same specimens**
+
+   * No refreshed evidence unless explicitly part of the test.
+   * Preserve the old evaluator as a witness, not just the outputs.
+
+3. **Classify every changed answer**
+
+   * intended correction
+   * newly answerable
+   * newly unanswerable
+   * retroactive reclassification
+   * illicit current-state leakage
+   * predicate collapse
+   * actual regression
+
+4. **Flip surrounding contexts**
+
+   * old/new policy
+   * old/new evaluator
+   * then/current evidence
+   * before/after revocation
+   * observed/synthetic origin
+   * historical/current query mode
+
+5. **Emit a judgment migration ledger**
+
+   * same object
+   * old judgment
+   * new judgment
+   * changed context
+   * justification
+   * consequence boundary
+   * whether historical outputs remain reproducible
+
+6. **Gate release claims**
+
+   * A version cannot quietly say “we improved correctness” when it actually changed the question.
+   * A historical query cannot inherit new policy unless explicitly retrospective.
+   * A current view cannot rewrite what was knowable at the old cut.
+
+The killer check is probably:
+
+> **Did the new version make any judgment more portable without adding custody, evidence, or an explicit semantic migration?**
+
+That catches a lot of “harmless refactors.”
+
+I’d resist building a dedicated service. But a **Mill campaign archetype plus a small comparison harness** feels earned:
+
+```text
+version-context audit
+  prior release
+  candidate release
+  frozen specimen corpus
+  judgment inventory
+  context-flip matrix
+  migration ledger
+  release ruling
+```
+
+And it scales beyond releases. Policy updates, schema migrations, classifier changes, key rotation, reference retirement, even “we changed the dashboard query” all become the same governed cycle.
+
+The actual tool isn’t TPKI. It’s closer to a **semantic upgrade auditor**—one that asks whether vN+1 merely changed implementation, or quietly changed what the system is claiming to know. That’s nasty enough to deserve machinery.
+
+
+Yeah. Rust gives you the skeleton almost for free.
+
+The first pass can be brutally mechanical:
+
+* enumerate domain enums
+* find every `match` that produces a judgment
+* flag wildcard arms, default fallbacks, and lossy `bool` projections
+* generate one-axis flips for each variant
+* compare old/new outputs across versions
+* report newly reachable, newly collapsed, or silently reclassified states
+
+Especially useful targets:
+
+```rust
+enum BasisState { Live, Stale, Retired, Invalidated, Unknown }
+enum AuthorityState { Active, Revoked, Compromised }
+enum OriginMode { Observed, Synthetic, Drill }
+enum Judgment { Admissible, Historical, Governing, Refused, CannotTestify }
+```
+
+Then the audit asks: for a fixed specimen, what happens when only one enum member changes?
+
+The compiler already tells you where the semantic choke points are. A new variant forces you through exhaustive matches—unless somebody has committed the traditional crimes:
+
+```rust
+_ => true
+```
+
+or:
+
+```rust
+state.is_not_retired()
+```
+
+which is apparently how you get the NQ Human Now Frame bug.
+
+The harder layer is where state escaped the type system:
+
+* database strings
+* serde aliases / `#[serde(other)]`
+* nullable columns
+* booleans like `valid`, `active`, `ok`
+* SQL views
+* policy files
+* versioned evaluator behavior
+* cached projections
+
+So the tool could have two passes:
+
+1. **Typed inventory:** enums, variants, matches, conversions, serialization boundaries.
+2. **Escape inventory:** places where rich state becomes strings, booleans, SQL predicates, or generic status codes.
+
+That second one is probably where most of the bodies are buried. The enum tells you the intended ontology; the projections tell you where somebody quietly reduced it to “good enough.”
+
+For versioning, you could snapshot a machine-readable judgment matrix per release and diff it:
+
+```text
+specimen × context variant × evaluator version → judgment
+```
+
+Rust makes generating that corpus and keeping it exhaustive unusually tractable. Not easy, exactly. But much less mystical than trying to reconstruct semantics from a Python swamp full of dictionaries named `state`.
