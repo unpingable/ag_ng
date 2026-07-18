@@ -1,0 +1,163 @@
+{
+  "schema": "ag.formal-calculus-obligations/v1",
+  "baseline": {
+    "repository": "lean",
+    "revision": "ff491b808ebeab2a132d9ade46d234cf85dcfbe9",
+    "tree": "72cba07e35588e9f67c252b0bd92cf0523ab178f",
+    "release": "14.0.0",
+    "worktree": "clean",
+    "license": "Apache-2.0",
+    "license_sha256": "daf85dd251c45a0c88446c612396eb0bc812dee770519dcef1c06be0b7f1bd26"
+  },
+  "authority_fence": "lean_theorems_are_specification_evidence_and_never_runtime_authority",
+  "statuses": ["unmapped", "structural_only", "partially_correspondent", "qualified"],
+  "obligations": [
+    {
+      "id": "CALC-LOC-001",
+      "rung": 1,
+      "lean_surface": "Admissibility.PathVerdict Domains and Located",
+      "claim": "domain transport and carried locations do not repair evidence",
+      "rust_surface": "PathVerdict, LocatedObstruction, and EvaluationTrace",
+      "status": "structural_only",
+      "runtime_evidence": ["ordered_obstruction_trace", "clean_never_heals_test"],
+      "gaps": ["runtime_locations_require_independent_authentication"],
+      "campaign": "runtime_qualification"
+    },
+    {
+      "id": "CALC-ID-001",
+      "rung": 2,
+      "lean_surface": "Admissibility.Calculus.Core.GovernedFamily",
+      "claim": "claims index native witness and refusal data",
+      "rust_surface": "ag_kernel::NativeJudgment and concrete family types",
+      "status": "partially_correspondent",
+      "runtime_evidence": ["typed_claims", "typed_witnesses", "typed_refusals"],
+      "gaps": ["no_proof_rust_family_instantiates_lean_family"],
+      "campaign": "adapter"
+    },
+    {
+      "id": "CALC-ID-002",
+      "lean_surface": "GovernedFamily standing/custody/obligation books",
+      "claim": "books remain separate and do not convert into authority",
+      "rust_surface": "non-convertible BookRef types and sealed Authority reconstruction",
+      "status": "partially_correspondent",
+      "runtime_evidence": ["compile_fail_type_separation", "authority_replay_checks"],
+      "gaps": ["runtime_store_provenance_is_external_to_pure_kernel"],
+      "campaign": "runtime_qualification"
+    },
+    {
+      "id": "CALC-INSTANCE-001",
+      "rung": 3,
+      "lean_surface": "Weathering and BoundedPaidReachability instances",
+      "claim": "the governed-family signature has reviewed concrete inhabitants",
+      "rust_surface": "none",
+      "status": "unmapped",
+      "runtime_evidence": [],
+      "gaps": ["no_weathering_family", "no_paid_reachability_family", "no_payment_or_settlement_claim"],
+      "campaign": "deferred"
+    },
+    {
+      "id": "CALC-SER-001",
+      "rung": 4,
+      "lean_surface": "SpineEncoding and LosslessEncoding",
+      "claim": "selected claim-indexed refusal packets round-trip exactly",
+      "rust_surface": "CalculusDecisionV1 canonical digest and serde round-trip",
+      "status": "structural_only",
+      "runtime_evidence": ["jcs_digest_binding", "refusal_round_trip_test"],
+      "gaps": ["no_cross_language_encoding_equivalence", "no_universal_exact_encoding_claim"],
+      "campaign": "adapter"
+    },
+    {
+      "id": "CALC-ORD-001",
+      "rung": 6,
+      "lean_surface": "Crossing.CheckedCrossing",
+      "claim": "native branches are decided once and downstream views use the stored pair",
+      "rust_surface": "CalculusDecisionV1 and CalculusDecisionLedgerV1",
+      "status": "partially_correspondent",
+      "runtime_evidence": ["stored_outcome", "one_use_projection_test"],
+      "gaps": ["no_daemon_integration", "rollback_resistance_requires_store_epoch_ceremony"],
+      "campaign": "runtime_qualification"
+    },
+    {
+      "id": "CALC-REF-001",
+      "lean_surface": "Crossing.Refusal",
+      "claim": "mixed refusal retains successful native evidence and refusing evidence",
+      "rust_surface": "NativeJudgment and concrete crossing refusal enums",
+      "status": "structural_only",
+      "runtime_evidence": ["typed_refusal_variants", "digest_substitution_test"],
+      "gaps": ["no_formal_correspondence_for_concrete_rust_crossing"],
+      "campaign": "adapter"
+    },
+    {
+      "id": "CALC-TOT-001",
+      "lean_surface": "GovernedFamily.decide",
+      "claim": "family decision is total",
+      "rust_surface": "OperationalEvaluation wrapping NativeJudgment",
+      "status": "partially_correspondent",
+      "runtime_evidence": ["indeterminate_is_not_refusal_or_admission"],
+      "gaps": ["operational_failures_have_no_lean_total_decision_counterpart"],
+      "campaign": "adapter"
+    },
+    {
+      "id": "CALC-PROV-001",
+      "lean_surface": "witness and refusal data",
+      "claim": "native data is retained by the formal judgment",
+      "rust_surface": "adapter context and complete native outcome",
+      "status": "structural_only",
+      "runtime_evidence": ["domain", "epoch", "origin", "evaluator_digest", "input_digest"],
+      "gaps": ["adapter_does_not_authenticate_evaluator_or_issuer"],
+      "campaign": "runtime_qualification"
+    },
+    {
+      "id": "CALC-CMP-001",
+      "rung": 5,
+      "lean_surface": "Admissibility.Calculus.Comparison",
+      "claim": "comparison entries retain their selected law, receipts, and nonclaims",
+      "rust_surface": "none",
+      "status": "unmapped",
+      "runtime_evidence": [],
+      "gaps": ["no_runtime_comparison_ledger", "digests_do_not_prove_comparison_laws"],
+      "campaign": "deferred"
+    },
+    {
+      "id": "CALC-HIST-001",
+      "rung": 7,
+      "lean_surface": "BreakGlass lifecycle origin and history",
+      "claim": "exceptional origin and audit history remain load-bearing",
+      "rust_surface": "none",
+      "status": "unmapped",
+      "runtime_evidence": ["breakglass_refuses_as_unsupported_family"],
+      "gaps": ["origin_allocator", "attestor_honesty", "history_correspondence", "recovery_semantics"],
+      "campaign": "deferred_breakglass_model"
+    },
+    {
+      "id": "CALC-STATE-001",
+      "lean_surface": "BreakGlass conditional state-change receipts",
+      "claim": "state change requires an explicit non-identity hypothesis",
+      "rust_surface": "typed effects with observed prestate and verified poststate",
+      "status": "structural_only",
+      "runtime_evidence": ["managed_pointer_prestate", "managed_pointer_poststate", "reconciliation"],
+      "gaps": ["no_shared_transition_model", "no_breakglass_effect"],
+      "campaign": "deferred"
+    },
+    {
+      "id": "CALC-REPLAY-001",
+      "lean_surface": "stored decision crossing",
+      "claim": "derived views do not re-decide native branches",
+      "rust_surface": "one-use projection ledger",
+      "status": "partially_correspondent",
+      "runtime_evidence": ["serialized_restart_replay_refusal", "concurrent_single_winner"],
+      "gaps": ["copied_old_store_replay_requires_activation_epoch_fence"],
+      "campaign": "runtime_qualification"
+    },
+    {
+      "id": "CALC-VERSION-001",
+      "lean_surface": "v14 stable surface custody",
+      "claim": "the reviewed theorem surface is revision-bound",
+      "rust_surface": "CalculusAdapterContextV1",
+      "status": "qualified",
+      "runtime_evidence": ["schema_pin", "release_pin", "revision_pin", "hostile_baseline_substitution_test"],
+      "gaps": ["future_calculus_upgrade_requires_new_reviewed_adapter_version"],
+      "campaign": "adapter"
+    }
+  ]
+}

@@ -12,6 +12,13 @@ minimal privileged effect broker. The initial production target is a
 single-host Linux service for contained batch work, Git managed-ref promotion,
 managed files, and systemd units.
 
+The pure kernel is crosswalked against the public Governed Admissibility
+Calculus v14 through an explicit, non-authorizing adapter. The adapter binds
+native Rust decisions to a reviewed specification revision and operational
+context; it cannot deserialize or convert them into runtime authority. See
+`docs/formal-calculus-crosswalk.md` for correspondence and non-correspondence
+claims.
+
 This repository does not preserve the classic command, API, database, or
 authority-token surfaces. The Rust-only frozen archive verifier treats classic
 files as bounded opaque evidence and never imports them as runtime authority.

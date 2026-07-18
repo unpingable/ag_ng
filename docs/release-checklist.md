@@ -64,9 +64,9 @@ Known blockers in the current tree include:
   supported distribution/architecture pair;
 - Debian maintainer/distribution metadata are placeholders because no release
   remote or signing authority has been enrolled;
-- source-license evidence is recorded, but the private `skunkworks`
-  formalization has no license declaration at its pinned revision or current
-  tree; reuse permission and release treatment remain unresolved;
+- the public Lean v14 baseline and Apache-2.0 license evidence are pinned, but
+  runtime correspondence remains only partially established by the explicit
+  non-authorizing adapter and obligation ledger;
 - audited Ed25519 generation, independent public-key enrollment, rotation, and
   recovery tooling is not packaged.
 - daemon stores durably bind authority, exact configuration, security profile,
@@ -114,6 +114,28 @@ worktrees, and classic command/API/database compatibility are out of scope.
   UID/PID observations do not replace the signature.
 - [ ] No serialized witness, capability, digest, or receipt is accepted as
   runtime authority without reconstruction from committed local state.
+
+## Formal-calculus correspondence gates
+
+- [x] The clean public Lean v14 revision, release, worktree state, and license
+  evidence are pinned independently of the historical private design input.
+- [x] Every promoted calculus rung has a human-readable disposition and a
+  machine-readable obligation; the ledger is not loaded by a daemon.
+- [x] The pure adapter binds schema, calculus revision/release, domain, epoch,
+  lifecycle origin, evaluator identity, input digest, and complete native
+  outcome without constructing authority.
+- [x] Semantic refusal remains distinct from operational indeterminacy, and
+  hostile serialization tests preserve refusal evidence and reject baseline or
+  evidence substitution.
+- [x] One-use projection survives serialized restart and concurrent consumers
+  produce one winner in the pure ledger model.
+- [ ] A daemon/store integration proves durable decision custody, rollback
+  fencing, and evaluator/issuer authenticity under crash and restore.
+- [ ] Any claimed Lean-to-Rust correspondence has an independently reviewed
+  adapter receipt; type-name similarity, a green Lean build, or a green Rust
+  test is never sufficient.
+- [x] BreakGlass has no runtime schema, catalog entry, mandate, or execution
+  path; its formal instance is recorded as a deferred model obligation only.
 
 ## Build and supply-chain gates
 

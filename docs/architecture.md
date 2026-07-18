@@ -173,8 +173,32 @@ BreakGlass, direct checkout, arbitrary privileged commands, hostile
 multi-tenancy, public TCP APIs, and compatibility aliases are intentionally
 absent.
 
+## Formal calculus correspondence boundary
+
+AG-ng's reviewed formal baseline is the public Governed Admissibility Calculus
+at Lean revision `ff491b808ebeab2a132d9ade46d234cf85dcfbe9`. The calculus
+constrains the operational contract but is neither linked nor executed by any
+daemon. Its theorems do not authenticate runtime evidence and cannot mint
+authority.
+
+`ag-kernel` contains a pure, non-authorizing adapter which binds one complete
+native Rust result to the exact calculus revision, adapter schema, authority
+domain, epoch, lifecycle origin, evaluator identity, and input digest. It
+preserves semantic refusal and operational indeterminacy as distinct outcomes.
+A stored-decision ledger can record one projection of that evidence, but it is
+not an authority ledger and cannot defend a copied old store without the
+system's independent epoch and restore ceremonies.
+
+The detailed correspondence dispositions and gaps live in
+`docs/formal-calculus-crosswalk.md` and
+`docs/formal-calculus-obligations.json`. No daemon consumes either document.
+BreakGlass remains absent despite its formal instance; exceptional runtime
+authority requires a separate model, custody design, hostile review, and
+operator decision.
+
 ## Implementation rule
 
 No calculus family, abstraction, or crate is admitted unless it is consumed by
-the next authority-bearing vertical slice or required by a compiled hostile
-specimen.
+the next authority-bearing vertical slice, by an explicit non-authorizing
+correspondence adapter, or by a compiled hostile specimen. A theorem-shaped
+Rust API is not correspondence evidence.

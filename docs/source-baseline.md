@@ -1,8 +1,9 @@
 # Source baseline receipt
 
-Captured 2026-07-17 while AG-ng implementation began. A source revision is an
-input witness, not a runtime dependency. Implementations never chase these
-repositories automatically.
+Captured 2026-07-17 while AG-ng implementation began and extended 2026-07-18
+for the public calculus release. A source revision is an input witness, not a
+runtime dependency. Implementations never chase these repositories
+automatically.
 
 | Source | Revision | Worktree state |
 | --- | --- | --- |
@@ -14,12 +15,22 @@ repositories automatically.
 | Standing | `a5120add32a5ce12fe302b67f1c9bce4f691930a` | clean |
 | Wicket | `049309398e13be793806ed2a856fc082e19e108a` | clean |
 | Linear Accountant | `2975500dfdf92841e69ded3c51ac4d3dbfcfe8dc` | clean |
+| Governed Admissibility Calculus (Lean) | `ff491b808ebeab2a132d9ade46d234cf85dcfbe9` | clean |
 
-The formalization source is the `skunkworks` repository at
-`7c3de3ada5e42066c61224e3fc135cb01e8659eb`, plus a dirty-tree witness whose
-binary diff digest was
+The current formal specification baseline is the clean public Lean repository
+at `ff491b808ebeab2a132d9ade46d234cf85dcfbe9`, release 14.0.0. It contains
+the separately ratified seven-rung Governed Admissibility Calculus and
+supersedes the dirty private formalization witness as AG-ng's active
+assumption-audit input. A Lean theorem is specification evidence, never a
+runtime dependency or authority source.
+
+The pinned Lean tree is `72cba07e35588e9f67c252b0bd92cf0523ab178f`.
+
+For historical reproducibility, the original architecture design also read
+the `skunkworks` repository at `7c3de3ada5e42066c61224e3fc135cb01e8659eb`
+plus a dirty-tree witness with binary diff digest
 `sha256:0f6c6aa403a9ded5d35ef80e94ea08698ad1310b781f1f692f674e3a00ae7cfb`.
-The untracked files consumed by the design had these exact byte digests:
+The untracked design inputs had these exact byte digests:
 
 - rung-1 transfer receipt: `sha256:2646597e793708a8ba6cfe127c4eb246e1c9391b8b0d34896f7bcbd394b85f18`
 - rung-2 GovernedFamily candidate: `sha256:0a822f5b103f94097102c7402721d94527e2732f2469d111ac4db97abf5b5f75`
@@ -45,16 +56,17 @@ permission or establish release compliance.
 | Standing | root Apache License 2.0; `LICENSE` `sha256:f8c96bf1a1e2b2e6f57d8ae035d6207de5fa64ba92428c1e822569e11a071405`; virtual-workspace metadata omits a license field | `sha256:c1a3562abd370620cc35b1c1c33cfe21b25fba923fc8450562b7cf6ad9a37517` |
 | Wicket | package SPDX `Apache-2.0`; `LICENSE` `sha256:fbb1b63a7394ac58d4f9cd6906528a1c7674c2b364b381c494b15d15fdcb3b7e` | `sha256:f87887cbd1c531b47d246bc1e5d760591f2bfee4e7cf5021350466582a38c8df` |
 | Linear Accountant | package SPDX `Apache-2.0`; `LICENSE` `sha256:43a93bc3f5afd26caa1cebc6c9c665e974a8229e3cfbaa1f4c30e8f9b2dd9c83` | `sha256:610bcc6c86cdecbbef7e6fee302f832259b8d8f5f57bb01edb96cb310816aac9` |
+| Governed Admissibility Calculus (Lean) | root Apache License 2.0; `LICENSE` `sha256:daf85dd251c45a0c88446c612396eb0bc812dee770519dcef1c06be0b7f1bd26` | absent |
 
-The `skunkworks` repository and its `formalization` component have no root
-`LICENSE`, `COPYING`, or `NOTICE`; `formalization/lakefile.toml` has no license
-field. The same was true at the pinned `7c3de3a` revision. Permission to reuse
-that material is therefore unresolved and remains a release blocker. AG-ng's
-implementation uses the formalization as a private behavioral cross-check; no
-Lean source is copied into this repository.
+The historical `skunkworks` formalization input had no root license declaration
+at the pinned revision and remains unsuitable for source reuse. The active
+public Lean baseline carries Apache-2.0 license evidence. AG-ng copies no Lean
+source; it records theorem surfaces as specification inputs and implements an
+independent operational adapter.
 
-The audit rechecked all eight separately pinned revisions as clean exact
-matches. The parent `skunkworks` repository was at
+The original audit rechecked all eight runtime-source revisions as clean exact
+matches. The public Lean revision was independently observed clean when the
+calculus crosswalk was added. The parent `skunkworks` repository was at
 `506b13e1a6eb5372c94e48a120a58cdfbff18d4f` during the audit; the pinned
 revision remains an ancestor, and the only observed dirt was the four expected
 untracked formalization/rung-source and `nq-ng` paths.

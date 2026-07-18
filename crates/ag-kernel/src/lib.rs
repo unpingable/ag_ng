@@ -6,6 +6,11 @@
 //! provenance remains the responsibility of the store that supplies that
 //! evidence.
 //!
+//! Similarity to the promoted Lean calculus is not a correspondence claim.
+//! [`CalculusDecisionV1`] is the explicit non-authorizing membrane: it binds
+//! operational evidence to one reviewed specification baseline, but cannot
+//! construct [`Authority`].
+//!
 //! Book references are intentionally not interchangeable:
 //!
 //! ```compile_fail
@@ -40,6 +45,7 @@
 //! ```
 
 mod authority;
+mod correspondence;
 mod family;
 mod judgment;
 mod path;
@@ -48,6 +54,11 @@ mod recomposition;
 pub use authority::{
     AdmissionCommit, Authority, AuthorityError, AuthorityFamily, EffectFamily,
     reconstruct_effect_authority,
+};
+pub use correspondence::{
+    ADMISSIBILITY_CALCULUS_RELEASE_V1, ADMISSIBILITY_CALCULUS_REVISION_V1,
+    CALCULUS_ADAPTER_SCHEMA_V1, CalculusAdapterContextV1, CalculusAdapterError,
+    CalculusDecisionLedgerV1, CalculusDecisionV1, CalculusDispositionV1, CalculusUseReceiptV1,
 };
 pub use family::{
     CapacityBook, CapacityBookEntry, CapacityClaim, CapacityFailure, CapacityRef, CapacityRefusal,
