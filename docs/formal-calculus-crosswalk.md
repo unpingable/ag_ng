@@ -72,3 +72,11 @@ BreakGlass exclusion.
 - Campaign 3: hostile serialization, baseline drift, replay, restart, foreign
   origin, and concurrent-consumption qualification.
 - Deferred: durable daemon consumption and a model-only BreakGlass campaign.
+
+## Frontier watch
+
+The dated
+`ILLEGAL_LIFTS_FRONTIER_CENSUS_2026-07-18.md` records unpromoted skunkworks
+directions that may later force new correspondence obligations. It has no
+current adapter or runtime authority status; entries become work only through a
+separately reviewed forcing case and campaign.
