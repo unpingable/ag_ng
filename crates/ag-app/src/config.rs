@@ -6,8 +6,10 @@ use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
-use ag_effect::SystemdUnitActionV1;
-use ag_primitives::{AuthorityDomain, Digest, Epoch, PrincipalKindV1};
+use ag_effect::{SystemdUnitActionV1, TargetId};
+use ag_primitives::{
+    AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, PrincipalKindV1, ProjectId,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,6 +21,10 @@ use crate::signed_transport::SIGNED_RPC_RESPONSE_TIMEOUT_MS;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const PROVIDER_RPC_STRUCTURAL_RESERVE_BYTES: u64 = 128 * 1024;
+// Candidate content occurs once in the worker proof on each RPC wire. This
+// reserve covers the complete signed principal/session/intent envelopes around
+// that one canonical base64 value.
+const WORKER_RPC_STRUCTURAL_RESERVE_BYTES: u64 = 128 * 1024;
 const PROVIDER_RPC_COMPLETION_MARGIN_MS: u64 = 5_000;
 const PROVIDER_MIN_EVENT_STREAM_BYTES: u64 = 4 * 1024;
 
@@ -39,7 +45,7 @@ pub struct StoreConfigV1 {
 /// Directory modes include the set-group-ID bit when it is part of the
 /// deployment contract. Runtime validation compares all permission and
 /// special bits exactly; values are never inferred from the process umask.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FilesystemNodeCustodyV1 {
     /// Numeric owner expected from site enrollment.
@@ -208,6 +214,63 @@ pub struct AgdLimitsV1 {
     pub max_session_seconds: u64,
 }
 
+/// Root-reviewed launch substrate for contained generic workers.
+///
+/// This configuration names exact executable bytes and fixed argument vectors;
+/// it is not a command runner. Provider routes are intentionally absent from
+/// this first slice, which supports offline workers only.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerLauncherConfigV1 {
+    /// Stable daemon-chain root independently mirrored in effectd's agd peer
+    /// enrollment. The live agd signing principal is the leaf when distinct.
+    pub governor_principal_root: Digest,
+    /// Exact skew policy under which workers verify the governor's one-shot
+    /// challenge. Effectd requires this complete policy to equal its enrolled
+    /// `agd_peer.rpc_key` before accepting durable worker proof.
+    pub governor_challenge_maximum_clock_skew_ms: u64,
+    /// Parent beneath which `agd` creates one independent proposal workspace
+    /// for each non-reusable session.
+    pub workspace_root: PathBuf,
+    /// Exact expected custody of the already-created workspace root.
+    pub workspace_root_custody: FilesystemNodeCustodyV1,
+    /// Absolute path of the reviewed Bubblewrap executable.
+    pub sandbox_executable: PathBuf,
+    /// Exact bytes expected at `sandbox_executable`.
+    pub sandbox_identity: ExecutableIdentityV1,
+    /// Runtime roots admitted read-only into the otherwise empty sandbox.
+    pub runtime_roots: Vec<PathBuf>,
+    /// Closed set of workers selectable by identifier.
+    pub profiles: Vec<WorkerProfileConfigV1>,
+}
+
+/// One fixed executable-to-candidate mapping reviewed in root-owned policy.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerProfileConfigV1 {
+    /// Closed selector accepted by the control API.
+    pub profile_id: String,
+    /// Governed project bound into the transient principal.
+    pub project: String,
+    /// Absolute worker executable locator, revalidated against the retained
+    /// descriptor immediately before launch.
+    pub executable: PathBuf,
+    /// Exact executable bytes approved for this profile.
+    pub executable_identity: ExecutableIdentityV1,
+    /// Exact arguments following the fixed sandbox executable name. No shell
+    /// or implicit `PATH` interpretation occurs.
+    pub fixed_arguments: Vec<String>,
+    /// Only managed-file target to which accepted candidate bytes are mapped
+    /// by `agd`; the worker never receives or selects this value.
+    pub managed_file_target: String,
+    /// Closed semantic label required on the candidate frame.
+    pub candidate_semantic_type: String,
+    /// Exclusive wall-clock runtime limit.
+    pub timeout_ms: u64,
+    /// Exact cumulative candidate-output bound.
+    pub output_budget_bytes: u64,
+}
+
 /// `agd` configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -237,6 +300,10 @@ pub struct AgdConfigV1 {
     pub proposer_peer: PeerPolicyV1,
     /// Authenticated effect-broker policy for outbound responses.
     pub effectd_peer: PeerPolicyV1,
+    /// Optional closed worker catalog. Absence disables worker launch without
+    /// affecting the existing external proposer path.
+    #[serde(default)]
+    pub worker_launcher: Option<WorkerLauncherConfigV1>,
     /// Resource limits.
     pub limits: AgdLimitsV1,
 }
@@ -740,6 +807,78 @@ fn validate_agctl_separate_caller(
     Ok(())
 }
 
+fn validate_worker_launcher(
+    launcher: &WorkerLauncherConfigV1,
+    limits: &AgdLimitsV1,
+) -> Result<(), ConfigError> {
+    validate_absolute(&[&launcher.workspace_root, &launcher.sandbox_executable])?;
+    validate_directory_custody(
+        &launcher.workspace_root_custody,
+        "worker workspace root",
+        false,
+    )?;
+    if launcher.sandbox_identity.size == 0
+        || launcher.governor_challenge_maximum_clock_skew_ms == 0
+        || launcher.governor_challenge_maximum_clock_skew_ms > 300_000
+        // Multi-worker scheduling is deliberately outside this vertical
+        // slice. One live worker keeps deadline-critical polling isolated
+        // from every potentially blocking authority operation.
+        || limits.max_active_sessions != 1
+        || launcher.runtime_roots != [PathBuf::from("/usr")]
+        || launcher.profiles.is_empty()
+        || launcher.profiles.len() > 1024
+    {
+        return Err(ConfigError::InvalidLimit("worker launcher"));
+    }
+    let mut runtime_roots = BTreeSet::new();
+    for root in &launcher.runtime_roots {
+        validate_absolute(&[root])?;
+        if root != Path::new("/usr") || !runtime_roots.insert(root.clone()) {
+            return Err(ConfigError::UnsafePath(root.clone()));
+        }
+    }
+
+    let mut profile_ids = BTreeSet::new();
+    for profile in &launcher.profiles {
+        validate_absolute(&[&profile.executable])?;
+        if !valid_policy_token(&profile.profile_id)
+            || !profile_ids.insert(profile.profile_id.clone())
+            || ProjectId::parse(&profile.project).is_err()
+            || TargetId::parse(profile.managed_file_target.clone()).is_err()
+            || !valid_policy_token(&profile.candidate_semantic_type)
+            || profile.executable_identity.size == 0
+            || profile.fixed_arguments.len() > 64
+            || profile.fixed_arguments.iter().any(|argument| {
+                argument.is_empty() || argument.len() > 4096 || argument.as_bytes().contains(&0)
+            })
+            || profile.timeout_ms == 0
+            || profile.timeout_ms > limits.max_session_seconds.saturating_mul(1000)
+            // The one-shot challenge is delivered before release. A profile
+            // cannot outlive the exact agd enrollment policy effectd checks.
+            || profile.timeout_ms > launcher.governor_challenge_maximum_clock_skew_ms
+            || profile.output_budget_bytes == 0
+            || profile.output_budget_bytes > limits.max_artifact_bytes
+            || profile
+                .output_budget_bytes
+                .div_ceil(3)
+                .checked_mul(4)
+                .and_then(|encoded| encoded.checked_add(WORKER_RPC_STRUCTURAL_RESERVE_BYTES))
+                .is_none_or(|wire_bound| wire_bound > u64::from(limits.max_control_frame_bytes))
+        {
+            return Err(ConfigError::InvalidLimit("worker profile"));
+        }
+    }
+    Ok(())
+}
+
+fn valid_policy_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 impl AgctlConfigV1 {
     /// Validates the role-specific CLI's fail-closed endpoint and identity policy.
     ///
@@ -818,11 +957,7 @@ impl AgdConfigV1 {
         validate_peer(&self.effectd_peer)?;
         validate_peer_kind(
             &self.proposer_peer,
-            &[
-                PrincipalKindV1::Operator,
-                PrincipalKindV1::Service,
-                PrincipalKindV1::WorkerSession,
-            ],
+            &[PrincipalKindV1::Operator, PrincipalKindV1::Service],
         )?;
         validate_peer_kind(&self.effectd_peer, &[PrincipalKindV1::Daemon])?;
         validate_separate_roles(
@@ -835,6 +970,14 @@ impl AgdConfigV1 {
             || self.limits.max_session_seconds == 0
         {
             return Err(ConfigError::InvalidLimit("agd limits"));
+        }
+        if let Some(launcher) = &self.worker_launcher {
+            if self.security_profile != "development" {
+                return Err(ConfigError::InvalidLimit(
+                    "worker launcher is development-only until production isolation is attested",
+                ));
+            }
+            validate_worker_launcher(launcher, &self.limits)?;
         }
         Ok(())
     }
@@ -869,11 +1012,7 @@ impl EffectdConfigV1 {
         validate_peer_kind(&self.agd_peer, &[PrincipalKindV1::Daemon])?;
         validate_peer_kind(
             &self.proposer_peer,
-            &[
-                PrincipalKindV1::Operator,
-                PrincipalKindV1::Service,
-                PrincipalKindV1::WorkerSession,
-            ],
+            &[PrincipalKindV1::Operator, PrincipalKindV1::Service],
         )?;
         validate_peer_kind(
             &self.admin_peer,
@@ -1147,6 +1286,26 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigError::RpcRootCollision)
+        ));
+    }
+
+    #[test]
+    fn static_proposer_enrollment_cannot_impersonate_a_worker_session() {
+        let mut agd: AgdConfigV1 = toml::from_str(include_str!("../../../config/agd.example.toml"))
+            .expect("strict agd example");
+        agd.proposer_peer.principal_kind = PrincipalKindV1::WorkerSession;
+        assert!(matches!(
+            agd.validate(),
+            Err(ConfigError::UnexpectedPrincipalKind(_))
+        ));
+
+        let mut effectd: EffectdConfigV1 =
+            toml::from_str(include_str!("../../../config/effectd.example.toml"))
+                .expect("strict effectd example");
+        effectd.proposer_peer.principal_kind = PrincipalKindV1::WorkerSession;
+        assert!(matches!(
+            effectd.validate(),
+            Err(ConfigError::UnexpectedPrincipalKind(_))
         ));
     }
 

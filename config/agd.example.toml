@@ -11,6 +11,10 @@ control_socket = "/run/agent-governor/agd/control.sock"
 effectd_proposal_socket = "/run/agent-governor/effectd/proposal/proposal.sock"
 providerd_socket = "/run/agent-governor/providerd/provider.sock"
 
+# `worker_launcher` is deliberately absent. The current offline Bubblewrap
+# launcher is a development-only ingress slice; this production profile rejects
+# it rather than claiming production or high-assurance containment.
+
 # Numeric custody values are enrollment data resolved after sysusers/tmpfiles,
 # not portable account defaults. Ancestors are also checked for symlinks.
 [store_custody.database_parent]
@@ -86,6 +90,8 @@ maximum_clock_skew_ms = 30000
 [limits]
 max_control_frame_bytes = 1048576
 max_artifact_bytes = 2147483648
+# A development `worker_launcher` additionally requires this to be exactly 1.
+# This production example has no worker launcher.
 max_active_sessions = 16
 max_session_seconds = 14400
 max_rpc_replay_entries = 4096

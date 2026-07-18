@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -195,6 +195,31 @@ impl RpcPeerKeyPolicyV1 {
         }
         Ok(())
     }
+}
+
+/// Computes the reviewed identity of one ephemeral worker candidate-ingress
+/// key policy without including its lifecycle principal.
+///
+/// Excluding `policy.principal` is intentional: the worker principal itself
+/// commits this identity, so including it would create a construction cycle.
+/// The explicit role tag prevents the same key material from being silently
+/// reinterpreted as another credential role.
+///
+/// # Errors
+///
+/// Returns an error if the policy bounds or canonical encoding are invalid.
+pub fn candidate_ingress_key_identity(policy: &RpcPeerKeyPolicyV1) -> Result<Digest, RpcAuthError> {
+    policy.validate()?;
+    canonical_json_digest(
+        "ag-local-rpc-candidate-ingress-key-identity-v1",
+        &(
+            "worker_candidate_ingress",
+            &policy.key_id,
+            &policy.public_key,
+            policy.maximum_clock_skew_ms,
+        ),
+    )
+    .map_err(RpcAuthError::from)
 }
 
 /// Local signing identity whose secret half is an explicit credential file.
@@ -468,6 +493,40 @@ pub struct RpcSignerV1 {
     key_pair: Ed25519KeyPair,
 }
 
+/// Owned PKCS#8 bytes for one ephemeral worker candidate-ingress key.
+///
+/// This key can authenticate exactly the protocol role into which its public
+/// enrollment is installed. It carries no effect, ratification, provider, or
+/// other bearer authority. The wrapper deliberately has no `Debug`, clone, or
+/// byte-returning accessor; launchers transfer it only through an explicitly
+/// admitted descriptor and then drop it.
+pub struct EphemeralRpcPrivateKeyV1 {
+    bytes: Vec<u8>,
+}
+
+impl EphemeralRpcPrivateKeyV1 {
+    /// Writes the exact PKCS#8 bytes to one launcher-admitted descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error without exposing private bytes in diagnostics.
+    pub fn write_to(&self, writer: &mut impl Write) -> Result<(), std::io::Error> {
+        writer.write_all(&self.bytes)
+    }
+
+    /// Returns the bounded byte count for descriptor accounting.
+    #[must_use]
+    pub fn byte_length(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl Drop for EphemeralRpcPrivateKeyV1 {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
+
 impl RpcSignerV1 {
     /// Loads an Ed25519 PKCS#8 v2 key from one explicit, protected credential.
     ///
@@ -485,6 +544,62 @@ impl RpcSignerV1 {
             return Err(RpcAuthError::CredentialPublicKeyMismatch);
         }
         Ok(signer)
+    }
+
+    /// Generates a fresh Ed25519 identity for one worker's candidate-ingress
+    /// channel.
+    ///
+    /// The launcher may supply a provisional construction principal, compute
+    /// the public key-policy identity (which deliberately excludes that field),
+    /// and then rebind the public enrollment to the complete reviewed
+    /// `WorkerSessionPrincipalV1`. It must durably commit that final enrollment
+    /// before release, write the private material only to an admitted worker
+    /// descriptor, and then drop both private copies. This is authentication
+    /// material, not serialized effect authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if secure key generation or PKCS#8 parsing fails.
+    pub fn generate_ephemeral_candidate_ingress(
+        principal: Digest,
+        key_id: RpcKeyIdV1,
+    ) -> Result<(Self, EphemeralRpcPrivateKeyV1), RpcAuthError> {
+        let document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .map_err(|_| RpcAuthError::Randomness)?;
+        let material = EphemeralRpcPrivateKeyV1 {
+            bytes: document.as_ref().to_vec(),
+        };
+        let signer = Self::from_pkcs8(principal, key_id, &material.bytes)?;
+        Ok((signer, material))
+    }
+
+    /// Loads one worker candidate-ingress signer from an admitted descriptor.
+    ///
+    /// Callers supply the principal and key ID from the immutable session
+    /// record. The reader is bounded and must contain exactly one nonempty
+    /// Ed25519 PKCS#8 v2 document. This method does not accept a pathname or
+    /// perform implicit credential discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty, oversized, unreadable, or invalid key.
+    pub fn from_ephemeral_candidate_ingress_reader(
+        principal: Digest,
+        key_id: RpcKeyIdV1,
+        reader: &mut impl Read,
+    ) -> Result<Self, RpcAuthError> {
+        let mut bytes = Vec::new();
+        reader
+            .take(MAX_CREDENTIAL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| RpcAuthError::CredentialIo { source })?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_CREDENTIAL_BYTES {
+            bytes.fill(0);
+            return Err(RpcAuthError::InvalidCredentialFile);
+        }
+        let result = Self::from_pkcs8(principal, key_id, &bytes);
+        bytes.fill(0);
+        result
     }
 
     fn from_pkcs8(
@@ -549,7 +664,17 @@ impl RpcSignerV1 {
     }
 
     /// Creates a fresh, audience-bound server challenge.
-    pub(crate) fn issue_challenge(
+    ///
+    /// This low-level primitive is public so a launcher-owned, per-session
+    /// candidate ingress can use the same three-frame proof protocol without
+    /// inventing another signature format. Enrollment at the receiving socket
+    /// determines the only accepted role; a challenge is not effect authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid enrollment policy, randomness, or strict
+    /// canonicalization failure.
+    pub fn issue_challenge(
         &self,
         audience: &RpcPeerEnrollmentV1,
         issued_at_unix_ms: u64,
@@ -575,7 +700,17 @@ impl RpcSignerV1 {
     }
 
     /// Signs a strict request for one exact server challenge.
-    pub(crate) fn sign_request<T: Serialize>(
+    ///
+    /// Generic fixed workers use this only with `WorkerCandidateRequestV1` and
+    /// their per-session ephemeral signer. The proof authenticates candidate
+    /// bytes to that enrolled ingress; it cannot create a proposal judgment,
+    /// canonical effect, ratification, or provider capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid request, wrong challenge audience,
+    /// randomness, or strict canonicalization failure.
+    pub fn sign_request<T: Serialize>(
         &self,
         request: RequestEnvelopeV1<T>,
         challenge: &SignedServerChallengeV1,
@@ -1350,6 +1485,81 @@ mod tests {
             pkcs8.as_ref(),
         )
         .expect("signer")
+    }
+
+    #[test]
+    fn ephemeral_candidate_key_round_trips_only_through_admitted_bytes() {
+        let principal = Digest::hash_bytes(b"ephemeral-worker-principal");
+        let key_id = RpcKeyIdV1::new("worker-candidate.v1").expect("key ID");
+        let (generated, material) =
+            RpcSignerV1::generate_ephemeral_candidate_ingress(principal.clone(), key_id.clone())
+                .expect("generate candidate key");
+        let credential_limit =
+            usize::try_from(MAX_CREDENTIAL_BYTES).expect("credential limit fits usize");
+        assert!(material.byte_length() > 0);
+        assert!(material.byte_length() <= credential_limit);
+
+        let mut admitted = Vec::new();
+        material.write_to(&mut admitted).expect("write admitted FD");
+        let mut reader = std::io::Cursor::new(admitted);
+        let loaded =
+            RpcSignerV1::from_ephemeral_candidate_ingress_reader(principal, key_id, &mut reader)
+                .expect("load candidate key");
+        assert_eq!(
+            generated.enrollment(30_000).expect("generated enrollment"),
+            loaded.enrollment(30_000).expect("loaded enrollment")
+        );
+
+        let mut oversized = std::io::Cursor::new(vec![0_u8; credential_limit + 1]);
+        assert!(matches!(
+            RpcSignerV1::from_ephemeral_candidate_ingress_reader(
+                Digest::hash_bytes(b"other-worker"),
+                RpcKeyIdV1::new("other-worker.v1").expect("key ID"),
+                &mut oversized,
+            ),
+            Err(RpcAuthError::InvalidCredentialFile)
+        ));
+    }
+
+    #[test]
+    fn candidate_ingress_key_identity_excludes_principal_but_binds_key_policy() {
+        let original = signer("candidate-key")
+            .enrollment(30_000)
+            .expect("candidate enrollment")
+            .key;
+        let identity = candidate_ingress_key_identity(&original).expect("candidate key identity");
+
+        let mut another_principal = original.clone();
+        another_principal.principal = Digest::hash_bytes(b"principal-computed-after-key-binding");
+        assert_eq!(
+            identity,
+            candidate_ingress_key_identity(&another_principal).expect("acyclic identity")
+        );
+
+        let mut another_key_id = original.clone();
+        another_key_id.key_id = RpcKeyIdV1::new("candidate-key-rotated").expect("key ID");
+        assert_ne!(
+            identity,
+            candidate_ingress_key_identity(&another_key_id).expect("key-id identity")
+        );
+
+        let mut another_public_key = original.clone();
+        another_public_key.public_key = signer("substituted-candidate-key")
+            .enrollment(30_000)
+            .expect("substitute enrollment")
+            .key
+            .public_key;
+        assert_ne!(
+            identity,
+            candidate_ingress_key_identity(&another_public_key).expect("public-key identity")
+        );
+
+        let mut another_skew = original;
+        another_skew.maximum_clock_skew_ms = 30_001;
+        assert_ne!(
+            identity,
+            candidate_ingress_key_identity(&another_skew).expect("skew identity")
+        );
     }
 
     #[test]

@@ -6,13 +6,18 @@ use ag_effect::{
     CanonicalEffectProposalV1, ProposalIntentV1, ProposalStateV1, RatificationV1,
     ReconciliationEvidenceV1, ReconciliationRecordV1,
 };
-use ag_primitives::{Digest, InferenceCapabilityId, PrincipalId};
-use ag_session::{ProviderCapabilityV1, ProviderRequestCustodyV1, SessionId};
+use ag_primitives::{
+    Digest, InferenceCapabilityId, JcsDocument, JcsError, LifecycleNonce, PrincipalChainV1,
+    PrincipalId, WorkerSessionPrincipalV1,
+};
+use ag_session::{
+    ProviderCapabilityV1, ProviderRequestCustodyV1, SessionId, WorkerSessionRecordV1,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::rpc_auth::{SignedRequestEnvelopeV1, SignedServerChallengeV1};
+use crate::rpc_auth::{RpcPeerKeyPolicyV1, SignedRequestEnvelopeV1, SignedServerChallengeV1};
 
 /// Exact direct effect-plane record projection schema.
 pub const EFFECT_RECORD_SCHEMA_V1: &str = "ag.effect-record/v1";
@@ -124,6 +129,23 @@ pub enum AgdRequestV1 {
         /// Untrusted intent. `agd` cannot canonicalize this into authority.
         intent: Box<ProposalIntentV1>,
     },
+    /// Launch one exact reviewed fixed-argv worker profile.
+    LaunchWorker {
+        /// Root-reviewed profile identifier; never an executable or argv.
+        profile_id: String,
+    },
+    /// Inspect one durable worker-session record.
+    InspectWorker {
+        /// Non-reusable session identity.
+        session_id: SessionId,
+    },
+    /// Permanently fence and terminate one worker principal.
+    CancelWorker {
+        /// Non-reusable session identity.
+        session_id: SessionId,
+        /// Exact operator/service cancellation reason evidence.
+        reason: Digest,
+    },
 }
 
 /// Responses from the governor control plane.
@@ -139,6 +161,8 @@ pub enum AgdResponseV1 {
     ProposalSubmitted {
         /// Broker-generated correlation identifier.
         proposal_id: String,
+        /// Exact broker-owned canonical proposal identity.
+        proposal_digest: Digest,
     },
     /// Broker returned an operationally indeterminate envelope.
     Indeterminate {
@@ -149,6 +173,23 @@ pub enum AgdResponseV1 {
     Refused {
         /// Exact refusal record.
         refusal: Digest,
+    },
+    /// A reviewed worker profile was durably launched.
+    WorkerLaunched {
+        /// Non-reusable session identity.
+        session_id: SessionId,
+        /// Exact minted worker-session principal.
+        principal: PrincipalId,
+    },
+    /// Direct durable worker-session status.
+    WorkerStatus {
+        /// Exact governor-owned worker record.
+        record: Box<WorkerSessionRecordV1>,
+    },
+    /// Worker ingress is durably fenced and cleanup has begun.
+    WorkerCancelled {
+        /// Exact cancelled session.
+        session_id: SessionId,
     },
 }
 
@@ -161,11 +202,14 @@ pub enum EffectProposalRequestV1 {
     /// Submit the original end-to-end authenticated intent plus governed
     /// artifact references. Target observations are absent.
     SubmitAuthenticatedIntent {
-        /// Exact original proposer-to-governor exchange. Effectd independently
-        /// verifies both signatures and reconstructs the proposer chain.
-        ingress: Box<ProposalIngressProofV1>,
+        /// Exact governed source accepted by the governor. Effectd verifies
+        /// the source variant and reconstructs the proposer chain itself.
+        ingress: Box<GovernedProposalIngressV1>,
         /// Exact admitted artifact bytes transferred into effectd custody.
         /// The initial vertical slice bounds these to one local protocol frame.
+        /// Worker ingress sends this vector empty: its one candidate artifact
+        /// is derived from the independently authenticated proof so candidate
+        /// bytes occur only once on the governor-to-broker wire.
         artifacts: Vec<ArtifactTransferV1>,
     },
 }
@@ -181,6 +225,150 @@ pub struct ProposalIngressProofV1 {
     pub server_challenge: SignedServerChallengeV1,
     /// Exact proposer-signed request, including its strict intent body.
     pub signed_request: Box<SignedRequestEnvelopeV1<AgdRequestV1>>,
+}
+
+/// Candidate-only request emitted by one live worker session.
+///
+/// Authority context, session identity, workspace identity, effects,
+/// judgments, receipts, and principal chains are deliberately absent. The
+/// governor resolves those exclusively from reviewed durable launch state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerCandidateRequestV1 {
+    /// Submit one bounded candidate byte string.
+    Submit {
+        /// Non-transferable nonce bound to this worker lifecycle.
+        candidate_nonce: LifecycleNonce,
+        /// Closed semantic type interpreted by reviewed governor policy.
+        semantic_type: String,
+        /// Exact candidate bytes; these are not canonical effect bytes.
+        content: OpaqueBytesV1,
+    },
+}
+
+/// Public, credential-free bootstrap delivered through one admitted worker
+/// descriptor. The PKCS#8 candidate-ingress key is carried on a separate
+/// read-only descriptor and is never serialized into this object.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCandidateBootstrapV1 {
+    /// Exact bootstrap schema.
+    pub schema: String,
+    /// Principal represented by the ephemeral candidate-ingress key.
+    pub principal: Digest,
+    /// Exact ephemeral key identifier.
+    pub key_id: crate::rpc_auth::RpcKeyIdV1,
+    /// Lifecycle nonce required in the candidate-only request.
+    pub candidate_nonce: LifecycleNonce,
+    /// Reviewed candidate semantic type for this fixed launch profile.
+    pub semantic_type: String,
+    /// Exact request identifier fixed by the launcher.
+    pub request_id: ag_protocol::RequestId,
+    /// Maximum complete signed candidate frame.
+    pub maximum_frame_bytes: u32,
+    /// Maximum decoded candidate bytes bound into the principal/session.
+    pub maximum_candidate_bytes: u64,
+    /// Governor-signed challenge addressed to the ephemeral worker key.
+    pub server_challenge: SignedServerChallengeV1,
+}
+
+/// Exact compact worker-to-governor proof held as canonical bytes in durable
+/// candidate custody and forwarded to the effect broker.
+///
+/// This is authenticated evidence, never bearer authority. The outer signed
+/// effectd request independently authenticates `agd`, and effectd re-verifies
+/// the embedded dynamic worker proof before compiling any canonical bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCandidateIngressProofV1 {
+    /// Exact governor enrollment policy under which candidate ingress checked
+    /// challenge freshness. Effectd requires equality with its configured agd
+    /// enrollment before replaying this durable proof.
+    pub governor_enrollment: RpcPeerKeyPolicyV1,
+    /// Ephemeral public enrollment committed before worker launch.
+    pub worker_enrollment: RpcPeerKeyPolicyV1,
+    /// Governor challenge addressed to this dynamic worker enrollment.
+    pub server_challenge: SignedServerChallengeV1,
+    /// Exact worker-signed candidate-only request.
+    pub signed_request: Box<SignedRequestEnvelopeV1<WorkerCandidateRequestV1>>,
+}
+
+impl WorkerCandidateIngressProofV1 {
+    /// Returns the exact JCS bytes which enter immutable candidate custody.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strict proof cannot be canonicalized.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, JcsError> {
+        Ok(JcsDocument::canonicalize(self)?.as_bytes().to_vec())
+    }
+
+    /// Returns the digest of the exact JCS custody bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the strict proof cannot be canonicalized.
+    pub fn digest(&self) -> Result<Digest, JcsError> {
+        Digest::from_serializable(self)
+    }
+}
+
+/// Exact worker source bindings forwarded to the effect broker.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCandidateSourceProofV1 {
+    /// Full, immutable worker principal minted from reviewed launch state.
+    pub worker: WorkerSessionPrincipalV1,
+    /// Exact authenticated governor-to-worker lineage.
+    pub worker_chain: PrincipalChainV1,
+    /// Exact opaque proof whose canonical bytes are held in candidate custody.
+    pub ingress_proof: WorkerCandidateIngressProofV1,
+    /// Immutable session-spec binding; never a digest of mutable lifecycle state.
+    pub session_binding: Digest,
+    /// Descriptor-bound proposal-workspace construction identity.
+    pub workspace_identity: Digest,
+    /// Exact descriptor-bound launch receipt.
+    pub launch_receipt: Digest,
+    /// Exact governor candidate-custody record.
+    pub candidate_custody: Digest,
+    /// Trusted time at which complete candidate ingress committed.
+    pub accepted_at_unix_ms: u64,
+}
+
+/// Computes the exact opaque worker-ingress proof identity held in candidate
+/// custody.
+///
+/// The digest covers only the dynamic enrollment and the complete
+/// challenge/request exchange. Lifecycle records bind this value before the
+/// candidate can be forwarded; later cleanup does not change it.
+///
+/// # Errors
+///
+/// Returns an error if the strict proof values cannot be canonicalized.
+pub fn worker_candidate_ingress_proof_digest(
+    proof: &WorkerCandidateIngressProofV1,
+) -> Result<Digest, JcsError> {
+    proof.digest()
+}
+
+/// Closed authenticated sources from which effectd may receive an untrusted
+/// proposal intent.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "ingress_kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GovernedProposalIngressV1 {
+    /// Existing statically enrolled proposer-to-governor exchange.
+    ExternalSigned {
+        /// Exact end-to-end proof containing the untrusted intent.
+        proof: Box<ProposalIngressProofV1>,
+    },
+    /// Candidate from a dynamically minted, bounded worker principal.
+    WorkerCandidate {
+        /// Intent constructed by `agd` from reviewed policy and durable
+        /// candidate custody; it was not supplied by the worker.
+        intent: Box<ProposalIntentV1>,
+        /// Exact worker proof and governor custody binding.
+        source: Box<WorkerCandidateSourceProofV1>,
+    },
 }
 
 /// One bounded content-addressed artifact transfer into effectd custody.
@@ -531,6 +719,34 @@ mod tests {
         assert!(
             serde_json::from_str::<ProviderRequestV1>(
                 r#"{"method":"health","reserved_cost_microunits":0}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_candidate_wire_cannot_smuggle_authority_context() {
+        let valid = r#"{"method":"submit","candidate_nonce":"07070707070707070707070707070707","semantic_type":"managed_file_content","content":"YQ=="}"#;
+        assert!(matches!(
+            serde_json::from_str::<WorkerCandidateRequestV1>(valid).unwrap(),
+            WorkerCandidateRequestV1::Submit { content, .. } if content.as_slice() == b"a"
+        ));
+        let smuggled = r#"{"method":"submit","candidate_nonce":"07070707070707070707070707070707","semantic_type":"managed_file_content","content":"YQ==","judgment":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        assert!(serde_json::from_str::<WorkerCandidateRequestV1>(smuggled).is_err());
+    }
+
+    #[test]
+    fn worker_control_requests_select_profiles_not_executables() {
+        assert!(matches!(
+            serde_json::from_str::<AgdRequestV1>(
+                r#"{"method":"launch_worker","profile_id":"fixture"}"#
+            )
+            .unwrap(),
+            AgdRequestV1::LaunchWorker { profile_id } if profile_id == "fixture"
+        ));
+        assert!(
+            serde_json::from_str::<AgdRequestV1>(
+                r#"{"method":"launch_worker","profile_id":"fixture","executable":"/bin/sh"}"#
             )
             .is_err()
         );

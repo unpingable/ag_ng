@@ -24,7 +24,8 @@ pub use identity::{
     Principal, PrincipalChainError, PrincipalChainNodeV1, PrincipalChainV1,
     PrincipalEnrollmentStateV1, PrincipalId, PrincipalKindV1, PrincipalNameError,
     PrincipalSeparationFailure, PrincipalSeparationPredicateV1, PrincipalV1, ProjectId, RoleId,
-    ServicePrincipalV1, SessionId, SystemdUnitIdentity, WorkerSessionPrincipalV1,
+    ServicePrincipalV1, SessionId, SystemdUnitIdentity, WorkerProviderRouteV1,
+    WorkerSessionPrincipalV1,
 };
 pub use origin::{
     AnyBookRef, AuthorityDomain, AuthorityDomainId, BookKind, BookKindMismatch, BookLocalId,

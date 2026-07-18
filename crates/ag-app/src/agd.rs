@@ -1,17 +1,30 @@
 //! Governor-side calculus replay and broker forwarding.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ag_effect::ProposalIntentV1;
+use ag_effect::{EFFECT_SCHEMA_V1, EffectIntentV1, ProposalIntentV1, TargetId};
 use ag_kernel::{
-    AdmissionCommit, CapacityBook, CapacityBookEntry, CustodyBook, CustodyBookEntry,
-    EffectCrossingClaim, EffectCrossingRefusal, EffectCrossingWitness, FailureEvidence,
-    NativeJudgment, NonEmpty, ObligationBook, ObligationBookEntry, StandingBook, StandingBookEntry,
-    evaluate_effect_crossing, reconstruct_effect_authority,
+    AdmissionCommit, CapacityBook, CapacityBookEntry, CapacityClaim, CapacityRef, CustodyBook,
+    CustodyBookEntry, CustodyClaim, CustodyRef, EffectCrossingClaim, EffectCrossingRefusal,
+    EffectCrossingWitness, FailureEvidence, NativeJudgment, NonEmpty, ObligationBook,
+    ObligationBookEntry, ObligationClaim, ObligationRef, StandingBook, StandingBookEntry,
+    StandingClaim, StandingRef, evaluate_effect_crossing, reconstruct_effect_authority,
 };
-use ag_primitives::{AuthorityDomain, Digest, Epoch, LifecycleOrigin, PrincipalChainV1};
-use ag_protocol::RequestId;
+use ag_primitives::{
+    AuthorityDomain, BookLocalId, CgroupIdentity, Digest, Epoch, HostCredentialObservationV1,
+    LaunchProfileIdentityV1, LifecycleNonce, LifecycleOrigin, PrincipalChainNodeV1,
+    PrincipalChainV1, PrincipalId, PrincipalKindV1, PrincipalNameError, ProjectId, SessionId,
+    WorkerProviderRouteV1, WorkerSessionPrincipalV1,
+};
+use ag_protocol::{FrameCodec, RequestId};
+use ag_session::{
+    AdmittedDescriptorV1, BatchSessionSpecV1, DescriptorAccessV1, DescriptorPurposeV1,
+    IsolationEvidenceV1, SecurityProfileV1, SessionError, SourceSnapshotV1, WorkerBindingV1,
+    WorkerCandidateBrokerOutcomeV1, WorkerCandidateCustodyStateV1, WorkerCandidateRefusalCodeV1,
+    WorkerIngressContextV1, WorkerSessionRecordV1, WorkerTerminationReasonV1, WorkspaceModeV1,
+};
 use ag_store::{NewEventV1, Store};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -19,12 +32,30 @@ use thiserror::Error;
 
 use crate::api::{
     AgdRequestV1, AgdResponseV1, ApiErrorCodeV1, ApiResultV1, ArtifactTransferV1,
-    EffectProposalRequestV1, EffectProposalResponseV1, HealthV1, ProposalIngressProofV1,
+    EffectProposalRequestV1, EffectProposalResponseV1, GovernedProposalIngressV1, HealthV1,
+    ProposalIngressProofV1, WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1,
+    WorkerCandidateRequestV1, WorkerCandidateSourceProofV1, worker_candidate_ingress_proof_digest,
 };
 use crate::config::AgdConfigV1;
 use crate::peer::signed_principal_chain;
-use crate::rpc_auth::{RpcReplayGuardV1, RpcSignerV1, SystemRpcClockV1, VerifiedRpcPrincipalV1};
+use crate::rpc_auth::{
+    EphemeralRpcPrivateKeyV1, RpcKeyIdV1, RpcPeerEnrollmentV1, RpcPeerKeyPolicyV1,
+    RpcReplayGuardV1, RpcSignerV1, SignedServerChallengeV1, SystemRpcClockV1,
+    VerifiedRpcPrincipalV1, candidate_ingress_key_identity, verify_forwarded_signed_request,
+    verify_forwarded_signed_request_bindings,
+};
 use crate::signed_transport::{AcceptedSignedRequestV1, SocketPeerCheckV1, call_signed};
+use crate::worker::{
+    AdmittedWorkerInputV1, PreparedWorkerLaunchV1, WorkerLaunchError, WorkerLaunchReleaseV1,
+    WorkerProcessV1, prepare_worker_launch,
+};
+use crate::worker_protocol::{
+    CANDIDATE_BOOTSTRAP_PURPOSE, CANDIDATE_INGRESS_CREDENTIAL_PURPOSE, WorkerProtocolError,
+    decode_exact_signed_worker_candidate,
+};
+use crate::worker_session::{
+    WorkerSessionStoreError, WorkerSessionStoreV1, WorkerStartupRecoveryReportV1,
+};
 
 /// Exact replay inputs from the four separately committed family books.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -131,7 +162,7 @@ pub struct ForwardOutboxRecordV1 {
     /// This is evidence already accepted by agd, not bearer authority.
     /// Effectd independently verifies it and permits a stale/replayed proof
     /// only when it exactly matches the proof in an existing durable result.
-    pub ingress: ProposalIngressProofV1,
+    pub ingress: GovernedProposalIngressV1,
     /// Durable dispatch lifecycle.
     pub state: ForwardOutboxStateV1,
 }
@@ -154,6 +185,76 @@ enum ForwardOutboxPreparationV1 {
     },
 }
 
+struct ActiveWorkerRuntimeV1 {
+    process: WorkerProcessV1,
+    governor_enrollment: RpcPeerKeyPolicyV1,
+    worker_enrollment: RpcPeerKeyPolicyV1,
+    server_challenge: SignedServerChallengeV1,
+    ingress: WorkerRuntimeIngressBindingsV1,
+}
+
+/// Launcher-retained facts used to revalidate live candidate ingress.
+///
+/// These values are captured from the descriptor-bound prepared launch before
+/// the durable session record is written.  Ingress compares them with the
+/// independently reloaded session; it never manufactures "live" evidence by
+/// copying the values it is supposed to check from that record.
+struct WorkerRuntimeIngressBindingsV1 {
+    authority_domain: AuthorityDomain,
+    epoch: Epoch,
+    principal_id: PrincipalId,
+    session_id: SessionId,
+    proposal_workspace_identity: Digest,
+    security_profile_identity: Digest,
+    executable: ag_primitives::ExecutableIdentityV1,
+    observed_uid: u32,
+    observed_gid: u32,
+    session_binding: Digest,
+}
+
+impl WorkerRuntimeIngressBindingsV1 {
+    fn context(&self, now_unix_ms: u64) -> WorkerIngressContextV1 {
+        WorkerIngressContextV1 {
+            authority_domain: self.authority_domain.clone(),
+            epoch: self.epoch,
+            principal_id: self.principal_id.clone(),
+            session_id: self.session_id.clone(),
+            proposal_workspace_identity: self.proposal_workspace_identity.clone(),
+            security_profile_identity: self.security_profile_identity.clone(),
+            executable: self.executable.clone(),
+            observed_uid: self.observed_uid,
+            observed_gid: self.observed_gid,
+            now_unix_ms,
+        }
+    }
+}
+
+/// Result of one nonblocking pass over the live worker set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkerPollReportV1 {
+    /// Processes which remain live after this pass.
+    pub pending: u64,
+    /// Complete authenticated candidates committed to durable custody.
+    pub accepted: u64,
+    /// Workers durably fenced after a known terminal failure.
+    pub failed: u64,
+    /// Accepted candidates whose broker forward remains recoverable.
+    pub deferred: u64,
+}
+
+/// Result of one bounded startup pass over accepted candidate custody.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WorkerCandidateRecoveryReportV1 {
+    /// Sessions linked to broker-owned canonical proposal bytes.
+    pub canonicalized: u64,
+    /// Sessions durably linked to broker-owned semantic refusals.
+    pub refused: u64,
+    /// Sessions durably linked to broker-owned reconciliation envelopes.
+    pub indeterminate: u64,
+    /// Safe, tombstoned custody which still awaits broker availability/outcome.
+    pub deferred: u64,
+}
+
 /// Single-writer governor core.
 pub struct AgdCoreV1 {
     store: Store,
@@ -162,6 +263,8 @@ pub struct AgdCoreV1 {
     epoch: Epoch,
     rpc_signer: Arc<RpcSignerV1>,
     rpc_replay: Arc<RpcReplayGuardV1>,
+    active_workers: BTreeMap<SessionId, ActiveWorkerRuntimeV1>,
+    worker_recovery_required: bool,
 }
 
 impl AgdCoreV1 {
@@ -187,7 +290,735 @@ impl AgdCoreV1 {
             epoch,
             rpc_signer,
             rpc_replay,
+            active_workers: BTreeMap::new(),
+            worker_recovery_required: false,
         })
+    }
+
+    /// Permanently retires every prepared or active worker principal found
+    /// after daemon startup. Historical records remain inspectable; no
+    /// principal is recreated or worker relaunched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a durable session/index binding is corrupt, the
+    /// trusted clock cannot be represented, or the store cannot commit the
+    /// restart tombstones.
+    pub fn recover_worker_sessions(&mut self) -> Result<WorkerStartupRecoveryReportV1, AgdError> {
+        Ok(WorkerSessionStoreV1::new(&mut self.store).recover_startup(now_u64()?)?)
+    }
+
+    /// Loads one historical or live worker record directly from governor
+    /// custody.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an absent session or any durable binding failure.
+    pub fn inspect_worker_session(
+        &mut self,
+        session: &ag_session::SessionId,
+    ) -> Result<WorkerSessionRecordV1, AgdError> {
+        Ok(WorkerSessionStoreV1::new(&mut self.store)
+            .load_session(session)?
+            .record)
+    }
+
+    /// Launches one configured offline worker behind a durable principal fence.
+    ///
+    /// The child is prepared behind a descriptor gate. Its exact executable,
+    /// workspace, ephemeral ingress key, fixed argv, host observations, and
+    /// deadline are committed before the gate is released. No caller-supplied
+    /// executable, argv, target, identity, or workspace enters this path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for quiescence, catalog/profile mismatch,
+    /// containment refusal, session-capacity exhaustion, key/protocol failure,
+    /// durable binding failure, or release failure.
+    // Keeping the gate/key/principal/store/release sequence linear makes its
+    // fail-closed order directly auditable; splitting it would obscure which
+    // fallible operations occur before durable activation.
+    #[allow(clippy::too_many_lines)]
+    pub fn launch_worker(
+        &mut self,
+        profile_id: &str,
+    ) -> Result<(SessionId, PrincipalId), AgdError> {
+        if self.worker_recovery_required {
+            return Err(AgdError::WorkerRecoveryRequired);
+        }
+        if self.store.active_backup_cut()?.is_some() {
+            return Err(AgdError::Quiesced);
+        }
+        if !self.active_workers.is_empty() {
+            return Err(AgdError::WorkerCapacityExhausted);
+        }
+        let launcher = self
+            .config
+            .worker_launcher
+            .clone()
+            .ok_or(AgdError::WorkerRuntimeUnavailable)?;
+        let profile = launcher
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == profile_id)
+            .cloned()
+            .ok_or_else(|| WorkerLaunchError::UnknownProfile(profile_id.to_owned()))?;
+        let security_profile = configured_worker_security_profile(&self.config.security_profile)?;
+        let governor_enrollment = self
+            .rpc_signer
+            .enrollment(launcher.governor_challenge_maximum_clock_skew_ms)?
+            .key;
+        let session_nonce = LifecycleNonce::random();
+        let session = SessionId::new(format!("worker-{}", hex::encode(session_nonce.as_bytes())))?;
+        if self.active_workers.contains_key(&session) {
+            return Err(AgdError::WorkerRuntimeCollision);
+        }
+        let key_id = RpcKeyIdV1::new(format!("worker-{}", hex::encode(session_nonce.as_bytes())))?;
+        let provisional_principal = Digest::hash_domain(
+            "ag-ng/worker-candidate-key-provisional/v1",
+            session_nonce.as_bytes(),
+        );
+        let (candidate_signer, private_key) =
+            RpcSignerV1::generate_ephemeral_candidate_ingress(provisional_principal, key_id)?;
+        let provisional_enrollment = candidate_signer.enrollment(profile.timeout_ms)?;
+        let candidate_key_identity = candidate_ingress_key_identity(&provisional_enrollment.key)?;
+        let admitted_inputs = worker_admitted_inputs();
+        let maximum_wire_bytes = u64::from(self.config.limits.max_control_frame_bytes)
+            .checked_add(4)
+            .ok_or(AgdError::ArtifactTransferTooLarge)?;
+        let mut prepared = prepare_worker_launch(
+            security_profile,
+            &launcher,
+            profile_id,
+            session.as_str(),
+            maximum_wire_bytes,
+            &admitted_inputs,
+        )?;
+        // The launcher arms its monotonic process deadline immediately before
+        // returning this gated process. Observing the durable wall deadline
+        // afterward guarantees process custody expires no later than the
+        // principal, even when executable hashing is slow.
+        let prepared_at = now_u64()?;
+        let expires_at = prepared_at
+            .checked_add(profile.timeout_ms)
+            .ok_or_else(|| AgdError::Clock("worker deadline overflow".to_owned()))?;
+        let launch_receipt = Digest::from_serializable(&prepared.evidence)?;
+        let worker = worker_principal_from_launch(
+            &self.authority_domain,
+            self.epoch,
+            self.rpc_signer.principal(),
+            &profile,
+            &session,
+            session_nonce,
+            expires_at,
+            candidate_key_identity.clone(),
+            &prepared,
+        )?;
+        let worker_id = worker.id();
+        let worker_chain = worker_principal_chain(
+            &self.authority_domain,
+            self.epoch,
+            &launcher.governor_principal_root,
+            self.rpc_signer.principal(),
+            &worker,
+        )?;
+        let worker_enrollment = RpcPeerKeyPolicyV1 {
+            principal: worker_id.digest().clone(),
+            ..provisional_enrollment.key
+        };
+        debug_assert_eq!(
+            candidate_ingress_key_identity(&worker_enrollment)?,
+            candidate_key_identity
+        );
+        let enrolled_worker =
+            RpcPeerEnrollmentV1::new(worker_id.digest().clone(), worker_enrollment.clone())?;
+        let server_challenge = self
+            .rpc_signer
+            .issue_challenge(&enrolled_worker, prepared_at)?;
+        let bootstrap = WorkerCandidateBootstrapV1 {
+            schema: "ag.worker-candidate-bootstrap/v1".to_owned(),
+            principal: worker_id.digest().clone(),
+            key_id: worker_enrollment.key_id.clone(),
+            candidate_nonce: session_nonce,
+            semantic_type: profile.candidate_semantic_type.clone(),
+            request_id: RequestId::new(format!("candidate-{}", session.as_str()))?,
+            maximum_frame_bytes: self.config.limits.max_control_frame_bytes,
+            maximum_candidate_bytes: profile.output_budget_bytes,
+            server_challenge: server_challenge.clone(),
+        };
+        populate_worker_inputs(&mut prepared, &private_key, &bootstrap)?;
+        let spec = worker_session_spec(
+            &self.authority_domain,
+            self.epoch,
+            security_profile,
+            &profile,
+            &session,
+            candidate_key_identity,
+            worker,
+            worker_chain,
+            &prepared,
+            expires_at,
+        )?;
+        let ingress = WorkerRuntimeIngressBindingsV1 {
+            authority_domain: self.authority_domain.clone(),
+            epoch: self.epoch,
+            principal_id: worker_id.clone(),
+            session_id: session.clone(),
+            proposal_workspace_identity: prepared.workspace.identity.clone(),
+            security_profile_identity: security_profile.identity(),
+            executable: prepared.evidence.worker_executable.clone(),
+            observed_uid: prepared.evidence.observed_uid,
+            observed_gid: prepared.evidence.observed_gid,
+            session_binding: Digest::from_serializable(&spec)?,
+        };
+        let record = WorkerSessionRecordV1::new(spec)?;
+        if WorkerSessionStoreV1::new(&mut self.store)
+            .prepare(&record, prepared_at)
+            .is_err()
+        {
+            // A store error may be commit-ambiguous.  The worker remains
+            // gated and is synchronously reaped, while this governor refuses
+            // every further mutating request until startup recovery inspects
+            // the durable session namespace.
+            self.worker_recovery_required = true;
+            prepared.release.abort();
+            let _ = prepared.process.terminate();
+            return Err(AgdError::WorkerRecoveryRequired);
+        }
+        if let Err(error) = WorkerSessionStoreV1::new(&mut self.store).activate(
+            &session,
+            launch_receipt,
+            prepared_at,
+        ) {
+            let failure = Digest::hash_domain(
+                "ag-ng/worker-activation-failure/v1",
+                b"worker-session-activation-store-boundary",
+            );
+            let reason = WorkerTerminationReasonV1::LaunchFailed { failure };
+            let tombstone = WorkerSessionStoreV1::new(&mut self.store).tombstone(
+                &session,
+                reason.clone(),
+                prepared_at,
+            );
+            prepared.release.abort();
+            let terminated = prepared.process.terminate();
+            if tombstone.is_err() || terminated.is_err() {
+                self.worker_recovery_required = true;
+                return Err(AgdError::WorkerRecoveryRequired);
+            }
+            let cleanup = Digest::from_serializable(&(
+                "ag.worker-activation-failure-cleanup/v1",
+                &session,
+                &reason,
+                prepared_at,
+            ))?;
+            let Ok(cleanup_at) = now_u64() else {
+                self.worker_recovery_required = true;
+                return Err(AgdError::WorkerRecoveryRequired);
+            };
+            if WorkerSessionStoreV1::new(&mut self.store)
+                .complete_cleanup(&session, cleanup, cleanup_at)
+                .is_err()
+            {
+                self.worker_recovery_required = true;
+                return Err(AgdError::WorkerRecoveryRequired);
+            }
+            return Err(error.into());
+        }
+        if prepared.process.deadline_expired() {
+            self.fence_and_cleanup_runtime(
+                &session,
+                &mut prepared.process,
+                WorkerTerminationReasonV1::DeadlineExpired,
+                Some(prepared.release),
+            )?;
+            return Err(WorkerLaunchError::TimedOut.into());
+        }
+        if let Err(error) = prepared.release.release() {
+            let failure = Digest::hash_domain(
+                "ag-ng/worker-release-failure/v1",
+                b"worker-release-gate-boundary",
+            );
+            self.fence_and_cleanup_runtime(
+                &session,
+                &mut prepared.process,
+                WorkerTerminationReasonV1::LaunchFailed { failure },
+                None,
+            )?;
+            return Err(error.into());
+        }
+        let replaced = self.active_workers.insert(
+            session.clone(),
+            ActiveWorkerRuntimeV1 {
+                process: prepared.process,
+                governor_enrollment,
+                worker_enrollment,
+                server_challenge,
+                ingress,
+            },
+        );
+        debug_assert!(replaced.is_none());
+        Ok((session, worker_id))
+    }
+
+    fn fence_and_cleanup_runtime(
+        &mut self,
+        session: &SessionId,
+        process: &mut WorkerProcessV1,
+        reason: WorkerTerminationReasonV1,
+        gated_release: Option<WorkerLaunchReleaseV1>,
+    ) -> Result<(), AgdError> {
+        let Ok(terminal_at) = now_u64() else {
+            self.worker_recovery_required = true;
+            return Err(AgdError::WorkerRecoveryRequired);
+        };
+        let Ok(cleanup_receipt) = Digest::from_serializable(&(
+            "ag.worker-process-cleanup/v1",
+            session,
+            &reason,
+            terminal_at,
+        )) else {
+            self.worker_recovery_required = true;
+            return Err(AgdError::WorkerRecoveryRequired);
+        };
+        if WorkerSessionStoreV1::new(&mut self.store)
+            .tombstone(session, reason, terminal_at)
+            .is_err()
+        {
+            // The session CAS may be commit-ambiguous. The retained release
+            // guard/process still fail closed on return, but the in-memory
+            // runtime is no longer a sufficient capacity fence. Refuse all
+            // further mutation until startup recovery resolves durable state.
+            self.worker_recovery_required = true;
+            return Err(AgdError::WorkerRecoveryRequired);
+        }
+        if let Some(release) = gated_release {
+            release.abort();
+        }
+        process.terminate()?;
+        WorkerSessionStoreV1::new(&mut self.store).complete_cleanup(
+            session,
+            cleanup_receipt,
+            now_u64()?,
+        )?;
+        Ok(())
+    }
+
+    /// Polls every retained worker without blocking for process completion.
+    ///
+    /// A timeout, output overflow, or process failure is durably tombstoned
+    /// before the supervisor sends a termination signal. A successful process
+    /// must produce exactly one complete signed candidate frame before its
+    /// principal is atomically exchanged for candidate custody.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the durable authority boundary cannot be
+    /// updated or its state is corrupt. Individual worker failures are fenced
+    /// and counted rather than terminating the daemon.
+    pub fn poll_workers(&mut self) -> Result<WorkerPollReportV1, AgdError> {
+        let mut report = WorkerPollReportV1::default();
+        let sessions = self.active_workers.keys().cloned().collect::<Vec<_>>();
+        for session in sessions {
+            let poll = self
+                .active_workers
+                .get_mut(&session)
+                .ok_or(AgdError::WorkerRuntimeCollision)?
+                .process
+                .try_wait();
+            match poll {
+                Ok(None) => {
+                    report.pending = report.pending.saturating_add(1);
+                }
+                Err(error) => {
+                    let mut runtime = self
+                        .active_workers
+                        .remove(&session)
+                        .ok_or(AgdError::WorkerRuntimeCollision)?;
+                    let reason = worker_process_failure_reason(&error);
+                    self.fence_and_cleanup_runtime(&session, &mut runtime.process, reason, None)?;
+                    report.failed = report.failed.saturating_add(1);
+                }
+                Ok(Some(exit)) => {
+                    let mut runtime = self
+                        .active_workers
+                        .remove(&session)
+                        .ok_or(AgdError::WorkerRuntimeCollision)?;
+                    if !exit.status.success() {
+                        let reason = WorkerTerminationReasonV1::WorkerFailed {
+                            failure: Digest::from_serializable(&(
+                                "ag.worker-abnormal-exit/v1",
+                                &session,
+                                exit.status.code(),
+                            ))?,
+                        };
+                        self.fence_and_cleanup_runtime(
+                            &session,
+                            &mut runtime.process,
+                            reason,
+                            None,
+                        )?;
+                        report.failed = report.failed.saturating_add(1);
+                        continue;
+                    }
+                    if let Err(error) =
+                        self.accept_worker_candidate(&session, &runtime, &exit.candidate)
+                    {
+                        if let Some(reason) = worker_candidate_refusal_reason(&error) {
+                            self.fence_and_cleanup_runtime(
+                                &session,
+                                &mut runtime.process,
+                                reason,
+                                None,
+                            )?;
+                            report.failed = report.failed.saturating_add(1);
+                            continue;
+                        }
+                        // A nonsemantic ingress error may be a commit-ambiguous
+                        // store boundary.  Do not overwrite it with a refusal
+                        // tombstone or cleanup receipt.  Confirm process exit,
+                        // poison this core, and make the daemon restart into
+                        // durable recovery.
+                        self.worker_recovery_required = true;
+                        runtime.process.terminate()?;
+                        return Err(AgdError::WorkerRecoveryRequired);
+                    }
+                    self.complete_accepted_worker_cleanup(&session, &mut runtime.process)?;
+                    report.accepted = report.accepted.saturating_add(1);
+                    match self.forward_custodied_worker_candidate(&session) {
+                        Ok(_) => {}
+                        Err(error) if is_deferred_forward_error(&error) => {
+                            report.deferred = report.deferred.saturating_add(1);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Permanently fences an active worker, then terminates and reaps its
+    /// retained process handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable tombstone cannot commit, the session
+    /// is not represented by a live retained process, or cleanup cannot be
+    /// recorded.
+    pub fn cancel_worker(
+        &mut self,
+        session: &SessionId,
+        reason_digest: Digest,
+    ) -> Result<(), AgdError> {
+        let terminal_at = now_u64()?;
+        let reason = WorkerTerminationReasonV1::Cancelled { reason_digest };
+        WorkerSessionStoreV1::new(&mut self.store).tombstone(
+            session,
+            reason.clone(),
+            terminal_at,
+        )?;
+        let mut runtime = self
+            .active_workers
+            .remove(session)
+            .ok_or(AgdError::WorkerRuntimeMissing)?;
+        runtime.process.terminate()?;
+        let cleanup = Digest::from_serializable(&(
+            "ag.worker-cancel-cleanup/v1",
+            session,
+            &reason,
+            terminal_at,
+        ))?;
+        WorkerSessionStoreV1::new(&mut self.store).complete_cleanup(
+            session,
+            cleanup,
+            now_u64()?,
+        )?;
+        Ok(())
+    }
+
+    /// Replays every accepted, non-canonicalized candidate from exact durable
+    /// proof and blob custody. No historical principal is recreated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt session/proof bindings or an unrecoverable
+    /// broker/store response. Broker unavailability remains a deferred count.
+    pub fn recover_worker_candidates(
+        &mut self,
+    ) -> Result<WorkerCandidateRecoveryReportV1, AgdError> {
+        if self.worker_recovery_required {
+            return Err(AgdError::WorkerRecoveryRequired);
+        }
+        if !self.active_workers.is_empty() {
+            return Err(AgdError::WorkerSupervisorBusy);
+        }
+        let mut report = WorkerCandidateRecoveryReportV1::default();
+        let mut cursor = None;
+        loop {
+            let entities =
+                self.store
+                    .entity_ids_after("worker-session:", cursor.as_deref(), 128)?;
+            if entities.is_empty() {
+                return Ok(report);
+            }
+            cursor = entities.last().cloned();
+            for entity in entities {
+                let Some(materialized) = self
+                    .store
+                    .materialized_state::<WorkerSessionRecordV1>(&entity)?
+                else {
+                    return Err(AgdError::WorkerProofMismatch);
+                };
+                let loaded = WorkerSessionStoreV1::new(&mut self.store)
+                    .load_session(&materialized.state.spec.session)?;
+                if loaded.entity_id != entity || loaded.record != materialized.state {
+                    return Err(AgdError::WorkerProofMismatch);
+                }
+                if !matches!(
+                    loaded.record.candidate,
+                    WorkerCandidateCustodyStateV1::InCustody { .. }
+                ) {
+                    continue;
+                }
+                match self.forward_custodied_worker_candidate(&loaded.record.spec.session) {
+                    Ok(WorkerCandidateBrokerOutcomeV1::Canonicalized { .. }) => {
+                        report.canonicalized = report.canonicalized.saturating_add(1);
+                    }
+                    Ok(WorkerCandidateBrokerOutcomeV1::Refused { .. }) => {
+                        report.refused = report.refused.saturating_add(1);
+                    }
+                    Ok(WorkerCandidateBrokerOutcomeV1::Indeterminate { .. }) => {
+                        report.indeterminate = report.indeterminate.saturating_add(1);
+                    }
+                    Err(error) if is_deferred_forward_error(&error) => {
+                        report.deferred = report.deferred.saturating_add(1);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+
+    fn accept_worker_candidate(
+        &mut self,
+        session: &SessionId,
+        runtime: &ActiveWorkerRuntimeV1,
+        frame: &[u8],
+    ) -> Result<(), AgdError> {
+        let accepted_at = now_u64()?;
+        let loaded = WorkerSessionStoreV1::new(&mut self.store).load_session(session)?;
+        let principal = &loaded.record.spec.worker.principal;
+        if accepted_at >= principal.expires_at_unix_ms {
+            return Err(AgdError::WorkerCandidateExpired);
+        }
+        if runtime.ingress.session_id != *session
+            || runtime.ingress.session_binding != Digest::from_serializable(&loaded.record.spec)?
+            || runtime.worker_enrollment.principal != *principal.id().digest()
+            || principal.candidate_ingress_key_identity
+                != candidate_ingress_key_identity(&runtime.worker_enrollment)?
+        {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let context = runtime.ingress.context(accepted_at);
+        match loaded.record.validate_active_ingress(&context) {
+            Ok(()) => {}
+            Err(SessionError::PrincipalExpired) => {
+                return Err(AgdError::WorkerCandidateExpired);
+            }
+            Err(_) => return Err(AgdError::WorkerProofMismatch),
+        }
+        let signed = decode_exact_signed_worker_candidate(
+            frame,
+            self.config.limits.max_control_frame_bytes,
+        )?;
+        let worker_enrollment = RpcPeerEnrollmentV1::new(
+            principal.id().digest().clone(),
+            runtime.worker_enrollment.clone(),
+        )?;
+        let governor_enrollment = RpcPeerEnrollmentV1::new(
+            self.rpc_signer.principal().clone(),
+            runtime.governor_enrollment.clone(),
+        )?;
+        let verified = verify_forwarded_signed_request(
+            &runtime.server_challenge,
+            &signed,
+            &governor_enrollment,
+            &worker_enrollment,
+            &self.rpc_replay,
+            accepted_at,
+        )?;
+        if verified.principal != *principal.id().digest()
+            || signed.request.echo.request_id
+                != RequestId::new(format!("candidate-{}", session.as_str()))?
+        {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let proof = WorkerCandidateIngressProofV1 {
+            governor_enrollment: runtime.governor_enrollment.clone(),
+            worker_enrollment: runtime.worker_enrollment.clone(),
+            server_challenge: runtime.server_challenge.clone(),
+            signed_request: Box::new(signed),
+        };
+        let WorkerCandidateRequestV1::Submit {
+            candidate_nonce,
+            semantic_type,
+            content,
+        } = &proof.signed_request.request.body;
+        let reviewed_profile =
+            self.config
+                .worker_launcher
+                .as_ref()
+                .and_then(|launcher| {
+                    launcher.profiles.iter().find(|profile| {
+                        profile.profile_id == loaded.record.spec.reviewed_profile_id
+                    })
+                })
+                .ok_or(AgdError::WorkerProfileBindingMismatch)?;
+        if loaded.record.spec.output_budget_bytes != reviewed_profile.output_budget_bytes {
+            return Err(AgdError::WorkerProfileBindingMismatch);
+        }
+        if *candidate_nonce != principal.session_nonce {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        if *semantic_type != reviewed_profile.candidate_semantic_type {
+            return Err(AgdError::WorkerCandidateSemanticMismatch);
+        }
+        if u64::try_from(content.len())
+            .ok()
+            .is_none_or(|length| length > loaded.record.spec.output_budget_bytes)
+        {
+            return Err(AgdError::WorkerCandidateBudgetExceeded {
+                observed_bytes: u64::try_from(content.len()).unwrap_or(u64::MAX),
+            });
+        }
+        let proof_bytes = proof.canonical_bytes()?;
+        WorkerSessionStoreV1::new(&mut self.store).accept_candidate(
+            &context,
+            content.as_slice(),
+            &proof_bytes,
+            semantic_type.clone(),
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn complete_accepted_worker_cleanup(
+        &mut self,
+        session: &SessionId,
+        process: &mut WorkerProcessV1,
+    ) -> Result<(), AgdError> {
+        let record = WorkerSessionStoreV1::new(&mut self.store)
+            .load_session(session)?
+            .record;
+        let receipt = Digest::from_serializable(&(
+            "ag.worker-accepted-cleanup/v1",
+            session,
+            &record.authority,
+        ))?;
+        process.terminate()?;
+        WorkerSessionStoreV1::new(&mut self.store).complete_cleanup(
+            session,
+            receipt,
+            now_u64()?,
+        )?;
+        Ok(())
+    }
+
+    fn worker_candidate_source(
+        &mut self,
+        session: &SessionId,
+    ) -> Result<WorkerCandidateSourceProofV1, AgdError> {
+        let proof_bytes = WorkerSessionStoreV1::new(&mut self.store).read_ingress_proof(session)?;
+        let ingress_proof: WorkerCandidateIngressProofV1 =
+            ag_protocol::strict_json_from_slice(&proof_bytes)?;
+        if ingress_proof.canonical_bytes()? != proof_bytes {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let record = WorkerSessionStoreV1::new(&mut self.store)
+            .load_session(session)?
+            .record;
+        let candidate = match &record.candidate {
+            WorkerCandidateCustodyStateV1::InCustody { candidate }
+            | WorkerCandidateCustodyStateV1::BrokerCompleted { candidate, .. } => candidate,
+            WorkerCandidateCustodyStateV1::Awaiting => {
+                return Err(AgdError::WorkerCandidateNotInCustody);
+            }
+        };
+        let (launch_receipt, tombstone) = match &record.authority {
+            ag_session::WorkerAuthorityStateV1::Tombstoned {
+                launch_receipt: Some(launch_receipt),
+                tombstone,
+                ..
+            } if tombstone.reason == WorkerTerminationReasonV1::CandidateAccepted => {
+                (launch_receipt, tombstone)
+            }
+            _ => return Err(AgdError::WorkerProofMismatch),
+        };
+        if candidate.ingress_proof != ingress_proof.digest()? {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let launcher = self
+            .config
+            .worker_launcher
+            .as_ref()
+            .ok_or(AgdError::WorkerRuntimeUnavailable)?;
+        let expected_chain = worker_principal_chain(
+            &self.authority_domain,
+            self.epoch,
+            &launcher.governor_principal_root,
+            self.rpc_signer.principal(),
+            &record.spec.worker.principal,
+        )?;
+        if expected_chain != record.spec.worker.principal_chain {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let session_binding = Digest::from_serializable(&record.spec)?;
+        Ok(WorkerCandidateSourceProofV1 {
+            worker: record.spec.worker.principal,
+            worker_chain: expected_chain,
+            ingress_proof,
+            session_binding,
+            workspace_identity: record.spec.proposal_workspace_identity,
+            launch_receipt: launch_receipt.clone(),
+            candidate_custody: candidate.custody_record.clone(),
+            accepted_at_unix_ms: tombstone.terminal_since_unix_ms,
+        })
+    }
+
+    fn forward_custodied_worker_candidate(
+        &mut self,
+        session: &SessionId,
+    ) -> Result<WorkerCandidateBrokerOutcomeV1, AgdError> {
+        let record = WorkerSessionStoreV1::new(&mut self.store)
+            .load_session(session)?
+            .record;
+        if let WorkerCandidateCustodyStateV1::BrokerCompleted { outcome, .. } = record.candidate {
+            return Ok(outcome);
+        }
+        let source = self.worker_candidate_source(session)?;
+        let intent = self.admit_worker_candidate(session)?;
+        let response = self.forward_worker_candidate(&intent, source)?;
+        let outcome = match response {
+            AgdResponseV1::ProposalSubmitted {
+                proposal_digest, ..
+            } => WorkerCandidateBrokerOutcomeV1::Canonicalized {
+                canonical_proposal: proposal_digest,
+            },
+            AgdResponseV1::Refused { refusal } => {
+                WorkerCandidateBrokerOutcomeV1::Refused { refusal }
+            }
+            AgdResponseV1::Indeterminate { envelope } => {
+                WorkerCandidateBrokerOutcomeV1::Indeterminate { envelope }
+            }
+            _ => return Err(AgdError::OutboxBindingMismatch),
+        };
+        WorkerSessionStoreV1::new(&mut self.store).record_broker_outcome(
+            session,
+            outcome.clone(),
+            now_u64()?,
+        )?;
+        Ok(outcome)
     }
 
     /// Attempts to finish every durable pending effect forward.
@@ -205,6 +1036,12 @@ impl AgdCoreV1 {
     /// broker availability failures leave the record pending and are counted
     /// as deferred.
     pub fn recover_forward_outbox(&mut self) -> Result<ForwardRecoveryReportV1, AgdError> {
+        if self.worker_recovery_required {
+            return Err(AgdError::WorkerRecoveryRequired);
+        }
+        if !self.active_workers.is_empty() {
+            return Err(AgdError::WorkerSupervisorBusy);
+        }
         let mut report = ForwardRecoveryReportV1::default();
         let mut cursor = None;
         loop {
@@ -236,7 +1073,14 @@ impl AgdCoreV1 {
                 if admission != loaded.state.admission {
                     return Err(AgdError::OutboxBindingMismatch);
                 }
-                let artifacts = self.load_artifact_transfers(&intent)?;
+                let artifacts = if matches!(
+                    &loaded.state.ingress,
+                    GovernedProposalIngressV1::WorkerCandidate { .. }
+                ) {
+                    Vec::new()
+                } else {
+                    self.load_artifact_transfers(&intent)?
+                };
                 match self.submit_to_effectd(loaded.state.ingress.clone(), artifacts) {
                     Ok(response) => {
                         self.complete_forward_outbox(
@@ -292,10 +1136,20 @@ impl AgdCoreV1 {
             judgment: judgment.clone(),
         };
         let digest = Digest::from_serializable(&record)?;
+        let entity = judgment_entity(&digest);
+        if let Some(existing) = self
+            .store
+            .materialized_state::<EffectJudgmentRecordV1>(&entity)?
+        {
+            if existing.state != record || Digest::from_serializable(&existing.state)? != digest {
+                return Err(AgdError::JudgmentBindingMismatch);
+            }
+            return Ok((digest, existing.state.judgment));
+        }
         self.store.append_event(
             NewEventV1 {
                 event_id: uuid::Uuid::new_v4().to_string(),
-                entity_id: judgment_entity(&digest),
+                entity_id: entity,
                 event_kind: judgment_kind(&judgment).to_owned(),
                 occurred_at_unix_ms: now_i64()?,
                 payload: &record,
@@ -378,6 +1232,87 @@ impl AgdCoreV1 {
         })
     }
 
+    /// Maps one durably accepted candidate through a single reviewed
+    /// managed-file target and commits the native four-family judgment used by
+    /// the normal proposal path. Target selection is policy input; worker
+    /// bytes cannot name or alter it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless candidate custody and its tombstone are valid,
+    /// the worker chain is exact, the target is canonical, or the native
+    /// judgment/store transition fails.
+    pub fn admit_worker_candidate(
+        &mut self,
+        session: &ag_session::SessionId,
+    ) -> Result<ProposalIntentV1, AgdError> {
+        let record = WorkerSessionStoreV1::new(&mut self.store)
+            .load_session(session)?
+            .record;
+        record.validate()?;
+        let candidate = match &record.candidate {
+            WorkerCandidateCustodyStateV1::InCustody { candidate }
+            | WorkerCandidateCustodyStateV1::BrokerCompleted { candidate, .. } => candidate,
+            WorkerCandidateCustodyStateV1::Awaiting => {
+                return Err(AgdError::WorkerCandidateNotInCustody);
+            }
+        };
+        let launcher = self
+            .config
+            .worker_launcher
+            .as_ref()
+            .ok_or(AgdError::WorkerRuntimeUnavailable)?;
+        let profile = launcher
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == record.spec.reviewed_profile_id)
+            .ok_or(AgdError::WorkerProfileBindingMismatch)?;
+        if candidate.semantic_type != profile.candidate_semantic_type {
+            return Err(AgdError::WorkerProfileBindingMismatch);
+        }
+        let principal = &record.spec.worker.principal;
+        let worker_chain = worker_principal_chain(
+            &self.authority_domain,
+            self.epoch,
+            &launcher.governor_principal_root,
+            self.rpc_signer.principal(),
+            principal,
+        )?;
+        let target = TargetId::parse(profile.managed_file_target.clone())?;
+        let mut intent = ProposalIntentV1 {
+            schema: EFFECT_SCHEMA_V1.to_owned(),
+            intent_id: worker_intent_id(&record.spec.session, &candidate.custody_record),
+            authority_domain: self.authority_domain.clone(),
+            epoch: self.epoch,
+            proposer: worker_chain,
+            // Excluded from the semantic subject and replaced immediately
+            // after the exact native judgment commits.
+            judgment: Digest::hash_domain(
+                "ag-ng/worker-judgment-placeholder/v1",
+                candidate.custody_record.as_str().as_bytes(),
+            ),
+            admitted_artifacts: BTreeSet::from([candidate.content.clone()]),
+            effects: vec![EffectIntentV1::ManagedFilePut {
+                target,
+                content: candidate.content.clone(),
+            }],
+        };
+        let subject = intent.judgment_subject_digest()?;
+        let evaluation = worker_effect_evaluation(
+            self.authority_domain.clone(),
+            self.epoch,
+            principal.session_nonce,
+            subject,
+        )?;
+        let (judgment, result) = self.evaluate_and_commit(evaluation)?;
+        if !matches!(result, StoredEffectJudgmentV1::Admit { .. }) {
+            return Err(AgdError::WorkerJudgmentDidNotAdmit);
+        }
+        intent.judgment = judgment;
+        intent.validate_shape()?;
+        Ok(intent)
+    }
+
     /// Handles one authenticated governor control request.
     pub fn handle_control(
         &mut self,
@@ -393,6 +1328,22 @@ impl AgdCoreV1 {
         &mut self,
         accepted: &AcceptedSignedRequestV1<AgdRequestV1>,
     ) -> Result<AgdResponseV1, AgdError> {
+        if self.worker_recovery_required
+            && !matches!(
+                accepted.body(),
+                AgdRequestV1::Health | AgdRequestV1::InspectWorker { .. }
+            )
+        {
+            return Err(AgdError::WorkerRecoveryRequired);
+        }
+        if !self.active_workers.is_empty()
+            && matches!(
+                accepted.body(),
+                AgdRequestV1::SubmitProposal { .. } | AgdRequestV1::LaunchWorker { .. }
+            )
+        {
+            return Err(AgdError::WorkerSupervisorBusy);
+        }
         match accepted.body() {
             AgdRequestV1::Health => Ok(AgdResponseV1::Health {
                 health: HealthV1 {
@@ -409,11 +1360,29 @@ impl AgdCoreV1 {
             AgdRequestV1::SubmitProposal { intent } => self.forward_intent(
                 intent,
                 &accepted.authenticated_peer,
-                ProposalIngressProofV1 {
-                    server_challenge: accepted.server_challenge.clone(),
-                    signed_request: Box::new(accepted.signed_request.clone()),
+                GovernedProposalIngressV1::ExternalSigned {
+                    proof: Box::new(ProposalIngressProofV1 {
+                        server_challenge: accepted.server_challenge.clone(),
+                        signed_request: Box::new(accepted.signed_request.clone()),
+                    }),
                 },
             ),
+            AgdRequestV1::LaunchWorker { profile_id } => {
+                let (session_id, principal) = self.launch_worker(profile_id)?;
+                Ok(AgdResponseV1::WorkerLaunched {
+                    session_id,
+                    principal,
+                })
+            }
+            AgdRequestV1::InspectWorker { session_id } => Ok(AgdResponseV1::WorkerStatus {
+                record: Box::new(self.inspect_worker_session(session_id)?),
+            }),
+            AgdRequestV1::CancelWorker { session_id, reason } => {
+                self.cancel_worker(session_id, reason.clone())?;
+                Ok(AgdResponseV1::WorkerCancelled {
+                    session_id: session_id.clone(),
+                })
+            }
         }
     }
 
@@ -421,7 +1390,7 @@ impl AgdCoreV1 {
         &mut self,
         intent: &ProposalIntentV1,
         peer: &VerifiedRpcPrincipalV1,
-        ingress: ProposalIngressProofV1,
+        ingress: GovernedProposalIngressV1,
     ) -> Result<AgdResponseV1, AgdError> {
         if self.store.active_backup_cut()?.is_some() {
             return Err(AgdError::Quiesced);
@@ -443,16 +1412,120 @@ impl AgdCoreV1 {
         ) {
             return Err(AgdError::ProposerBindingMismatch);
         }
+        self.forward_governed_intent(intent, ingress)
+    }
+
+    /// Verifies one dynamic worker proof and forwards only the governor-built
+    /// intent already backed by durable candidate custody and a native
+    /// admission judgment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any signature, freshness, lifecycle, chain,
+    /// candidate-custody, admission, artifact, or broker binding failure.
+    pub fn forward_worker_candidate(
+        &mut self,
+        intent: &ProposalIntentV1,
+        source: WorkerCandidateSourceProofV1,
+    ) -> Result<AgdResponseV1, AgdError> {
+        let durable_source = self.worker_candidate_source(&source.worker.session_id)?;
+        if durable_source != source {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let proof = &source.ingress_proof;
+        let worker_id = source.worker.id();
+        if proof.worker_enrollment.principal != *worker_id.digest()
+            || source.worker.candidate_ingress_key_identity
+                != candidate_ingress_key_identity(&proof.worker_enrollment)?
+            || intent.proposer != source.worker_chain
+            || source.worker_chain.authority_domain() != &self.authority_domain
+            || source.worker_chain.epoch() != self.epoch
+            || source.worker.authority_domain != self.authority_domain
+            || source.worker.epoch != self.epoch
+            || source.worker.proposal_workspace_identity != source.workspace_identity
+            || source.accepted_at_unix_ms >= source.worker.expires_at_unix_ms
+        {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let worker_enrollment =
+            RpcPeerEnrollmentV1::new(worker_id.digest().clone(), proof.worker_enrollment.clone())?;
+        let launcher = self
+            .config
+            .worker_launcher
+            .as_ref()
+            .ok_or(AgdError::WorkerRuntimeUnavailable)?;
+        let expected_governor_policy = self
+            .rpc_signer
+            .enrollment(launcher.governor_challenge_maximum_clock_skew_ms)?
+            .key;
+        if proof.governor_enrollment != expected_governor_policy {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let governor_enrollment = RpcPeerEnrollmentV1::new(
+            self.rpc_signer.principal().clone(),
+            proof.governor_enrollment.clone(),
+        )?;
+        let verified = verify_forwarded_signed_request_bindings(
+            &proof.server_challenge,
+            &proof.signed_request,
+            &governor_enrollment,
+            &worker_enrollment,
+        )?;
+        if verified.principal != *worker_id.digest() {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let WorkerCandidateRequestV1::Submit {
+            candidate_nonce,
+            semantic_type,
+            content,
+        } = &proof.signed_request.request.body;
+        let ingress_proof = worker_candidate_ingress_proof_digest(proof)?;
+        let candidate = ag_session::WorkerCandidateCustodyV1::new(
+            Digest::hash_bytes(content.as_slice()),
+            u64::try_from(content.len()).map_err(|_| AgdError::ArtifactTransferTooLarge)?,
+            semantic_type.clone(),
+            None,
+            ingress_proof,
+        )?;
+        if *candidate_nonce != source.worker.session_nonce
+            || candidate.custody_record != source.candidate_custody
+        {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        let ingress = GovernedProposalIngressV1::WorkerCandidate {
+            intent: Box::new(intent.clone()),
+            source: Box::new(source),
+        };
+        self.forward_governed_intent(intent, ingress)
+    }
+
+    fn forward_governed_intent(
+        &mut self,
+        intent: &ProposalIntentV1,
+        ingress: GovernedProposalIngressV1,
+    ) -> Result<AgdResponseV1, AgdError> {
+        if self.worker_recovery_required {
+            return Err(AgdError::WorkerRecoveryRequired);
+        }
+        if !self.active_workers.is_empty() {
+            return Err(AgdError::WorkerSupervisorBusy);
+        }
+        if self.store.active_backup_cut()?.is_some() {
+            return Err(AgdError::Quiesced);
+        }
+        intent.validate_shape()?;
+        if intent.authority_domain != self.authority_domain
+            || intent.epoch != self.epoch
+            || intent.proposer.authority_domain() != &self.authority_domain
+            || intent.proposer.epoch() != self.epoch
+        {
+            return Err(AgdError::ProposerBindingMismatch);
+        }
         let expected_subject = intent.judgment_subject_digest()?;
         let verified = self.verify_admission(&intent.judgment, &expected_subject)?;
         let intent_digest = Digest::from_serializable(intent)?;
-        let source = Digest::from_serializable(&(
-            "ag.effect.governor-forward-source/v1",
-            &self.authority_domain,
-            self.epoch,
-            &authenticated_proposer,
-            &intent_digest,
-        ))?;
+        let source =
+            governor_forward_source(&self.authority_domain, self.epoch, &ingress, &intent_digest)?;
         let (entity, record, revision) =
             match self.prepare_forward_outbox(&source, intent_digest, &verified, &ingress)? {
                 ForwardOutboxPreparationV1::Completed(response) => return Ok(response),
@@ -462,7 +1535,16 @@ impl AgdCoreV1 {
                     revision,
                 } => (entity, *record, revision),
             };
-        let artifacts = self.load_artifact_transfers(intent)?;
+        // Worker candidate bytes already occur exactly once in the signed
+        // ingress proof.  Re-encoding them as an artifact transfer would
+        // double the frame cost and could strand accepted custody behind a
+        // second, hidden wire limit.  Effectd derives and installs that one
+        // artifact from the independently verified proof.
+        let artifacts = if matches!(&ingress, GovernedProposalIngressV1::WorkerCandidate { .. }) {
+            Vec::new()
+        } else {
+            self.load_artifact_transfers(intent)?
+        };
         let result = self.submit_to_effectd(ingress, artifacts)?;
         self.complete_forward_outbox(entity, record, revision, &result)?;
         Ok(result)
@@ -473,7 +1555,7 @@ impl AgdCoreV1 {
         source: &Digest,
         intent: Digest,
         admission: &VerifiedEffectAdmissionV1,
-        ingress: &ProposalIngressProofV1,
+        ingress: &GovernedProposalIngressV1,
     ) -> Result<ForwardOutboxPreparationV1, AgdError> {
         let entity = forward_entity(source);
         if let Some(loaded) = self
@@ -499,7 +1581,7 @@ impl AgdCoreV1 {
                     NewEventV1 {
                         event_id: uuid::Uuid::new_v4().to_string(),
                         entity_id: entity.clone(),
-                        event_kind: "effect-forward.reproofed.v2".to_owned(),
+                        event_kind: "effect-forward.reproofed.v3".to_owned(),
                         occurred_at_unix_ms: now_i64()?,
                         payload: ingress,
                     },
@@ -519,7 +1601,7 @@ impl AgdCoreV1 {
             });
         }
         let record = ForwardOutboxRecordV1 {
-            schema: "ag.effect-forward-outbox/v2".to_owned(),
+            schema: "ag.effect-forward-outbox/v3".to_owned(),
             source: source.clone(),
             intent,
             admission: admission.clone(),
@@ -530,7 +1612,7 @@ impl AgdCoreV1 {
             NewEventV1 {
                 event_id: uuid::Uuid::new_v4().to_string(),
                 entity_id: entity.clone(),
-                event_kind: "effect-forward.pending.v2".to_owned(),
+                event_kind: "effect-forward.pending.v3".to_owned(),
                 occurred_at_unix_ms: now_i64()?,
                 payload: (source, admission),
             },
@@ -551,14 +1633,13 @@ impl AgdCoreV1 {
     ) -> Result<(), AgdError> {
         let intent = ingress_intent(&record.ingress)?;
         let intent_digest = Digest::from_serializable(intent)?;
-        let source = Digest::from_serializable(&(
-            "ag.effect.governor-forward-source/v1",
+        let source = governor_forward_source(
             &self.authority_domain,
             self.epoch,
-            &intent.proposer,
+            &record.ingress,
             &intent_digest,
-        ))?;
-        if record.schema != "ag.effect-forward-outbox/v2"
+        )?;
+        if record.schema != "ag.effect-forward-outbox/v3"
             || record.intent != intent_digest
             || record.source != source
             || entity != forward_entity(&source)
@@ -593,7 +1674,7 @@ impl AgdCoreV1 {
 
     fn submit_to_effectd(
         &self,
-        ingress: ProposalIngressProofV1,
+        ingress: GovernedProposalIngressV1,
         artifacts: Vec<ArtifactTransferV1>,
     ) -> Result<AgdResponseV1, AgdError> {
         let request_id = RequestId::new(format!("agd-{}", uuid::Uuid::new_v4()))?;
@@ -626,9 +1707,13 @@ impl AgdCoreV1 {
             }
         };
         match broker_response {
-            EffectProposalResponseV1::Canonicalized { proposal_id, .. } => {
-                Ok(AgdResponseV1::ProposalSubmitted { proposal_id })
-            }
+            EffectProposalResponseV1::Canonicalized {
+                proposal_id,
+                proposal_digest,
+            } => Ok(AgdResponseV1::ProposalSubmitted {
+                proposal_id,
+                proposal_digest,
+            }),
             EffectProposalResponseV1::Indeterminate { envelope } => {
                 Ok(AgdResponseV1::Indeterminate { envelope })
             }
@@ -684,6 +1769,375 @@ fn proposer_binding_matches(
         && intent_proposer.leaf().principal_id == authenticated_proposer.leaf().principal_id
 }
 
+fn configured_worker_security_profile(profile: &str) -> Result<SecurityProfileV1, AgdError> {
+    match profile {
+        "development" => Ok(SecurityProfileV1::Development),
+        "production" => Ok(SecurityProfileV1::Production),
+        "high_assurance" => Ok(SecurityProfileV1::HighAssurance),
+        _ => Err(AgdError::WorkerRuntimeUnavailable),
+    }
+}
+
+fn worker_process_failure_reason(error: &WorkerLaunchError) -> WorkerTerminationReasonV1 {
+    match error {
+        WorkerLaunchError::TimedOut => WorkerTerminationReasonV1::DeadlineExpired,
+        WorkerLaunchError::CandidateLimitExceeded { observed_bytes } => {
+            WorkerTerminationReasonV1::OutputBudgetExceeded {
+                observed_bytes: *observed_bytes,
+            }
+        }
+        WorkerLaunchError::CandidateStreamIndeterminate | WorkerLaunchError::Io { .. } => {
+            WorkerTerminationReasonV1::BoundaryIndeterminate {
+                envelope: Digest::hash_domain(
+                    "ag-ng/worker-boundary-failure/v1",
+                    error.to_string().as_bytes(),
+                ),
+            }
+        }
+        _ => WorkerTerminationReasonV1::WorkerFailed {
+            failure: Digest::hash_domain(
+                "ag-ng/worker-process-failure/v1",
+                error.to_string().as_bytes(),
+            ),
+        },
+    }
+}
+
+fn worker_candidate_refusal_reason(error: &AgdError) -> Option<WorkerTerminationReasonV1> {
+    let code = match error {
+        AgdError::WorkerProtocol(_) => WorkerCandidateRefusalCodeV1::MalformedFrame,
+        AgdError::RpcAuthentication(_) => WorkerCandidateRefusalCodeV1::AuthenticationFailed,
+        AgdError::WorkerProofMismatch => WorkerCandidateRefusalCodeV1::PrincipalBindingMismatch,
+        AgdError::WorkerProfileBindingMismatch | AgdError::WorkerCandidateSemanticMismatch => {
+            WorkerCandidateRefusalCodeV1::ReviewedProfileMismatch
+        }
+        AgdError::WorkerCandidateExpired => WorkerCandidateRefusalCodeV1::Expired,
+        AgdError::WorkerCandidateBudgetExceeded { observed_bytes } => {
+            return Some(WorkerTerminationReasonV1::OutputBudgetExceeded {
+                observed_bytes: *observed_bytes,
+            });
+        }
+        _ => return None,
+    };
+    Some(WorkerTerminationReasonV1::CandidateRefused { code })
+}
+
+fn worker_admitted_inputs() -> Vec<AdmittedWorkerInputV1> {
+    vec![
+        AdmittedWorkerInputV1 {
+            descriptor: 3,
+            purpose: CANDIDATE_INGRESS_CREDENTIAL_PURPOSE.to_owned(),
+            maximum_bytes: 4096,
+        },
+        AdmittedWorkerInputV1 {
+            descriptor: 4,
+            purpose: CANDIDATE_BOOTSTRAP_PURPOSE.to_owned(),
+            maximum_bytes: 4096,
+        },
+    ]
+}
+
+fn populate_worker_inputs(
+    prepared: &mut PreparedWorkerLaunchV1,
+    private_key: &EphemeralRpcPrivateKeyV1,
+    bootstrap: &WorkerCandidateBootstrapV1,
+) -> Result<(), AgdError> {
+    let mut private_bytes = Vec::with_capacity(private_key.byte_length());
+    if let Err(source) = private_key.write_to(&mut private_bytes) {
+        private_bytes.fill(0);
+        return Err(WorkerLaunchError::Io {
+            operation: "materialize admitted worker credential",
+            source,
+        }
+        .into());
+    }
+    let bootstrap_frame = FrameCodec::new(bootstrap.maximum_frame_bytes)?.encode_json(bootstrap)?;
+    let result = (|| {
+        let mut wrote_credential = false;
+        let mut wrote_challenge = false;
+        for mut pipe in std::mem::take(&mut prepared.admitted_inputs) {
+            match pipe.purpose() {
+                CANDIDATE_INGRESS_CREDENTIAL_PURPOSE if !wrote_credential => {
+                    pipe.write_all(&private_bytes)?;
+                    wrote_credential = true;
+                }
+                CANDIDATE_BOOTSTRAP_PURPOSE if !wrote_challenge => {
+                    pipe.write_all(&bootstrap_frame)?;
+                    wrote_challenge = true;
+                }
+                _ => return Err(WorkerLaunchError::DescriptorHandoff.into()),
+            }
+            pipe.close();
+        }
+        if !wrote_credential || !wrote_challenge {
+            return Err(WorkerLaunchError::DescriptorHandoff.into());
+        }
+        Ok(())
+    })();
+    private_bytes.fill(0);
+    result
+}
+
+fn worker_session_inputs(
+    session: &SessionId,
+    candidate_key_identity: &Digest,
+    workspace: &Digest,
+) -> Result<(SourceSnapshotV1, Vec<AdmittedDescriptorV1>, Digest), AgdError> {
+    let source = SourceSnapshotV1 {
+        content: Digest::hash_domain("ag-ng/worker-empty-source/v1", session.as_str().as_bytes()),
+        format: "empty_snapshot_v1".to_owned(),
+        source_object: None,
+    };
+    let descriptors = vec![
+        AdmittedDescriptorV1 {
+            descriptor: 1,
+            purpose: DescriptorPurposeV1::CandidateSink,
+            access: DescriptorAccessV1::WriteOnly,
+            object_identity: Digest::from_serializable(&(
+                "ag.worker-candidate-sink/v1",
+                session,
+                workspace,
+            ))?,
+        },
+        AdmittedDescriptorV1 {
+            descriptor: 3,
+            purpose: DescriptorPurposeV1::CandidateIngressCredential,
+            access: DescriptorAccessV1::ReadOnly,
+            object_identity: candidate_key_identity.clone(),
+        },
+        AdmittedDescriptorV1 {
+            descriptor: 4,
+            purpose: DescriptorPurposeV1::CandidateChallenge,
+            access: DescriptorAccessV1::ReadOnly,
+            object_identity: Digest::from_serializable(&(
+                "ag.worker-candidate-challenge-channel/v1",
+                session,
+                candidate_key_identity,
+            ))?,
+        },
+    ];
+    let input_set =
+        Digest::from_serializable(&("ag.worker-admitted-input-set/v1", &source, &descriptors))?;
+    Ok((source, descriptors, input_set))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_principal_from_launch(
+    authority_domain: &AuthorityDomain,
+    epoch: Epoch,
+    governor_principal: &Digest,
+    profile: &crate::config::WorkerProfileConfigV1,
+    session: &SessionId,
+    session_nonce: LifecycleNonce,
+    expires_at_unix_ms: u64,
+    candidate_key_identity: Digest,
+    prepared: &PreparedWorkerLaunchV1,
+) -> Result<WorkerSessionPrincipalV1, AgdError> {
+    let (_, _, input_set_digest) = worker_session_inputs(
+        session,
+        &candidate_key_identity,
+        &prepared.workspace.identity,
+    )?;
+    Ok(WorkerSessionPrincipalV1 {
+        authority_domain: authority_domain.clone(),
+        epoch,
+        project: ProjectId::parse(&profile.project)?,
+        session_id: session.clone(),
+        session_nonce,
+        launcher: PrincipalId::new(governor_principal.clone()),
+        executable: prepared.evidence.worker_executable.clone(),
+        launch_profile: LaunchProfileIdentityV1::new(
+            prepared.evidence.launch_profile.clone(),
+            Digest::hash_domain(
+                "ag-ng/worker-candidate-protocol-schema/v1",
+                b"candidate-only-signed-frame-v1",
+            ),
+        ),
+        proposal_workspace_identity: prepared.workspace.identity.clone(),
+        security_profile_identity: SecurityProfileV1::Development.identity(),
+        candidate_ingress_key_identity: candidate_key_identity,
+        expires_at_unix_ms,
+        output_budget_bytes: profile.output_budget_bytes,
+        provider_route: WorkerProviderRouteV1::Offline,
+        input_set_digest,
+        observed_credentials: HostCredentialObservationV1 {
+            uid: prepared.evidence.observed_uid,
+            gid: prepared.evidence.observed_gid,
+            pid: prepared.evidence.sandbox_pid,
+            cgroup: CgroupIdentity::parse("development-unattested")?,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_session_spec(
+    authority_domain: &AuthorityDomain,
+    epoch: Epoch,
+    security_profile: SecurityProfileV1,
+    profile: &crate::config::WorkerProfileConfigV1,
+    session: &SessionId,
+    candidate_key_identity: Digest,
+    worker: WorkerSessionPrincipalV1,
+    worker_chain: PrincipalChainV1,
+    prepared: &PreparedWorkerLaunchV1,
+    expires_at_unix_ms: u64,
+) -> Result<BatchSessionSpecV1, AgdError> {
+    let (source, admitted_descriptors, input_set_digest) = worker_session_inputs(
+        session,
+        &candidate_key_identity,
+        &prepared.workspace.identity,
+    )?;
+    if worker.input_set_digest != input_set_digest {
+        return Err(AgdError::WorkerProfileBindingMismatch);
+    }
+    let launch_receipt = Digest::from_serializable(&prepared.evidence)?;
+    let isolation = IsolationEvidenceV1 {
+        user_namespace: Digest::hash_domain(
+            "ag-ng/development-user-namespace-evidence/v1",
+            launch_receipt.as_str().as_bytes(),
+        ),
+        mount_namespace: Digest::hash_domain(
+            "ag-ng/development-mount-namespace-evidence/v1",
+            launch_receipt.as_str().as_bytes(),
+        ),
+        pid_namespace: Digest::hash_domain(
+            "ag-ng/development-pid-namespace-evidence/v1",
+            launch_receipt.as_str().as_bytes(),
+        ),
+        cgroup: Digest::hash_domain(
+            "ag-ng/development-unattested-cgroup/v1",
+            launch_receipt.as_str().as_bytes(),
+        ),
+        seccomp_profile: Digest::hash_domain(
+            "ag-ng/development-unattested-seccomp/v1",
+            launch_receipt.as_str().as_bytes(),
+        ),
+        landlock_ruleset: Digest::hash_domain(
+            "ag-ng/development-unattested-landlock/v1",
+            launch_receipt.as_str().as_bytes(),
+        ),
+        network_namespace: Digest::hash_domain(
+            "ag-ng/development-network-namespace/v1",
+            launch_receipt.as_str().as_bytes(),
+        ),
+        observed_uid: prepared.evidence.observed_uid,
+        observed_gid: prepared.evidence.observed_gid,
+        observed_pid: prepared.evidence.sandbox_pid,
+        observed_executable: prepared.evidence.worker_executable.clone(),
+    };
+    Ok(BatchSessionSpecV1 {
+        schema: ag_session::SESSION_SCHEMA_V1.to_owned(),
+        session: session.clone(),
+        authority_domain: authority_domain.clone(),
+        epoch,
+        security_profile,
+        reviewed_profile_id: profile.profile_id.clone(),
+        candidate_ingress_key_identity: candidate_key_identity,
+        worker: WorkerBindingV1 {
+            principal: worker,
+            principal_chain: worker_chain,
+            isolation,
+        },
+        workspace_mode: WorkspaceModeV1::IndependentSnapshot,
+        proposal_workspace_identity: prepared.workspace.identity.clone(),
+        source,
+        admitted_descriptors,
+        provider_capability: None,
+        deadline_unix_ms: expires_at_unix_ms,
+        output_budget_bytes: profile.output_budget_bytes,
+    })
+}
+
+fn worker_effect_evaluation(
+    authority_domain: AuthorityDomain,
+    epoch: Epoch,
+    lifecycle_nonce: ag_primitives::LifecycleNonce,
+    subject: Digest,
+) -> Result<EffectEvaluationInputV1, AgdError> {
+    let origin = LifecycleOrigin::new(authority_domain, epoch, lifecycle_nonce);
+    let standing_ref = StandingRef::new(origin.clone(), BookLocalId::new("worker-standing-v1")?);
+    let custody_ref = CustodyRef::new(
+        origin.clone(),
+        BookLocalId::new("worker-candidate-custody-v1")?,
+    );
+    let obligation_ref = ObligationRef::new(
+        origin.clone(),
+        BookLocalId::new("worker-reviewed-mapping-v1")?,
+    );
+    let capacity_ref = CapacityRef::new(
+        origin.clone(),
+        BookLocalId::new("worker-output-capacity-v1")?,
+    );
+    Ok(EffectEvaluationInputV1 {
+        subject: subject.clone(),
+        books: EffectBookSnapshotV1 {
+            origin: origin.clone(),
+            standing: vec![StandingBookEntry::new(
+                standing_ref.clone(),
+                subject.clone(),
+            )],
+            custody: vec![CustodyBookEntry::new(custody_ref.clone(), subject.clone())],
+            obligation: vec![ObligationBookEntry::new(
+                obligation_ref.clone(),
+                subject.clone(),
+            )],
+            capacity: vec![CapacityBookEntry::new(
+                capacity_ref.clone(),
+                subject.clone(),
+            )],
+        },
+        claim: EffectCrossingClaim::new(
+            StandingClaim::new(origin.clone(), subject.clone(), standing_ref),
+            CustodyClaim::new(origin.clone(), subject.clone(), custody_ref),
+            ObligationClaim::new(origin.clone(), subject.clone(), obligation_ref),
+            CapacityClaim::new(origin, subject, capacity_ref),
+        ),
+    })
+}
+
+fn worker_principal_chain(
+    authority_domain: &AuthorityDomain,
+    epoch: Epoch,
+    configured_root: &Digest,
+    governor_signing_principal: &Digest,
+    worker: &ag_primitives::WorkerSessionPrincipalV1,
+) -> Result<PrincipalChainV1, AgdError> {
+    let root = PrincipalId::new(configured_root.clone());
+    let governor = PrincipalId::new(governor_signing_principal.clone());
+    if worker.launcher != governor {
+        return Err(AgdError::WorkerProfileBindingMismatch);
+    }
+    let mut nodes = vec![PrincipalChainNodeV1::root(
+        root.clone(),
+        PrincipalKindV1::Daemon,
+    )];
+    if governor != root {
+        nodes.push(PrincipalChainNodeV1::child(
+            governor.clone(),
+            PrincipalKindV1::Daemon,
+            root,
+        ));
+    }
+    nodes.push(PrincipalChainNodeV1::child(
+        worker.id(),
+        PrincipalKindV1::WorkerSession,
+        governor,
+    ));
+    Ok(PrincipalChainV1::new(
+        authority_domain.clone(),
+        epoch,
+        nodes,
+    )?)
+}
+
+fn worker_intent_id(session: &ag_session::SessionId, custody: &Digest) -> String {
+    let suffix = custody
+        .as_str()
+        .strip_prefix("sha256:")
+        .unwrap_or(custody.as_str());
+    format!("worker-{}-{}", session.as_str(), &suffix[..16])
+}
+
 fn replay_books(
     snapshot: &EffectBookSnapshotV1,
 ) -> Result<(StandingBook, CustodyBook, ObligationBook, CapacityBook), AgdError> {
@@ -737,10 +2191,46 @@ fn forward_entity(source: &Digest) -> String {
     )
 }
 
-fn ingress_intent(ingress: &ProposalIngressProofV1) -> Result<&ProposalIntentV1, AgdError> {
-    match &ingress.signed_request.request.body {
-        AgdRequestV1::SubmitProposal { intent } => Ok(intent),
-        AgdRequestV1::Health => Err(AgdError::OutboxBindingMismatch),
+fn ingress_intent(ingress: &GovernedProposalIngressV1) -> Result<&ProposalIntentV1, AgdError> {
+    match ingress {
+        GovernedProposalIngressV1::ExternalSigned { proof } => {
+            match &proof.signed_request.request.body {
+                AgdRequestV1::SubmitProposal { intent } => Ok(intent),
+                AgdRequestV1::Health
+                | AgdRequestV1::LaunchWorker { .. }
+                | AgdRequestV1::InspectWorker { .. }
+                | AgdRequestV1::CancelWorker { .. } => Err(AgdError::OutboxBindingMismatch),
+            }
+        }
+        GovernedProposalIngressV1::WorkerCandidate { intent, .. } => Ok(intent),
+    }
+}
+
+fn governor_forward_source(
+    authority_domain: &AuthorityDomain,
+    epoch: Epoch,
+    ingress: &GovernedProposalIngressV1,
+    intent_digest: &Digest,
+) -> Result<Digest, AgdError> {
+    let intent = ingress_intent(ingress)?;
+    match ingress {
+        GovernedProposalIngressV1::ExternalSigned { .. } => Ok(Digest::from_serializable(&(
+            "ag.effect.governor-forward-source/v1",
+            authority_domain,
+            epoch,
+            &intent.proposer,
+            intent_digest,
+        ))?),
+        GovernedProposalIngressV1::WorkerCandidate { source, .. } => {
+            Ok(Digest::from_serializable(&(
+                "ag.effect.governor-worker-forward-source/v1",
+                authority_domain,
+                epoch,
+                &intent.proposer,
+                intent_digest,
+                source,
+            ))?)
+        }
     }
 }
 
@@ -766,6 +2256,13 @@ fn now_i64() -> Result<i64, AgdError> {
     i64::try_from(duration.as_millis()).map_err(|_| AgdError::Clock("clock overflow".to_owned()))
 }
 
+fn now_u64() -> Result<u64, AgdError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| AgdError::Clock(error.to_string()))?;
+    u64::try_from(duration.as_millis()).map_err(|_| AgdError::Clock("clock overflow".to_owned()))
+}
+
 fn agd_api_error<T>(error: &AgdError) -> ApiResultV1<T> {
     let code = match error {
         AgdError::Quiesced => ApiErrorCodeV1::Quiesced,
@@ -775,7 +2272,10 @@ fn agd_api_error<T>(error: &AgdError) -> ApiResultV1<T> {
         }
         AgdError::ProposerBindingMismatch => ApiErrorCodeV1::Unauthenticated,
         AgdError::Effect(_) | AgdError::Protocol(_) => ApiErrorCodeV1::InvalidRequest,
-        AgdError::Broker(_) => ApiErrorCodeV1::Indeterminate,
+        AgdError::Broker(_) | AgdError::WorkerRecoveryRequired => ApiErrorCodeV1::Indeterminate,
+        AgdError::WorkerSupervisorBusy | AgdError::WorkerCapacityExhausted => {
+            ApiErrorCodeV1::Conflict
+        }
         _ => ApiErrorCodeV1::Internal,
     };
     ApiResultV1::error(code, error.to_string())
@@ -787,9 +2287,27 @@ pub enum AgdError {
     /// Authority identifier failed strict parsing.
     #[error(transparent)]
     Identifier(#[from] ag_primitives::IdentifierError),
+    /// Canonical principal/session name failed strict parsing.
+    #[error(transparent)]
+    PrincipalName(#[from] PrincipalNameError),
+    /// Principal lineage failed structural validation.
+    #[error(transparent)]
+    PrincipalChain(#[from] ag_primitives::PrincipalChainError),
     /// Event store failed.
     #[error(transparent)]
     Store(#[from] ag_store::StoreError),
+    /// Durable worker-session custody failed.
+    #[error(transparent)]
+    WorkerSessionStore(#[from] WorkerSessionStoreError),
+    /// Fixed-profile worker launch or process custody failed.
+    #[error(transparent)]
+    WorkerLaunch(#[from] WorkerLaunchError),
+    /// Candidate-only worker framing/signing protocol failed.
+    #[error(transparent)]
+    WorkerProtocol(#[from] WorkerProtocolError),
+    /// Worker principal/candidate model failed closed validation.
+    #[error(transparent)]
+    Session(#[from] ag_session::SessionError),
     /// Family-book replay failed.
     #[error(transparent)]
     Book(#[from] ag_kernel::FamilyBookError),
@@ -845,6 +2363,52 @@ pub enum AgdError {
     /// Initial framed artifact-transfer slice exceeded its explicit bound.
     #[error("admitted artifacts exceed the bounded proposal transfer frame")]
     ArtifactTransferTooLarge,
+    /// The reviewed worker catalog exists but the live launch supervisor has
+    /// not been attached to this governor core.
+    #[error("worker launch runtime is unavailable")]
+    WorkerRuntimeUnavailable,
+    /// Configured maximum live-worker count has been reached.
+    #[error("worker launch capacity is exhausted")]
+    WorkerCapacityExhausted,
+    /// A non-reusable session unexpectedly collided in live process custody.
+    #[error("worker runtime session collision")]
+    WorkerRuntimeCollision,
+    /// A durable active worker had no retained process custody.
+    #[error("worker runtime process custody is missing")]
+    WorkerRuntimeMissing,
+    /// Deadline-critical supervision excludes blocking authority work while
+    /// the one admitted worker is live.
+    #[error("worker supervisor is busy with the one admitted live worker")]
+    WorkerSupervisorBusy,
+    /// A commit-ambiguous launch-store transition requires daemon restart and
+    /// startup recovery before any further mutation.
+    #[error("worker launch state requires restart recovery")]
+    WorkerRecoveryRequired,
+    /// Dynamic candidate proof does not bind the active worker/session.
+    #[error("worker candidate proof does not match durable session custody")]
+    WorkerProofMismatch,
+    /// Candidate semantic type differs from the exact reviewed profile.
+    #[error("worker candidate semantic type does not match the reviewed profile")]
+    WorkerCandidateSemanticMismatch,
+    /// Candidate bytes exceed the exact reviewed output budget.
+    #[error("worker candidate exceeds the reviewed output budget")]
+    WorkerCandidateBudgetExceeded {
+        /// Exact decoded candidate length observed at ingress.
+        observed_bytes: u64,
+    },
+    /// Candidate arrived at or after the principal's exclusive deadline.
+    #[error("worker candidate principal is expired")]
+    WorkerCandidateExpired,
+    /// Worker candidate custody has not reached the atomic accepted state.
+    #[error("worker candidate is not in durable governor custody")]
+    WorkerCandidateNotInCustody,
+    /// A contained-session native judgment unexpectedly did not admit the
+    /// exact reviewed candidate mapping.
+    #[error("worker candidate native judgment did not admit")]
+    WorkerJudgmentDidNotAdmit,
+    /// Durable session/profile/launcher mapping differs from reviewed config.
+    #[error("worker session does not match its reviewed launch profile")]
+    WorkerProfileBindingMismatch,
 }
 
 #[cfg(test)]
@@ -896,5 +2460,39 @@ mod tests {
             epoch,
             &authenticated,
         ));
+    }
+
+    #[test]
+    fn candidate_refusals_remain_closed_and_budget_is_not_authentication() {
+        assert_eq!(
+            worker_candidate_refusal_reason(&AgdError::WorkerProofMismatch),
+            Some(WorkerTerminationReasonV1::CandidateRefused {
+                code: WorkerCandidateRefusalCodeV1::PrincipalBindingMismatch,
+            })
+        );
+        assert_eq!(
+            worker_candidate_refusal_reason(&AgdError::WorkerCandidateSemanticMismatch),
+            Some(WorkerTerminationReasonV1::CandidateRefused {
+                code: WorkerCandidateRefusalCodeV1::ReviewedProfileMismatch,
+            })
+        );
+        assert_eq!(
+            worker_candidate_refusal_reason(&AgdError::WorkerCandidateExpired),
+            Some(WorkerTerminationReasonV1::CandidateRefused {
+                code: WorkerCandidateRefusalCodeV1::Expired,
+            })
+        );
+        assert_eq!(
+            worker_candidate_refusal_reason(&AgdError::WorkerCandidateBudgetExceeded {
+                observed_bytes: 4097,
+            }),
+            Some(WorkerTerminationReasonV1::OutputBudgetExceeded {
+                observed_bytes: 4097,
+            })
+        );
+        assert_eq!(
+            worker_candidate_refusal_reason(&AgdError::WorkerRecoveryRequired),
+            None
+        );
     }
 }

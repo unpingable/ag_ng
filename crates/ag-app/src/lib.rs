@@ -12,6 +12,9 @@ pub mod rpc_auth;
 pub mod runtime;
 pub mod signed_transport;
 pub mod transport;
+pub mod worker;
+pub mod worker_protocol;
+pub mod worker_session;
 
 use tracing_subscriber::EnvFilter;
 

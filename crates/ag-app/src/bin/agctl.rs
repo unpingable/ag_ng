@@ -16,7 +16,7 @@ use ag_app::doctor::{DoctorConfigPathsV1, diagnose_host};
 use ag_app::rpc_auth::{RpcPeerEnrollmentV1, RpcReplayGuardV1, RpcSignerV1, SystemRpcClockV1};
 use ag_app::signed_transport::{SocketPeerCheckV1, call_signed};
 use ag_effect::{ProposalIntentV1, ReconciliationEvidenceV1};
-use ag_primitives::Digest;
+use ag_primitives::{Digest, SessionId};
 use ag_protocol::{RequestId, canonical_json, strict_json_from_slice};
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -72,6 +72,12 @@ enum Command {
         /// Governor intent operation.
         #[command(subcommand)]
         command: IntentCommand,
+    },
+    /// Launch, inspect, or cancel a reviewed contained worker session.
+    Worker {
+        /// Governor worker operation.
+        #[command(subcommand)]
+        command: WorkerCommand,
     },
 }
 
@@ -131,6 +137,28 @@ enum IntentCommand {
         /// Regular, non-symlink intent file. Standard input is deliberately unsupported.
         #[arg(long, value_name = "PATH")]
         file: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkerCommand {
+    /// Launch one root-reviewed fixed executable/argv profile.
+    Launch {
+        /// Closed profile ID from the agd worker catalog.
+        profile_id: String,
+    },
+    /// Inspect durable worker authority, custody, and terminal state.
+    Show {
+        /// Non-reusable worker session ID.
+        session_id: SessionId,
+    },
+    /// Durably fence a live worker principal and begin bounded cleanup.
+    Cancel {
+        /// Non-reusable worker session ID.
+        session_id: SessionId,
+        /// Digest of the caller's reviewed cancellation reason/evidence.
+        #[arg(long)]
+        reason: Digest,
     },
 }
 
@@ -314,6 +342,7 @@ fn authorize_command(profile: &AgctlCommandProfileV1, command: &Command) -> anyh
             Command::Health {
                 component: HealthComponent::Agd
             } | Command::Intent { .. }
+                | Command::Worker { .. }
         ),
         AgctlCommandProfileV1::EffectAdmin { .. } => matches!(
             command,
@@ -351,9 +380,38 @@ fn dispatch(client: &ClientV1, command: Command) -> anyhow::Result<()> {
                         bail!("agd reached an operationally indeterminate result")
                     }
                     AgdResponseV1::Health { .. } => bail!("agd returned an unexpected response"),
+                    AgdResponseV1::WorkerLaunched { .. }
+                    | AgdResponseV1::WorkerStatus { .. }
+                    | AgdResponseV1::WorkerCancelled { .. } => {
+                        bail!("agd returned a worker response to an intent request")
+                    }
                 }
             }
         },
+        Command::Worker { command } => worker(client, command),
+    }
+}
+
+fn worker(client: &ClientV1, command: WorkerCommand) -> anyhow::Result<()> {
+    let response = match command {
+        WorkerCommand::Launch { profile_id } => {
+            client.call_agd(AgdRequestV1::LaunchWorker { profile_id })?
+        }
+        WorkerCommand::Show { session_id } => {
+            client.call_agd(AgdRequestV1::InspectWorker { session_id })?
+        }
+        WorkerCommand::Cancel { session_id, reason } => {
+            client.call_agd(AgdRequestV1::CancelWorker { session_id, reason })?
+        }
+    };
+    match &response {
+        AgdResponseV1::WorkerLaunched { .. }
+        | AgdResponseV1::WorkerStatus { .. }
+        | AgdResponseV1::WorkerCancelled { .. } => write_canonical(&response),
+        AgdResponseV1::Health { .. }
+        | AgdResponseV1::ProposalSubmitted { .. }
+        | AgdResponseV1::Indeterminate { .. }
+        | AgdResponseV1::Refused { .. } => bail!("agd returned an unexpected response"),
     }
 }
 

@@ -6,7 +6,7 @@ one root-owned role profile and one signing identity. The two profiles are
 mutually exclusive:
 
 - `proposer` contains only the `agd` socket/enrollment and authorizes `health
-  agd` plus `intent submit`;
+  agd`, `intent submit`, and the closed `worker` command family;
 - `effect_admin` contains only the `ag-effectd` admin socket/enrollment and
   authorizes `health ag-effectd` plus the closed `effect` command family.
 
@@ -52,8 +52,8 @@ readiness: it does not change the deliberately conservative health responses.
 
 The effect authority boundary is visible in the command routing:
 
-- `agctl --config .../agctl-proposer.toml health agd` and `intent submit`
-  terminate at `agd` under the proposer identity;
+- `agctl --config .../agctl-proposer.toml health agd`, `intent submit`, and
+  `worker` operations terminate at `agd` under the proposer identity;
 - `agctl --config .../agctl.toml health ag-effectd`, `effect show`, `effect
   record`, `effect list`, `effect ratify`, `effect reconcile-draft`, and
   `effect reconcile` terminate directly at `ag-effectd` under the independent
@@ -63,6 +63,38 @@ There is no governor projection of proposal bytes or ratification. Provider
 health is not exposed to either CLI identity in v1: `ag-providerd` enrolls its
 service caller separately, so adding a convenient CLI route would broaden
 credential-proxy access.
+
+## Development worker operations
+
+The proposer profile may control the bounded generic-worker ingress:
+
+```text
+agctl --config /etc/agent-governor/agctl-proposer.toml \
+  worker launch REVIEWED_PROFILE_ID
+agctl --config /etc/agent-governor/agctl-proposer.toml \
+  worker show SESSION_ID
+agctl --config /etc/agent-governor/agctl-proposer.toml \
+  worker cancel SESSION_ID --reason sha256:<reviewed-reason-digest>
+```
+
+`worker launch` accepts a profile ID, never an executable path, argv, shell
+string, workspace, target, identity, or provider endpoint. The profile and
+durable session state supply those bindings. `worker show` reads the durable
+authority/custody record, including terminal state; it does not recreate the
+principal. `worker cancel` durably fences the principal before bounded process
+cleanup, and the reason is an exact caller-reviewed evidence digest.
+
+These commands are available only when `agd` has a development worker catalog.
+Production and high-assurance configurations reject that catalog. The launched
+worker does not call `agctl`: it receives a narrow ephemeral signing key and
+may emit only a signed candidate frame. `agd` authenticates and judges the
+candidate against the durable session and reviewed mapping, while `ag-effectd`
+alone creates the canonical proposal through the normal proposal socket.
+
+Only one live worker is admitted by this slice. A second launch and external
+proposal submission return a conflict while it is live; inspection and
+cancellation remain available. This keeps the retained process deadline under
+the governor's bounded polling loop and is not a multi-worker API.
 
 ## Exact inspection and ratification
 

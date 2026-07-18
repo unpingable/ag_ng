@@ -9,12 +9,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ag_effect::{
     CanonicalEffectV1, EFFECT_SCHEMA_V1, EffectCatalogV1, EffectCompilerV1, EffectError,
-    ProposalEventV1, ProposalStateV1, RECONCILIATION_EVIDENCE_SCHEMA_V1,
+    ProposalEventV1, ProposalIntentV1, ProposalStateV1, RECONCILIATION_EVIDENCE_SCHEMA_V1,
     RECONCILIATION_RECORD_SCHEMA_V1, RatificationV1, ReconciliationClassificationV1,
     ReconciliationEvidenceV1, ReconciliationRecordV1, TargetDefinitionV1, TargetId,
     TargetObservationV1,
 };
-use ag_primitives::{AuthorityDomain, Digest, Epoch, PrincipalChainV1};
+use ag_primitives::{
+    AuthorityDomain, Digest, Epoch, PrincipalChainNodeV1, PrincipalChainV1, PrincipalKindV1,
+};
+use ag_session::WorkerCandidateCustodyV1;
 use ag_store::{BlobDescriptorV1, NewEventV1, Store};
 use base64::Engine as _;
 use rustix::fs::{FileType, Mode, OFlags, ResolveFlags};
@@ -24,13 +27,16 @@ use thiserror::Error;
 use crate::api::{
     AgdRequestV1, ApiErrorCodeV1, ApiResultV1, ArtifactTransferV1, EFFECT_RECORD_SCHEMA_V1,
     EffectAdminRequestV1, EffectAdminResponseV1, EffectProposalRequestV1, EffectProposalResponseV1,
-    EffectRecordV1, HealthV1, ProposalIngressProofV1, ProposalSummaryV1,
+    EffectRecordV1, GovernedProposalIngressV1, HealthV1, ProposalSummaryV1,
+    WorkerCandidateRequestV1, WorkerCandidateSourceProofV1, worker_candidate_ingress_proof_digest,
 };
+#[cfg(test)]
+use crate::api::{ProposalIngressProofV1, WorkerCandidateIngressProofV1};
 use crate::config::{EffectTargetConfigV1, EffectdConfigV1, PeerPolicyV1};
 use crate::peer::signed_principal_chain;
 use crate::rpc_auth::{
-    RpcReplayGuardV1, VerifiedRpcPrincipalV1, record_forwarded_signed_request_freshness,
-    verify_forwarded_signed_request_bindings,
+    RpcReplayGuardV1, VerifiedRpcPrincipalV1, candidate_ingress_key_identity,
+    record_forwarded_signed_request_freshness, verify_forwarded_signed_request_bindings,
 };
 
 #[cfg(target_os = "linux")]
@@ -74,8 +80,8 @@ pub struct BrokerSubmissionRecordV1 {
     pub governor: VerifiedRpcPrincipalV1,
     /// Proposer chain reconstructed by effectd from the forwarded proof.
     pub proposer: PrincipalChainV1,
-    /// Exact originally verified proposer-to-governor exchange.
-    pub ingress_proof: ProposalIngressProofV1,
+    /// Exact originally verified governed proposal source.
+    pub ingress_proof: GovernedProposalIngressV1,
     /// Full broker-owned evaluation evidence. A digest-only response is never
     /// the sole custody for a refusal or operational failure.
     pub evaluation: BrokerEvaluationEvidenceV1,
@@ -471,7 +477,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
     #[allow(clippy::too_many_lines)]
     fn submit_authenticated_intent(
         &mut self,
-        ingress: &ProposalIngressProofV1,
+        ingress: &GovernedProposalIngressV1,
         artifacts: Vec<ArtifactTransferV1>,
         governor: &VerifiedRpcPrincipalV1,
         governor_chain: &PrincipalChainV1,
@@ -479,38 +485,13 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         if self.store.active_backup_cut()?.is_some() {
             return Err(BrokerError::Quiesced);
         }
-        let governor_enrollment = self.agd_policy.rpc_enrollment()?;
-        let proposer_enrollment = self.proposer_policy.rpc_enrollment()?;
-        let verified_proposer = verify_forwarded_signed_request_bindings(
-            &ingress.server_challenge,
-            &ingress.signed_request,
-            &governor_enrollment,
-            &proposer_enrollment,
-        )?;
-        let authenticated_proposer = signed_principal_chain(
-            &verified_proposer,
-            &self.proposer_policy,
-            self.authority_domain.clone(),
-            self.epoch,
-        )?;
-        let AgdRequestV1::SubmitProposal { intent } = &ingress.signed_request.request.body else {
-            return Err(BrokerError::ProposerProofMismatch);
-        };
-        let intent = intent.as_ref();
-        if intent.proposer != authenticated_proposer {
-            return Err(BrokerError::ProposerProofMismatch);
+        if matches!(ingress, GovernedProposalIngressV1::WorkerCandidate { .. })
+            && !artifacts.is_empty()
+        {
+            return Err(BrokerError::ArtifactTransferMismatch);
         }
-        let intent_digest = Digest::from_serializable(intent)?;
-        let source = Digest::from_serializable(&(
-            "ag.effect.authenticated-submission-key/v1",
-            &self.authority_domain,
-            self.epoch,
-            governor,
-            governor_chain,
-            &verified_proposer,
-            &authenticated_proposer,
-            &intent_digest,
-        ))?;
+        let (intent, authenticated_proposer, source) =
+            self.verify_governed_ingress_bindings(ingress, governor, governor_chain)?;
         if let Some(existing) = self
             .store
             .materialized_state::<BrokerSubmissionRecordV1>(&submission_entity(&source))?
@@ -542,28 +523,18 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             // Re-presenting the exact proof which created this durable record
             // is a result lookup, not a new authority use. This path is what
             // lets agd recover after effectd committed but its signed response
-            // was lost. A different proof for the same semantic source still
-            // has to be fresh and consume its replay entries.
+            // was lost. A worker session is one-shot, so any changed proof or
+            // candidate under that principal refuses. The static external
+            // path preserves its existing fresh-proof behavior.
             if existing.state.ingress_proof != *ingress {
-                record_forwarded_signed_request_freshness(
-                    &ingress.server_challenge,
-                    &ingress.signed_request,
-                    &governor_enrollment,
-                    &proposer_enrollment,
-                    &self.rpc_replay,
-                    now_u64()?,
-                )?;
+                if matches!(ingress, GovernedProposalIngressV1::WorkerCandidate { .. }) {
+                    return Err(BrokerError::WorkerSourceProofMismatch);
+                }
+                self.record_governed_ingress_freshness(ingress)?;
             }
             return Ok(existing.state.response);
         }
-        record_forwarded_signed_request_freshness(
-            &ingress.server_challenge,
-            &ingress.signed_request,
-            &governor_enrollment,
-            &proposer_enrollment,
-            &self.rpc_replay,
-            now_u64()?,
-        )?;
+        self.record_governed_ingress_freshness(ingress)?;
         if intent.authority_domain != self.authority_domain
             || intent.epoch != self.epoch
             || intent.proposer.authority_domain() != &self.authority_domain
@@ -577,11 +548,11 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         if self.ready_proposal_count()? >= self.max_ready_proposals as usize {
             return Err(BrokerError::ReadyLimit);
         }
-        self.install_transferred_artifacts(intent, artifacts)?;
+        self.install_governed_artifacts(&intent, ingress, artifacts)?;
 
         let proposal_id = stable_proposal_id(&source);
         let governor_authentication = source.clone();
-        let observations = match self.observe_intent(intent) {
+        let observations = match self.observe_intent(&intent) {
             Ok(observations) => observations,
             Err(error) => {
                 let failure_code = match &error {
@@ -613,7 +584,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         };
         let canonical = match self.compiler.compile(
             proposal_id.clone(),
-            intent,
+            &intent,
             &authenticated_proposer,
             governor_authentication,
             &observations,
@@ -662,6 +633,203 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             ingress.clone(),
             &canonical,
         )
+    }
+
+    fn verify_governed_ingress_bindings(
+        &self,
+        ingress: &GovernedProposalIngressV1,
+        governor: &VerifiedRpcPrincipalV1,
+        governor_chain: &PrincipalChainV1,
+    ) -> Result<(ProposalIntentV1, PrincipalChainV1, Digest), BrokerError> {
+        match ingress {
+            GovernedProposalIngressV1::ExternalSigned { proof } => {
+                let governor_enrollment = self.agd_policy.rpc_enrollment()?;
+                let proposer_enrollment = self.proposer_policy.rpc_enrollment()?;
+                let verified_proposer = verify_forwarded_signed_request_bindings(
+                    &proof.server_challenge,
+                    &proof.signed_request,
+                    &governor_enrollment,
+                    &proposer_enrollment,
+                )?;
+                let authenticated_proposer = signed_principal_chain(
+                    &verified_proposer,
+                    &self.proposer_policy,
+                    self.authority_domain.clone(),
+                    self.epoch,
+                )?;
+                let AgdRequestV1::SubmitProposal { intent } = &proof.signed_request.request.body
+                else {
+                    return Err(BrokerError::ProposerProofMismatch);
+                };
+                if intent.proposer != authenticated_proposer {
+                    return Err(BrokerError::ProposerProofMismatch);
+                }
+                let intent_digest = Digest::from_serializable(intent.as_ref())?;
+                let source = Digest::from_serializable(&(
+                    "ag.effect.authenticated-submission-key/v1",
+                    &self.authority_domain,
+                    self.epoch,
+                    governor,
+                    governor_chain,
+                    &verified_proposer,
+                    &authenticated_proposer,
+                    &intent_digest,
+                ))?;
+                Ok((intent.as_ref().clone(), authenticated_proposer, source))
+            }
+            GovernedProposalIngressV1::WorkerCandidate { intent, source } => self
+                .verify_worker_candidate_bindings(
+                    intent.as_ref(),
+                    source,
+                    governor,
+                    governor_chain,
+                ),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn verify_worker_candidate_bindings(
+        &self,
+        intent: &ProposalIntentV1,
+        source: &WorkerCandidateSourceProofV1,
+        governor: &VerifiedRpcPrincipalV1,
+        governor_chain: &PrincipalChainV1,
+    ) -> Result<(ProposalIntentV1, PrincipalChainV1, Digest), BrokerError> {
+        let proof = &source.ingress_proof;
+        let worker_id = source.worker.id();
+        if proof.governor_enrollment != self.agd_policy.rpc_key
+            || proof.worker_enrollment.principal != *worker_id.digest()
+            || source.worker.candidate_ingress_key_identity
+                != candidate_ingress_key_identity(&proof.worker_enrollment)?
+        {
+            return Err(BrokerError::WorkerSourceProofMismatch);
+        }
+        let worker_enrollment = crate::rpc_auth::RpcPeerEnrollmentV1::new(
+            worker_id.digest().clone(),
+            proof.worker_enrollment.clone(),
+        )?;
+        let governor_enrollment = crate::rpc_auth::RpcPeerEnrollmentV1::new(
+            proof.governor_enrollment.principal.clone(),
+            proof.governor_enrollment.clone(),
+        )?;
+        let verified_worker = verify_forwarded_signed_request_bindings(
+            &proof.server_challenge,
+            &proof.signed_request,
+            &governor_enrollment,
+            &worker_enrollment,
+        )?;
+        if verified_worker.principal != *worker_id.digest() {
+            return Err(BrokerError::WorkerSourceProofMismatch);
+        }
+
+        let governor_nodes = governor_chain.nodes();
+        let worker_nodes = source.worker_chain.nodes();
+        let Some(worker_leaf) = worker_nodes.last() else {
+            return Err(BrokerError::WorkerSourceProofMismatch);
+        };
+        if source.worker_chain.authority_domain() != &self.authority_domain
+            || source.worker_chain.epoch() != self.epoch
+            || worker_nodes.len() != governor_nodes.len().saturating_add(1)
+            || worker_nodes.get(..governor_nodes.len()) != Some(governor_nodes)
+            || worker_leaf
+                != &PrincipalChainNodeV1::child(
+                    worker_id.clone(),
+                    PrincipalKindV1::WorkerSession,
+                    governor_chain.leaf().principal_id.clone(),
+                )
+            || source.worker.launcher != governor_chain.leaf().principal_id
+        {
+            return Err(BrokerError::WorkerSourceProofMismatch);
+        }
+
+        if source.worker.authority_domain != self.authority_domain
+            || source.worker.epoch != self.epoch
+            || source.worker.proposal_workspace_identity != source.workspace_identity
+            || source.worker.output_budget_bytes == 0
+            || source.accepted_at_unix_ms >= source.worker.expires_at_unix_ms
+            || intent.proposer != source.worker_chain
+        {
+            return Err(BrokerError::WorkerSourceBindingMismatch);
+        }
+
+        let WorkerCandidateRequestV1::Submit {
+            candidate_nonce,
+            semantic_type,
+            content,
+        } = &proof.signed_request.request.body;
+        let byte_length =
+            u64::try_from(content.len()).map_err(|_| BrokerError::WorkerCandidateMismatch)?;
+        let content_digest = Digest::hash_bytes(content.as_slice());
+        let ingress_proof = worker_candidate_ingress_proof_digest(proof)?;
+        let custody = WorkerCandidateCustodyV1::new(
+            content_digest.clone(),
+            byte_length,
+            semantic_type.clone(),
+            None,
+            ingress_proof,
+        )?;
+        if *candidate_nonce != source.worker.session_nonce
+            || byte_length > source.worker.output_budget_bytes
+            || custody.custody_record != source.candidate_custody
+            || intent.admitted_artifacts != BTreeSet::from([content_digest])
+        {
+            return Err(BrokerError::WorkerCandidateMismatch);
+        }
+
+        let source_digest = Digest::from_serializable(&(
+            "ag.effect.worker-session-one-shot-submission-key/v1",
+            &self.authority_domain,
+            self.epoch,
+            governor,
+            governor_chain,
+            &verified_worker,
+            &source.worker,
+            &source.worker_chain,
+        ))?;
+        Ok((intent.clone(), source.worker_chain.clone(), source_digest))
+    }
+
+    fn record_governed_ingress_freshness(
+        &self,
+        ingress: &GovernedProposalIngressV1,
+    ) -> Result<(), BrokerError> {
+        let governor_enrollment = self.agd_policy.rpc_enrollment()?;
+        match ingress {
+            GovernedProposalIngressV1::ExternalSigned { proof } => {
+                let proposer_enrollment = self.proposer_policy.rpc_enrollment()?;
+                record_forwarded_signed_request_freshness(
+                    &proof.server_challenge,
+                    &proof.signed_request,
+                    &governor_enrollment,
+                    &proposer_enrollment,
+                    &self.rpc_replay,
+                    now_u64()?,
+                )?;
+            }
+            GovernedProposalIngressV1::WorkerCandidate { source, .. } => {
+                let proof = &source.ingress_proof;
+                if proof.governor_enrollment != self.agd_policy.rpc_key {
+                    return Err(BrokerError::WorkerSourceProofMismatch);
+                }
+                let governor_enrollment = crate::rpc_auth::RpcPeerEnrollmentV1::new(
+                    proof.governor_enrollment.principal.clone(),
+                    proof.governor_enrollment.clone(),
+                )?;
+                let worker_enrollment = crate::rpc_auth::RpcPeerEnrollmentV1::new(
+                    source.worker.id().digest().clone(),
+                    proof.worker_enrollment.clone(),
+                )?;
+                record_forwarded_signed_request_freshness(
+                    &proof.server_challenge,
+                    &proof.signed_request,
+                    &governor_enrollment,
+                    &worker_enrollment,
+                    &self.rpc_replay,
+                    source.accepted_at_unix_ms,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Handles one direct authenticated inspection/admin method.
@@ -1201,11 +1369,37 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         Ok(())
     }
 
-    fn install_transferred_artifacts(
+    fn install_governed_artifacts(
         &mut self,
         intent: &ag_effect::ProposalIntentV1,
+        ingress: &GovernedProposalIngressV1,
         artifacts: Vec<ArtifactTransferV1>,
     ) -> Result<(), BrokerError> {
+        if let GovernedProposalIngressV1::WorkerCandidate { source, .. } = ingress {
+            if !artifacts.is_empty() {
+                return Err(BrokerError::ArtifactTransferMismatch);
+            }
+            let WorkerCandidateRequestV1::Submit { content, .. } =
+                &source.ingress_proof.signed_request.request.body;
+            let byte_length =
+                u64::try_from(content.len()).map_err(|_| BrokerError::ArtifactTransferMismatch)?;
+            let digest = Digest::hash_bytes(content.as_slice());
+            if byte_length > self.max_artifact_bytes
+                || intent.admitted_artifacts != BTreeSet::from([digest.clone()])
+            {
+                return Err(BrokerError::ArtifactTransferMismatch);
+            }
+            self.store.install_blob(
+                &BlobDescriptorV1 {
+                    digest,
+                    byte_length,
+                },
+                &mut content.as_slice(),
+                now_i64()?,
+            )?;
+            return Ok(());
+        }
+
         let mut observed = BTreeSet::new();
         for transfer in artifacts {
             if !observed.insert(transfer.digest.clone())
@@ -1714,7 +1908,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         source: &Digest,
         governor: VerifiedRpcPrincipalV1,
         proposer: PrincipalChainV1,
-        ingress_proof: ProposalIngressProofV1,
+        ingress_proof: GovernedProposalIngressV1,
         canonical: &ag_effect::CanonicalEffectProposalV1,
     ) -> Result<EffectProposalResponseV1, BrokerError> {
         canonical.verify_digest()?;
@@ -2154,6 +2348,8 @@ fn broker_api_error<T>(error: &BrokerError) -> ApiResultV1<T> {
         | BrokerError::PrincipalChainsNotIndependent
         | BrokerError::AuthorityContextMismatch
         | BrokerError::ProposerProofMismatch
+        | BrokerError::WorkerSourceProofMismatch
+        | BrokerError::WorkerSourceBindingMismatch
         | BrokerError::RpcAuthentication(_) => ApiErrorCodeV1::Unauthorized,
         BrokerError::UnsupportedAuthorityFamily => ApiErrorCodeV1::UnsupportedAuthorityFamily,
         BrokerError::Observation(_) | BrokerError::ActivationNotReady => {
@@ -2162,10 +2358,12 @@ fn broker_api_error<T>(error: &BrokerError) -> ApiResultV1<T> {
         BrokerError::Effect(EffectError::InvalidTransition { .. })
         | BrokerError::ReconciliationStateUnresolved
         | BrokerError::ReconciliationNotRequired => ApiErrorCodeV1::Conflict,
-        BrokerError::Effect(_) | BrokerError::PlanTooLarge | BrokerError::ReadyLimit => {
-            ApiErrorCodeV1::InvalidRequest
-        }
-        BrokerError::ReconciliationEvidenceMismatch => ApiErrorCodeV1::InvalidRequest,
+        BrokerError::Effect(_)
+        | BrokerError::Session(_)
+        | BrokerError::WorkerCandidateMismatch
+        | BrokerError::PlanTooLarge
+        | BrokerError::ReadyLimit
+        | BrokerError::ReconciliationEvidenceMismatch => ApiErrorCodeV1::InvalidRequest,
         _ => ApiErrorCodeV1::Internal,
     };
     ApiResultV1::error(code, error.to_string())
@@ -2192,6 +2390,9 @@ pub enum BrokerError {
     /// Signed-RPC principal binding failed.
     #[error(transparent)]
     RpcAuthentication(#[from] crate::rpc_auth::RpcAuthError),
+    /// Worker-session custody contract failed strict validation.
+    #[error(transparent)]
+    Session(#[from] ag_session::SessionError),
     /// Local observation failed.
     #[error("effect observation failed: {0}")]
     Io(#[from] std::io::Error),
@@ -2215,6 +2416,15 @@ pub enum BrokerError {
     /// proposer and proposal intent.
     #[error("forwarded proposal does not match the end-to-end proposer proof")]
     ProposerProofMismatch,
+    /// Dynamic worker signature/enrollment or launcher-chain proof differs.
+    #[error("worker candidate does not match its authenticated principal proof")]
+    WorkerSourceProofMismatch,
+    /// Worker authority context, workspace, expiry, budget, or proposer differs.
+    #[error("worker candidate source does not match its durable session bindings")]
+    WorkerSourceBindingMismatch,
+    /// Candidate nonce, bytes, length, custody digest, or admitted artifact differs.
+    #[error("worker candidate bytes do not match governor custody and intent")]
+    WorkerCandidateMismatch,
     /// Submitted reconciliation bytes disagree with broker custody, the
     /// uncertainty boundary, or the independently observed target state.
     #[error("reconciliation evidence does not match broker-owned state")]
@@ -2266,7 +2476,12 @@ pub enum BrokerError {
 #[cfg(test)]
 mod tests {
     use ag_effect::{EFFECT_SCHEMA_V1, EffectIntentV1, ProposalIntentV1};
+    use ag_primitives::{
+        CgroupIdentity, ExecutableIdentityV1, HostCredentialObservationV1, LaunchProfileIdentityV1,
+        LifecycleNonce, ProjectId, SessionId, WorkerProviderRouteV1, WorkerSessionPrincipalV1,
+    };
     use ag_protocol::{RequestEnvelopeV1, RequestId};
+    use ag_session::WorkerCandidateCustodyV1;
     use ag_store::{StoreIdentityV1, WriterIdentityV1};
     use nix::unistd::{getegid, geteuid};
     use ring::rand::SystemRandom;
@@ -2311,6 +2526,424 @@ mod tests {
                     .expect("signed request"),
             ),
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn worker_candidate_source_is_verified_end_to_end_and_hostile_drift_refuses() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut config: EffectdConfigV1 =
+            toml::from_str(include_str!("../../../config/effectd.example.toml"))
+                .expect("effectd config");
+        config.store.database = directory.path().join("effectd.db");
+        config.store.object_store = directory.path().join("objects");
+        config.targets = vec![EffectTargetConfigV1::ManagedFile {
+            id: "managed-config".to_owned(),
+            path: directory.path().join("managed.conf"),
+            mode: 0o600,
+            uid: geteuid().as_raw(),
+            gid: getegid().as_raw(),
+        }];
+
+        let governor_signer = signer("worker-governor");
+        config.agd_peer.rpc_key = governor_signer
+            .enrollment(30_000)
+            .expect("governor enrollment")
+            .key;
+        let governor_peer = VerifiedRpcPrincipalV1 {
+            principal: config.agd_peer.rpc_key.principal.clone(),
+            key_id: config.agd_peer.rpc_key.key_id.clone(),
+        };
+        let domain = AuthorityDomain::parse(&config.authority_domain).expect("domain");
+        let epoch = Epoch::parse(&config.epoch).expect("epoch");
+        let governor_chain =
+            signed_principal_chain(&governor_peer, &config.agd_peer, domain.clone(), epoch)
+                .expect("governor chain");
+
+        let content = b"worker candidate content".to_vec();
+        let content_digest = Digest::hash_bytes(&content);
+        let workspace_identity = Digest::hash_bytes(b"workspace-inode-and-construction");
+        let session_nonce = LifecycleNonce::new([7; 16]);
+        // The broker is intentionally created well after this one-shot proof
+        // was accepted and the worker expired. A new replay guard models an
+        // effectd restart recovering a durably custodied candidate.
+        let broker_started_at = now_u64().expect("clock");
+        let accepted_at = broker_started_at.saturating_sub(600_000);
+        let worker_key_material =
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).expect("worker key");
+        let worker_key_id = RpcKeyIdV1::new("worker-session.v1").expect("worker key ID");
+        let provisional_worker_signer = RpcSignerV1::from_pkcs8_for_test(
+            Digest::hash_bytes(b"principal-not-yet-constructed"),
+            worker_key_id.clone(),
+            worker_key_material.as_ref(),
+        )
+        .expect("provisional worker signer");
+        let provisional_worker_policy = provisional_worker_signer
+            .enrollment(30_000)
+            .expect("provisional worker enrollment")
+            .key;
+        let candidate_key_identity =
+            candidate_ingress_key_identity(&provisional_worker_policy).expect("candidate key ID");
+        let worker = WorkerSessionPrincipalV1 {
+            authority_domain: domain.clone(),
+            epoch,
+            project: ProjectId::parse("fixture-project").expect("project"),
+            session_id: SessionId::parse("fixture-session").expect("session"),
+            session_nonce,
+            launcher: governor_chain.leaf().principal_id.clone(),
+            executable: ExecutableIdentityV1::new(
+                Digest::hash_bytes(b"fixture-worker-executable"),
+                4096,
+                None,
+            ),
+            launch_profile: LaunchProfileIdentityV1::new(
+                Digest::hash_bytes(b"fixed-argv-launch-profile"),
+                Digest::hash_bytes(b"candidate-protocol-schema"),
+            ),
+            proposal_workspace_identity: workspace_identity.clone(),
+            security_profile_identity: Digest::hash_bytes(b"development-profile"),
+            candidate_ingress_key_identity: candidate_key_identity,
+            expires_at_unix_ms: accepted_at.saturating_add(60_000),
+            output_budget_bytes: content.len() as u64,
+            provider_route: WorkerProviderRouteV1::Offline,
+            input_set_digest: Digest::hash_bytes(b"reviewed-input-set"),
+            observed_credentials: HostCredentialObservationV1 {
+                uid: 65_534,
+                gid: 65_534,
+                pid: 4242,
+                cgroup: CgroupIdentity::parse("ag-worker/fixture-session").expect("cgroup"),
+            },
+        };
+        assert!(worker.expires_at_unix_ms < broker_started_at);
+        let worker_signer = RpcSignerV1::from_pkcs8_for_test(
+            worker.id().digest().clone(),
+            worker_key_id,
+            worker_key_material.as_ref(),
+        )
+        .expect("worker signer");
+        let worker_enrollment = worker_signer
+            .enrollment(30_000)
+            .expect("worker enrollment")
+            .key;
+        assert_eq!(
+            candidate_ingress_key_identity(&worker_enrollment).expect("final candidate key ID"),
+            worker.candidate_ingress_key_identity
+        );
+        let mut worker_nodes = governor_chain.nodes().to_vec();
+        worker_nodes.push(PrincipalChainNodeV1::child(
+            worker.id(),
+            PrincipalKindV1::WorkerSession,
+            governor_chain.leaf().principal_id.clone(),
+        ));
+        let worker_chain =
+            PrincipalChainV1::new(domain.clone(), epoch, worker_nodes).expect("worker chain");
+        let challenge = governor_signer
+            .issue_challenge(
+                &worker_signer.enrollment(30_000).expect("worker enrollment"),
+                accepted_at,
+            )
+            .expect("worker challenge");
+        let candidate_request = RequestEnvelopeV1::new(
+            RequestId::new("worker-candidate-1").expect("request ID"),
+            WorkerCandidateRequestV1::Submit {
+                candidate_nonce: session_nonce,
+                semantic_type: "managed_file_content".to_owned(),
+                content: crate::api::OpaqueBytesV1::new(content.clone()),
+            },
+        )
+        .expect("candidate request");
+        let signed_request = worker_signer
+            .sign_request(candidate_request, &challenge, accepted_at)
+            .expect("signed worker request");
+        let ingress_proof = WorkerCandidateIngressProofV1 {
+            governor_enrollment: config.agd_peer.rpc_key.clone(),
+            worker_enrollment,
+            server_challenge: challenge,
+            signed_request: Box::new(signed_request),
+        };
+        let ingress_proof_digest =
+            worker_candidate_ingress_proof_digest(&ingress_proof).expect("ingress proof");
+        assert_eq!(
+            Digest::hash_bytes(
+                &ingress_proof
+                    .canonical_bytes()
+                    .expect("canonical proof bytes")
+            ),
+            ingress_proof_digest
+        );
+        let candidate_custody = WorkerCandidateCustodyV1::new(
+            content_digest.clone(),
+            content.len() as u64,
+            "managed_file_content",
+            None,
+            ingress_proof_digest,
+        )
+        .expect("candidate custody")
+        .custody_record;
+        let intent = ProposalIntentV1 {
+            schema: EFFECT_SCHEMA_V1.to_owned(),
+            intent_id: "worker-intent-1".to_owned(),
+            authority_domain: domain,
+            epoch,
+            proposer: worker_chain.clone(),
+            judgment: Digest::hash_bytes(b"agd-constructed-admission"),
+            admitted_artifacts: BTreeSet::from([content_digest.clone()]),
+            effects: vec![EffectIntentV1::ManagedFilePut {
+                target: TargetId::parse("managed-config").expect("target"),
+                content: content_digest.clone(),
+            }],
+        };
+        let worker_source = WorkerCandidateSourceProofV1 {
+            worker,
+            worker_chain: worker_chain.clone(),
+            ingress_proof,
+            session_binding: Digest::hash_bytes(b"immutable-session-spec"),
+            workspace_identity,
+            launch_receipt: Digest::hash_bytes(b"descriptor-bound-launch"),
+            candidate_custody,
+            accepted_at_unix_ms: accepted_at,
+        };
+        let ingress = GovernedProposalIngressV1::WorkerCandidate {
+            intent: Box::new(intent),
+            source: Box::new(worker_source),
+        };
+
+        let store = Store::open(
+            &config.store.database,
+            &config.store.object_store,
+            StoreIdentityV1::current(0x4147_4554, "effectd-worker-source-test")
+                .expect("store identity"),
+            &WriterIdentityV1 {
+                writer_id: "effectd-worker-source-writer".to_owned(),
+                principal_digest: Digest::hash_bytes(b"effectd-worker-source-writer"),
+                process_nonce: "effectd-worker-source-nonce".to_owned(),
+                claimed_at_unix_ms: 1,
+            },
+        )
+        .expect("store");
+        let replay = Arc::new(RpcReplayGuardV1::new(64).expect("replay"));
+        let catalog_identity =
+            configured_catalog_identity(&config.targets).expect("catalog identity");
+        let mut broker = EffectBrokerV1::new(
+            &config,
+            &catalog_identity,
+            store,
+            RefusingEffectRunnerV1,
+            replay,
+        )
+        .expect("broker");
+
+        let verified = broker
+            .verify_governed_ingress_bindings(&ingress, &governor_peer, &governor_chain)
+            .expect("valid worker proof");
+        assert_eq!(verified.1, worker_chain);
+
+        let mut forged_key = ingress.clone();
+        let GovernedProposalIngressV1::WorkerCandidate { source, .. } = &mut forged_key else {
+            unreachable!();
+        };
+        let attacker = signer("worker-attacker");
+        source.ingress_proof.worker_enrollment.public_key = attacker
+            .enrollment(30_000)
+            .expect("attacker enrollment")
+            .key
+            .public_key;
+        assert!(matches!(
+            broker.verify_governed_ingress_bindings(&forged_key, &governor_peer, &governor_chain),
+            Err(BrokerError::WorkerSourceProofMismatch)
+        ));
+
+        let mut wrong_governor_challenge_policy = ingress.clone();
+        let GovernedProposalIngressV1::WorkerCandidate { source, .. } =
+            &mut wrong_governor_challenge_policy
+        else {
+            unreachable!();
+        };
+        source
+            .ingress_proof
+            .governor_enrollment
+            .maximum_clock_skew_ms += 1;
+        assert!(matches!(
+            broker.verify_governed_ingress_bindings(
+                &wrong_governor_challenge_policy,
+                &governor_peer,
+                &governor_chain
+            ),
+            Err(BrokerError::WorkerSourceProofMismatch)
+        ));
+
+        let mut wrong_enrollment_identity = ingress.clone();
+        let GovernedProposalIngressV1::WorkerCandidate { source, .. } =
+            &mut wrong_enrollment_identity
+        else {
+            unreachable!();
+        };
+        source.worker.candidate_ingress_key_identity =
+            Digest::hash_bytes(b"unrelated-candidate-key-policy");
+        assert!(matches!(
+            broker.verify_governed_ingress_bindings(
+                &wrong_enrollment_identity,
+                &governor_peer,
+                &governor_chain
+            ),
+            Err(BrokerError::WorkerSourceProofMismatch)
+        ));
+
+        let mut wrong_chain = ingress.clone();
+        let GovernedProposalIngressV1::WorkerCandidate { source, .. } = &mut wrong_chain else {
+            unreachable!();
+        };
+        source.worker_chain = governor_chain.clone();
+        assert!(matches!(
+            broker.verify_governed_ingress_bindings(&wrong_chain, &governor_peer, &governor_chain),
+            Err(BrokerError::WorkerSourceProofMismatch)
+        ));
+
+        let mut wrong_workspace = ingress.clone();
+        let GovernedProposalIngressV1::WorkerCandidate { source, .. } = &mut wrong_workspace else {
+            unreachable!();
+        };
+        source.workspace_identity = Digest::hash_bytes(b"other-workspace");
+        assert!(matches!(
+            broker.verify_governed_ingress_bindings(
+                &wrong_workspace,
+                &governor_peer,
+                &governor_chain
+            ),
+            Err(BrokerError::WorkerSourceBindingMismatch)
+        ));
+
+        let mut expired = ingress.clone();
+        let GovernedProposalIngressV1::WorkerCandidate { source, .. } = &mut expired else {
+            unreachable!();
+        };
+        source.accepted_at_unix_ms = source.worker.expires_at_unix_ms;
+        assert!(matches!(
+            broker.verify_governed_ingress_bindings(&expired, &governor_peer, &governor_chain),
+            Err(BrokerError::WorkerSourceBindingMismatch)
+        ));
+
+        let mut wrong_candidate = ingress.clone();
+        let GovernedProposalIngressV1::WorkerCandidate { source, .. } = &mut wrong_candidate else {
+            unreachable!();
+        };
+        source.candidate_custody = WorkerCandidateCustodyV1::new(
+            content_digest.clone(),
+            content.len() as u64,
+            "managed_file_content",
+            None,
+            Digest::hash_bytes(b"different-authenticated-ingress-proof"),
+        )
+        .expect("wrong proof custody")
+        .custody_record;
+        assert!(matches!(
+            broker.verify_governed_ingress_bindings(
+                &wrong_candidate,
+                &governor_peer,
+                &governor_chain
+            ),
+            Err(BrokerError::WorkerCandidateMismatch)
+        ));
+
+        let mut changed_valid_proof = ingress.clone();
+        let GovernedProposalIngressV1::WorkerCandidate { source, .. } = &mut changed_valid_proof
+        else {
+            unreachable!();
+        };
+        let changed_challenge = governor_signer
+            .issue_challenge(
+                &worker_signer
+                    .enrollment(30_000)
+                    .expect("changed worker enrollment"),
+                accepted_at,
+            )
+            .expect("changed challenge");
+        let changed_request = RequestEnvelopeV1::new(
+            RequestId::new("worker-candidate-2").expect("changed request ID"),
+            WorkerCandidateRequestV1::Submit {
+                candidate_nonce: session_nonce,
+                semantic_type: "managed_file_content".to_owned(),
+                content: crate::api::OpaqueBytesV1::new(content.clone()),
+            },
+        )
+        .expect("changed request");
+        let changed_signed_request = worker_signer
+            .sign_request(changed_request, &changed_challenge, accepted_at)
+            .expect("changed signed request");
+        source.ingress_proof = WorkerCandidateIngressProofV1 {
+            governor_enrollment: config.agd_peer.rpc_key.clone(),
+            worker_enrollment: worker_signer
+                .enrollment(30_000)
+                .expect("changed worker enrollment")
+                .key,
+            server_challenge: changed_challenge,
+            signed_request: Box::new(changed_signed_request),
+        };
+        source.candidate_custody = WorkerCandidateCustodyV1::new(
+            content_digest.clone(),
+            content.len() as u64,
+            "managed_file_content",
+            None,
+            worker_candidate_ingress_proof_digest(&source.ingress_proof)
+                .expect("changed proof digest"),
+        )
+        .expect("changed proof custody")
+        .custody_record;
+
+        let artifact = ArtifactTransferV1 {
+            digest: content_digest.clone(),
+            byte_length: content.len() as u64,
+            content_base64: base64::engine::general_purpose::STANDARD.encode(&content),
+        };
+        let GovernedProposalIngressV1::WorkerCandidate { intent, .. } = &ingress else {
+            unreachable!();
+        };
+        assert!(matches!(
+            broker.install_governed_artifacts(intent, &ingress, vec![artifact.clone()]),
+            Err(BrokerError::ArtifactTransferMismatch)
+        ));
+        let exact_retry_ingress = ingress.clone();
+        let response = broker.handle_proposal(
+            EffectProposalRequestV1::SubmitAuthenticatedIntent {
+                ingress: Box::new(ingress),
+                artifacts: Vec::new(),
+            },
+            &governor_peer,
+        );
+        assert!(matches!(
+            response,
+            ApiResultV1::Ok {
+                response: EffectProposalResponseV1::Canonicalized { .. }
+            }
+        ));
+        assert!(matches!(
+            broker.submit_authenticated_intent(
+                &changed_valid_proof,
+                Vec::new(),
+                &governor_peer,
+                &governor_chain
+            ),
+            Err(BrokerError::WorkerSourceProofMismatch)
+        ));
+        assert!(matches!(
+            broker.submit_authenticated_intent(
+                &exact_retry_ingress,
+                vec![artifact],
+                &governor_peer,
+                &governor_chain
+            ),
+            Err(BrokerError::ArtifactTransferMismatch)
+        ));
+        let exact_retry = broker.handle_proposal(
+            EffectProposalRequestV1::SubmitAuthenticatedIntent {
+                ingress: Box::new(exact_retry_ingress),
+                artifacts: Vec::new(),
+            },
+            &governor_peer,
+        );
+        assert_eq!(response, exact_retry);
+        assert_eq!(broker.store.entity_ids("proposal-", 10).unwrap().len(), 1);
+        assert_eq!(broker.store.entity_ids("submission-", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -2409,26 +3042,32 @@ mod tests {
         );
         let first = broker.handle_proposal(
             EffectProposalRequestV1::SubmitAuthenticatedIntent {
-                ingress: Box::new(original_ingress.clone()),
+                ingress: Box::new(GovernedProposalIngressV1::ExternalSigned {
+                    proof: Box::new(original_ingress.clone()),
+                }),
                 artifacts: vec![artifact.clone()],
             },
             &governor_peer,
         );
         let exact_retry = broker.handle_proposal(
             EffectProposalRequestV1::SubmitAuthenticatedIntent {
-                ingress: Box::new(original_ingress),
+                ingress: Box::new(GovernedProposalIngressV1::ExternalSigned {
+                    proof: Box::new(original_ingress),
+                }),
                 artifacts: vec![artifact.clone()],
             },
             &governor_peer,
         );
         let second = broker.handle_proposal(
             EffectProposalRequestV1::SubmitAuthenticatedIntent {
-                ingress: Box::new(ingress(
-                    &governor_signer,
-                    &proposer_signer,
-                    intent,
-                    "submission-2",
-                )),
+                ingress: Box::new(GovernedProposalIngressV1::ExternalSigned {
+                    proof: Box::new(ingress(
+                        &governor_signer,
+                        &proposer_signer,
+                        intent,
+                        "submission-2",
+                    )),
+                }),
                 artifacts: vec![artifact],
             },
             &governor_peer,

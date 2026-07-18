@@ -8,7 +8,10 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use crate::{AuthorityDomainId, Digest, EpochId, JcsDocument, LifecycleNonce};
+use crate::{
+    AuthorityDomainId, Digest, EpochId, InferenceBudgetV1, InferenceEnvelopeV1, JcsDocument,
+    LifecycleNonce,
+};
 
 const MAX_NAME_LENGTH: usize = 128;
 
@@ -178,6 +181,27 @@ pub struct HostCredentialObservationV1 {
     pub cgroup: CgroupIdentity,
 }
 
+/// Provider access bound into one worker-session principal.
+///
+/// The constrained variant contains only configured, credential-free policy.
+/// Provider credentials and arbitrary network endpoints are structurally
+/// absent.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "route", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerProviderRouteV1 {
+    /// The worker has no provider channel or inference capability.
+    Offline,
+    /// The worker may use exactly one constrained provider policy envelope.
+    Constrained {
+        /// Exact root-owned provider-policy revision.
+        provider_policy_digest: Digest,
+        /// Closed endpoint/model/method/protocol envelope.
+        envelope: InferenceEnvelopeV1,
+        /// Maximum cumulative provider use.
+        budget: InferenceBudgetV1,
+    },
+}
+
 /// Current lifecycle state of an enrolled operator or service principal.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -264,9 +288,10 @@ pub struct ServicePrincipalV1 {
 
 /// A contained, transient worker session principal.
 ///
-/// The recycled Linux UID/PID are merely observations. Stable identity comes
-/// from the session nonce, launcher lineage, admitted executable/profile, and
-/// exact input set.
+/// Recycled Linux UID/PID values are not sufficient identities by themselves.
+/// They remain bound observations inside the full principal identity, whose
+/// non-reusability comes from the session nonce, launcher lineage, admitted
+/// executable/profile, workspace, key policy, and exact input set.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerSessionPrincipalV1 {
@@ -286,6 +311,18 @@ pub struct WorkerSessionPrincipalV1 {
     pub executable: ExecutableIdentityV1,
     /// Exact containment/launch profile.
     pub launch_profile: LaunchProfileIdentityV1,
+    /// Exact proposal-workspace construction identity.
+    pub proposal_workspace_identity: Digest,
+    /// Exact deployment security-profile identity.
+    pub security_profile_identity: Digest,
+    /// Exact reviewed candidate signing-key binding, excluding this principal ID.
+    pub candidate_ingress_key_identity: Digest,
+    /// Exclusive end of this principal's lifetime, Unix milliseconds.
+    pub expires_at_unix_ms: u64,
+    /// Maximum candidate bytes accepted across worker output sinks.
+    pub output_budget_bytes: u64,
+    /// Explicit constrained provider route or reviewed offline mode.
+    pub provider_route: WorkerProviderRouteV1,
     /// Digest of the complete admitted input set.
     pub input_set_digest: Digest,
     /// Transient host credential observations.
@@ -307,7 +344,7 @@ pub enum PrincipalV1 {
     /// Independently enrolled local service.
     Service(ServicePrincipalV1),
     /// Contained worker session.
-    WorkerSession(WorkerSessionPrincipalV1),
+    WorkerSession(Box<WorkerSessionPrincipalV1>),
 }
 
 impl PrincipalV1 {
@@ -404,7 +441,13 @@ macro_rules! principal_id_method {
 principal_id_method!(OperatorPrincipalV1, Operator);
 principal_id_method!(DaemonPrincipalV1, Daemon);
 principal_id_method!(ServicePrincipalV1, Service);
-principal_id_method!(WorkerSessionPrincipalV1, WorkerSession);
+impl WorkerSessionPrincipalV1 {
+    /// Returns the stable, fully bound principal identity.
+    #[must_use]
+    pub fn id(&self) -> PrincipalId {
+        PrincipalV1::WorkerSession(Box::new(self.clone())).id()
+    }
+}
 
 /// Closed principal-kind tag retained in a lineage chain.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -789,6 +832,7 @@ fn validate_chain(nodes: &[PrincipalChainNodeV1]) -> Result<(), PrincipalChainEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{InferenceMethodId, ModelId, ProviderEndpointId};
 
     fn digest(label: &str) -> Digest {
         Digest::hash_bytes(label.as_bytes())
@@ -821,6 +865,49 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn worker_principal() -> WorkerSessionPrincipalV1 {
+        WorkerSessionPrincipalV1 {
+            authority_domain: domain(),
+            epoch: epoch(),
+            project: ProjectId::new("project-alpha").unwrap(),
+            session_id: SessionId::new("session-1").unwrap(),
+            session_nonce: LifecycleNonce::new([3; 16]),
+            launcher: principal_id("agd-launcher"),
+            executable: ExecutableIdentityV1::new(digest("worker-exe"), 128, None),
+            launch_profile: LaunchProfileIdentityV1::new(
+                digest("worker-profile"),
+                digest("worker-protocol"),
+            ),
+            proposal_workspace_identity: digest("proposal-workspace"),
+            security_profile_identity: digest("security-profile"),
+            candidate_ingress_key_identity: digest("candidate-ingress-key-identity"),
+            expires_at_unix_ms: 20_000,
+            output_budget_bytes: 4096,
+            provider_route: WorkerProviderRouteV1::Constrained {
+                provider_policy_digest: digest("provider-policy"),
+                envelope: InferenceEnvelopeV1 {
+                    endpoint: ProviderEndpointId::new("fixture:primary").unwrap(),
+                    model: ModelId::new("fixture-model").unwrap(),
+                    method: InferenceMethodId::new("complete").unwrap(),
+                    protocol_digest: digest("provider-protocol"),
+                },
+                budget: InferenceBudgetV1 {
+                    requests: 2,
+                    input_bytes: 1024,
+                    output_bytes: 2048,
+                    cost_microunits: 10,
+                },
+            },
+            input_set_digest: digest("input-set"),
+            observed_credentials: HostCredentialObservationV1 {
+                uid: 900,
+                gid: 901,
+                pid: 902,
+                cgroup: CgroupIdentity::new("worker-1.scope").unwrap(),
+            },
+        }
     }
 
     #[test]
@@ -856,6 +943,49 @@ mod tests {
         let mut reused_uid = daemon;
         reused_uid.service_instance_nonce = LifecycleNonce::new([2; 16]);
         assert_ne!(original, reused_uid.id());
+    }
+
+    #[test]
+    fn worker_principal_id_binds_workspace_profile_expiry_budgets_and_route() {
+        let worker = worker_principal();
+        let original = worker.id();
+
+        let mut changed = worker.clone();
+        changed.proposal_workspace_identity = digest("other-workspace");
+        assert_ne!(changed.id(), original);
+
+        let mut changed = worker.clone();
+        changed.security_profile_identity = digest("other-profile");
+        assert_ne!(changed.id(), original);
+
+        let mut changed = worker.clone();
+        changed.candidate_ingress_key_identity = digest("other-ingress-key-identity");
+        assert_ne!(changed.id(), original);
+
+        let mut changed = worker.clone();
+        changed.expires_at_unix_ms += 1;
+        assert_ne!(changed.id(), original);
+
+        let mut changed = worker.clone();
+        changed.output_budget_bytes += 1;
+        assert_ne!(changed.id(), original);
+
+        let mut changed = worker;
+        changed.provider_route = WorkerProviderRouteV1::Offline;
+        assert_ne!(changed.id(), original);
+    }
+
+    #[test]
+    fn worker_provider_route_roundtrips_strictly() {
+        let worker = worker_principal();
+        let json = serde_json::to_value(&worker).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WorkerSessionPrincipalV1>(json.clone()).unwrap(),
+            worker
+        );
+        let mut with_unknown = json;
+        with_unknown["provider_route"]["credential"] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<WorkerSessionPrincipalV1>(with_unknown).is_err());
     }
 
     #[test]

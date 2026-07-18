@@ -18,11 +18,18 @@ Known blockers in the current tree include:
   transition;
 - effectd does not yet prove that every configured target equals the effective
   systemd `ReadWritePaths` sandbox before readiness;
-- admitted worker/check wrappers and one-shot launch-record consumption do not
-  exist and their unit templates are therefore not packaged;
+- a development-only, offline, fixed-profile Bubblewrap worker ingress now
+  mints and tombstones durable `WorkerSessionPrincipal` records and accepts
+  only authenticated candidate material; it enforces one live worker, checked
+  reaping, typed refusal tombstones, exact dynamic-key proof, and durable broker
+  outcomes, but it is deliberately rejected by
+  production/high-assurance configuration; the packaged agd unit cannot host
+  it, and production worker/check wrappers, sandbox attestation, and one-shot
+  launch-record consumption do not exist, so both templates remain withheld;
 - providerd is signed-agd-proxy-only, while the session ingress/proxy path does
   not yet prove the live `WorkerSessionPrincipal` before spending its committed
-  provider capability;
+  provider capability; the implemented worker slice is offline rather than a
+  provider-capability workaround;
 - `agctl doctor` implements a fail-closed configuration/custody/effective-unit
   audit, but kernel-feature attestation, a daemon activation-level readiness
   contract, and watchdog heartbeats are not implemented (`Type=exec`
@@ -124,6 +131,13 @@ worktrees, and classic command/API/database compatibility are out of scope.
   external outcome becomes indeterminate/reconciliation and never auto-retry.
 
 ## Worker and provider gates
+
+The development Bubblewrap slice exercises fixed-profile launch, authenticated
+candidate custody, durable transient-principal binding, terminal tombstones,
+checked process cleanup, typed refusals, and broker-owned canonical
+compilation. It does not close any production gate
+below; those gates require the production wrapper, sandbox/host attestation,
+provider relation, and full qualification matrix.
 
 - [ ] Worker source/artifact/delta custody uses independent repositories or
   snapshots and contains no governed target mount or hidden checkout sync.

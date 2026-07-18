@@ -16,6 +16,23 @@ This repository does not preserve the classic command, API, database, or
 authority-token surfaces. The Rust-only frozen archive verifier treats classic
 files as bounded opaque evidence and never imports them as runtime authority.
 
+The current tree also contains one deliberately bounded live-worker slice. In
+the `development` security profile, `agd` can launch an offline worker selected
+from a root-reviewed fixed executable/argv catalog inside a private Bubblewrap
+proposal workspace. The worker receives a non-transferable session identity
+and may return only authenticated candidate material; `agd` reconstructs the
+reviewed mapping and `ag-effectd` still owns compilation and persistence of the
+canonical proposal. Session authority is durably bound and tombstoned rather
+than recreated after exit or restart. This slice admits exactly one live worker
+at a time; while it is live, `agd` refuses other blocking proposal/launch work
+so deadline supervision cannot be starved.
+
+This is not a production containment claim. `production` and
+`high_assurance` configurations reject the development launcher, and the
+packaged `agd.service` namespace restrictions are not a host for it. Provider
+adapters, managed-pointer promotion, typed systemd effects, admitted check
+launch, and production worker qualification remain pending.
+
 See `docs/architecture.md` and `docs/source-baseline.md` for the implementation
 contract and source custody. Operational reviewers should also read
 `docs/deployment.md`, `docs/backup-restore.md`, and

@@ -226,7 +226,8 @@ support exact replay evidence. Providerd deletes plaintext after confirmed
 delivery and burns the peer/session-bound capability when the session ends.
 
 The current v1 provider socket enrolls only agd's signed proxy identity. The
-session ingress/proxy path does not yet prove the live
+implemented generic-worker slice is explicitly offline and cannot select a
+provider route. The session ingress/proxy path still does not prove the live
 `WorkerSessionPrincipal` before spending its committed provider capability.
 Provider inference is therefore a release blocker; do not substitute “request
 came from agd” for the missing worker/session/peer relation or expose the
@@ -234,17 +235,54 @@ provider socket directly to a group.
 
 ## Workers and admitted checks
 
-Workers are one-shot, noninteractive systemd instances with `DynamicUser=yes`,
-a private network namespace, no capabilities, no device access, a closed system
-call envelope, bounded time/tasks/memory/CPU, and an independent repository or
-snapshot. There is no PTY, pause/resume, arbitrary input, linked worktree,
-governed target mount, or direct checkout synchronization.
+The current implementation has one development-only offline worker path. A
+root-owned `agd` configuration defines a closed profile ID, exact executable
+bytes, fixed argv, semantic type, managed-file target mapping, runtime limit,
+and output budget. The caller selects the profile ID only. `agd` creates an
+independent proposal workspace, durably mints the bound
+`WorkerSessionPrincipal`, and launches the executable under Bubblewrap with an
+empty ambient environment, a private network namespace, read-only `/usr`, and
+the proposal workspace as its only writable host-filesystem bind. There is no
+shell string, implicit `PATH`, worker-selected executable or target,
+governed-target working directory, PTY, or provider route.
 
-The worker/check templates are source artifacts only until their Rust wrappers
-and root-owned launch-record protocol exist. When admitted, each wrapper must
-receive a single opaque instance identifier, resolve it once, reject replay,
-verify exact executable and launch-profile bytes, pass only declared helper
-descriptors, and close every unintended inherited descriptor.
+The development catalog is deliberately single-worker: configuration requires
+`max_active_sessions = 1`, and `agd` refuses another launch or an external
+proposal submission while that worker is live. This is a deadline-isolation
+fence, not a claim of multi-worker scheduling. The worker executable must be a
+native ELF image; shebang/startup scripts and implicit interpreter lookup are
+rejected. Exact retained-descriptor bytes, inode metadata, and launch profile
+are rechecked immediately before spawn.
+
+The only per-session credential delivered to the worker is its ephemeral
+candidate-ingress signing key and public bootstrap. That key is bound to the
+session, workspace, launcher lineage, expiry, budget, and activation context;
+it conveys no authority to create canonical proposals, ratify, admit, or
+execute an effect. Candidate output is accepted only through the authenticated
+protocol and then mapped from durable reviewed state. Effectd—not the worker
+and not a worker-supplied record—compiles and persists canonical proposal
+bytes. Exit, timeout, cancellation, budget failure, and restart recovery leave
+a durable terminal tombstone; inspection cannot silently recreate authority.
+Cleanup is marked complete only after confirmed process reaping. The governor
+challenge enrollment and skew policy travel in the authenticated ingress proof
+and must exactly match effectd's enrolled `agd` policy; a worker profile cannot
+outlive that window. Candidate bytes are transferred to effectd once, inside
+the proof, and all three broker terminal outcomes are recorded durably.
+
+This path is enabled only by `security_profile = "development"`.
+Configuration validation rejects it in `production` and `high_assurance`.
+The packaged `agd.service` also has `RestrictNamespaces=yes`, so it
+intentionally cannot host this in-process Bubblewrap launcher. Do not weaken
+that unit to make the development path run and do not interpret a manual
+development launch as systemd, cgroup, LSM, or distribution qualification.
+
+The source-side `ag-worker@.service` remains the intended production-shaped
+DynamicUser design, but it is withheld from packages until a separately
+attested wrapper and root-owned one-shot launch-record protocol exist. The
+`ag-check@.service` design is likewise withheld: admitted check launch is not
+implemented by this slice. Future wrappers must resolve one opaque instance,
+reject replay, verify exact executable and launch-profile bytes, pass only
+declared helper descriptors, and close every unintended inherited descriptor.
 
 ## Startup and observability
 

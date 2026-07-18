@@ -80,11 +80,21 @@ opens the credential mount and file through bounded no-symlink descriptors and
 accepts only a protected, single-link regular file owned by root or the daemon
 UID; group/other permissions and reads above 64 KiB are rejected.
 
-`ag-worker@.service` and `ag-check@.service` describe dynamic, batch-only
-containment. They are not in the package install manifest until their admitted
-wrappers exist. The wrapper must resolve `%i` through a root-owned one-shot
-launch record, pin exact executable bytes and launch profile, pass only named
-file descriptors, close all unintended descriptors, and make replay fail.
+The current generic-worker ingress is an in-process, offline Bubblewrap launch
+inside `agd`, accepted only by the `development` security profile. It does not
+use `ag-worker@.service`, and it is not a production deployment path. In
+particular, the packaged `agd.service` has `RestrictNamespaces=yes`, which
+intentionally prevents that development launcher from creating its namespaces.
+Do not relax the packaged unit and then describe the result as qualified
+containment.
+
+`ag-worker@.service` and `ag-check@.service` remain source-side descriptions of
+future dynamic, batch-only containment. They are not in the package install
+manifest until their separately admitted wrappers exist. A production worker
+wrapper must resolve `%i` through a root-owned one-shot launch record, pin exact
+executable bytes and launch profile, pass only named file descriptors, close
+all unintended descriptors, and make replay fail. Admitted check launch is not
+implemented by the development worker slice.
 
 All service output goes to journald. No file log is created, so installing a
 logrotate policy would be misleading; journal retention is configured through

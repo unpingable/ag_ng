@@ -28,8 +28,11 @@ operator-created enrollment/configuration content.
 
 Withheld from packages:
 
-- `ag-worker@.service` until the admitted one-shot worker wrapper exists;
+- `ag-worker@.service` until a production-attested one-shot worker wrapper
+  exists; the development-only in-process Bubblewrap launcher does not use or
+  qualify this unit;
 - `ag-check@.service` until the separately owned verifier wrapper exists;
-- any helper binary until exact-byte and launch-profile admission is wired;
+- any production worker/check helper binary until its exact-byte,
+  launch-profile, and one-shot admission path is wired and qualified;
 - compatibility aliases named `ag` or `governor` (permanently excluded);
 - logrotate configuration because services emit only to journald.
