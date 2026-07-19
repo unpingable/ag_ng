@@ -41,14 +41,19 @@ of `/usr/bin/systemctl show`. Both the property names and unit arguments
 in; no TOML or command-line value becomes a command surface. Doctor requires
 the exact service user/group, `ExecStart`, network/address-family envelope, and
 capability bound. It also requires every effectd managed-file parent to be
-covered by effective `ReadWritePaths=` and rejects writable entries broader
-than the enrolled state/target roots.
+part of an exact effective `ReadWritePaths=` set which also contains the
+database parent, object store, both socket parents, every managed-pointer
+repository, and every staging root. Optional, noncanonical, missing, extra, or
+explicitly broad entries fail closed.
 
 Standard output is one integer-only canonical JSON `ag.doctor-report/v1`.
 Every check is `pass`, `fail`, or `unavailable`; missing or unparseable host
 evidence is never promoted to a pass. The process exits nonzero unless every
 emitted required check passes. Doctor is an operational diagnostic, not daemon
-readiness: it does not change the deliberately conservative health responses.
+readiness: it cannot mint the fresh, non-serializable process standing behind
+an `ag-effectd` health response of `ready = true`. Its current systemd queries
+do not have a subprocess deadline, which remains an operational qualification
+gap rather than a bounded-completion claim.
 
 The effect authority boundary is visible in the command routing:
 
@@ -63,6 +68,13 @@ There is no governor projection of proposal bytes or ratification. Provider
 health is not exposed to either CLI identity in v1: `ag-providerd` enrolls its
 service caller separately, so adding a convenient CLI route would broaden
 credential-proxy access.
+
+The signed direct effectd Health RPC includes an inspectable
+`EffectdActivationStatusV1`: either the full non-authorizing process receipt or
+a bounded phase/code/detail refusal. The current `agctl health ag-effectd`
+command intentionally emits only the stable `HealthV1` projection, including
+`ready`; it does not yet print that diagnostic status. Operators must not infer
+phase detail from a boolean or treat the omitted receipt as standing.
 
 ## Development worker operations
 
@@ -113,14 +125,19 @@ ratification command always requires that challenge explicitly; inspection
 and ratification are never collapsed into one action.
 
 `effect record` is a separate read-only operational view. It returns the
-strict `ag.effect-record/v2` projection directly from effectd: the canonical
+strict `ag.effect-record/v3` projection directly from effectd: the canonical
 proposal, prepared-candidate/basis/input history, typed pre-burn promotion
 refusals, exact candidate ratification and accepted authorization when present,
 terminal and ordered step receipts, execution attempt, and full reconciliation
-record when present. Effectd validates all entity, canonical, lifecycle,
-authorization, attempt, terminal-receipt, and reconciliation bindings before
-returning it. The response contains no store revision, event query, arbitrary
-JSON, or challenge and cannot be ratified in place.
+record when present. A verified successful pointer promotion additionally
+includes the complete typed activation receipt: predecessor and installed
+object/tree, candidate/artifact/ratification/authorization, checkpoint, full
+commit evidence, and full post-fsync readback. Effectd validates all entity,
+canonical, lifecycle, authorization, attempt, terminal-receipt, activation,
+and reconciliation bindings before returning it. The response contains no
+generic event query, arbitrary JSON, or challenge and cannot be ratified in
+place. Version 2 records fail closed; they are not silently interpreted as
+version 3 activation custody.
 
 All successful machine-readable output is integer-only canonical JSON. Daemon
 errors, authentication failures, and terminal-safe diagnostics go to standard

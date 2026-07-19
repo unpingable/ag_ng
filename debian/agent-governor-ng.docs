@@ -4,6 +4,7 @@ docs/source-baseline.md
 docs/signed-local-rpc.md
 docs/agctl.md
 docs/deployment.md
+docs/managed-pointer-activation-readiness.md
 docs/backup-restore.md
 docs/release-checklist.md
 docs/migration-m8.md

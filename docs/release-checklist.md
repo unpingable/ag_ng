@@ -30,6 +30,40 @@ candidate-specific ratification, durable pre-burn basis refusals, and restart
 non-resurrection tests. It does not expand the deployment-qualification claim
 of the fixed `10b7aa9` baseline.
 
+## Managed-pointer activation/readiness campaign
+
+The campaign based on frozen `fe0bb86` adds a code-enforced activation gate;
+it does not upgrade the system verdict to production deployable:
+
+- Effectd config v2 names an exact reviewed genesis object, tree, and
+  descriptor-derived state identity. There is no `latest` or startup
+  rediscovery rule.
+- Verified success is the only history event that advances the governed head.
+  Exact `not_applied` reconciliation preserves it; unresolved, foreign, and
+  observed-applied-without-durability history blocks readiness.
+- `ManagedPointerActivationReceiptV1` is durable proposal custody only after
+  CAS, ref/directory fsync, final exact readback, and nested receipt
+  verification. The process-lifecycle `EffectdLiveActivationV1` is not
+  serializable or reloadable.
+- Child-local descriptor closure and Landlock constrain handled Git mutation
+  rights to the admitted quarantine/target roots. Managed-pointer readiness
+  requires Landlock ABI 3 or newer; command-bearing repository filters,
+  hooks, helpers, protocol access, and writable candidate stdin are closed.
+- One broker actor, one store-writer fence, current-basis revalidation, and
+  Git old-object CAS provide the implemented contention rule. Rollback has no
+  pointer-edit escape hatch and requires a new forward candidate and
+  ratification.
+- The pre-burn gate and authenticated health consume the same reconstructed
+  history and exact live-head verdict. A same-object ref-inode substitution
+  therefore blocks managed-file authority as well as pointer authority.
+
+Still open: clean-host service/package activation; operator genesis
+measurement/enrollment tooling; simultaneous client and reader specimens;
+expanded `SystemCallFilter` equality; real disk-full, WAL/fsync, power-loss and
+filesystem matrices; applied-reconciliation durability recovery; whole
+store-plus-target anti-rollback; same-inode historical ABA; bounded/cached
+history reconstruction; and a deadline for doctor subprocesses.
+
 Explicit qualification gaps are real power-loss/torn-write testing, live
 multi-process daemon restart under the packaged sandbox, package
 install/upgrade/rollback across the support matrix, SQLite/WAL/disk-full/fsync
@@ -38,18 +72,19 @@ modeling. These are recorded as gaps rather than simulated claims.
 
 Known blockers in the current tree include:
 
-- managed-file execution and a development-qualified managed-ref CAS path are
-  wired, but typed systemd D-Bus backends remain deliberately unavailable;
-  managed-pointer production activation is still blocked on effective-unit
-  sandbox parity, target-owner capability packaging, host/Git qualification,
-  and the power-loss matrix;
+- managed-file execution and the managed-ref CAS path are wired, while typed
+  systemd D-Bus backends remain deliberately unavailable; managed-pointer now
+  has fresh process-lifecycle activation standing, exact effective-unit/
+  capability/configured-write-root parity, live required/protected mount
+  checks, target preflight, and an inspectable durable
+  activation receipt, but real packaged-host/Git/Landlock/filesystem
+  qualification, genesis enrollment tooling, expanded syscall-filter
+  attestation, and the power-loss matrix remain open;
 - offline three-writer-fence coordination, sealed SQLite/object capture,
   hostile coherence validation, atomic local publication, and immutable
   evidence restore exist, but there is no live cross-daemon coordinator,
   independent release ceremony, activation journal, or recovery-only epoch
   transition;
-- effectd does not yet prove that every configured target equals the effective
-  systemd `ReadWritePaths` sandbox before readiness;
 - a development-only, offline, fixed-profile Bubblewrap worker ingress now
   mints and tombstones durable `WorkerSessionPrincipal` records and accepts
   only authenticated candidate material; it enforces one live worker, checked
@@ -63,8 +98,9 @@ Known blockers in the current tree include:
   provider capability; the implemented worker slice is offline rather than a
   provider-capability workaround;
 - `agctl doctor` implements a fail-closed configuration/custody/effective-unit
-  audit, but kernel-feature attestation, a daemon activation-level readiness
-  contract, and watchdog heartbeats are not implemented (`Type=exec`
+  audit and effectd independently reconstructs non-serializable live readiness
+  from store, process, unit, mount, helper and target evidence; broader kernel
+  feature/LSM qualification and watchdog heartbeats remain absent (`Type=exec`
   intentionally claims only exec);
 - package install, upgrade, rollback, and removal tests have not run on every
   supported distribution/architecture pair;

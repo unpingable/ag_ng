@@ -45,13 +45,16 @@ refuses.
 
 This is not a production containment claim. `production` and
 `high_assurance` configurations reject the development launcher, and the
-packaged `agd.service` namespace restrictions are not a host for it. Provider
-adapters, typed systemd effects, admitted check launch, production activation
-of managed-pointer execution, and production worker qualification remain
-pending.
+packaged `agd.service` namespace restrictions are not a host for it. The
+managed-pointer broker now has code-level live activation gating and a
+complete inspectable activation receipt, but its host/Git/filesystem,
+power-loss, and package matrices remain unqualified. Provider adapters, typed
+systemd effects, admitted check launch, and production worker qualification
+remain pending.
 
 See `docs/architecture.md` and `docs/source-baseline.md` for the implementation
 contract and source custody. Operational reviewers should also read
-`docs/deployment.md`, `docs/backup-restore.md`, and
-`docs/release-checklist.md`, and `docs/migration-m8.md`; the current tree is
-explicitly not production deployable until that checklist closes.
+`docs/deployment.md`, `docs/managed-pointer-activation-readiness.md`,
+`docs/backup-restore.md`, `docs/release-checklist.md`, and
+`docs/migration-m8.md`; the current tree is explicitly not production
+deployable until that checklist closes.

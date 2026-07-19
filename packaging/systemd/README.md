@@ -1,13 +1,17 @@
 # systemd deployment contract
 
 These files are packaging inputs, not evidence that a host satisfies the
-production contract. `agctl doctor` now checks strict daemon configuration,
+production contract. `agctl doctor` checks strict daemon configuration,
 enrolled store/socket custody, fixed effective unit properties, target-root
 drop-ins, credential-unit bindings, and configured installed executable
-digests. Kernel-feature attestation, socket ACL interpretation beyond enrolled
-numeric custody, providerd self-executable enrollment, and the remaining gates
-in `docs/release-checklist.md` are still absent, so the units remain a
-reviewable deployment skeleton rather than a production-readiness claim.
+digests. Effectd additionally reconstructs its code-level live process/unit/
+mount/target readiness on every start. Managed-pointer Git children use
+child-local exact-FD closure plus descriptor-rooted Landlock confinement and
+therefore require ABI 3 or newer. Distro/LSM and packaged-host qualification,
+socket ACL interpretation beyond enrolled numeric custody, providerd
+self-executable enrollment, and the remaining gates in
+`docs/release-checklist.md` are still absent, so the units remain a reviewable
+deployment skeleton rather than a production-readiness claim.
 
 ## Socket custody
 
@@ -41,8 +45,9 @@ IDs resolved on that host. The example IDs and digests are placeholders.
 The current daemons do not call `sd_notify` and do not emit watchdog
 heartbeats. Their units therefore use `Type=exec` and have no `WatchdogSec=`.
 This reports successful `execve`, not application readiness. Dependents and
-operators must treat a successful authenticated socket probe as readiness once
-such a probe exists.
+operators must use the existing authenticated `agctl health ag-effectd` path
+and require `ready = true`; a prior doctor report, unit start, or stored
+activation receipt is insufficient.
 
 The stable local-RPC identity is an enrolled Ed25519 key; service private keys
 arrive through the base unit's encrypted `rpc-ed25519-pkcs8` credential. The
@@ -55,17 +60,36 @@ second generic effect surface.
 
 ## Effects, provider credentials, and workers
 
-For every managed repository or file parent, install a root-owned effectd
-drop-in such as:
+For every managed repository, staging root, or file parent, install a
+root-owned effectd drop-in. A managed-pointer catalog must also replace the
+base bounding set with the exact six-capability target-owner contract:
 
 ```ini
 [Service]
+CapabilityBoundingSet=
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETGID CAP_SETUID
 ReadWritePaths=/srv/agent-governor/repos/service.git
+ReadWritePaths=/var/lib/agent-governor/effectd/promotion-stage
 ReadWritePaths=/etc/example-service
 ```
 
-Effectd must compare the effective sandbox to its target catalog before
-production readiness. A config entry alone never grants a writable target.
+The base unit already lists the database parent, object store, and both socket
+parents. Effectd reconstructs the full exact set from configuration and
+requires exact effective `ReadWritePaths` equality. It separately checks that
+every required root is writable and `/usr`, `/boot`, `/etc`, and `/srv` remain
+read-only in its live mount namespace; it does not claim absence of unrelated
+writable API or private temporary mounts. It also checks exact process
+capability masks and privilege floor, then preflights pinned Git, staging
+custody, repository identity, owner, and loose-ref state. Missing, optional,
+extra, or broad configured paths and missing or excess capabilities keep
+health live but not ready. A config entry or prior doctor report never grants
+a writable target or reconstructs readiness standing.
+
+The base syscall filter explicitly admits the three Landlock syscalls. The
+daemon does not yet compare systemd's architecture-expanded
+`SystemCallFilter=` property with an independently derived expected set, so a
+clean-host qualification must verify it; package text alone is not live
+attestation evidence.
 
 Each base daemon unit maps a distinct host/TPM-bound blob from
 `/etc/credstore.encrypted` to the runtime ID `rpc-ed25519-pkcs8`. Provider API

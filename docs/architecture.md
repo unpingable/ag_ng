@@ -29,12 +29,12 @@ references; its projections are never ratification inputs.
 
 The current executable vertical slices are exact human ratification, managed
 regular-file effects with broker-owned reconciliation, a development-only
-offline generic-worker ingress, and development-qualified managed-ref
-promotion. Provider ingress, production-qualified worker containment,
-admitted check launch, bounded mandates, typed systemd D-Bus backends, and
-production qualification of managed-pointer execution remain fail-closed
-release blockers; listing them above defines the v1 target and is not a
-production support claim.
+offline generic-worker ingress, and managed-ref promotion with a code-level
+production activation gate. Provider ingress, production-qualified worker
+containment, admitted check launch, bounded mandates, typed systemd D-Bus
+backends, and packaged-host/Git/filesystem/power-loss qualification of
+managed-pointer execution remain fail-closed release blockers; listing them
+above defines the v1 target and is not a production support claim.
 
 ## Development worker ingress
 
@@ -98,9 +98,9 @@ or distribution qualification. It is not the future systemd/DynamicUser
 wrapper design and does not implement checks, provider-specific adapters,
 multi-worker orchestration, host mandates, or systemd effects.
 
-## Development managed-pointer promotion
+## Managed-pointer promotion and activation
 
-The implemented code-promotion path closes one development lifecycle without
+The implemented code-promotion path closes one governed lifecycle without
 giving either the worker or `agd` write access to the governed target:
 
 ```text
@@ -174,6 +174,42 @@ reconciliation-required; automatic retry is forbidden. Reconciliation
 independently classifies the live target as exact prestate (`not_applied`),
 exact poststate (`applied`), or neither (`foreign`).
 
+Only a verified success materializes
+`ag.managed-pointer.activation-receipt/v1`. That receipt binds the exact
+canonical effect, prepared candidate, candidate-specific ratification,
+accepted authorization, attempt and checkpoint, predecessor and installed
+object/tree, repository identity, full commit evidence, and final post-fsync
+readback. The direct effectd inspection plane returns it in the strict
+`ag.effect-record/v3` projection. Legacy v2 proposal records are not
+reinterpreted as v3 activation custody.
+
+Production and high-assurance authority additionally require a fresh,
+non-serializable process-lifecycle activation value. Effectd reconstructs it
+from the activated store (including config/profile/catalog/build identity),
+current process capability and no-new-privileges state, strict effective unit
+properties, the current mount namespace, pinned Git, root-owned staging
+custody, and descriptor-bound repository enrollment. Applying that value is a
+separate broker step: it starts from the configured exact genesis
+object/tree/state identity, scans terminal managed-pointer history, advances
+only through verified success receipts, requires `not_applied` reconciliation
+to preserve the head, and compares the resulting head with the exact live ref.
+Unresolved, foreign, or observed-applied-without-durability history blocks
+readiness. The process receipt remains memory-resident explanation only;
+doctor output and receipts cannot reconstruct standing after restart. A
+mismatch leaves authenticated health live but not ready and refuses authority
+before ratification burn.
+
+Git children inherit only explicitly admitted descriptors after a child-local
+`close_range(CLOEXEC)` floor. Managed-pointer readiness requires Landlock ABI 3
+or newer. Fixed mutation children receive descriptor-rooted handled-write
+sets: the quarantine stage for preparation, the exact target `objects/pack`
+directory for import, and the exact Git directory for ref CAS (Git may also
+transact `HEAD.lock` for a bare repository). Read-only Git inspection receives
+no directory write grant. Repository command filters are refused, hooks and
+helpers are intrinsically disabled, and candidate PACK stdin is reopened
+read-only. This is a closed pinned-helper contract, not a general Linux claim
+that Landlock mediates every metadata operation.
+
 Version 1 manages one existing, descriptor-validated loose ref in a bare
 repository or a ref that is not checked out in any attached worktree. A target
 available only through `packed-refs` refuses. It deliberately refuses a
@@ -182,10 +218,13 @@ no hidden checkout synchronization, direct-checkout mode, generic Git command
 effect, promoter daemon, provider adapter, check launcher, host mandate, or
 systemd effect in this slice.
 
-This is a development-qualified managed-ref CAS claim, not a production
-deployment claim. The activation/upgrade ceremony, effective systemd sandbox
-parity, target-owner capability packaging, host sandbox attestation, Git and
-distribution qualification, and power-loss matrix remain open release gates.
+This is a code-enforced and locally tested managed-ref activation claim, not a
+production deployment claim. Fresh effective-unit/process/target readiness
+and the target-owner capability package contract are implemented against an
+explicit checked property cut. Real package-host, expanded syscall-filter,
+Git/systemd/filesystem/LSM qualification, genesis enrollment tooling, the
+power-loss matrix, and the separate activation/upgrade ceremony remain open
+release gates.
 
 BreakGlass, direct checkout, arbitrary privileged commands, hostile
 multi-tenancy, public TCP APIs, and compatibility aliases are intentionally

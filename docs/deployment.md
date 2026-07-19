@@ -12,7 +12,10 @@ to deploy it over a governed host.
 
 ## Host and file custody
 
-The production baseline is Linux 6.1 or newer with systemd 252 or newer. The
+The production baseline is Linux 6.1 or newer with systemd 252 or newer. A
+catalog containing a managed-pointer target additionally requires the running
+kernel to report Landlock ABI 3 or newer; the version number alone is not
+treated as proof of a distribution backport. The
 supported package targets are Debian 12 and Ubuntu 24.04 on amd64 and arm64.
 SELinux/AppArmor policy, filesystem features, cgroup v2 delegation, and D-Bus
 policy still require a host-specific preflight.
@@ -167,7 +170,7 @@ pointer, “pinned helper” means the digest of exact Git executable bytes plus
 the digest of the built-in fixed operation, argv, environment, descriptor, and
 security-profile contract—not a pathname or an operator-supplied command.
 
-The development-qualified managed-pointer target also names one normalized
+The code-enforced managed-pointer target also names one normalized
 repository strictly beneath an allowed root, one exact `refs/heads/` ref, the
 repository identity, expected non-root owner UID/GID, a broker-controlled
 staging root outside the allowed target root, a bounded promotion lifetime,
@@ -176,6 +179,18 @@ and the pinned Git identities. The candidate semantic is exactly
 bundle v2 with one `refs/heads/ag-candidate`, no prerequisites, one commit whose
 sole parent is the live base, and no gitlinks. The target repository is not
 selected from candidate bytes.
+
+Effectd config schema v2 also requires
+`activation_genesis_object`, `activation_genesis_tree`, and
+`activation_genesis_state` for each managed pointer. They are reviewed
+enrollment facts for the exact loose ref before the authority store has any
+successful history; they are never populated by “latest,” directory order, or
+daemon startup observation. The state value is the digest of AG's
+descriptor-derived repository-state evidence, not the object ID repeated in a
+different field. The tree currently has no packaged measurement/enrollment
+command, so constructing these values is a release blocker rather than an
+invitation to hand-author a digest. Schema v1 and records unable to prove the
+new bindings fail closed.
 
 Effectd stages and inspects the bundle outside the governed repository, then
 compiles canonical bytes that bind the exact artifact and pack, base commit and
@@ -202,6 +217,19 @@ post-ref and tree. Ambiguity at the commit boundary requires reconciliation;
 it is never converted into success or a safe automatic retry. Reconciliation
 distinguishes exact prestate, exact poststate, and foreign state.
 
+Git is executed from a sealed exact-byte descriptor. In the child,
+`close_range(CLOEXEC)` first closes the ambient inheritance channel and only
+reviewed descriptors are re-admitted. Candidate PACK stdin is read-only.
+Command-bearing repository filters and config indirection refuse enrollment;
+hooks, external diff/text conversion, helpers, reflogs, and protocols are
+disabled. Landlock ABI 3 mediates handled write/truncate/create/remove/rename
+rights: quarantine operations receive the exact stage root, target import the
+exact `objects/pack` directory, and ref CAS the exact Git directory (needed for
+Git's possible `HEAD.lock` transaction). This prevents redirected writes into
+another target for the handled rights; it does not turn Landlock into proof
+about unmediated metadata syscalls or remove the pinned Git and dynamic-loader
+package set from the host TCB.
+
 Version 1 supports one existing, descriptor-validated loose ref in a bare
 repository or a managed ref not checked out in any attached worktree. A target
 available only through `packed-refs`, a dirty non-bare repository, or a
@@ -211,25 +239,36 @@ compatibility mode. A site that needs a live checkout must perform that
 synchronization through a future, separately specified governed effect; it
 must not point this effect at the live branch and assume Git will update files.
 
-Every configured repository or managed-file parent also appears in an
-effectd unit drop-in as `ReadWritePaths=`. Before readiness, effectd must compare
-the effective unit sandbox with its target catalog and refuse any mismatch.
-Do not grant a common parent such as `/etc`, `/srv`, or `/var/lib` merely to
-make enrollment convenient. Unit actions are escaped exact systemd unit names
-with a closed action list.
+Every configured repository, staging root, managed-file parent, broker state
+root, and socket parent appears exactly in effective `ReadWritePaths=`.
+Effectd requires exact equality between the effective unit's `ReadWritePaths`
+property and that closed set before readiness, and refuses optional, missing,
+extra, or broad entries. It separately proves every required root writable in
+the current namespace and the protected `/usr`, `/boot`, `/etc`, and `/srv`
+roots read-only; this is not a claim that Linux exposes no other writable API
+or private temporary mounts. Do not grant a common parent such as `/etc`,
+`/srv`, or `/var/lib` merely to make enrollment convenient. Unit actions are
+escaped exact systemd unit names with a closed action list.
 
 The base effectd unit is networkless and has no shell or generic command
-surface. A target drop-in may add filesystem access only; it must not add an IP
-address family, network namespace access, shell, interpreter, broad capability,
-or writable executable search path.
+surface. A target drop-in may add only exact target-derived filesystem paths
+and, for managed pointers, the exact `CAP_SETUID`/`CAP_SETGID` delta documented
+below. It must not add an IP address family, network namespace access, shell,
+interpreter, any other capability, or writable executable search path.
 
-The checked-in effectd unit already grants `CAP_CHOWN` for its closed target
-custody operations, but it does not grant the `CAP_SETUID`/`CAP_SETGID` needed
-to enter a configured non-root target owner. Managed-pointer execution
-therefore fails closed under the packaged unit. Do not broaden that unit ad
-hoc: the exact target-owner capability set, effective `ReadWritePaths`
-comparison, executable access, and staging/target mount layout require review
-and qualification before this development slice is production deployable.
+The checked-in base unit grants the exact four capabilities used by a
+managed-file-only catalog. A managed-pointer deployment installs a root-owned
+drop-in which resets the bound and adds exactly `CAP_SETUID` and `CAP_SETGID`
+so the fixed Git child can enter the configured non-root target owner. Fresh
+in-process activation checks permitted, effective and bounding masks, empty
+inheritable/ambient masks, empty supplementary groups, `NoNewPrivileges`, the
+effective unit contract, current mount exceptions, helper bytes/profile,
+staging custody, repository identity/owner/ref, and a harmless target-owner Git
+observation. Missing or excess privilege refuses readiness. This closes the
+code-level activation gate, not the host/Git/filesystem or power-loss
+qualification matrix. The packaged unit permits the three Landlock syscalls,
+but live readiness does not yet compare systemd's expanded
+`SystemCallFilter=` set; exact host parity is a release qualification gap.
 
 ## Provider credentials and custody
 
@@ -343,9 +382,11 @@ declared helper descriptors, and close every unintended inherited descriptor.
 Services are installed disabled. After configuration validation and the entire
 release checklist succeed, start effectd and providerd before agd. Current
 units use `Type=exec`: systemd activation means only that the daemon executable
-was entered. It does not mean the database, backup fence, peer policies, target
-catalog, or sockets are ready. Production release requires an authenticated
-readiness probe or a correctly implemented `sd_notify` contract.
+was entered. Effectd constructs fresh non-serializable activation standing
+before reporting authenticated health ready; a prior doctor or activation
+receipt cannot recreate it. The remaining daemons still have their narrower
+authenticated health contracts, and no unit implements `sd_notify` or watchdog
+heartbeats.
 
 Logs go only to journald. Set retention, forwarding, sealing, rate limits, and
 disk quotas in host journal policy. Audit exports are protocol artifacts, not a

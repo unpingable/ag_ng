@@ -15,7 +15,7 @@ a package until their named release gates pass.
 | three daemon unit files | `/usr/lib/systemd/system/` | `0644 root:root`, disabled |
 | `sysusers.d/agent-governor-ng.conf` | `/usr/lib/sysusers.d/` | `0644 root:root` |
 | `tmpfiles.d/agent-governor-ng.conf` | `/usr/lib/tmpfiles.d/` | `0644 root:root` |
-| `docs/*.md`, `README.md` | `/usr/share/doc/agent-governor-ng/` | documentation |
+| selected `docs/*.md` listed by the package skeleton, `README.md` | `/usr/share/doc/agent-governor-ng/` | operator and campaign documentation |
 | `config/*.example.toml` | `/usr/share/doc/agent-governor-ng/examples/` | examples only |
 | `migration/` | `/usr/share/doc/agent-governor-ng/migration/` | immutable-source manifest, partial disposition ledger, receipts, and hostile specimens |
 
