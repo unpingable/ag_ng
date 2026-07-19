@@ -10,10 +10,12 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,11 +51,12 @@ const PACK_VERSION_V2: u32 = 2;
 const MAX_PACK_OBJECTS: u32 = 1_000_000;
 const MAX_GIT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REPOSITORY_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_GIT_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Versioned digest of the exact built-in Git launch contract.
-pub const MANAGED_POINTER_LAUNCH_PROFILE_SCHEMA_V1: &str =
-    "ag.managed-pointer.git-launch-profile/v1";
+pub const MANAGED_POINTER_LAUNCH_PROFILE_SCHEMA_V2: &str =
+    "ag.managed-pointer.git-launch-profile/v2";
 
 /// Versioned descriptor-bound repository identity contract.
 pub const MANAGED_REPOSITORY_IDENTITY_SCHEMA_V1: &str = "ag.managed-pointer.repository-identity/v1";
@@ -74,6 +77,9 @@ pub const MANAGED_POINTER_POSTSTATE_EVIDENCE_SCHEMA_V1: &str =
 /// Versioned complete explanation emitted only after a durable activation.
 pub const MANAGED_POINTER_ACTIVATION_RECEIPT_SCHEMA_V1: &str =
     "ag.managed-pointer.activation-receipt/v1";
+
+/// Versioned fresh target-preflight evidence used only for live broker readiness.
+pub const MANAGED_POINTER_READINESS_SCHEMA_V1: &str = "ag.managed-pointer.production-readiness/v1";
 
 /// Evidence emitted only when a live, non-serializable promotion standing is
 /// minted from exact ratification and a fresh basis observation.
@@ -308,7 +314,7 @@ pub struct ManagedRepositoryStateEvidenceV1 {
 }
 
 impl ManagedRepositoryStateEvidenceV1 {
-    fn identity(&self) -> Result<Digest, ManagedPointerError> {
+    pub(crate) fn identity(&self) -> Result<Digest, ManagedPointerError> {
         Ok(Digest::from_serializable(self)?)
     }
 }
@@ -388,6 +394,12 @@ impl ManagedPointerActivationReceiptV1 {
     pub fn verify(&self, effect: &CanonicalEffectV1) -> Result<(), ManagedPointerError> {
         let fields = CanonicalPointerFieldsV1::from_effect(effect)?;
         let effect_identity = Digest::from_serializable(effect)?;
+        let expected_request = Digest::from_serializable(&(
+            "ag.managed-pointer.commit-request/v1",
+            &self.execution,
+            &self.preparation_checkpoint,
+            effect,
+        ))?;
         if self.schema != MANAGED_POINTER_ACTIVATION_RECEIPT_SCHEMA_V1
             || self.effect != effect_identity
             || self.target != *fields.target
@@ -404,7 +416,11 @@ impl ManagedPointerActivationReceiptV1 {
             || self.installed_tree != fields.expected_post_tree
             || self.commit.execution != self.execution
             || self.poststate.execution != self.execution
+            || self.commit.schema != MANAGED_POINTER_COMMIT_EVIDENCE_SCHEMA_V1
+            || self.poststate.schema != MANAGED_POINTER_POSTSTATE_EVIDENCE_SCHEMA_V1
+            || self.poststate.state.schema != MANAGED_REPOSITORY_STATE_SCHEMA_V1
             || self.commit.operation_id != self.operation_id
+            || self.commit.request_digest != expected_request
             || self.commit.preparation_checkpoint != self.preparation_checkpoint
             || self.poststate.preparation_checkpoint != self.preparation_checkpoint
             || self.commit.previous_object != self.previous_object
@@ -598,14 +614,25 @@ pub struct ManagedPointerRuntimeV1 {
     security_profile_identity: Digest,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedPointerActivationHeadV1 {
+    pub(crate) object: String,
+    pub(crate) tree: String,
+    pub(crate) state_identity: Digest,
+}
+
 struct ManagedPointerTargetV1 {
     allowed_root: PathBuf,
     repository: PathBuf,
     reference: String,
+    activation_genesis_object: String,
+    activation_genesis_tree: String,
+    activation_genesis_state: Digest,
     repository_identity: Digest,
     uid: u32,
     gid: u32,
     staging_root: PathBuf,
+    production_staging_custody: bool,
     promotion_ttl_ms: u64,
     git: Mutex<PinnedGitV1>,
     launch_profile: Digest,
@@ -734,6 +761,9 @@ impl ManagedPointerRuntimeV1 {
                 allowed_root,
                 repository,
                 reference,
+                activation_genesis_object,
+                activation_genesis_tree,
+                activation_genesis_state,
                 repository_identity,
                 uid,
                 gid,
@@ -760,10 +790,14 @@ impl ManagedPointerRuntimeV1 {
                 allowed_root: allowed_root.clone(),
                 repository: repository.clone(),
                 reference: reference.clone(),
+                activation_genesis_object: activation_genesis_object.clone(),
+                activation_genesis_tree: activation_genesis_tree.clone(),
+                activation_genesis_state: activation_genesis_state.clone(),
                 repository_identity: repository_identity.clone(),
                 uid: *uid,
                 gid: *gid,
                 staging_root: staging_root.clone(),
+                production_staging_custody: config.security_profile != "development",
                 promotion_ttl_ms: *promotion_ttl_ms,
                 git: Mutex::new(git),
                 launch_profile,
@@ -782,6 +816,131 @@ impl ManagedPointerRuntimeV1 {
     #[must_use]
     pub fn security_profile_identity(&self) -> &Digest {
         &self.security_profile_identity
+    }
+
+    /// Return every exact reviewed activation genesis. The order is canonical
+    /// and no filesystem state is consulted.
+    pub(crate) fn activation_geneses(&self) -> BTreeMap<TargetId, ManagedPointerActivationHeadV1> {
+        self.targets
+            .iter()
+            .map(|(target, runtime)| {
+                (
+                    target.clone(),
+                    ManagedPointerActivationHeadV1 {
+                        object: runtime.activation_genesis_object.clone(),
+                        tree: runtime.activation_genesis_tree.clone(),
+                        state_identity: runtime.activation_genesis_state.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Require one enrolled target to select the exact object and tree derived
+    /// from governed genesis plus ordered terminal activation history.
+    pub(crate) fn require_activation_state(
+        &self,
+        target: &TargetId,
+        expected: &ManagedPointerActivationHeadV1,
+    ) -> Result<(), ManagedPointerError> {
+        let runtime = self
+            .targets
+            .get(target)
+            .ok_or(ManagedPointerError::TargetUnavailable)?;
+        let repository = runtime.open_repository()?;
+        runtime.require_enrolled_repository(&repository)?;
+        let state = runtime.observe_repository_state(&repository)?;
+        if !state.clean
+            || state.reference_checked_out
+            || state.current_object != expected.object
+            || state.current_tree != expected.tree
+            || state.evidence.identity()? != expected.state_identity
+        {
+            return Err(ManagedPointerError::PrestateDrift(
+                "live target does not match exact governed activation history".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Revalidate the static helper, staging-root, repository-layout, owner,
+    /// and launch-profile cut used by a live production activation value.
+    ///
+    /// This method creates no standing and performs no governed-target write.
+    /// Its digest is process-lifecycle evidence only.
+    pub(crate) fn production_readiness(&self) -> Result<Digest, ManagedPointerError> {
+        #[derive(Serialize)]
+        struct TargetReadinessV1<'a> {
+            target: &'a TargetId,
+            helper_executable: Digest,
+            helper_launch_profile: &'a Digest,
+            activation_genesis_object: &'a str,
+            activation_genesis_tree: &'a str,
+            activation_genesis_state: &'a Digest,
+            staging_root: String,
+            staging_device: u64,
+            staging_inode: u64,
+            repository_identity: Digest,
+        }
+
+        let landlock_abi = if self.targets.is_empty() {
+            None
+        } else {
+            let version = crate::exact_exec::landlock_abi_version()?;
+            if version < 3 {
+                return Err(ManagedPointerError::UnsafeRepository(
+                    "Landlock ABI 3 or newer is required for descriptor-bound Git mutation"
+                        .to_owned(),
+                ));
+            }
+            Some(version)
+        };
+        let mut evidence = Vec::with_capacity(self.targets.len());
+        for (target, runtime) in &self.targets {
+            let mut git = runtime
+                .git
+                .lock()
+                .map_err(|_| ManagedPointerError::GitIdentityMismatch)?;
+            git.revalidate()?;
+            let helper_executable = git.executable.clone();
+            drop(git);
+
+            let staging = open_absolute_directory(&runtime.staging_root)?;
+            let staging_stat = rustix::fs::fstat(&staging).map_err(errno_to_io)?;
+            validate_production_staging_custody(
+                FileType::from_raw_mode(staging_stat.st_mode).is_dir(),
+                staging_stat.st_uid,
+                staging_stat.st_gid,
+                staging_stat.st_mode,
+            )?;
+
+            let repository = runtime.open_repository()?;
+            runtime.require_enrolled_repository(&repository)?;
+            let state = runtime.observe_repository_state(&repository)?;
+            if !state.clean || state.reference_checked_out {
+                return Err(ManagedPointerError::PrestateDrift(
+                    "production target is dirty or its managed ref is checked out".to_owned(),
+                ));
+            }
+            evidence.push(TargetReadinessV1 {
+                target,
+                helper_executable,
+                helper_launch_profile: &runtime.launch_profile,
+                activation_genesis_object: &runtime.activation_genesis_object,
+                activation_genesis_tree: &runtime.activation_genesis_tree,
+                activation_genesis_state: &runtime.activation_genesis_state,
+                staging_root: utf8_path(&runtime.staging_root)?,
+                staging_device: staging_stat.st_dev,
+                staging_inode: staging_stat.st_ino,
+                repository_identity: repository.identity_evidence.identity()?,
+            });
+        }
+        Ok(Digest::from_serializable(&(
+            MANAGED_POINTER_READINESS_SCHEMA_V1,
+            &self.security_profile_identity,
+            landlock_abi,
+            evidence,
+        ))?)
     }
 
     /// Mints one non-serializable, target-scoped preparation standing from the
@@ -1552,6 +1711,14 @@ impl ManagedPointerRuntimeV1 {
         cas_environment
             .descriptor_path("GIT_DIR", &before_cas_repository.git_directory, None)
             .map_err(CommitErrorV1::Failed)?;
+        cas_environment
+            // `git update-ref` also transacts `HEAD.lock` when a bare
+            // repository's HEAD symbolically selects the managed ref. The
+            // UAPI cannot admit that one not-yet-created file without its
+            // parent, so the fixed update-ref child receives the exact
+            // descriptor-opened Git directory and no other target root.
+            .admit_write_root(&before_cas_repository.git_directory)
+            .map_err(CommitErrorV1::Failed)?;
         let cas = target_runtime.run_git_update_ref(
             &[
                 OsString::from("--no-deref"),
@@ -1808,30 +1975,34 @@ impl ManagedPointerTargetV1 {
                 "bundle and repository object formats differ".to_owned(),
             ));
         }
-        let stage = StagingDirectoryV1::create(&self.staging_root)?;
+        let stage =
+            StagingDirectoryV1::create(&self.staging_root, self.production_staging_custody)?;
         self.initialize_staging(&stage, repository_format)?;
-        let pack_path = stage.path.join("candidate.pack");
-        let mut pack = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&pack_path)?;
+        let mut pack = File::from(
+            rustix::fs::openat2(
+                &stage.directory,
+                "candidate.pack",
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::from_raw_mode(0o600),
+                ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+            )
+            .map_err(errno_to_io)?,
+        );
         pack.write_all(bundle.pack)?;
         pack.sync_all()?;
         pack.seek(SeekFrom::Start(0))?;
-        let stage_fd = open_absolute_directory(&stage.path)?;
         let mut environment = GitEnvironmentV1::default();
-        environment.descriptor_path("GIT_DIR", &stage_fd, None)?;
+        environment.writable_descriptor_path("GIT_DIR", &stage.directory, None)?;
         let maximum = format!("--max-input-size={}", bundle.pack.len());
         self.run_git_checked(
             GitOperationV1::IndexPack,
             &[OsString::from("--stdin"), OsString::from(maximum)],
             &environment,
-            Some(pack.try_clone()?),
+            Some(reopen_read_only(&pack)?),
             true,
         )?;
+        let mut environment = GitEnvironmentV1::default();
+        environment.descriptor_path("GIT_DIR", &stage.directory, None)?;
         let object_kind = self.run_git_checked(
             GitOperationV1::CatFile,
             &[OsString::from("-t"), OsString::from(&bundle.candidate)],
@@ -1958,6 +2129,7 @@ impl ManagedPointerTargetV1 {
         let mut environment = GitEnvironmentV1::default();
         environment.descriptor_path("GIT_DIR", &repository.git_directory, None)?;
         environment.descriptor_path("GIT_OBJECT_DIRECTORY", &repository.objects, None)?;
+        environment.admit_write_root(&repository.pack_directory)?;
         let output = self.run_git(
             GitOperationV1::IndexPack,
             &[
@@ -1965,7 +2137,7 @@ impl ManagedPointerTargetV1 {
                 OsString::from(format!("--max-input-size={pack_size}")),
             ],
             &environment,
-            Some(pack.try_clone()?),
+            Some(reopen_read_only(pack)?),
             true,
         )?;
         if !output.status.success() {
@@ -2487,6 +2659,18 @@ fn hash_file(file: &mut File) -> Result<Digest, ManagedPointerError> {
     Ok(Digest::hash_bytes(&bytes))
 }
 
+fn reopen_read_only(file: &File) -> Result<File, ManagedPointerError> {
+    let before = rustix::fs::fstat(file).map_err(errno_to_io)?;
+    let reopened = File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    let after = rustix::fs::fstat(&reopened).map_err(errno_to_io)?;
+    if before.st_dev != after.st_dev || before.st_ino != after.st_ino {
+        return Err(ManagedPointerError::Artifact(
+            "read-only pack reopen changed descriptor identity".to_owned(),
+        ));
+    }
+    Ok(reopened)
+}
+
 fn sync_reference(
     git_directory: &OwnedFd,
     reference: &str,
@@ -2640,10 +2824,48 @@ struct GitOutputV1 {
     stderr: Vec<u8>,
 }
 
+struct ReapingGitChildV1 {
+    child: Child,
+    reaped: bool,
+}
+
+impl ReapingGitChildV1 {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            reaped: false,
+        }
+    }
+
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, std::io::Error> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
+
+    fn kill_and_reap(&mut self) {
+        let _ = self.child.kill();
+        if self.child.wait().is_ok() {
+            self.reaped = true;
+        }
+    }
+}
+
+impl Drop for ReapingGitChildV1 {
+    fn drop(&mut self) {
+        if !self.reaped {
+            self.kill_and_reap();
+        }
+    }
+}
+
 #[derive(Default)]
 struct GitEnvironmentV1 {
     values: Vec<(&'static str, OsString)>,
     retained_descriptors: Vec<OwnedFd>,
+    writable_roots: Vec<OwnedFd>,
 }
 
 impl GitEnvironmentV1 {
@@ -2657,8 +2879,7 @@ impl GitEnvironmentV1 {
         descriptor: &OwnedFd,
         suffix: Option<&str>,
     ) -> Result<(), ManagedPointerError> {
-        let inherited = rustix::io::dup(descriptor).map_err(errno_to_io)?;
-        rustix::io::fcntl_setfd(&inherited, rustix::io::FdFlags::empty()).map_err(errno_to_io)?;
+        let inherited = rustix::io::fcntl_dupfd_cloexec(descriptor, 3).map_err(errno_to_io)?;
         let mut value = format!("/proc/self/fd/{}", inherited.as_raw_fd());
         if let Some(suffix) = suffix {
             value.push('/');
@@ -2666,6 +2887,22 @@ impl GitEnvironmentV1 {
         }
         self.retained_descriptors.push(inherited);
         self.insert(key, value);
+        Ok(())
+    }
+
+    fn writable_descriptor_path(
+        &mut self,
+        key: &'static str,
+        descriptor: &OwnedFd,
+        suffix: Option<&str>,
+    ) -> Result<(), ManagedPointerError> {
+        self.descriptor_path(key, descriptor, suffix)?;
+        self.admit_write_root(descriptor)
+    }
+
+    fn admit_write_root(&mut self, descriptor: &OwnedFd) -> Result<(), ManagedPointerError> {
+        self.writable_roots
+            .push(rustix::io::fcntl_dupfd_cloexec(descriptor, 3).map_err(errno_to_io)?);
         Ok(())
     }
 }
@@ -2732,9 +2969,9 @@ impl ManagedPointerTargetV1 {
             .env("GIT_LITERAL_PATHSPECS", "1")
             .env("GIT_PROTOCOL_FROM_USER", "0")
             .env("GIT_ALLOW_PROTOCOL", "")
-            .env("GIT_EXEC_PATH", "/nonexistent")
-            .env("GIT_ASKPASS", "/nonexistent")
-            .env("SSH_ASKPASS", "/nonexistent")
+            .env("GIT_EXEC_PATH", "/dev/null")
+            .env("GIT_ASKPASS", "/dev/null")
+            .env("SSH_ASKPASS", "/dev/null")
             .arg("--no-pager")
             .arg("-c")
             .arg("core.hooksPath=/dev/null")
@@ -2750,6 +2987,8 @@ impl ManagedPointerTargetV1 {
             .arg("core.sharedRepository=0600")
             .arg("-c")
             .arg("pack.writeReverseIndex=false")
+            .arg("-c")
+            .arg("core.logAllRefUpdates=false")
             .arg("-c")
             .arg("protocol.allow=never")
             .arg(operation.as_str())
@@ -2791,8 +3030,13 @@ impl ManagedPointerTargetV1 {
         {
             return Err(ManagedPointerError::PromotionExpiredBeforeCas);
         }
-        let mut child = command.spawn()?;
+        let mut child = ReapingGitChildV1::new(spawn_with_exact_descriptors(
+            &mut command,
+            &environment.retained_descriptors,
+            &environment.writable_roots,
+        )?);
         let stdout = child
+            .child
             .stdout
             .take()
             .ok_or_else(|| ManagedPointerError::Git {
@@ -2800,6 +3044,7 @@ impl ManagedPointerTargetV1 {
                 detail: "stdout pipe unavailable".to_owned(),
             })?;
         let stderr = child
+            .child
             .stderr
             .take()
             .ok_or_else(|| ManagedPointerError::Git {
@@ -2814,8 +3059,7 @@ impl ManagedPointerTargetV1 {
                 break status;
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                child.kill_and_reap();
                 return Err(ManagedPointerError::Git {
                     operation: operation.as_str(),
                     detail: "operation exceeded its fixed deadline".to_owned(),
@@ -2859,6 +3103,20 @@ impl ManagedPointerTargetV1 {
         }
         Ok(output.stdout)
     }
+}
+
+fn spawn_with_exact_descriptors(
+    command: &mut Command,
+    admitted: &[OwnedFd],
+    writable_roots: &[OwnedFd],
+) -> Result<Child, ManagedPointerError> {
+    let inherited = admitted.iter().map(OwnedFd::as_raw_fd).collect::<Vec<_>>();
+    let writable_roots = writable_roots
+        .iter()
+        .map(OwnedFd::as_raw_fd)
+        .collect::<Vec<_>>();
+    crate::exact_exec::configure_exact_inherited_fds(command, &inherited, &writable_roots, 3)?;
+    command.spawn().map_err(ManagedPointerError::Io)
 }
 
 fn read_bounded_output(mut reader: impl Read) -> Result<Vec<u8>, std::io::Error> {
@@ -3001,6 +3259,7 @@ fn pinned_git_metadata_values_are_safe(
         && mode & (0o7000 | 0o022) == 0
         && mode & 0o111 != 0
         && size > 0
+        && size <= MAX_GIT_EXECUTABLE_BYTES
 }
 
 fn require_no_security_capability(file: &File) -> Result<(), ManagedPointerError> {
@@ -3069,19 +3328,22 @@ pub fn managed_pointer_launch_profile_identity(
         executable_transport: &'static str,
         source_custody: &'static str,
         privilege_floor: &'static str,
-        environment: [&'static str; 12],
+        environment: [&'static str; 14],
         operations: [&'static str; 11],
-        fixed_config: [&'static str; 8],
+        fixed_config: [&'static str; 9],
         candidate_ref: &'static str,
         bundle_version: u8,
         pack_version: u8,
         network: &'static str,
         credentials: &'static str,
+        descriptor_inheritance: &'static str,
+        mutation_confinement: &'static str,
+        null_device_custody: &'static str,
         object_durability: &'static str,
         boundary: &'static str,
     }
     Ok(Digest::from_serializable(&LaunchProfile {
-        schema: MANAGED_POINTER_LAUNCH_PROFILE_SCHEMA_V1,
+        schema: MANAGED_POINTER_LAUNCH_PROFILE_SCHEMA_V2,
         security_profile_identity,
         git_executable,
         executable_transport: "sealed-memfd-proc-self-fd",
@@ -3099,7 +3361,9 @@ pub fn managed_pointer_launch_profile_identity(
             "GIT_LITERAL_PATHSPECS=1",
             "GIT_PROTOCOL_FROM_USER=0",
             "GIT_ALLOW_PROTOCOL=",
-            "GIT_EXEC_PATH=/nonexistent",
+            "GIT_EXEC_PATH=/dev/null",
+            "GIT_ASKPASS=/dev/null",
+            "SSH_ASKPASS=/dev/null",
         ],
         operations: [
             "init",
@@ -3122,6 +3386,7 @@ pub fn managed_pointer_launch_profile_identity(
             "core.fsync=reference",
             "core.sharedRepository=0600",
             "pack.writeReverseIndex=false",
+            "core.logAllRefUpdates=false",
             "protocol.allow=never",
         ],
         candidate_ref: BUNDLE_CANDIDATE_REF,
@@ -3129,6 +3394,9 @@ pub fn managed_pointer_launch_profile_identity(
         pack_version: 2,
         network: "forbidden",
         credentials: "none",
+        descriptor_inheritance: "close-range-cloexec-then-exact-admitted-fds",
+        mutation_confinement: "landlock-abi-3-descriptor-rooted-write-set",
+        null_device_custody: "exact-root-owned-char-1-3-mode-0666-write-only-landlock-rule",
         object_durability: "descriptor-fsync-pack-index-packdir-objectsdir",
         boundary: "durable-unreachable-object-import-then-single-update-ref-cas",
     })?)
@@ -3296,6 +3564,21 @@ impl ManagedPointerTargetV1 {
         reject_entry(&git_directory, Path::new("worktrees"), "linked worktrees")?;
         reject_entry(
             &git_directory,
+            Path::new("commondir"),
+            "common-directory indirection",
+        )?;
+        reject_entry(
+            &git_directory,
+            Path::new("config.worktree"),
+            "per-worktree configuration",
+        )?;
+        reject_entry(
+            &git_directory,
+            &Path::new("logs").join(&self.reference),
+            "managed-reference reflog",
+        )?;
+        reject_entry(
+            &git_directory,
             Path::new("objects/info/alternates"),
             "object alternates",
         )?;
@@ -3305,13 +3588,14 @@ impl ManagedPointerTargetV1 {
             "HTTP object alternates",
         )?;
         reject_entry(&git_directory, Path::new("shallow"), "shallow repositories")?;
-        let (config_digest, config_node) = read_regular_digest_and_node(
+        let (config_digest, config_node, config_bytes) = read_regular_digest_and_node(
             &git_directory,
             Path::new("config"),
             MAX_REPOSITORY_CONFIG_BYTES,
             self.uid,
             self.gid,
         )?;
+        validate_closed_repository_config(&config_bytes)?;
 
         let mut environment = GitEnvironmentV1::default();
         environment.descriptor_path("GIT_DIR", &git_directory, None)?;
@@ -3481,11 +3765,11 @@ impl ManagedPointerTargetV1 {
         repository: &OpenRepositoryV1,
         current_object: &str,
     ) -> Result<bool, ManagedPointerError> {
-        let stage = StagingDirectoryV1::create(&self.staging_root)?;
+        let stage =
+            StagingDirectoryV1::create(&self.staging_root, self.production_staging_custody)?;
         self.initialize_staging(&stage, repository.identity_evidence.object_format)?;
-        let stage_fd = open_absolute_directory(&stage.path)?;
         let mut environment = GitEnvironmentV1::default();
-        environment.descriptor_path("GIT_DIR", &stage_fd, None)?;
+        environment.descriptor_path("GIT_DIR", &stage.directory, None)?;
         environment.descriptor_path("GIT_OBJECT_DIRECTORY", &repository.objects, None)?;
         environment.descriptor_path("GIT_INDEX_FILE", &repository.git_directory, Some("index"))?;
         environment.descriptor_path("GIT_WORK_TREE", &repository.repository, None)?;
@@ -3494,6 +3778,8 @@ impl ManagedPointerTargetV1 {
             &[
                 OsString::from("--quiet"),
                 OsString::from("--cached"),
+                OsString::from("--no-ext-diff"),
+                OsString::from("--no-textconv"),
                 OsString::from(current_object),
                 OsString::from("--"),
             ],
@@ -3509,6 +3795,7 @@ impl ManagedPointerTargetV1 {
             &[
                 OsString::from("--quiet"),
                 OsString::from("--no-ext-diff"),
+                OsString::from("--no-textconv"),
                 OsString::from("--ignore-submodules=dirty"),
                 OsString::from("--"),
             ],
@@ -3539,29 +3826,29 @@ impl ManagedPointerTargetV1 {
         stage: &StagingDirectoryV1,
         format: GitObjectFormatV1,
     ) -> Result<(), ManagedPointerError> {
-        let stage_fd = open_absolute_directory(&stage.path)?;
-        let stage_stat = rustix::fs::fstat(&stage_fd).map_err(errno_to_io)?;
-        rustix::fs::fchmod(&stage_fd, Mode::from_raw_mode(0o700)).map_err(errno_to_io)?;
+        let stage_fd = &stage.directory;
+        let stage_stat = rustix::fs::fstat(stage_fd).map_err(errno_to_io)?;
+        rustix::fs::fchmod(stage_fd, Mode::from_raw_mode(0o700)).map_err(errno_to_io)?;
         if stage_stat.st_uid != self.uid || stage_stat.st_gid != self.gid {
             rustix::fs::fchown(
-                &stage_fd,
+                stage_fd,
                 Some(Uid::from_raw(self.uid)),
                 Some(Gid::from_raw(self.gid)),
             )
             .map_err(errno_to_io)?;
         }
-        let handed_off = rustix::fs::fstat(&stage_fd).map_err(errno_to_io)?;
+        let handed_off = rustix::fs::fstat(stage_fd).map_err(errno_to_io)?;
         if !FileType::from_raw_mode(handed_off.st_mode).is_dir()
             || handed_off.st_uid != self.uid
             || handed_off.st_gid != self.gid
-            || handed_off.st_mode & 0o777 != 0o700
+            || handed_off.st_mode & 0o7777 != 0o700
         {
             return Err(ManagedPointerError::UnsafeRepository(
                 "staging custody transfer did not reach the configured target identity".to_owned(),
             ));
         }
         let mut environment = GitEnvironmentV1::default();
-        environment.descriptor_path("GIT_DIR", &stage_fd, None)?;
+        environment.writable_descriptor_path("GIT_DIR", stage_fd, None)?;
         self.run_git_checked(
             GitOperationV1::Init,
             &[
@@ -3716,7 +4003,7 @@ fn read_regular_digest_and_node(
     maximum: u64,
     uid: u32,
     gid: u32,
-) -> Result<(Digest, ManagedFilesystemNodeEvidenceV1), ManagedPointerError> {
+) -> Result<(Digest, ManagedFilesystemNodeEvidenceV1, Vec<u8>), ManagedPointerError> {
     let descriptor = rustix::fs::openat2(
         parent,
         relative,
@@ -3767,7 +4054,78 @@ fn read_regular_digest_and_node(
     Ok((
         Digest::hash_bytes(&bytes),
         node_evidence(utf8_path(relative)?, &after),
+        bytes,
     ))
+}
+
+fn validate_closed_repository_config(bytes: &[u8]) -> Result<(), ManagedPointerError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        ManagedPointerError::UnsafeRepository("repository config is not UTF-8".to_owned())
+    })?;
+    let mut section = "";
+    for line in text.lines() {
+        if line
+            .chars()
+            .any(|character| character.is_control() && character != '\t')
+        {
+            return Err(ManagedPointerError::UnsafeRepository(
+                "repository config contains control bytes".to_owned(),
+            ));
+        }
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            let closing = header.find(']').ok_or_else(|| {
+                ManagedPointerError::UnsafeRepository(
+                    "repository config section is malformed".to_owned(),
+                )
+            })?;
+            let trailing = header[closing + 1..].trim_start();
+            if !trailing.is_empty() && !trailing.starts_with('#') && !trailing.starts_with(';') {
+                return Err(ManagedPointerError::UnsafeRepository(
+                    "repository config section has trailing syntax".to_owned(),
+                ));
+            }
+            let name = header[..closing]
+                .split(|character: char| character.is_ascii_whitespace() || character == '"')
+                .next()
+                .unwrap_or_default();
+            let name = name.split('.').next().unwrap_or_default();
+            if name.eq_ignore_ascii_case("include") || name.eq_ignore_ascii_case("includeif") {
+                return Err(ManagedPointerError::UnsafeRepository(
+                    "repository config includes external configuration".to_owned(),
+                ));
+            }
+            if name.eq_ignore_ascii_case("filter") {
+                return Err(ManagedPointerError::UnsafeRepository(
+                    "repository config declares a command-bearing content filter".to_owned(),
+                ));
+            }
+            section = if name.eq_ignore_ascii_case("extensions") {
+                "extensions"
+            } else {
+                "other"
+            };
+            continue;
+        }
+        let key_end = line
+            .find(|character: char| character == '=' || character.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        let key = &line[..key_end];
+        if key.is_empty() {
+            return Err(ManagedPointerError::UnsafeRepository(
+                "repository config key is malformed".to_owned(),
+            ));
+        }
+        if section == "extensions" && !key.eq_ignore_ascii_case("objectformat") {
+            return Err(ManagedPointerError::UnsafeRepository(format!(
+                "repository extension {key} is outside the closed configuration contract"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_regular_bytes(
@@ -3880,30 +4238,72 @@ fn utf8_path(path: &Path) -> Result<String, ManagedPointerError> {
         .ok_or(ManagedPointerError::BindingMismatch)
 }
 
+fn validate_production_staging_custody(
+    is_directory: bool,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+) -> Result<(), ManagedPointerError> {
+    if !is_directory || uid != 0 || gid != 0 || mode & 0o7777 != 0o700 {
+        return Err(ManagedPointerError::UnsafeRepository(
+            "production staging root is not exact root-owned mode 0700 custody".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 struct StagingDirectoryV1 {
-    path: PathBuf,
+    root: OwnedFd,
+    name: String,
+    directory: OwnedFd,
 }
 
 impl StagingDirectoryV1 {
-    fn create(root: &Path) -> Result<Self, ManagedPointerError> {
-        let metadata = fs::symlink_metadata(root)?;
-        if !metadata.file_type().is_dir()
-            || metadata.uid() != nix::unistd::geteuid().as_raw()
-            || metadata.mode() & 0o022 != 0
-        {
+    fn create(root: &Path, production_custody: bool) -> Result<Self, ManagedPointerError> {
+        let root_directory = open_absolute_directory(root)?;
+        let root_stat = rustix::fs::fstat(&root_directory).map_err(errno_to_io)?;
+        let safe = if production_custody {
+            validate_production_staging_custody(
+                FileType::from_raw_mode(root_stat.st_mode).is_dir(),
+                root_stat.st_uid,
+                root_stat.st_gid,
+                root_stat.st_mode,
+            )
+            .is_ok()
+        } else {
+            FileType::from_raw_mode(root_stat.st_mode).is_dir()
+                && root_stat.st_uid == nix::unistd::geteuid().as_raw()
+                && root_stat.st_mode & 0o022 == 0
+        };
+        if !safe {
             return Err(ManagedPointerError::UnsafeRepository(
                 "staging root is not a broker-owned private directory".to_owned(),
             ));
         }
         for _ in 0..32 {
-            let path = root.join(format!(".ag-promotion-{}", uuid::Uuid::new_v4()));
-            match fs::create_dir(&path) {
+            let name = format!(".ag-promotion-{}", uuid::Uuid::new_v4());
+            match rustix::fs::mkdirat(&root_directory, name.as_str(), Mode::from_raw_mode(0o700)) {
                 Ok(()) => {
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
-                    return Ok(Self { path });
+                    let directory = open_directory_beneath(&root_directory, Path::new(&name))?;
+                    let stat = rustix::fs::fstat(&directory).map_err(errno_to_io)?;
+                    if !FileType::from_raw_mode(stat.st_mode).is_dir()
+                        || stat.st_uid != root_stat.st_uid
+                        || stat.st_gid != root_stat.st_gid
+                        || stat.st_mode & 0o7777 != 0o700
+                    {
+                        return Err(ManagedPointerError::UnsafeRepository(
+                            "new staging directory custody differs from its descriptor-bound root"
+                                .to_owned(),
+                        ));
+                    }
+                    return Ok(Self {
+                        root: root_directory,
+                        name,
+                        directory,
+                    });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(ManagedPointerError::Io(errno_to_io(error))),
             }
         }
         Err(ManagedPointerError::UnsafeRepository(
@@ -3914,7 +4314,11 @@ impl StagingDirectoryV1 {
 
 impl Drop for StagingDirectoryV1 {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        // Stay anchored to the retained, custody-validated root descriptor.
+        // A later pathname replacement must never redirect cleanup into an
+        // unrelated tree. Failure leaks a quarantined directory safely.
+        let anchored = format!("/proc/self/fd/{}/{}", self.root.as_raw_fd(), self.name);
+        let _ = fs::remove_dir_all(anchored);
     }
 }
 
@@ -3977,6 +4381,26 @@ mod tests {
             "A".repeat(40)
         );
         assert!(parse_strict_bundle(uppercase.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn repository_config_rejects_external_and_worktree_indirection() {
+        validate_closed_repository_config(
+            b"[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n",
+        )
+        .expect("ordinary bounded local config");
+        for hostile in [
+            b"[include]\n\tpath = /tmp/foreign\n".as_slice(),
+            b"[includeIf \"gitdir:/srv/**\"]\n\tpath = /tmp/foreign\n".as_slice(),
+            b"[filter \"hostile\"]\n\tclean = /bin/false\n".as_slice(),
+            b"[extensions]\n\tworktreeConfig = true\n".as_slice(),
+            b"[extensions]\n\trefStorage = reftable\n".as_slice(),
+        ] {
+            assert!(matches!(
+                validate_closed_repository_config(hostile),
+                Err(ManagedPointerError::UnsafeRepository(_))
+            ));
+        }
     }
 
     #[test]
@@ -4102,9 +4526,17 @@ mod tests {
             OsStr::new("rev-parse"),
             OsStr::new("HEAD"),
         ]));
+        let expected_tree = output_line(plain_git(&[
+            OsStr::new("-C"),
+            repository.as_os_str(),
+            OsStr::new("rev-parse"),
+            OsStr::new("HEAD^{tree}"),
+        ]));
         plain_git(&[
             OsStr::new("-C"),
             repository.as_os_str(),
+            OsStr::new("-c"),
+            OsStr::new("core.logAllRefUpdates=false"),
             OsStr::new("branch"),
             OsStr::new("managed"),
             OsStr::new(&expected_object),
@@ -4182,24 +4614,10 @@ mod tests {
         )
         .expect("pack directory mode");
 
-        // Install repository-controlled command surfaces after fixture setup.
-        // The managed runtime must neither read them as commands nor execute
-        // them, even though the exact config is enrolled below.
+        // Install a repository-controlled hook after fixture setup. The fixed
+        // hooks path must make it unreachable even though the exact config and
+        // filesystem state are enrolled below.
         let sentinel = directory.path().join("executed-sentinel");
-        let hostile = directory.path().join("hostile-filter");
-        fs::write(
-            &hostile,
-            format!("#!/bin/sh\ntouch {}\ncat\n", sentinel.display()),
-        )
-        .expect("hostile filter");
-        fs::set_permissions(&hostile, fs::Permissions::from_mode(0o755)).expect("filter mode");
-        plain_git(&[
-            OsStr::new("-C"),
-            repository.as_os_str(),
-            OsStr::new("config"),
-            OsStr::new("filter.hostile.clean"),
-            hostile.as_os_str(),
-        ]);
         fs::set_permissions(
             repository.join(".git/config"),
             fs::Permissions::from_mode(0o600),
@@ -4228,10 +4646,14 @@ mod tests {
             allowed_root,
             repository,
             reference: "refs/heads/managed".to_owned(),
+            activation_genesis_object: expected_object.clone(),
+            activation_genesis_tree: expected_tree,
+            activation_genesis_state: Digest::hash_bytes(b"genesis state"),
             repository_identity: Digest::hash_bytes(b"placeholder"),
             uid,
             gid,
             staging_root,
+            production_staging_custody: false,
             promotion_ttl_ms: 60_000,
             git: Mutex::new(PinnedGitV1::open(&git_path, &git_identity).expect("pin Git")),
             launch_profile,
@@ -4396,6 +4818,25 @@ mod tests {
     }
 
     #[test]
+    fn production_staging_custody_is_exact_and_privilege_independent_to_test() {
+        validate_production_staging_custody(true, 0, 0, libc::S_IFDIR | 0o700)
+            .expect("exact production custody");
+        for hostile in [
+            (false, 0, 0, libc::S_IFREG | 0o700),
+            (true, 1, 0, libc::S_IFDIR | 0o700),
+            (true, 0, 1, libc::S_IFDIR | 0o700),
+            (true, 0, 0, libc::S_IFDIR | 0o750),
+            (true, 0, 0, libc::S_IFDIR | 0o1700),
+            (true, 0, 0, libc::S_IFDIR | 0o2700),
+        ] {
+            assert!(matches!(
+                validate_production_staging_custody(hostile.0, hostile.1, hostile.2, hostile.3),
+                Err(ManagedPointerError::UnsafeRepository(_))
+            ));
+        }
+    }
+
+    #[test]
     fn candidate_preparation_requires_live_scope_and_budget_standing() {
         assert!(matches!(
             require_preparation_standing(None),
@@ -4447,6 +4888,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn exact_fd_git_path_prepares_and_commits_without_repo_commands() {
         let fixture = fixture();
         let effect = canonical_effect(&fixture);
@@ -4488,6 +4930,30 @@ mod tests {
             substituted_activation.verify(&effect),
             Err(ManagedPointerError::BindingMismatch)
         ));
+        let mut substituted_request = activation.clone();
+        substituted_request.commit.request_digest = Digest::hash_bytes(b"substituted request");
+        assert!(matches!(
+            substituted_request.verify(&effect),
+            Err(ManagedPointerError::BindingMismatch)
+        ));
+        for mutate_schema in [
+            |receipt: &mut ManagedPointerActivationReceiptV1| {
+                receipt.commit.schema = "foreign.commit".to_owned();
+            },
+            |receipt: &mut ManagedPointerActivationReceiptV1| {
+                receipt.poststate.schema = "foreign.poststate".to_owned();
+            },
+            |receipt: &mut ManagedPointerActivationReceiptV1| {
+                receipt.poststate.state.schema = "foreign.state".to_owned();
+            },
+        ] {
+            let mut substituted_schema = activation.clone();
+            mutate_schema(&mut substituted_schema);
+            assert!(matches!(
+                substituted_schema.verify(&effect),
+                Err(ManagedPointerError::BindingMismatch)
+            ));
+        }
         let observed = fixture
             .runtime
             .observe_canonical(&effect)
@@ -4533,6 +4999,31 @@ mod tests {
             nix::sys::prctl::get_no_new_privs().expect("read no-new-privileges state"),
             "helper launch must establish no-new-privileges before exec"
         );
+        let governed_head = ManagedPointerActivationHeadV1 {
+            object: activation.installed_object.clone(),
+            tree: activation.installed_tree.clone(),
+            state_identity: activation
+                .poststate
+                .state
+                .identity()
+                .expect("durable state identity"),
+        };
+        let reference = target.repository.join(".git/refs/heads/managed");
+        let replacement = target.repository.join(".git/refs/heads/.ag-replacement");
+        fs::write(
+            &replacement,
+            format!("{}\n", activation.installed_object).as_bytes(),
+        )
+        .expect("same-byte replacement");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+            .expect("replacement mode");
+        fs::rename(&replacement, &reference).expect("replace loose ref inode");
+        assert!(matches!(
+            fixture
+                .runtime
+                .require_activation_state(&fixture.target, &governed_head),
+            Err(ManagedPointerError::PrestateDrift(_))
+        ));
     }
 
     struct FixedManagedPointerClockV1(u64);
@@ -4583,6 +5074,7 @@ mod tests {
             (true, 0, 1, 0o101755, 1),
             (true, 0, 1, 0o100644, 1),
             (true, 0, 1, 0o100755, 0),
+            (true, 0, 1, 0o100755, MAX_GIT_EXECUTABLE_BYTES + 1),
         ] {
             assert!(!pinned_git_metadata_values_are_safe(
                 unsafe_metadata.0,

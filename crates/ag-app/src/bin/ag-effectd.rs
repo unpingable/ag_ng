@@ -10,6 +10,7 @@ use ag_app::api::{
 };
 use ag_app::config::{EffectdConfigV1, LoadedConfigV1, load_config_with_identity};
 use ag_app::effectd::{EffectBrokerV1, LinuxManagedEffectRunnerV1, configured_catalog_identity};
+use ag_app::effectd_activation::EffectdLiveActivationV1;
 use ag_app::managed_pointer::{ManagedPointerError, ManagedPointerRuntimeV1};
 use ag_app::rpc_auth::{
     RpcPeerEnrollmentV1, RpcReplayGuardV1, RpcSignerV1, SystemRpcClockV1, VerifiedRpcPrincipalV1,
@@ -102,6 +103,23 @@ fn main() -> anyhow::Result<()> {
         },
         &config.store,
     )?;
+    let mut activation_failure = None;
+    let live_activation = if config.security_profile == "development" {
+        None
+    } else {
+        match EffectdLiveActivationV1::attest(&config, &catalog_identity, &store) {
+            Ok(activation) => Some(activation),
+            Err(error) => {
+                activation_failure = Some((
+                    error.phase().to_owned(),
+                    error.code().to_owned(),
+                    error.to_string(),
+                ));
+                warn!(%error, "effect broker is live but production activation is not ready");
+                None
+            }
+        }
+    };
     let mut broker = EffectBrokerV1::new(
         &config,
         &catalog_identity,
@@ -109,6 +127,29 @@ fn main() -> anyhow::Result<()> {
         LinuxManagedEffectRunnerV1::default(),
         Arc::clone(&replay_guard),
     )?;
+    if let Some((phase, code, detail)) = activation_failure {
+        broker.record_activation_failure(&phase, &code, &detail);
+    }
+    if let Some(activation) = live_activation {
+        match broker.apply_live_activation(&config, activation) {
+            Ok(()) => {
+                if let Some(receipt) = broker.activation_receipt() {
+                    info!(
+                        activation = %receipt.identity()?,
+                        "effect broker production activation is ready"
+                    );
+                }
+            }
+            Err(error) => {
+                broker.record_activation_failure(
+                    "broker_application",
+                    "activation_application_refused",
+                    &error.to_string(),
+                );
+                warn!(%error, "effect broker target changed during activation; authority remains disabled");
+            }
+        }
+    }
     let proposal_listener = bind_socket(&config.proposal_socket, &config.proposal_socket_custody)?;
     let admin_listener = bind_socket(&config.admin_socket, &config.admin_socket_custody)?;
     let codec = FrameCodec::new(config.limits.max_control_frame_bytes)?;
@@ -327,6 +368,9 @@ mod tests {
             allowed_root,
             repository,
             reference: "refs/heads/main".to_owned(),
+            activation_genesis_object: "0000000000000000000000000000000000000000".to_owned(),
+            activation_genesis_tree: "0000000000000000000000000000000000000000".to_owned(),
+            activation_genesis_state: Digest::hash_bytes(b"genesis state"),
             repository_identity: Digest::hash_bytes(b"repository identity"),
             uid: 1000,
             gid: 1000,

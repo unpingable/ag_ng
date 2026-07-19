@@ -7,6 +7,8 @@ mod custody;
 pub mod derived;
 pub mod doctor;
 pub mod effectd;
+pub mod effectd_activation;
+mod exact_exec;
 pub mod managed_pointer;
 pub mod peer;
 pub mod rpc_auth;

@@ -12,6 +12,7 @@ ConditionPathIsDirectory=/run/agent-governor/effectd/admin
 Type=exec
 User=root
 Group=root
+SupplementaryGroups=
 ExecStartPre=/usr/bin/ag-effectd --config /etc/agent-governor/effectd.toml --check-config
 ExecStart=/usr/bin/ag-effectd --config /etc/agent-governor/effectd.toml
 LoadCredentialEncrypted=rpc-ed25519-pkcs8:/etc/credstore.encrypted/effectd-rpc-ed25519-pkcs8.cred
@@ -27,9 +28,12 @@ StandardError=journal
 SyslogIdentifier=ag-effectd
 
 NoNewPrivileges=yes
-# These are only the capabilities needed by the closed managed-file/ref
-# vocabulary. In particular, effectd receives no ptrace, network, mount,
-# setuid, setgid, sys_admin, or arbitrary-exec capability.
+# The base capability set serves managed-file-only catalogs. A deployment with
+# a managed-pointer target must install the exact target-derived drop-in in the
+# packaging README, adding only SETUID/SETGID so the fixed Git child can enter
+# the enrolled target owner. Live readiness refuses either missing or excess
+# capabilities. Effectd never receives ptrace, network, mount, sys_admin, or a
+# generic execution capability.
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER
 AmbientCapabilities=
 DevicePolicy=closed
@@ -45,6 +49,7 @@ ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectProc=invisible
 ProtectSystem=strict
+ReadOnlyPaths=/run
 ProcSubset=pid
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
@@ -52,19 +57,23 @@ KeyringMode=private
 RemoveIPC=yes
 RestrictAddressFamilies=AF_UNIX
 RestrictNamespaces=yes
+PrivateMounts=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 SystemCallArchitectures=native
-SystemCallFilter=@system-service
+SystemCallFilter=@system-service landlock_create_ruleset landlock_add_rule landlock_restrict_self
 SystemCallErrorNumber=EPERM
 LimitCORE=0
 LimitNOFILE=4096
 TasksMax=128
 
-# Every admitted target root must be repeated in a root-owned local drop-in as
-# ReadWritePaths=. effectd config validation must refuse a target absent from
-# the effective sandbox. This base unit admits only broker-owned state.
+# Every admitted target root must be repeated in a root-owned local drop-in.
+# The live process requires exact equality with the complete configured set;
+# optional, missing, redundant-unconfigured, or broad paths refuse readiness.
 ReadWritePaths=/var/lib/agent-governor/effectd
+ReadWritePaths=/var/lib/agent-governor/effectd/objects
+ReadWritePaths=/run/agent-governor/effectd/proposal
+ReadWritePaths=/run/agent-governor/effectd/admin
 
 [Install]
 WantedBy=multi-user.target

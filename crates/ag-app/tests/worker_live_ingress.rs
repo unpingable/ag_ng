@@ -22,7 +22,8 @@ use ag_app::config::{
 };
 use ag_app::effectd::{EffectBrokerV1, RefusingEffectRunnerV1, configured_catalog_identity};
 use ag_app::managed_pointer::{
-    MANAGED_REPOSITORY_IDENTITY_SCHEMA_V1, ManagedRepositoryIdentityEvidenceV1,
+    MANAGED_REPOSITORY_IDENTITY_SCHEMA_V1, MANAGED_REPOSITORY_STATE_SCHEMA_V1,
+    ManagedRepositoryIdentityEvidenceV1, ManagedRepositoryStateEvidenceV1,
     managed_pointer_launch_profile_identity,
 };
 use ag_app::rpc_auth::{
@@ -173,6 +174,7 @@ struct PointerWorkerFixtureV1 {
     bundle: Vec<u8>,
     base_object: String,
     base_tree: String,
+    genesis_state_identity: Digest,
     candidate_object: String,
     candidate_tree: String,
     repository_identity: Digest,
@@ -407,6 +409,16 @@ fn pointer_worker_fixture(root: &Path) -> PointerWorkerFixtureV1 {
     }
     .identity()
     .expect("descriptor-bound repository identity");
+    let genesis_state_identity = Digest::from_serializable(&ManagedRepositoryStateEvidenceV1 {
+        schema: MANAGED_REPOSITORY_STATE_SCHEMA_V1.to_owned(),
+        repository_identity: repository_identity.clone(),
+        reference: node("refs/heads/main", &repository.join("refs/heads/main")),
+        current_object: base_object.clone(),
+        current_tree: base_tree.clone(),
+        clean: true,
+        reference_checked_out: false,
+    })
+    .expect("genesis state identity");
     let git_identity = Digest::hash_bytes(&fs::read(GIT).expect("exact Git bytes"));
     let helper_launch_profile = managed_pointer_launch_profile_identity(
         &Digest::hash_domain("ag-security-profile-identity-v1", b"development"),
@@ -420,6 +432,7 @@ fn pointer_worker_fixture(root: &Path) -> PointerWorkerFixtureV1 {
         bundle,
         base_object,
         base_tree,
+        genesis_state_identity,
         candidate_object,
         candidate_tree,
         repository_identity,
@@ -1130,6 +1143,9 @@ fn live_worker_bundle_closes_the_managed_pointer_lifecycle() {
         allowed_root: pointer.allowed_root.clone(),
         repository: pointer.repository.clone(),
         reference: "refs/heads/main".to_owned(),
+        activation_genesis_object: pointer.base_object.clone(),
+        activation_genesis_tree: pointer.base_tree.clone(),
+        activation_genesis_state: pointer.genesis_state_identity.clone(),
         repository_identity: pointer.repository_identity.clone(),
         uid: pointer.uid,
         gid: pointer.gid,

@@ -355,6 +355,7 @@ pub struct EffectdLimitsV1 {
 /// One root-owned effect target.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum EffectTargetConfigV1 {
     /// Git managed-ref target.
     ManagedPointer {
@@ -366,6 +367,13 @@ pub enum EffectTargetConfigV1 {
         repository: PathBuf,
         /// Exact ref.
         reference: String,
+        /// Exact reviewed object selected before this authority store has any
+        /// successful activation history for the target.
+        activation_genesis_object: String,
+        /// Exact tree selected by `activation_genesis_object`.
+        activation_genesis_tree: String,
+        /// Exact descriptor-bound state identity of the reviewed genesis ref.
+        activation_genesis_state: Digest,
         /// Repository configuration identity.
         repository_identity: Digest,
         /// Numeric target owner under which Git mutation executes.
@@ -948,6 +956,8 @@ fn validate_managed_pointer_target(
     allowed_root: &Path,
     repository: &Path,
     reference: &str,
+    activation_genesis_object: &str,
+    activation_genesis_tree: &str,
     uid: u32,
     gid: u32,
     staging_root: &Path,
@@ -967,6 +977,9 @@ fn validate_managed_pointer_target(
         || helper.starts_with(allowed_root)
         || helper.starts_with(staging_root)
         || !valid_managed_git_ref(reference)
+        || !valid_git_object_name(activation_genesis_object)
+        || !valid_git_object_name(activation_genesis_tree)
+        || activation_genesis_object.len() != activation_genesis_tree.len()
         || uid == 0
         || gid == 0
         || uid == u32::MAX
@@ -977,6 +990,13 @@ fn validate_managed_pointer_target(
         return Err(ConfigError::InvalidLimit("managed-pointer target"));
     }
     Ok(())
+}
+
+fn valid_git_object_name(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 impl AgctlConfigV1 {
@@ -1091,7 +1111,7 @@ impl EffectdConfigV1 {
     /// Returns an error for schema, path, signing, peer, limit, target mode,
     /// helper path, or closed systemd-unit violations.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema != "ag.config.effectd.v1" {
+        if self.schema != "ag.config.effectd.v2" {
             return Err(ConfigError::Schema(self.schema.clone()));
         }
         validate_security_profile(&self.security_profile)?;
@@ -1137,6 +1157,8 @@ impl EffectdConfigV1 {
                     allowed_root,
                     repository,
                     reference,
+                    activation_genesis_object,
+                    activation_genesis_tree,
                     uid,
                     gid,
                     staging_root,
@@ -1148,6 +1170,8 @@ impl EffectdConfigV1 {
                     allowed_root,
                     repository,
                     reference,
+                    activation_genesis_object,
+                    activation_genesis_tree,
                     *uid,
                     *gid,
                     staging_root,
@@ -1414,6 +1438,9 @@ mod tests {
             allowed_root: PathBuf::from("/srv/agent-governor/repositories"),
             repository: PathBuf::from("/srv/agent-governor/repositories/service.git"),
             reference: "refs/heads/main".to_owned(),
+            activation_genesis_object: "1111111111111111111111111111111111111111".to_owned(),
+            activation_genesis_tree: "2222222222222222222222222222222222222222".to_owned(),
+            activation_genesis_state: Digest::hash_bytes(b"genesis state"),
             repository_identity: Digest::hash_bytes(b"repository identity"),
             uid: 1000,
             gid: 1000,
@@ -1430,8 +1457,32 @@ mod tests {
         let mut config: EffectdConfigV1 =
             toml::from_str(include_str!("../../../config/effectd.example.toml"))
                 .expect("strict effectd example");
+        let mut legacy = config.clone();
+        legacy.schema = "ag.config.effectd.v1".to_owned();
+        assert!(matches!(
+            legacy.validate(),
+            Err(ConfigError::Schema(schema)) if schema == "ag.config.effectd.v1"
+        ));
         config.targets.push(managed_pointer_target());
         config.validate().expect("closed managed-pointer target");
+
+        let mut malformed_genesis = managed_pointer_target();
+        let EffectTargetConfigV1::ManagedPointer {
+            activation_genesis_object,
+            ..
+        } = &mut malformed_genesis
+        else {
+            unreachable!("fixture is a managed pointer")
+        };
+        *activation_genesis_object = "ABCDEF".to_owned();
+        config.targets.pop();
+        config.targets.push(malformed_genesis);
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::InvalidLimit("managed-pointer target"))
+        ));
+        config.targets.pop();
+        config.targets.push(managed_pointer_target());
 
         let mut outside_root = managed_pointer_target();
         let EffectTargetConfigV1::ManagedPointer { repository, .. } = &mut outside_root else {

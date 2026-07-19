@@ -18,6 +18,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::effectd_activation::EffectdActivationStatusV1;
 use crate::managed_pointer::ManagedPointerActivationReceiptV1;
 use crate::rpc_auth::{RpcPeerKeyPolicyV1, SignedRequestEnvelopeV1, SignedServerChallengeV1};
 
@@ -514,6 +515,8 @@ pub enum EffectAdminResponseV1 {
     Health {
         /// Exact effect-broker health record.
         health: HealthV1,
+        /// Current non-authorizing production-activation explanation.
+        activation: EffectdActivationStatusV1,
     },
     /// Exact broker-owned object plus one-time display challenge.
     Proposal {

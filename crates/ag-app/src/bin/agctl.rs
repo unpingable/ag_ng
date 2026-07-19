@@ -422,7 +422,7 @@ fn health(client: &ClientV1, component: HealthComponent) -> anyhow::Result<()> {
             _ => bail!("agd returned an unexpected response"),
         },
         HealthComponent::Effectd => match client.call_effectd(EffectAdminRequestV1::Health)? {
-            EffectAdminResponseV1::Health { health } => {
+            EffectAdminResponseV1::Health { health, .. } => {
                 require_health_service(health, "ag-effectd")?
             }
             _ => bail!("ag-effectd returned an unexpected response"),
@@ -1142,6 +1142,15 @@ mod tests {
                             ready: true,
                             quiesced: false,
                         },
+                        activation:
+                            ag_app::effectd_activation::EffectdActivationStatusV1::NotReady {
+                                schema:
+                                    ag_app::effectd_activation::EFFECTD_ACTIVATION_STATUS_SCHEMA_V1
+                                        .to_owned(),
+                                phase: "test".to_owned(),
+                                code: "test".to_owned(),
+                                detail: "test fixture".to_owned(),
+                            },
                     },
                 },
                 &SystemRpcClockV1,

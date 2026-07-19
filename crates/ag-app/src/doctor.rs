@@ -16,47 +16,15 @@ use crate::config::{
     ProviderdConfigV1, SocketCustodyConfigV1, StoreConfigV1, load_config_with_identity,
 };
 use crate::custody::{CustodyError, CustodyNodeKindV1, validate_node};
+use crate::effectd_activation::{EFFECTD_UNIT_PROPERTIES, validate_effectd_static_unit};
 
 /// Canonical schema emitted by `agctl doctor`.
 pub const DOCTOR_REPORT_SCHEMA_V1: &str = "ag.doctor-report/v1";
 
 const MAX_SYSTEMD_SHOW_BYTES: usize = 1024 * 1024;
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
-const SYSTEMD_PROPERTIES: [&str; 12] = [
-    "Id",
-    "User",
-    "Group",
-    "ExecStart",
-    "PrivateNetwork",
-    "RestrictAddressFamilies",
-    "CapabilityBoundingSet",
-    "AmbientCapabilities",
-    "SupplementaryGroups",
-    "NoNewPrivileges",
-    "ProtectSystem",
-    "ReadWritePaths",
-];
+const SYSTEMD_PROPERTIES: &[&str] = EFFECTD_UNIT_PROPERTIES;
 const UNIT_IDS: [&str; 3] = ["agd.service", "ag-effectd.service", "ag-providerd.service"];
-const SYSTEMCTL_ARGS: [&str; 18] = [
-    "show",
-    "--no-pager",
-    "--property=Id",
-    "--property=User",
-    "--property=Group",
-    "--property=ExecStart",
-    "--property=PrivateNetwork",
-    "--property=RestrictAddressFamilies",
-    "--property=CapabilityBoundingSet",
-    "--property=AmbientCapabilities",
-    "--property=SupplementaryGroups",
-    "--property=NoNewPrivileges",
-    "--property=ProtectSystem",
-    "--property=ReadWritePaths",
-    "--",
-    "agd.service",
-    "ag-effectd.service",
-    "ag-providerd.service",
-];
 
 /// Explicit production configuration paths inspected by doctor.
 #[derive(Clone, Debug)]
@@ -559,8 +527,18 @@ fn hash_executable(path: &Path) -> Result<Digest, String> {
 }
 
 fn query_systemd() -> Result<Vec<u8>, String> {
-    let output = Command::new(SYSTEMCTL)
-        .args(SYSTEMCTL_ARGS)
+    let mut command = Command::new(SYSTEMCTL);
+    command.args(["show", "--no-pager"]);
+    for property in SYSTEMD_PROPERTIES {
+        command.arg(format!("--property={property}"));
+    }
+    let output = command
+        .args([
+            "--",
+            "agd.service",
+            "ag-effectd.service",
+            "ag-providerd.service",
+        ])
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -599,7 +577,7 @@ fn parse_systemd_show(bytes: &[u8]) -> Result<BTreeMap<String, SystemdUnitShowV1
     if text.contains('\r') || text.contains('\0') {
         return Err("systemctl output contains forbidden control bytes".to_owned());
     }
-    let allowed: BTreeSet<&str> = SYSTEMD_PROPERTIES.into_iter().collect();
+    let allowed: BTreeSet<&str> = SYSTEMD_PROPERTIES.iter().copied().collect();
     let mut units = BTreeMap::new();
     let mut current: BTreeMap<String, String> = BTreeMap::new();
     for line in text.lines().chain(std::iter::once("")) {
@@ -651,23 +629,7 @@ fn inspect_systemd(
     units: &BTreeMap<String, SystemdUnitShowV1>,
     checks: &mut Vec<DoctorCheckV1>,
 ) {
-    let effectd_capabilities = configs.effectd.as_ref().map(|config| {
-        let mut capabilities = BTreeSet::from([
-            "cap_chown",
-            "cap_dac_override",
-            "cap_dac_read_search",
-            "cap_fowner",
-        ]);
-        if config
-            .targets
-            .iter()
-            .any(|target| matches!(target, EffectTargetConfigV1::ManagedPointer { .. }))
-        {
-            capabilities.insert("cap_setgid");
-            capabilities.insert("cap_setuid");
-        }
-        capabilities
-    });
+    let effectd_capabilities = configs.effectd.as_ref().map(required_effectd_capabilities);
     let specifications = [
         (
             "agd",
@@ -721,6 +683,11 @@ fn inspect_systemd(
 
     inspect_configured_unit_bindings(configs, checks);
     inspect_effectd_write_paths(
+        configs.effectd.as_ref(),
+        &units["ag-effectd.service"],
+        checks,
+    );
+    inspect_effectd_activation_profile(
         configs.effectd.as_ref(),
         &units["ag-effectd.service"],
         checks,
@@ -986,7 +953,57 @@ fn inspect_effectd_write_paths(
     ));
 }
 
-fn required_effectd_write_paths(config: &EffectdConfigV1) -> Result<BTreeSet<PathBuf>, String> {
+fn inspect_effectd_activation_profile(
+    config: Option<&EffectdConfigV1>,
+    unit: &SystemdUnitShowV1,
+    checks: &mut Vec<DoctorCheckV1>,
+) {
+    let Some(config) = config else {
+        checks.push(check(
+            "ag-effectd.systemd.activation-profile",
+            "ag-effectd",
+            DoctorCheckStatusV1::Unavailable,
+            "validated effectd configuration is required for the static activation profile",
+        ));
+        return;
+    };
+    let paths = required_effectd_write_paths(config).and_then(|paths| {
+        paths
+            .into_iter()
+            .map(|path| {
+                path.into_os_string().into_string().map_err(|_| {
+                    "effectd writable path is not UTF-8 for live profile parity".to_owned()
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()
+    });
+    let result = paths.and_then(|paths| {
+        validate_effectd_static_unit(
+            &unit.properties,
+            &required_effectd_capabilities(config),
+            &paths,
+        )
+        .map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(()) => checks.push(check(
+            "ag-effectd.systemd.activation-profile",
+            "ag-effectd",
+            DoctorCheckStatusV1::Pass,
+            "effective static unit properties match the live activation profile",
+        )),
+        Err(error) => checks.push(check(
+            "ag-effectd.systemd.activation-profile",
+            "ag-effectd",
+            DoctorCheckStatusV1::Fail,
+            error,
+        )),
+    }
+}
+
+pub(crate) fn required_effectd_write_paths(
+    config: &EffectdConfigV1,
+) -> Result<BTreeSet<PathBuf>, String> {
     let mut required = BTreeSet::new();
     insert_parent(&mut required, &config.store.database, "effectd database")?;
     insert_normalized_absolute(
@@ -1026,6 +1043,24 @@ fn required_effectd_write_paths(config: &EffectdConfigV1) -> Result<BTreeSet<Pat
         }
     }
     Ok(required)
+}
+
+pub(crate) fn required_effectd_capabilities(config: &EffectdConfigV1) -> BTreeSet<&'static str> {
+    let mut capabilities = BTreeSet::from([
+        "cap_chown",
+        "cap_dac_override",
+        "cap_dac_read_search",
+        "cap_fowner",
+    ]);
+    if config
+        .targets
+        .iter()
+        .any(|target| matches!(target, EffectTargetConfigV1::ManagedPointer { .. }))
+    {
+        capabilities.insert("cap_setgid");
+        capabilities.insert("cap_setuid");
+    }
+    capabilities
 }
 
 fn insert_parent(paths: &mut BTreeSet<PathBuf>, path: &Path, label: &str) -> Result<(), String> {
@@ -1197,18 +1232,88 @@ mod tests {
     }
 
     fn unit_block(unit: &UnitBlockV1<'_>) -> String {
-        format!(
-            "Id={}\nUser={}\nGroup={}\nExecStart={{ path={} ; argv[]={}; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}\nPrivateNetwork={}\nRestrictAddressFamilies={}\nCapabilityBoundingSet={}\nAmbientCapabilities=\nSupplementaryGroups=\nNoNewPrivileges=yes\nProtectSystem=strict\nReadWritePaths={}\n",
-            unit.id,
-            unit.user,
-            unit.group,
-            unit.executable,
-            unit.executable,
-            unit.private_network,
-            unit.families,
-            unit.capabilities,
-            unit.write_paths,
-        )
+        let effectd = unit.id == "ag-effectd.service";
+        let mut properties: BTreeMap<&str, String> = SYSTEMD_PROPERTIES
+            .iter()
+            .map(|property| (*property, String::new()))
+            .collect();
+        properties.insert("Id", unit.id.to_owned());
+        properties.insert("MainPID", "4242".to_owned());
+        properties.insert("ControlGroup", format!("/system.slice/{}", unit.id));
+        properties.insert(
+            "InvocationID",
+            "11111111111111111111111111111111".to_owned(),
+        );
+        properties.insert("User", unit.user.to_owned());
+        properties.insert("Group", unit.group.to_owned());
+        let argv = if effectd {
+            "/usr/bin/ag-effectd --config /etc/agent-governor/effectd.toml"
+        } else {
+            unit.executable
+        };
+        properties.insert(
+            "ExecStart",
+            format!(
+                "{{ path={} ; argv[]={argv} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}",
+                unit.executable
+            ),
+        );
+        if effectd {
+            properties.insert(
+                "ExecStartPre",
+                "{ path=/usr/bin/ag-effectd ; argv[]=/usr/bin/ag-effectd --config /etc/agent-governor/effectd.toml --check-config ; ignore_errors=no ; }".to_owned(),
+            );
+        }
+        properties.insert("PrivateNetwork", unit.private_network.to_owned());
+        properties.insert("RestrictAddressFamilies", unit.families.to_owned());
+        properties.insert("CapabilityBoundingSet", unit.capabilities.to_owned());
+        properties.insert("UMask", "0077".to_owned());
+        properties.insert("DevicePolicy", "closed".to_owned());
+        properties.insert("ProtectClock", "yes".to_owned());
+        properties.insert("ProtectHostname", "yes".to_owned());
+        properties.insert("KeyringMode", "private".to_owned());
+        properties.insert("RemoveIPC", "yes".to_owned());
+        properties.insert("RestrictRealtime", "yes".to_owned());
+        properties.insert("SystemCallArchitectures", "native".to_owned());
+        properties.insert("SystemCallErrorNumber", "EPERM".to_owned());
+        properties.insert("LimitCORE", "0".to_owned());
+        properties.insert("LimitNOFILE", "4096".to_owned());
+        properties.insert("TasksMax", "128".to_owned());
+        properties.insert("NoNewPrivileges", "yes".to_owned());
+        properties.insert("ProtectSystem", "strict".to_owned());
+        properties.insert("ReadWritePaths", unit.write_paths.to_owned());
+        if effectd {
+            for property in [
+                "ProtectHome",
+                "PrivateTmp",
+                "PrivateDevices",
+                "PrivateMounts",
+                "ProtectKernelTunables",
+                "ProtectControlGroups",
+                "ProtectKernelModules",
+                "ProtectKernelLogs",
+                "RestrictNamespaces",
+                "RestrictSUIDSGID",
+                "MemoryDenyWriteExecute",
+                "LockPersonality",
+            ] {
+                properties.insert(property, "yes".to_owned());
+            }
+            properties.insert("ProtectProc", "invisible".to_owned());
+            properties.insert("ProcSubset", "pid".to_owned());
+            properties.insert("DynamicUser", "no".to_owned());
+            properties.insert("ReadOnlyPaths", "/run".to_owned());
+            properties.insert("StateDirectory", "agent-governor/effectd".to_owned());
+            properties.insert("StateDirectoryMode", "0700".to_owned());
+        }
+        let mut output = String::new();
+        for property in SYSTEMD_PROPERTIES {
+            output.push_str(property);
+            output.push('=');
+            output.push_str(&properties[*property]);
+            output.push('\n');
+        }
+        output
     }
 
     fn valid_show() -> String {
@@ -1245,6 +1350,37 @@ mod tests {
             }),
         ]
         .join("\n")
+    }
+
+    fn replace_unit_property(
+        show: &str,
+        unit_id: &str,
+        property: &str,
+        replacement: &str,
+    ) -> String {
+        let mut current_unit = "";
+        let property_prefix = format!("{property}=");
+        let mut replaced = false;
+        let mut output = show
+            .lines()
+            .map(|line| {
+                if let Some(id) = line.strip_prefix("Id=") {
+                    current_unit = id;
+                }
+                if current_unit == unit_id && line.starts_with(&property_prefix) {
+                    replaced = true;
+                    format!("{property}={replacement}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(replaced, "missing {property} for {unit_id}");
+        if show.ends_with('\n') {
+            output.push('\n');
+        }
+        output
     }
 
     fn example_configs() -> LoadedDaemonConfigsV1 {
@@ -1284,6 +1420,9 @@ mod tests {
             allowed_root: PathBuf::from("/srv/agent-governor/repositories"),
             repository: PathBuf::from("/srv/agent-governor/repositories/service.git"),
             reference: "refs/heads/main".to_owned(),
+            activation_genesis_object: "1111111111111111111111111111111111111111".to_owned(),
+            activation_genesis_tree: "2222222222222222222222222222222222222222".to_owned(),
+            activation_genesis_state: Digest::hash_bytes(b"genesis state"),
             repository_identity: Digest::hash_bytes(b"repository identity"),
             uid: 1000,
             gid: 1000,
@@ -1351,11 +1490,8 @@ mod tests {
 
     #[test]
     fn hostile_effect_and_provider_network_properties_fail_closed() {
-        let effect_network = valid_show().replacen(
-            "Id=ag-effectd.service\nUser=root\nGroup=root\nExecStart={ path=/usr/bin/ag-effectd ; argv[]=/usr/bin/ag-effectd; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\nPrivateNetwork=yes",
-            "Id=ag-effectd.service\nUser=root\nGroup=root\nExecStart={ path=/usr/bin/ag-effectd ; argv[]=/usr/bin/ag-effectd; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\nPrivateNetwork=no",
-            1,
-        );
+        let effect_network =
+            replace_unit_property(&valid_show(), "ag-effectd.service", "PrivateNetwork", "no");
         assert_eq!(
             status(
                 &inspect_fake_systemd(&effect_network),
@@ -1364,10 +1500,11 @@ mod tests {
             DoctorCheckStatusV1::Fail
         );
 
-        let provider_network = valid_show().replacen(
-            "Id=ag-providerd.service\nUser=ag-provider\nGroup=ag-provider\nExecStart={ path=/usr/bin/ag-providerd ; argv[]=/usr/bin/ag-providerd; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\nPrivateNetwork=no",
-            "Id=ag-providerd.service\nUser=ag-provider\nGroup=ag-provider\nExecStart={ path=/usr/bin/ag-providerd ; argv[]=/usr/bin/ag-providerd; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\nPrivateNetwork=yes",
-            1,
+        let provider_network = replace_unit_property(
+            &valid_show(),
+            "ag-providerd.service",
+            "PrivateNetwork",
+            "yes",
         );
         assert_eq!(
             status(

@@ -17,8 +17,9 @@ use ag_app::api::{
 use ag_app::config::{EffectTargetConfigV1, EffectdConfigV1, PeerPolicyV1};
 use ag_app::effectd::{EffectBrokerV1, RefusingEffectRunnerV1, configured_catalog_identity};
 use ag_app::managed_pointer::{
-    MANAGED_REPOSITORY_IDENTITY_SCHEMA_V1, ManagedPointerRuntimeV1,
-    ManagedRepositoryIdentityEvidenceV1, managed_pointer_launch_profile_identity,
+    MANAGED_REPOSITORY_IDENTITY_SCHEMA_V1, MANAGED_REPOSITORY_STATE_SCHEMA_V1,
+    ManagedPointerRuntimeV1, ManagedRepositoryIdentityEvidenceV1, ManagedRepositoryStateEvidenceV1,
+    managed_pointer_launch_profile_identity,
 };
 use ag_app::peer::signed_principal_chain;
 use ag_app::rpc_auth::{
@@ -37,6 +38,7 @@ use tempfile::TempDir;
 
 const GIT: &str = "/usr/bin/git";
 const TARGET_ID: &str = "managed-main";
+const FILE_TARGET_ID: &str = "managed-file";
 const TARGET_REF: &str = "refs/heads/main";
 const CANDIDATE_REF: &str = "refs/heads/ag-candidate";
 
@@ -49,6 +51,7 @@ struct GitFixtureV1 {
     bundle: Vec<u8>,
     base_object: String,
     base_tree: String,
+    genesis_state_identity: Digest,
     candidate_object: String,
     candidate_tree: String,
     repository_identity: Digest,
@@ -321,6 +324,16 @@ fn git_fixture() -> GitFixtureV1 {
         config_digest,
     };
     let repository_identity = evidence.identity().expect("repository identity");
+    let genesis_state_identity = Digest::from_serializable(&ManagedRepositoryStateEvidenceV1 {
+        schema: MANAGED_REPOSITORY_STATE_SCHEMA_V1.to_owned(),
+        repository_identity: repository_identity.clone(),
+        reference: node(TARGET_REF, &repository.join(TARGET_REF)),
+        current_object: base_object.clone(),
+        current_tree: base_tree.clone(),
+        clean: true,
+        reference_checked_out: false,
+    })
+    .expect("genesis state identity");
     let git_identity = Digest::hash_bytes(&fs::read(GIT).expect("exact Git bytes"));
     let security_profile_identity =
         Digest::hash_domain("ag-security-profile-identity-v1", b"development");
@@ -337,6 +350,7 @@ fn git_fixture() -> GitFixtureV1 {
         bundle,
         base_object,
         base_tree,
+        genesis_state_identity,
         candidate_object,
         candidate_tree,
         repository_identity,
@@ -402,20 +416,32 @@ fn broker_harness(fixture: &GitFixtureV1, label: &str) -> BrokerHarnessV1 {
     config.agd_peer = peer_policy("governor", &governor, PrincipalKindV1::Daemon);
     config.proposer_peer = peer_policy("proposer", &proposer, PrincipalKindV1::Service);
     config.admin_peer = peer_policy("ratifier", &admin, PrincipalKindV1::Operator);
-    config.targets = vec![EffectTargetConfigV1::ManagedPointer {
-        id: TARGET_ID.to_owned(),
-        allowed_root: fixture.allowed_root.clone(),
-        repository: fixture.repository.clone(),
-        reference: TARGET_REF.to_owned(),
-        repository_identity: fixture.repository_identity.clone(),
-        uid: fixture.uid,
-        gid: fixture.gid,
-        staging_root: fixture.staging_root.clone(),
-        promotion_ttl_ms: 60_000,
-        helper: PathBuf::from(GIT),
-        helper_executable: fixture.git_identity.clone(),
-        helper_launch_profile: fixture.helper_launch_profile.clone(),
-    }];
+    config.targets = vec![
+        EffectTargetConfigV1::ManagedPointer {
+            id: TARGET_ID.to_owned(),
+            allowed_root: fixture.allowed_root.clone(),
+            repository: fixture.repository.clone(),
+            reference: TARGET_REF.to_owned(),
+            activation_genesis_object: fixture.base_object.clone(),
+            activation_genesis_tree: fixture.base_tree.clone(),
+            activation_genesis_state: fixture.genesis_state_identity.clone(),
+            repository_identity: fixture.repository_identity.clone(),
+            uid: fixture.uid,
+            gid: fixture.gid,
+            staging_root: fixture.staging_root.clone(),
+            promotion_ttl_ms: 60_000,
+            helper: PathBuf::from(GIT),
+            helper_executable: fixture.git_identity.clone(),
+            helper_launch_profile: fixture.helper_launch_profile.clone(),
+        },
+        EffectTargetConfigV1::ManagedFile {
+            id: FILE_TARGET_ID.to_owned(),
+            path: fixture.allowed_root.join("managed-file.conf"),
+            mode: 0o600,
+            uid: fixture.uid,
+            gid: fixture.gid,
+        },
+    ];
     config
         .validate()
         .expect("development pointer configuration");
@@ -778,6 +804,7 @@ fn assert_committed_reference_custody(fixture: &GitFixtureV1) {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn independently_ratified_bundle_promotes_exact_ref_once() {
     if !Path::new(GIT).is_file() {
         eprintln!("skipping managed-pointer integration: {GIT} is absent");
@@ -788,6 +815,20 @@ fn independently_ratified_bundle_promotes_exact_ref_once() {
     let proposal = submit_pointer(&mut harness, &fixture, "success-proposal");
     let challenge = inspect_pointer(&mut harness, &fixture, &proposal, "success-display");
     let result = ratify(&mut harness, &proposal, challenge, "success-ratification");
+    let failure_record = if matches!(
+        &result,
+        ApiResultV1::Ok {
+            response: EffectAdminResponseV1::ExecutionReceipt { terminal_state, .. }
+        } if terminal_state != "succeeded"
+    ) {
+        Some(inspect_record(
+            &mut harness,
+            &proposal,
+            "unexpected-success-record",
+        ))
+    } else {
+        None
+    };
     assert!(
         matches!(
             &result,
@@ -798,7 +839,7 @@ fn independently_ratified_bundle_promotes_exact_ref_once() {
                 }
             } if terminal_state == "succeeded"
         ),
-        "unexpected promotion result: {result:?}"
+        "unexpected promotion result: {result:?}; record: {failure_record:?}"
     );
     assert_eq!(target_object(&fixture), fixture.candidate_object);
     assert_eq!(target_tree(&fixture), fixture.candidate_tree);
@@ -883,6 +924,187 @@ fn independently_ratified_bundle_promotes_exact_ref_once() {
             ..
         }
     ));
+    assert_eq!(target_object(&fixture), fixture.candidate_object);
+    assert_eq!(target_tree(&fixture), fixture.candidate_tree);
+    assert_committed_reference_custody(&fixture);
+}
+
+#[test]
+fn divergent_pointer_blocks_managed_file_authority_before_burn() {
+    if !Path::new(GIT).is_file() {
+        eprintln!("skipping managed-pointer integration: {GIT} is absent");
+        return;
+    }
+    let fixture = git_fixture();
+    let mut harness = broker_harness(&fixture, "cross-family-activation-gate");
+    let content = b"must remain uninstalled\n".to_vec();
+    let artifact = Digest::hash_bytes(&content);
+    let intent = ProposalIntentV1 {
+        schema: EFFECT_SCHEMA_V1.to_owned(),
+        intent_id: "cross-family-managed-file".to_owned(),
+        authority_domain: harness.domain.clone(),
+        epoch: harness.epoch,
+        proposer: harness.proposer_chain.clone(),
+        judgment: Digest::hash_bytes(b"managed-file-judgment"),
+        admitted_artifacts: BTreeSet::from([artifact.clone()]),
+        effects: vec![EffectIntentV1::ManagedFilePut {
+            target: TargetId::parse(FILE_TARGET_ID).expect("file target ID"),
+            content: artifact.clone(),
+        }],
+    };
+    let proof = proposal_ingress(&harness, intent, "cross-family-file-proposal");
+    let submitted = harness.broker.handle_proposal(
+        EffectProposalRequestV1::SubmitAuthenticatedIntent {
+            ingress: Box::new(GovernedProposalIngressV1::ExternalSigned {
+                proof: Box::new(proof),
+            }),
+            artifacts: vec![ArtifactTransferV1 {
+                digest: artifact,
+                byte_length: content.len() as u64,
+                content_base64: base64::engine::general_purpose::STANDARD.encode(&content),
+            }],
+        },
+        &harness.governor_peer,
+    );
+    let ApiResultV1::Ok {
+        response:
+            EffectProposalResponseV1::Canonicalized {
+                proposal_digest, ..
+            },
+    } = submitted
+    else {
+        panic!("managed-file intent did not canonicalize: {submitted:?}");
+    };
+    let inspected = harness.broker.handle_admin(
+        EffectAdminRequestV1::InspectProposal {
+            proposal: proposal_digest.clone(),
+        },
+        &harness.admin_peer,
+        &Digest::hash_bytes(b"cross-family-file-inspection"),
+    );
+    let ApiResultV1::Ok {
+        response: EffectAdminResponseV1::Proposal { challenge, .. },
+    } = inspected
+    else {
+        panic!("managed-file proposal was not inspectable: {inspected:?}");
+    };
+
+    // Preserve the enrolled object bytes while replacing the exact ref inode.
+    // The managed pointer is no longer the governed activation head even
+    // though its Git object value appears unchanged.
+    let enrolled_ref = fixture.repository.join(TARGET_REF);
+    let substituted_ref = fixture.repository.join("refs/heads/hostile-replacement");
+    fs::write(&substituted_ref, format!("{}\n", fixture.base_object))
+        .expect("write hostile same-object reference");
+    fs::set_permissions(&substituted_ref, fs::Permissions::from_mode(0o600))
+        .expect("hostile reference mode");
+    fs::rename(&substituted_ref, &enrolled_ref).expect("replace enrolled reference inode");
+
+    let result = ratify(
+        &mut harness,
+        &proposal_digest,
+        challenge,
+        "cross-family-file-ratification",
+    );
+    assert!(matches!(
+        result,
+        ApiResultV1::Error {
+            code: ApiErrorCodeV1::Indeterminate,
+            ..
+        }
+    ));
+    let record = inspect_record(&mut harness, &proposal_digest, "cross-family-file-record");
+    assert!(matches!(record.state, ProposalStateV1::Ready { .. }));
+    assert!(record.authorization.is_none());
+    assert!(record.execution_attempt.is_none());
+    assert!(!fixture.allowed_root.join("managed-file.conf").exists());
+}
+
+#[test]
+fn separately_canonicalized_same_predecessor_activations_serialize_first_wins() {
+    if !Path::new(GIT).is_file() {
+        eprintln!("skipping managed-pointer integration: {GIT} is absent");
+        return;
+    }
+    let fixture = git_fixture();
+    let mut harness = broker_harness(&fixture, "same-predecessor-contention");
+
+    // Both broker-owned proposals bind the same exact predecessor before
+    // either proposal receives ratification or reaches the managed ref.
+    let first = submit_pointer(&mut harness, &fixture, "contention-first-proposal");
+    let second = submit_pointer(&mut harness, &fixture, "contention-second-proposal");
+    assert_ne!(first, second, "separate intents remain separate proposals");
+    let first_challenge =
+        inspect_pointer(&mut harness, &fixture, &first, "contention-first-display");
+    let second_challenge =
+        inspect_pointer(&mut harness, &fixture, &second, "contention-second-display");
+
+    let first_result = ratify(
+        &mut harness,
+        &first,
+        first_challenge,
+        "contention-first-ratification",
+    );
+    assert!(
+        matches!(
+            &first_result,
+            ApiResultV1::Ok {
+                response: EffectAdminResponseV1::ExecutionReceipt {
+                    terminal_state,
+                    ..
+                }
+            } if terminal_state == "succeeded"
+        ),
+        "first exact activation did not win: {first_result:?}"
+    );
+    let winning_record = inspect_record(&mut harness, &first, "contention-first-record");
+    assert!(matches!(
+        winning_record.state,
+        ProposalStateV1::Succeeded { .. }
+    ));
+    let winning_activation = winning_record
+        .managed_pointer_activation
+        .as_ref()
+        .expect("winning proposal has one durable activation receipt");
+    assert_eq!(winning_activation.previous_object, fixture.base_object);
+    assert_eq!(
+        winning_activation.installed_object,
+        fixture.candidate_object
+    );
+    assert_eq!(target_object(&fixture), fixture.candidate_object);
+    assert_eq!(target_tree(&fixture), fixture.candidate_tree);
+
+    let stale_result = ratify(
+        &mut harness,
+        &second,
+        second_challenge,
+        "contention-second-ratification",
+    );
+    assert!(
+        matches!(
+            &stale_result,
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::Conflict,
+                ..
+            }
+        ),
+        "stale contender did not fail closed: {stale_result:?}"
+    );
+    let stale_record = inspect_record(&mut harness, &second, "contention-second-record");
+    assert!(matches!(stale_record.state, ProposalStateV1::Ready { .. }));
+    assert!(stale_record.authorization.is_none());
+    assert!(stale_record.candidate_ratification.is_none());
+    assert!(stale_record.execution_attempt.is_none());
+    assert!(stale_record.step_receipts.is_empty());
+    assert!(stale_record.managed_pointer_activation.is_none());
+    assert_eq!(stale_record.promotion_refusals.len(), 1);
+    assert_eq!(
+        stale_record.promotion_refusals[0].code,
+        ag_effect::ManagedPointerPromotionRefusalCodeV1::CurrentBasisMismatch
+    );
+
+    // The losing activation neither overwrites the winner nor creates a
+    // second authority-bearing transition.
     assert_eq!(target_object(&fixture), fixture.candidate_object);
     assert_eq!(target_tree(&fixture), fixture.candidate_tree);
     assert_committed_reference_custody(&fixture);
@@ -992,7 +1214,7 @@ fn restart_preserves_ratification_history_without_reexecution() {
 }
 
 #[test]
-fn ref_drift_after_canonicalization_is_a_known_no_effect_failure() {
+fn ref_drift_after_canonicalization_refuses_shared_activation_before_burn() {
     if !Path::new(GIT).is_file() {
         eprintln!("skipping managed-pointer integration: {GIT} is absent");
         return;
@@ -1062,7 +1284,7 @@ fn ref_drift_after_canonicalization_is_a_known_no_effect_failure() {
         matches!(
             &result,
             ApiResultV1::Error {
-                code: ApiErrorCodeV1::Conflict,
+                code: ApiErrorCodeV1::Indeterminate,
                 ..
             }
         ),
@@ -1074,10 +1296,8 @@ fn ref_drift_after_canonicalization_is_a_known_no_effect_failure() {
     assert!(matches!(record.state, ProposalStateV1::Ready { .. }));
     assert!(record.authorization.is_none());
     assert!(record.candidate_ratification.is_none());
+    assert!(record.execution_attempt.is_none());
     assert!(record.step_receipts.is_empty());
-    assert_eq!(record.promotion_refusals.len(), 1);
-    assert_eq!(
-        record.promotion_refusals[0].code,
-        ag_effect::ManagedPointerPromotionRefusalCodeV1::CurrentBasisMismatch
-    );
+    assert!(record.managed_pointer_activation.is_none());
+    assert!(record.promotion_refusals.is_empty());
 }

@@ -37,10 +37,15 @@ use crate::api::{
 #[cfg(test)]
 use crate::api::{ProposalIngressProofV1, WorkerCandidateIngressProofV1};
 use crate::config::{EffectTargetConfigV1, EffectdConfigV1, PeerPolicyV1};
+use crate::effectd_activation::{
+    EFFECTD_ACTIVATION_STATUS_SCHEMA_V1, EffectdActivationReceiptV1, EffectdActivationStatusV1,
+    EffectdLiveActivationV1,
+};
 use crate::managed_pointer::{
-    ManagedPointerActivationReceiptV1, ManagedPointerCommitEvidenceV1,
-    ManagedPointerCommitResultV1, ManagedPointerError, ManagedPointerPoststateEvidenceV1,
-    ManagedPointerPreparationStandingContextV1, ManagedPointerRuntimeV1,
+    ManagedPointerActivationHeadV1, ManagedPointerActivationReceiptV1,
+    ManagedPointerCommitEvidenceV1, ManagedPointerCommitResultV1, ManagedPointerError,
+    ManagedPointerPoststateEvidenceV1, ManagedPointerPreparationStandingContextV1,
+    ManagedPointerRuntimeV1,
 };
 use crate::peer::signed_principal_chain;
 use crate::rpc_auth::{
@@ -435,6 +440,8 @@ pub struct EffectBrokerV1<R> {
     max_artifact_bytes: u64,
     development_authority_bypass: bool,
     activation_ready: bool,
+    activation_receipt: Option<EffectdActivationReceiptV1>,
+    activation_status: EffectdActivationStatusV1,
     challenges: BTreeMap<String, ChallengeV1>,
     pointer_runtime: ManagedPointerRuntimeV1,
     runner: R,
@@ -486,6 +493,23 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             // not yet attested by this build. Production authority must stay
             // disabled until that proof is installed.
             activation_ready: false,
+            activation_receipt: None,
+            activation_status: EffectdActivationStatusV1::NotReady {
+                schema: EFFECTD_ACTIVATION_STATUS_SCHEMA_V1.to_owned(),
+                phase: "startup".to_owned(),
+                code: if config.security_profile == "development" {
+                    "development_profile"
+                } else {
+                    "live_attestation_not_applied"
+                }
+                .to_owned(),
+                detail: if config.security_profile == "development" {
+                    "development authority bypass does not create production readiness"
+                } else {
+                    "fresh live activation evidence has not been applied"
+                }
+                .to_owned(),
+            },
             challenges: BTreeMap::new(),
             pointer_runtime,
             runner,
@@ -494,6 +518,239 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         broker.validate_all_proposal_records()?;
         broker.recover_incomplete_attempts()?;
         Ok(broker)
+    }
+
+    /// Consume fresh, non-serializable startup evidence and enable the
+    /// production authority gate for this process lifetime only.
+    ///
+    /// The serializable receipt remains process-memory diagnostic evidence.
+    /// Restart reconstructs a new live value and never reloads this field as
+    /// standing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evidence differs from the exact store,
+    /// config, catalog, profile, helper, repository, or staging context.
+    pub fn apply_live_activation(
+        &mut self,
+        config: &EffectdConfigV1,
+        activation: EffectdLiveActivationV1,
+    ) -> Result<(), BrokerError> {
+        activation
+            .verify_for(config, &self.catalog_identity, &self.store)
+            .map_err(|error| BrokerError::ActivationEvidence(error.to_string()))?;
+        let target_readiness = self
+            .pointer_runtime
+            .production_readiness()
+            .map_err(|error| BrokerError::ActivationEvidence(error.to_string()))?;
+        if activation.receipt().target_readiness != target_readiness {
+            return Err(BrokerError::ActivationEvidence(
+                "managed-pointer target state changed during activation".to_owned(),
+            ));
+        }
+        self.validate_current_managed_pointer_activations()?;
+        let receipt = activation.into_receipt();
+        self.activation_status = EffectdActivationStatusV1::Ready {
+            schema: EFFECTD_ACTIVATION_STATUS_SCHEMA_V1.to_owned(),
+            receipt: Box::new(receipt.clone()),
+        };
+        self.activation_receipt = Some(receipt);
+        self.activation_ready = true;
+        Ok(())
+    }
+
+    /// Retain a bounded, non-authorizing explanation when startup activation
+    /// cannot be established. This never changes authority state to ready.
+    pub fn record_activation_failure(&mut self, phase: &str, code: &str, detail: &str) {
+        self.activation_ready = false;
+        self.activation_receipt = None;
+        self.activation_status = EffectdActivationStatusV1::NotReady {
+            schema: EFFECTD_ACTIVATION_STATUS_SCHEMA_V1.to_owned(),
+            phase: bounded_activation_text(phase),
+            code: bounded_activation_text(code),
+            detail: bounded_activation_text(detail),
+        };
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconstruct_managed_pointer_activation_heads(
+        &self,
+    ) -> Result<BTreeMap<TargetId, ManagedPointerActivationHeadV1>, BrokerError> {
+        let mut history = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self
+                .store
+                .entity_ids_after("proposal-", cursor.as_deref(), 512)?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().cloned();
+            for entity in page {
+                let loaded = self.load_proposal_entity_with_revision(&entity)?;
+                if matches!(
+                    &loaded.state.canonical.body().effects[0],
+                    CanonicalEffectV1::ManagedPointerPromotion { .. }
+                ) {
+                    history.push((loaded.last_event_sequence, loaded.state));
+                }
+            }
+        }
+        history.sort_by_key(|(sequence, _)| *sequence);
+        let mut expected_current = self.pointer_runtime.activation_geneses();
+        for (_, record) in history {
+            let effect = &record.canonical.body().effects[0];
+            let CanonicalEffectV1::ManagedPointerPromotion {
+                target,
+                expected_object,
+                expected_tree,
+                prestate_identity,
+                new_object,
+                expected_post_tree,
+                ..
+            } = effect
+            else {
+                return Err(BrokerError::Corrupt(
+                    "managed-pointer history contains another effect family".to_owned(),
+                ));
+            };
+            let current = expected_current.get_mut(target).ok_or_else(|| {
+                BrokerError::Corrupt(
+                    "managed-pointer history names a target without activation genesis".to_owned(),
+                )
+            })?;
+            let requires_current_prestate = matches!(
+                &record.state,
+                ProposalStateV1::Succeeded { .. }
+                    | ProposalStateV1::Reconciled { .. }
+                    | ProposalStateV1::AuthorizationBurned { .. }
+                    | ProposalStateV1::Preparing { .. }
+                    | ProposalStateV1::Executing { .. }
+                    | ProposalStateV1::ReconciliationRequired { .. }
+            );
+            if requires_current_prestate
+                && (current.object != *expected_object
+                    || current.tree != *expected_tree
+                    || current.state_identity != *prestate_identity)
+            {
+                return Err(BrokerError::ActivationEvidence(
+                    "managed-pointer activation history is not an exact predecessor chain"
+                        .to_owned(),
+                ));
+            }
+            match &record.state {
+                ProposalStateV1::Succeeded { .. } => {
+                    let activation =
+                        record.managed_pointer_activation.as_ref().ok_or_else(|| {
+                            BrokerError::Corrupt(
+                                "successful managed-pointer history lacks activation custody"
+                                    .to_owned(),
+                            )
+                        })?;
+                    activation.verify(effect)?;
+                    *current = ManagedPointerActivationHeadV1 {
+                        object: new_object.clone(),
+                        tree: expected_post_tree.clone(),
+                        state_identity: activation.poststate.state.identity()?,
+                    };
+                }
+                ProposalStateV1::ReconciliationRequired { .. }
+                | ProposalStateV1::AuthorizationBurned { .. }
+                | ProposalStateV1::Preparing { .. }
+                | ProposalStateV1::Executing { .. } => {
+                    return Err(BrokerError::ActivationEvidence(
+                        "managed-pointer activation history contains an unresolved attempt"
+                            .to_owned(),
+                    ));
+                }
+                ProposalStateV1::Reconciled { .. } => {
+                    let reconciliation = record.reconciliation.as_ref().ok_or_else(|| {
+                        BrokerError::Corrupt("reconciled promotion lacks exact custody".to_owned())
+                    })?;
+                    let classification = reconciliation.evidence.classification;
+                    match classification {
+                        ReconciliationClassificationV1::Applied => {
+                            return Err(BrokerError::ActivationEvidence(
+                                "applied managed-pointer reconciliation lacks an exact durability-confirmation receipt"
+                                    .to_owned(),
+                            ));
+                        }
+                        ReconciliationClassificationV1::NotApplied => {
+                            let observation = reconciliation
+                                .evidence
+                                .observed_poststate
+                                .get(target)
+                                .ok_or_else(|| {
+                                    BrokerError::Corrupt(
+                                        "managed-pointer reconciliation lacks its target observation"
+                                            .to_owned(),
+                                    )
+                                })?;
+                            let TargetObservationV1::ManagedPointer {
+                                current_object,
+                                current_tree,
+                                prestate_identity,
+                                ..
+                            } = observation
+                            else {
+                                return Err(BrokerError::Corrupt(
+                                    "managed-pointer reconciliation has foreign observation family"
+                                        .to_owned(),
+                                ));
+                            };
+                            if current_object != &current.object
+                                || current_tree != &current.tree
+                                || prestate_identity != &current.state_identity
+                            {
+                                return Err(BrokerError::ActivationEvidence(
+                                    "not-applied reconciliation does not preserve the exact governed head"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
+                        ReconciliationClassificationV1::Foreign => {
+                            return Err(BrokerError::ActivationEvidence(
+                                "managed-pointer activation history ends in foreign state"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                }
+                ProposalStateV1::Ready { .. }
+                | ProposalStateV1::Failed { .. }
+                | ProposalStateV1::Received
+                | ProposalStateV1::Refused { .. }
+                | ProposalStateV1::Indeterminate { .. } => {}
+            }
+        }
+        Ok(expected_current)
+    }
+
+    fn validate_live_managed_pointer_heads(
+        &self,
+        expected: &BTreeMap<TargetId, ManagedPointerActivationHeadV1>,
+    ) -> Result<(), BrokerError> {
+        for (target, head) in expected {
+            self.pointer_runtime
+                .require_activation_state(target, head)
+                .map_err(|error| BrokerError::ActivationEvidence(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn validate_current_managed_pointer_activations(
+        &self,
+    ) -> Result<BTreeMap<TargetId, ManagedPointerActivationHeadV1>, BrokerError> {
+        let heads = self.reconstruct_managed_pointer_activation_heads()?;
+        self.validate_live_managed_pointer_heads(&heads)?;
+        Ok(heads)
+    }
+
+    /// Borrow the current-process activation receipt for startup logging and
+    /// diagnostics. It is never accepted as authority input.
+    #[must_use]
+    pub fn activation_receipt(&self) -> Option<&EffectdActivationReceiptV1> {
+        self.activation_receipt.as_ref()
     }
 
     /// Handles one authenticated governor-facing method.
@@ -912,9 +1169,13 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         signed_request: &Digest,
     ) -> Result<EffectAdminResponseV1, BrokerError> {
         match request {
-            EffectAdminRequestV1::Health => Ok(EffectAdminResponseV1::Health {
-                health: self.health()?,
-            }),
+            EffectAdminRequestV1::Health => {
+                let activation = self.current_activation_status();
+                Ok(EffectAdminResponseV1::Health {
+                    health: self.health_for_activation(&activation)?,
+                    activation,
+                })
+            }
             EffectAdminRequestV1::InspectProposal { proposal } => {
                 let record = self.load_proposal(&proposal)?;
                 record.canonical.verify_digest()?;
@@ -1013,7 +1274,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         if self.store.active_backup_cut()?.is_some() {
             return Err(BrokerError::Quiesced);
         }
-        self.require_authority_activation()?;
+        let governed_heads = self.require_authority_activation()?;
         let expected = self
             .challenges
             .remove(proposal.as_str())
@@ -1101,6 +1362,26 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                 };
                 binding.verify_bindings(proposal, candidate, &authorization_digest)?;
                 let standing_observed_at = now_u64()?;
+                let governed_head = governed_heads.get(target).ok_or_else(|| {
+                    BrokerError::Corrupt(
+                        "managed-pointer proposal target lacks a governed activation head"
+                            .to_owned(),
+                    )
+                })?;
+                if candidate.exact_basis.current_object != governed_head.object
+                    || candidate.exact_basis.current_tree != governed_head.tree
+                    || candidate.exact_basis.prestate_identity != governed_head.state_identity
+                {
+                    return self.record_promotion_refusal(
+                        loaded,
+                        authorization,
+                        binding,
+                        standing_observed_at,
+                        &ManagedPointerError::PrestateDrift(
+                            "candidate basis is not the exact governed activation head".to_owned(),
+                        ),
+                    );
+                }
                 let standing = match self.pointer_runtime.promotion_standing(
                     &context,
                     &effect,
@@ -1825,20 +2106,71 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
     }
 
     fn health(&self) -> Result<HealthV1, BrokerError> {
+        let activation = self.current_activation_status();
+        self.health_for_activation(&activation)
+    }
+
+    fn health_for_activation(
+        &self,
+        activation: &EffectdActivationStatusV1,
+    ) -> Result<HealthV1, BrokerError> {
         Ok(HealthV1 {
             schema: "ag.health/v1".to_owned(),
             service: "ag-effectd".to_owned(),
             build: env!("CARGO_PKG_VERSION").to_owned(),
-            // Managed-target sandbox equality is not yet proven against the
-            // effective service unit, so this process is live but not ready.
-            ready: self.activation_ready,
+            // Production readiness exists only after this process consumed
+            // fresh, non-serializable activation evidence. Development keeps
+            // its explicit authority bypass but does not manufacture a
+            // production-readiness claim.
+            ready: matches!(activation, EffectdActivationStatusV1::Ready { .. }),
             quiesced: self.store.active_backup_cut()?.is_some(),
         })
     }
 
-    fn require_authority_activation(&self) -> Result<(), BrokerError> {
+    fn current_activation_status(&self) -> EffectdActivationStatusV1 {
+        if !self.activation_ready {
+            return self.activation_status.clone();
+        }
+        match self.require_authority_activation() {
+            Ok(_) => self.activation_status.clone(),
+            Err(error) => EffectdActivationStatusV1::NotReady {
+                schema: EFFECTD_ACTIVATION_STATUS_SCHEMA_V1.to_owned(),
+                phase: "runtime_revalidation".to_owned(),
+                code: "activation_evidence_mismatch".to_owned(),
+                detail: bounded_activation_text(&error.to_string()),
+            },
+        }
+    }
+
+    fn require_authority_activation(
+        &self,
+    ) -> Result<BTreeMap<TargetId, ManagedPointerActivationHeadV1>, BrokerError> {
         if self.activation_ready || self.development_authority_bypass {
-            Ok(())
+            if self.activation_ready {
+                let receipt = self.activation_receipt.as_ref().ok_or_else(|| {
+                    BrokerError::ActivationEvidence(
+                        "live activation flag lacks its process receipt".to_owned(),
+                    )
+                })?;
+                let static_readiness = self
+                    .pointer_runtime
+                    .production_readiness()
+                    .map_err(|error| BrokerError::ActivationEvidence(error.to_string()))?;
+                if static_readiness != receipt.target_readiness {
+                    return Err(BrokerError::ActivationEvidence(
+                        "static helper, staging, or repository custody changed after activation"
+                            .to_owned(),
+                    ));
+                }
+            }
+            // A process-lifetime host token cannot launder a later unresolved
+            // or externally divergent target transition. Rebuild the exact
+            // genesis-to-terminal chain and compare every live managed pointer
+            // with it immediately before any authority family can spend
+            // standing. The selected target's proposal-specific typed checks
+            // remain an additional boundary rather than a substitute for this
+            // shared activation gate.
+            self.validate_current_managed_pointer_activations()
         } else {
             Err(BrokerError::ActivationNotReady)
         }
@@ -2727,6 +3059,7 @@ fn build_catalog(
                 helper,
                 helper_executable,
                 helper_launch_profile,
+                ..
             } => {
                 if Digest::hash_bytes(&fs::read(helper)?) != *helper_executable {
                     return Err(BrokerError::HelperIdentityMismatch(
@@ -3239,6 +3572,20 @@ fn security_profile_identity(profile: &str) -> Digest {
     Digest::hash_domain("ag-security-profile-identity-v1", profile.as_bytes())
 }
 
+fn bounded_activation_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii() && !character.is_ascii_control() {
+                character
+            } else {
+                '?'
+            }
+        })
+        .take(512)
+        .collect()
+}
+
 fn now_u64() -> Result<u64, BrokerError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3264,6 +3611,7 @@ fn broker_api_error<T>(error: &BrokerError) -> ApiResultV1<T> {
         BrokerError::UnsupportedAuthorityFamily => ApiErrorCodeV1::UnsupportedAuthorityFamily,
         BrokerError::Observation(_)
         | BrokerError::ManagedPointer(_)
+        | BrokerError::ActivationEvidence(_)
         | BrokerError::ActivationNotReady => ApiErrorCodeV1::Indeterminate,
         BrokerError::Effect(EffectError::InvalidTransition { .. })
         | BrokerError::PromotionExpired
@@ -3389,6 +3737,9 @@ pub enum BrokerError {
     /// readiness, including the effective sandbox, has been attested.
     #[error("effect authority is disabled because broker activation is not ready")]
     ActivationNotReady,
+    /// Fresh live startup evidence differs from the exact broker context.
+    #[error("effect broker activation evidence refused: {0}")]
+    ActivationEvidence(String),
     /// Clock cannot be represented.
     #[error("trusted clock observation failed: {0}")]
     Clock(String),

@@ -1,7 +1,7 @@
 # Production-shaped example, not an installable authority document.
 # All targets, identities, paths, actions, ownership values, and digests are
 # root-owned enrollment data and must be replaced from local measurements.
-schema = "ag.config.effectd.v1"
+schema = "ag.config.effectd.v2"
 security_profile = "production"
 authority_domain = "example-host.production"
 epoch = "1"
@@ -125,3 +125,28 @@ path = "/etc/example-service/generated.conf"
 mode = 0o640
 uid = 0
 gid = 0
+
+# Managed-pointer enrollment is intentionally not active in this example.
+# Every value below is fake. In particular, activation_genesis_state is the
+# digest of AG's descriptor-derived state evidence; it is not the object ID and
+# must never be chosen by "latest" discovery. No packaged measurement command
+# exists yet, so uncommenting or hand-copying this block is not an enrollment
+# procedure.
+#
+# [[targets]]
+# kind = "managed_pointer"
+# id = "service-repository"
+# allowed_root = "/srv/agent-governor/repositories"
+# repository = "/srv/agent-governor/repositories/service.git"
+# reference = "refs/heads/main"
+# activation_genesis_object = "1111111111111111111111111111111111111111"
+# activation_genesis_tree = "2222222222222222222222222222222222222222"
+# activation_genesis_state = "sha256:3111111111111111111111111111111111111111111111111111111111111111"
+# repository_identity = "sha256:4111111111111111111111111111111111111111111111111111111111111111"
+# uid = 1001
+# gid = 1001
+# staging_root = "/var/lib/agent-governor/effectd/promotion-stage"
+# promotion_ttl_ms = 900000
+# helper = "/usr/bin/git"
+# helper_executable = "sha256:5111111111111111111111111111111111111111111111111111111111111111"
+# helper_launch_profile = "sha256:6111111111111111111111111111111111111111111111111111111111111111"
