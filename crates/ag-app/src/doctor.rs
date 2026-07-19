@@ -22,7 +22,7 @@ pub const DOCTOR_REPORT_SCHEMA_V1: &str = "ag.doctor-report/v1";
 
 const MAX_SYSTEMD_SHOW_BYTES: usize = 1024 * 1024;
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
-const SYSTEMD_PROPERTIES: [&str; 8] = [
+const SYSTEMD_PROPERTIES: [&str; 12] = [
     "Id",
     "User",
     "Group",
@@ -30,10 +30,14 @@ const SYSTEMD_PROPERTIES: [&str; 8] = [
     "PrivateNetwork",
     "RestrictAddressFamilies",
     "CapabilityBoundingSet",
+    "AmbientCapabilities",
+    "SupplementaryGroups",
+    "NoNewPrivileges",
+    "ProtectSystem",
     "ReadWritePaths",
 ];
 const UNIT_IDS: [&str; 3] = ["agd.service", "ag-effectd.service", "ag-providerd.service"];
-const SYSTEMCTL_ARGS: [&str; 14] = [
+const SYSTEMCTL_ARGS: [&str; 18] = [
     "show",
     "--no-pager",
     "--property=Id",
@@ -43,6 +47,10 @@ const SYSTEMCTL_ARGS: [&str; 14] = [
     "--property=PrivateNetwork",
     "--property=RestrictAddressFamilies",
     "--property=CapabilityBoundingSet",
+    "--property=AmbientCapabilities",
+    "--property=SupplementaryGroups",
+    "--property=NoNewPrivileges",
+    "--property=ProtectSystem",
     "--property=ReadWritePaths",
     "--",
     "agd.service",
@@ -643,6 +651,23 @@ fn inspect_systemd(
     units: &BTreeMap<String, SystemdUnitShowV1>,
     checks: &mut Vec<DoctorCheckV1>,
 ) {
+    let effectd_capabilities = configs.effectd.as_ref().map(|config| {
+        let mut capabilities = BTreeSet::from([
+            "cap_chown",
+            "cap_dac_override",
+            "cap_dac_read_search",
+            "cap_fowner",
+        ]);
+        if config
+            .targets
+            .iter()
+            .any(|target| matches!(target, EffectTargetConfigV1::ManagedPointer { .. }))
+        {
+            capabilities.insert("cap_setgid");
+            capabilities.insert("cap_setuid");
+        }
+        capabilities
+    });
     let specifications = [
         (
             "agd",
@@ -650,7 +675,7 @@ fn inspect_systemd(
             "ag-governor",
             "ag-governor",
             "/usr/bin/agd",
-            BTreeSet::new(),
+            Some(BTreeSet::new()),
             false,
         ),
         (
@@ -659,12 +684,7 @@ fn inspect_systemd(
             "root",
             "root",
             "/usr/bin/ag-effectd",
-            BTreeSet::from([
-                "cap_chown",
-                "cap_dac_override",
-                "cap_dac_read_search",
-                "cap_fowner",
-            ]),
+            effectd_capabilities,
             false,
         ),
         (
@@ -673,7 +693,7 @@ fn inspect_systemd(
             "ag-provider",
             "ag-provider",
             "/usr/bin/ag-providerd",
-            BTreeSet::new(),
+            Some(BTreeSet::new()),
             true,
         ),
     ];
@@ -713,7 +733,7 @@ struct ExpectedUnitV1<'a> {
     user: &'a str,
     group: &'a str,
     executable: &'a str,
-    capabilities: BTreeSet<&'a str>,
+    capabilities: Option<BTreeSet<&'a str>>,
     needs_network: bool,
 }
 
@@ -769,16 +789,7 @@ fn inspect_systemd_unit(
             error,
         )),
     }
-    checks.push(boolean_check(
-        format!("{component}.systemd.capability-bound"),
-        component,
-        words(unit.get("CapabilityBoundingSet")) == expected.capabilities,
-        "effective capability bound is exact",
-        format!(
-            "unexpected effective capability bound: {}",
-            unit.get("CapabilityBoundingSet")
-        ),
-    ));
+    inspect_systemd_privilege_floor(unit, expected, checks);
 
     let expected_families = if expected.needs_network {
         BTreeSet::from(["AF_UNIX", "AF_INET", "AF_INET6"])
@@ -806,6 +817,72 @@ fn inspect_systemd_unit(
         } else {
             "network access is enabled or its address-family bound drifted"
         },
+    ));
+}
+
+fn inspect_systemd_privilege_floor(
+    unit: &SystemdUnitShowV1,
+    expected: &ExpectedUnitV1<'_>,
+    checks: &mut Vec<DoctorCheckV1>,
+) {
+    let component = expected.component;
+    match &expected.capabilities {
+        Some(capabilities) => checks.push(boolean_check(
+            format!("{component}.systemd.capability-bound"),
+            component,
+            &words(unit.get("CapabilityBoundingSet")) == capabilities,
+            "effective capability bound is exact",
+            format!(
+                "unexpected effective capability bound: {}",
+                unit.get("CapabilityBoundingSet")
+            ),
+        )),
+        None => checks.push(check(
+            format!("{component}.systemd.capability-bound"),
+            component,
+            DoctorCheckStatusV1::Unavailable,
+            "validated component configuration is required to derive the capability bound",
+        )),
+    }
+    checks.push(boolean_check(
+        format!("{component}.systemd.ambient-capabilities"),
+        component,
+        words(unit.get("AmbientCapabilities")).is_empty(),
+        "effective ambient capability set is empty",
+        format!(
+            "unexpected effective ambient capabilities: {}",
+            unit.get("AmbientCapabilities")
+        ),
+    ));
+    checks.push(boolean_check(
+        format!("{component}.systemd.supplementary-groups"),
+        component,
+        words(unit.get("SupplementaryGroups")).is_empty(),
+        "effective supplementary group set is empty",
+        format!(
+            "unexpected effective supplementary groups: {}",
+            unit.get("SupplementaryGroups")
+        ),
+    ));
+    checks.push(boolean_check(
+        format!("{component}.systemd.no-new-privileges"),
+        component,
+        unit.get("NoNewPrivileges") == "yes",
+        "effective NoNewPrivileges is enabled",
+        format!(
+            "effective NoNewPrivileges is {}, expected yes",
+            unit.get("NoNewPrivileges")
+        ),
+    ));
+    checks.push(boolean_check(
+        format!("{component}.systemd.protect-system"),
+        component,
+        unit.get("ProtectSystem") == "strict",
+        "effective ProtectSystem is strict",
+        format!(
+            "effective ProtectSystem is {}, expected strict",
+            unit.get("ProtectSystem")
+        ),
     ));
 }
 
@@ -886,45 +963,103 @@ fn inspect_effectd_write_paths(
             return;
         }
     };
-    let mut approved_roots = BTreeSet::new();
-    let mut required_roots = BTreeSet::new();
-    if let Some(parent) = config.store.database.parent() {
-        approved_roots.insert(parent.to_owned());
-        required_roots.insert(parent.to_owned());
-    }
-    approved_roots.insert(config.store.object_store.clone());
-    required_roots.insert(config.store.object_store.clone());
-    for target in &config.targets {
-        if let EffectTargetConfigV1::ManagedFile { path, .. } = target
-            && let Some(parent) = path.parent()
-        {
-            approved_roots.insert(parent.to_owned());
-            required_roots.insert(parent.to_owned());
+    let required = match required_effectd_write_paths(config) {
+        Ok(required) => required,
+        Err(error) => {
+            checks.push(check(
+                "ag-effectd.systemd.read-write-paths",
+                "ag-effectd",
+                DoctorCheckStatusV1::Unavailable,
+                error,
+            ));
+            return;
         }
-    }
-
-    let every_required_root_covered = required_roots
-        .iter()
-        .all(|target| parsed.iter().any(|writable| target.starts_with(writable)));
-    let no_overbroad_path = parsed.iter().all(|writable| {
-        approved_roots
-            .iter()
-            .any(|approved| writable.starts_with(approved))
-    });
+    };
     checks.push(boolean_check(
         "ag-effectd.systemd.read-write-paths",
         "ag-effectd",
-        every_required_root_covered && no_overbroad_path,
-        "every state and managed-file root is covered without an overbroad writable path",
-        "state/managed-file coverage is missing or an effective writable path is overbroad",
+        parsed == required,
+        "effective writable paths exactly equal the closed configured effectd set",
+        format!(
+            "effective writable paths differ from the closed configured effectd set: observed={parsed:?}, required={required:?}"
+        ),
     ));
+}
+
+fn required_effectd_write_paths(config: &EffectdConfigV1) -> Result<BTreeSet<PathBuf>, String> {
+    let mut required = BTreeSet::new();
+    insert_parent(&mut required, &config.store.database, "effectd database")?;
+    insert_normalized_absolute(
+        &mut required,
+        &config.store.object_store,
+        "effectd object store",
+    )?;
+    insert_parent(
+        &mut required,
+        &config.proposal_socket,
+        "effectd proposal socket",
+    )?;
+    insert_parent(&mut required, &config.admin_socket, "effectd admin socket")?;
+    for target in &config.targets {
+        match target {
+            EffectTargetConfigV1::ManagedFile { path, .. } => {
+                insert_parent(&mut required, path, "managed-file target")?;
+            }
+            EffectTargetConfigV1::ManagedPointer {
+                repository,
+                staging_root,
+                ..
+            } => {
+                insert_normalized_absolute(
+                    &mut required,
+                    repository,
+                    "managed-pointer repository",
+                )?;
+                insert_normalized_absolute(
+                    &mut required,
+                    staging_root,
+                    "managed-pointer staging root",
+                )?;
+            }
+            EffectTargetConfigV1::SystemdUnit { .. }
+            | EffectTargetConfigV1::SystemdManager { .. } => {}
+        }
+    }
+    Ok(required)
+}
+
+fn insert_parent(paths: &mut BTreeSet<PathBuf>, path: &Path, label: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} path has no parent"))?;
+    insert_normalized_absolute(paths, parent, label)
+}
+
+fn insert_normalized_absolute(
+    paths: &mut BTreeSet<PathBuf>,
+    path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let normalized: PathBuf = path.components().collect();
+    if !path.is_absolute()
+        || path != normalized
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(format!("{label} path is not canonical and absolute"));
+    }
+    paths.insert(normalized);
+    Ok(())
 }
 
 fn parse_read_write_paths(value: &str) -> Result<BTreeSet<PathBuf>, String> {
     let mut paths = BTreeSet::new();
     for raw in value.split_ascii_whitespace() {
-        let raw = raw.strip_prefix('-').unwrap_or(raw);
-        if raw.starts_with(['+', '!']) || raw.contains(['"', '\'', '\\']) {
+        if raw.starts_with(['-', '+', '!']) || raw.contains(['"', '\'', '\\']) {
             return Err("unsupported effective ReadWritePaths syntax".to_owned());
         }
         let path = PathBuf::from(raw);
@@ -1063,7 +1198,7 @@ mod tests {
 
     fn unit_block(unit: &UnitBlockV1<'_>) -> String {
         format!(
-            "Id={}\nUser={}\nGroup={}\nExecStart={{ path={} ; argv[]={}; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}\nPrivateNetwork={}\nRestrictAddressFamilies={}\nCapabilityBoundingSet={}\nReadWritePaths={}\n",
+            "Id={}\nUser={}\nGroup={}\nExecStart={{ path={} ; argv[]={}; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}\nPrivateNetwork={}\nRestrictAddressFamilies={}\nCapabilityBoundingSet={}\nAmbientCapabilities=\nSupplementaryGroups=\nNoNewPrivileges=yes\nProtectSystem=strict\nReadWritePaths={}\n",
             unit.id,
             unit.user,
             unit.group,
@@ -1096,7 +1231,7 @@ mod tests {
                 private_network: "yes",
                 families: "AF_UNIX",
                 capabilities: "cap_chown cap_dac_override cap_dac_read_search cap_fowner",
-                write_paths: "/var/lib/agent-governor/effectd /etc/example-service",
+                write_paths: "/var/lib/agent-governor/effectd /var/lib/agent-governor/effectd/objects /run/agent-governor/effectd/proposal /run/agent-governor/effectd/admin /etc/example-service",
             }),
             unit_block(&UnitBlockV1 {
                 id: "ag-providerd.service",
@@ -1130,10 +1265,34 @@ mod tests {
     }
 
     fn inspect_fake_systemd(show: &str) -> Vec<DoctorCheckV1> {
+        inspect_fake_systemd_with_configs(show, &example_configs())
+    }
+
+    fn inspect_fake_systemd_with_configs(
+        show: &str,
+        configs: &LoadedDaemonConfigsV1,
+    ) -> Vec<DoctorCheckV1> {
         let units = parse_systemd_show(show.as_bytes()).expect("strict fake systemd evidence");
         let mut checks = Vec::new();
-        inspect_systemd(&example_configs(), &units, &mut checks);
+        inspect_systemd(configs, &units, &mut checks);
         checks
+    }
+
+    fn managed_pointer_target() -> EffectTargetConfigV1 {
+        EffectTargetConfigV1::ManagedPointer {
+            id: "repository.main".to_owned(),
+            allowed_root: PathBuf::from("/srv/agent-governor/repositories"),
+            repository: PathBuf::from("/srv/agent-governor/repositories/service.git"),
+            reference: "refs/heads/main".to_owned(),
+            repository_identity: Digest::hash_bytes(b"repository identity"),
+            uid: 1000,
+            gid: 1000,
+            staging_root: PathBuf::from("/var/lib/agent-governor/effectd/promotion-stage"),
+            promotion_ttl_ms: 15 * 60 * 1_000,
+            helper: PathBuf::from("/usr/bin/git"),
+            helper_executable: Digest::hash_bytes(b"git executable"),
+            helper_launch_profile: Digest::hash_bytes(b"closed git launch profile"),
+        }
     }
 
     fn status(checks: &[DoctorCheckV1], id: &str) -> DoctorCheckStatusV1 {
@@ -1220,6 +1379,78 @@ mod tests {
     }
 
     #[test]
+    fn hostile_privilege_floor_properties_fail_closed() {
+        let cases = [
+            (
+                "AmbientCapabilities=",
+                "AmbientCapabilities=cap_sys_admin",
+                "agd.systemd.ambient-capabilities",
+            ),
+            (
+                "SupplementaryGroups=",
+                "SupplementaryGroups=wheel",
+                "agd.systemd.supplementary-groups",
+            ),
+            (
+                "NoNewPrivileges=yes",
+                "NoNewPrivileges=no",
+                "agd.systemd.no-new-privileges",
+            ),
+            (
+                "ProtectSystem=strict",
+                "ProtectSystem=full",
+                "agd.systemd.protect-system",
+            ),
+        ];
+        for (from, to, check_id) in cases {
+            let hostile = valid_show().replacen(from, to, 1);
+            assert_eq!(
+                status(&inspect_fake_systemd(&hostile), check_id),
+                DoctorCheckStatusV1::Fail,
+                "{check_id} accepted hostile effective-unit evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_pointer_derives_exact_effectd_capabilities_and_write_paths() {
+        let mut configs = example_configs();
+        configs
+            .effectd
+            .as_mut()
+            .expect("effectd example")
+            .targets
+            .push(managed_pointer_target());
+        let show = valid_show()
+            .replace(
+                "CapabilityBoundingSet=cap_chown cap_dac_override cap_dac_read_search cap_fowner",
+                "CapabilityBoundingSet=cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_setgid cap_setuid",
+            )
+            .replace(
+                "ReadWritePaths=/var/lib/agent-governor/effectd /var/lib/agent-governor/effectd/objects /run/agent-governor/effectd/proposal /run/agent-governor/effectd/admin /etc/example-service",
+                "ReadWritePaths=/var/lib/agent-governor/effectd /var/lib/agent-governor/effectd/objects /run/agent-governor/effectd/proposal /run/agent-governor/effectd/admin /etc/example-service /srv/agent-governor/repositories/service.git /var/lib/agent-governor/effectd/promotion-stage",
+            );
+        let checks = inspect_fake_systemd_with_configs(&show, &configs);
+        assert_eq!(
+            status(&checks, "ag-effectd.systemd.capability-bound"),
+            DoctorCheckStatusV1::Pass
+        );
+        assert_eq!(
+            status(&checks, "ag-effectd.systemd.read-write-paths"),
+            DoctorCheckStatusV1::Pass
+        );
+
+        let missing_owner_transition = show.replace(" cap_setgid cap_setuid", "");
+        assert_eq!(
+            status(
+                &inspect_fake_systemd_with_configs(&missing_owner_transition, &configs),
+                "ag-effectd.systemd.capability-bound"
+            ),
+            DoctorCheckStatusV1::Fail
+        );
+    }
+
+    #[test]
     fn hostile_capability_and_write_scope_properties_fail_closed() {
         let capabilities = valid_show().replace(
             "CapabilityBoundingSet=cap_chown cap_dac_override cap_dac_read_search cap_fowner",
@@ -1234,8 +1465,8 @@ mod tests {
         );
 
         let missing_target = valid_show().replace(
-            "ReadWritePaths=/var/lib/agent-governor/effectd /etc/example-service",
-            "ReadWritePaths=/var/lib/agent-governor/effectd",
+            "ReadWritePaths=/var/lib/agent-governor/effectd /var/lib/agent-governor/effectd/objects /run/agent-governor/effectd/proposal /run/agent-governor/effectd/admin /etc/example-service",
+            "ReadWritePaths=/var/lib/agent-governor/effectd /var/lib/agent-governor/effectd/objects /run/agent-governor/effectd/proposal /run/agent-governor/effectd/admin",
         );
         assert_eq!(
             status(
@@ -1246,8 +1477,8 @@ mod tests {
         );
 
         let overbroad = valid_show().replace(
-            "ReadWritePaths=/var/lib/agent-governor/effectd /etc/example-service",
-            "ReadWritePaths=/var/lib/agent-governor/effectd /etc",
+            "ReadWritePaths=/var/lib/agent-governor/effectd /var/lib/agent-governor/effectd/objects /run/agent-governor/effectd/proposal /run/agent-governor/effectd/admin /etc/example-service",
+            "ReadWritePaths=/var/lib/agent-governor/effectd /var/lib/agent-governor/effectd/objects /run/agent-governor/effectd/proposal /run/agent-governor/effectd/admin /etc/example-service /etc",
         );
         assert_eq!(
             status(
@@ -1261,7 +1492,7 @@ mod tests {
     #[test]
     fn writable_path_parser_rejects_ambiguous_or_noncanonical_syntax() {
         assert!(parse_read_write_paths("/etc/example /var/lib/agent").is_ok());
-        assert!(parse_read_write_paths("-/etc/example").is_ok());
+        assert!(parse_read_write_paths("-/etc/example").is_err());
         assert!(parse_read_write_paths("+/etc/example").is_err());
         assert!(parse_read_write_paths("!/etc/example").is_err());
         assert!(parse_read_write_paths("/etc/../root").is_err());
