@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::api::{
-    AgdRequestV1, ApiErrorCodeV1, ApiResultV1, ArtifactTransferV1, EFFECT_RECORD_SCHEMA_V2,
+    AgdRequestV1, ApiErrorCodeV1, ApiResultV1, ArtifactTransferV1, EFFECT_RECORD_SCHEMA_V3,
     EffectAdminRequestV1, EffectAdminResponseV1, EffectProposalRequestV1, EffectProposalResponseV1,
     EffectRecordV1, GovernedProposalIngressV1, HealthV1, ProposalSummaryV1,
     WorkerCandidateRequestV1, WorkerCandidateSourceProofV1, worker_candidate_ingress_proof_digest,
@@ -38,9 +38,9 @@ use crate::api::{
 use crate::api::{ProposalIngressProofV1, WorkerCandidateIngressProofV1};
 use crate::config::{EffectTargetConfigV1, EffectdConfigV1, PeerPolicyV1};
 use crate::managed_pointer::{
-    ManagedPointerCommitEvidenceV1, ManagedPointerCommitResultV1, ManagedPointerError,
-    ManagedPointerPoststateEvidenceV1, ManagedPointerPreparationStandingContextV1,
-    ManagedPointerRuntimeV1,
+    ManagedPointerActivationReceiptV1, ManagedPointerCommitEvidenceV1,
+    ManagedPointerCommitResultV1, ManagedPointerError, ManagedPointerPoststateEvidenceV1,
+    ManagedPointerPreparationStandingContextV1, ManagedPointerRuntimeV1,
 };
 use crate::peer::signed_principal_chain;
 use crate::rpc_auth::{
@@ -60,13 +60,13 @@ use ag_effect::executor::{
 };
 
 /// The broker's durable materialized proposal state.
-pub const BROKER_PROPOSAL_RECORD_SCHEMA_V2: &str = "ag.effect-broker-proposal/v2";
+pub const BROKER_PROPOSAL_RECORD_SCHEMA_V3: &str = "ag.effect-broker-proposal/v3";
 
 /// The broker's durable materialized proposal state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerProposalRecordV1 {
-    /// Explicit record schema. Legacy records without v2 candidate bindings
+    /// Explicit record schema. Legacy records without v3 activation custody
     /// deserialize only to fail closed during broker validation.
     #[serde(default)]
     pub schema: String,
@@ -93,6 +93,9 @@ pub struct BrokerProposalRecordV1 {
     pub execution_attempt: Option<Digest>,
     /// Full broker-owned reconciliation record, when completed.
     pub reconciliation: Option<ReconciliationRecordV1>,
+    /// Full durable managed-pointer activation explanation, present only for
+    /// a verified successful promotion. Persisted evidence is never standing.
+    pub managed_pointer_activation: Option<ManagedPointerActivationReceiptV1>,
 }
 
 /// Durable unique submission record binding one authenticated intent to its
@@ -1183,6 +1186,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                 receipt,
                 commit_evidence,
                 poststate_evidence,
+                activation_receipt,
             } = self.pointer_runtime.commit(prepared, now_u64()?);
             let mut receipt = enforce_receipt_bindings(
                 receipt,
@@ -1196,6 +1200,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                 &mut receipt,
                 commit_evidence.as_ref(),
                 poststate_evidence.as_ref(),
+                activation_receipt.as_ref(),
             );
             return self.finish_execution(
                 record,
@@ -1203,6 +1208,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                 &receipt,
                 commit_evidence.as_ref(),
                 poststate_evidence.as_ref(),
+                activation_receipt.as_ref(),
             );
         }
 
@@ -1226,7 +1232,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             0,
             &effect,
         );
-        self.finish_execution(record, revision, &receipt, None, None)
+        self.finish_execution(record, revision, &receipt, None, None, None)
     }
 
     fn record_promotion_refusal(
@@ -1364,6 +1370,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         execution_receipt: &ExecutionReceiptV1,
         pointer_commit_evidence: Option<&ManagedPointerCommitEvidenceV1>,
         pointer_poststate_evidence: Option<&ManagedPointerPoststateEvidenceV1>,
+        pointer_activation: Option<&ManagedPointerActivationReceiptV1>,
     ) -> Result<EffectAdminResponseV1, BrokerError> {
         let step_digest = execution_receipt
             .digest()
@@ -1374,13 +1381,17 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             ExecutionOutcomeV1::Indeterminate { .. } => CompositeTerminalV1::Indeterminate,
         };
         record.step_receipts.push(step_digest);
-        revision = if pointer_commit_evidence.is_some() || pointer_poststate_evidence.is_some() {
+        revision = if pointer_commit_evidence.is_some()
+            || pointer_poststate_evidence.is_some()
+            || pointer_activation.is_some()
+        {
             #[derive(Serialize)]
             struct PointerStepEventV1<'a> {
                 schema: &'static str,
                 receipt: &'a ExecutionReceiptV1,
                 commit_evidence: Option<&'a ManagedPointerCommitEvidenceV1>,
                 poststate_evidence: Option<&'a ManagedPointerPoststateEvidenceV1>,
+                activation: Option<&'a ManagedPointerActivationReceiptV1>,
             }
             self.persist_record(
                 &record,
@@ -1391,6 +1402,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                     receipt: execution_receipt,
                     commit_evidence: pointer_commit_evidence,
                     poststate_evidence: pointer_poststate_evidence,
+                    activation: pointer_activation,
                 },
             )?
         } else {
@@ -1423,6 +1435,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         };
         record.state = record.state.apply(event)?;
         record.terminal_receipt = Some(terminal.clone());
+        record.managed_pointer_activation = pointer_activation.cloned();
         self.persist_record(
             &record,
             revision,
@@ -2091,8 +2104,8 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             .verify_digest()
             .map_err(|error| BrokerError::Corrupt(error.to_string()))?;
         require_record_invariant(
-            record.schema == BROKER_PROPOSAL_RECORD_SCHEMA_V2,
-            "proposal record lacks the v2 preparation/ratification schema",
+            record.schema == BROKER_PROPOSAL_RECORD_SCHEMA_V3,
+            "proposal record lacks the v3 activation-explanation schema",
         )?;
         require_record_invariant(
             requested == record.canonical.digest(),
@@ -2300,6 +2313,49 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                     "candidate ratification does not match promotion authority custody".to_owned(),
                 ));
             }
+        }
+
+        let activation_required = promotion_candidate.is_some()
+            && matches!(&record.state, ProposalStateV1::Succeeded { .. });
+        require_record_invariant(
+            record.managed_pointer_activation.is_some() == activation_required,
+            "managed-pointer activation explanation does not match terminal lifecycle",
+        )?;
+        if let Some(activation) = &record.managed_pointer_activation {
+            let effect = &record.canonical.body().effects[0];
+            let candidate = promotion_candidate.ok_or_else(|| {
+                BrokerError::Corrupt(
+                    "activation explanation is attached to a non-promotion proposal".to_owned(),
+                )
+            })?;
+            let candidate_ratification =
+                record.candidate_ratification.as_ref().ok_or_else(|| {
+                    BrokerError::Corrupt(
+                        "activation explanation lacks candidate ratification custody".to_owned(),
+                    )
+                })?;
+            let authorization = authorization_digest.as_ref().ok_or_else(|| {
+                BrokerError::Corrupt(
+                    "activation explanation lacks accepted authorization custody".to_owned(),
+                )
+            })?;
+            let attempt = record.execution_attempt.as_ref().ok_or_else(|| {
+                BrokerError::Corrupt(
+                    "activation explanation lacks one-shot attempt custody".to_owned(),
+                )
+            })?;
+            activation
+                .verify(effect)
+                .map_err(|error| BrokerError::Corrupt(error.to_string()))?;
+            require_record_invariant(
+                activation.execution.proposal == *record.canonical.digest()
+                    && activation.execution.authorization == *authorization
+                    && activation.execution.attempt == *attempt
+                    && activation.execution.effect_index == 0
+                    && activation.prepared_candidate == candidate.identity()?
+                    && activation.candidate_ratification == candidate_ratification.identity()?,
+                "activation explanation differs from proposal authority or candidate custody",
+            )?;
         }
 
         match &record.state {
@@ -2597,7 +2653,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             proposal: canonical.digest().clone(),
         })?;
         let proposal_record = BrokerProposalRecordV1 {
-            schema: BROKER_PROPOSAL_RECORD_SCHEMA_V2.to_owned(),
+            schema: BROKER_PROPOSAL_RECORD_SCHEMA_V3.to_owned(),
             canonical: canonical.clone(),
             prepared_candidates,
             candidate_ratification: None,
@@ -2608,6 +2664,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             step_receipts: Vec::new(),
             execution_attempt: None,
             reconciliation: None,
+            managed_pointer_activation: None,
         };
         self.validate_proposal_record(canonical.digest(), &proposal_record)?;
         let response = EffectProposalResponseV1::Canonicalized {
@@ -2952,7 +3009,7 @@ fn classify_reconciliation(
 
 fn effect_record_projection(record: BrokerProposalRecordV1) -> EffectRecordV1 {
     EffectRecordV1 {
-        schema: EFFECT_RECORD_SCHEMA_V2.to_owned(),
+        schema: EFFECT_RECORD_SCHEMA_V3.to_owned(),
         canonical: record.canonical,
         prepared_candidates: record.prepared_candidates,
         candidate_ratification: record.candidate_ratification,
@@ -2963,6 +3020,7 @@ fn effect_record_projection(record: BrokerProposalRecordV1) -> EffectRecordV1 {
         step_receipts: record.step_receipts,
         execution_attempt: record.execution_attempt,
         reconciliation: record.reconciliation,
+        managed_pointer_activation: record.managed_pointer_activation,
     }
 }
 
@@ -3003,16 +3061,22 @@ fn enforce_managed_pointer_evidence_bindings(
     receipt: &mut ExecutionReceiptV1,
     commit: Option<&ManagedPointerCommitEvidenceV1>,
     poststate: Option<&ManagedPointerPoststateEvidenceV1>,
+    activation: Option<&ManagedPointerActivationReceiptV1>,
 ) {
     if !matches!(receipt.outcome, ExecutionOutcomeV1::Succeeded { .. }) {
         return;
     }
-    if commit.is_none() || poststate.is_none() {
+    let activation_matches = activation.is_some_and(|activation| {
+        activation.verify(&receipt.effect).is_ok()
+            && commit == Some(&activation.commit)
+            && poststate == Some(&activation.poststate)
+    });
+    if commit.is_none() || poststate.is_none() || !activation_matches {
         receipt.outcome = ExecutionOutcomeV1::Indeterminate {
             envelope: ExecutionIndeterminateV1 {
                 code: ExecutionIndeterminateCodeV1::BackendContractViolation,
                 phase: ExecutionPhaseV1::ReceiptValidation,
-                detail: "managed-pointer success lacks complete evidence".to_owned(),
+                detail: "managed-pointer success lacks complete activation evidence".to_owned(),
                 source_code: Some("missing_promotion_evidence".to_owned()),
                 evidence: None,
             },
@@ -3997,7 +4061,7 @@ mod tests {
         else {
             panic!("direct record inspection must succeed");
         };
-        assert_eq!(ready_record.schema, EFFECT_RECORD_SCHEMA_V2);
+        assert_eq!(ready_record.schema, EFFECT_RECORD_SCHEMA_V3);
         assert_eq!(ready_record.canonical, *proposal);
         assert!(matches!(ready_record.state, ProposalStateV1::Ready { .. }));
         assert!(matches!(
@@ -4228,7 +4292,7 @@ mod tests {
         else {
             panic!("reconciled custody record must remain inspectable");
         };
-        assert_eq!(record.schema, EFFECT_RECORD_SCHEMA_V2);
+        assert_eq!(record.schema, EFFECT_RECORD_SCHEMA_V3);
         assert_eq!(record.canonical, reconciled.canonical);
         assert_eq!(record.state, reconciled.state);
         assert_eq!(record.authorization, reconciled.authorization);

@@ -71,6 +71,10 @@ pub const MANAGED_POINTER_COMMIT_EVIDENCE_SCHEMA_V1: &str = "ag.managed-pointer.
 pub const MANAGED_POINTER_POSTSTATE_EVIDENCE_SCHEMA_V1: &str =
     "ag.managed-pointer.poststate-evidence/v1";
 
+/// Versioned complete explanation emitted only after a durable activation.
+pub const MANAGED_POINTER_ACTIVATION_RECEIPT_SCHEMA_V1: &str =
+    "ag.managed-pointer.activation-receipt/v1";
+
 /// Evidence emitted only when a live, non-serializable promotion standing is
 /// minted from exact ratification and a fresh basis observation.
 pub const MANAGED_POINTER_PROMOTION_STANDING_RECEIPT_SCHEMA_V1: &str =
@@ -325,6 +329,118 @@ pub struct ManagedPointerPoststateEvidenceV1 {
     pub state: ManagedRepositoryStateEvidenceV1,
 }
 
+/// Complete, non-authorizing explanation of one verified managed-ref activation.
+///
+/// This record is created only after the ref CAS, ref/directory durability
+/// sync, and final exact post-state readback all succeed. Persisted bytes are
+/// historical evidence; they cannot reconstruct promotion standing or make a
+/// divergent live ref current.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerActivationReceiptV1 {
+    /// Exact receipt schema.
+    pub schema: String,
+    /// Exact canonical effect identity.
+    pub effect: Digest,
+    /// Exact proposal, accepted authorization, attempt, and effect position.
+    pub execution: ManagedPointerExecutionContextV1,
+    /// Configured managed-pointer target.
+    pub target: TargetId,
+    /// Exact managed Git ref.
+    pub reference: String,
+    /// One-shot operation selected by canonical bytes.
+    pub operation_id: Digest,
+    /// Exact prepared candidate selected by ratification.
+    pub prepared_candidate: Digest,
+    /// Candidate-and-basis ratification identity.
+    pub candidate_ratification: Digest,
+    /// Exact ratified basis identity.
+    pub exact_basis: Digest,
+    /// Exact admitted candidate artifact.
+    pub artifact: Digest,
+    /// Exact PACK bytes imported before the pointer boundary.
+    pub candidate_pack: Digest,
+    /// Durable preparation checkpoint which armed the CAS.
+    pub preparation_checkpoint: Digest,
+    /// Descriptor-bound repository identity.
+    pub repository_identity: Digest,
+    /// Exact object selected before activation.
+    pub previous_object: String,
+    /// Exact tree selected before activation.
+    pub previous_tree: String,
+    /// Exact object selected after activation.
+    pub installed_object: String,
+    /// Exact tree selected after activation.
+    pub installed_tree: String,
+    /// Full evidence behind the ref CAS and durability assertion.
+    pub commit: ManagedPointerCommitEvidenceV1,
+    /// Full independently observed durable post-state.
+    pub poststate: ManagedPointerPoststateEvidenceV1,
+}
+
+impl ManagedPointerActivationReceiptV1 {
+    /// Verifies every activation explanation binding against canonical bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for schema drift, substituted evidence, a foreign
+    /// proposal/authorization/attempt, or any pre/post/durability mismatch.
+    pub fn verify(&self, effect: &CanonicalEffectV1) -> Result<(), ManagedPointerError> {
+        let fields = CanonicalPointerFieldsV1::from_effect(effect)?;
+        let effect_identity = Digest::from_serializable(effect)?;
+        if self.schema != MANAGED_POINTER_ACTIVATION_RECEIPT_SCHEMA_V1
+            || self.effect != effect_identity
+            || self.target != *fields.target
+            || self.reference != fields.reference
+            || self.operation_id != *fields.operation_id
+            || self.prepared_candidate != *fields.prepared_candidate
+            || self.exact_basis != *fields.exact_basis
+            || self.artifact != *fields.artifact
+            || self.candidate_pack != *fields.candidate_pack_digest
+            || self.repository_identity != *fields.repository_identity
+            || self.previous_object != fields.expected_object
+            || self.previous_tree != fields.expected_tree
+            || self.installed_object != fields.new_object
+            || self.installed_tree != fields.expected_post_tree
+            || self.commit.execution != self.execution
+            || self.poststate.execution != self.execution
+            || self.commit.operation_id != self.operation_id
+            || self.commit.preparation_checkpoint != self.preparation_checkpoint
+            || self.poststate.preparation_checkpoint != self.preparation_checkpoint
+            || self.commit.previous_object != self.previous_object
+            || self.commit.previous_tree != self.previous_tree
+            || self.commit.installed_object != self.installed_object
+            || self.commit.installed_tree != self.installed_tree
+            || !self.commit.reference_fsynced
+            || self.poststate.repository_layout.identity()? != self.repository_identity
+            || self.poststate.state.repository_identity != self.repository_identity
+            || self.poststate.state.current_object != self.installed_object
+            || self.poststate.state.current_tree != self.installed_tree
+            || self.poststate.state.reference.name != fields.reference
+            || self.poststate.state.reference.uid != fields.uid
+            || self.poststate.state.reference.gid != fields.gid
+            || self.poststate.state.reference.link_count != 1
+            || !FileType::from_raw_mode(self.poststate.state.reference.mode).is_file()
+            || self.poststate.state.reference.mode & 0o022 != 0
+            || !self.poststate.state.clean
+            || self.poststate.state.reference_checked_out
+        {
+            return Err(ManagedPointerError::BindingMismatch);
+        }
+        Ok(())
+    }
+
+    /// Computes the identity of a fully verified activation explanation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if verification or canonical encoding fails.
+    pub fn identity(&self, effect: &CanonicalEffectV1) -> Result<Digest, ManagedPointerError> {
+        self.verify(effect)?;
+        Ok(Digest::from_serializable(self)?)
+    }
+}
+
 /// Terminal runtime result plus exact evidence preimages for broker custody.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedPointerCommitResultV1 {
@@ -334,12 +450,15 @@ pub struct ManagedPointerCommitResultV1 {
     pub commit_evidence: Option<ManagedPointerCommitEvidenceV1>,
     /// Full independent poststate preimage, present only for a verified success.
     pub poststate_evidence: Option<ManagedPointerPoststateEvidenceV1>,
+    /// Complete activation explanation, present only for a verified durable success.
+    pub activation_receipt: Option<ManagedPointerActivationReceiptV1>,
 }
 
 struct ManagedPointerCommitSuccessV1 {
     success: EffectSuccessV1,
     commit_evidence: ManagedPointerCommitEvidenceV1,
     poststate_evidence: ManagedPointerPoststateEvidenceV1,
+    activation_receipt: ManagedPointerActivationReceiptV1,
 }
 
 #[allow(dead_code)]
@@ -1289,7 +1408,7 @@ impl ManagedPointerRuntimeV1 {
     ) -> ManagedPointerCommitResultV1 {
         let effect = prepared.effect.clone();
         let context = prepared.context.clone();
-        let (outcome, commit_evidence, poststate_evidence) =
+        let (outcome, commit_evidence, poststate_evidence, activation_receipt) =
             match self.try_commit(&mut prepared, now_unix_ms, failpoint, clock) {
                 Ok(success) => (
                     ExecutionOutcomeV1::Succeeded {
@@ -1297,8 +1416,9 @@ impl ManagedPointerRuntimeV1 {
                     },
                     Some(success.commit_evidence),
                     Some(success.poststate_evidence),
+                    Some(success.activation_receipt),
                 ),
-                Err(CommitErrorV1::Failed(error)) => (failure_outcome(&error), None, None),
+                Err(CommitErrorV1::Failed(error)) => (failure_outcome(&error), None, None, None),
                 Err(CommitErrorV1::Indeterminate {
                     detail,
                     phase,
@@ -1315,12 +1435,14 @@ impl ManagedPointerRuntimeV1 {
                     },
                     None,
                     None,
+                    None,
                 ),
             };
         ManagedPointerCommitResultV1 {
             receipt: receipt_with_outcome(&context, &effect, outcome),
             commit_evidence,
             poststate_evidence,
+            activation_receipt,
         }
     }
 
@@ -1583,6 +1705,36 @@ impl ManagedPointerRuntimeV1 {
                 phase: ExecutionPhaseV1::ReceiptValidation,
                 evidence: Some(evidence.clone()),
             })?;
+        let activation_receipt = ManagedPointerActivationReceiptV1 {
+            schema: MANAGED_POINTER_ACTIVATION_RECEIPT_SCHEMA_V1.to_owned(),
+            effect: Digest::from_serializable(&prepared.effect)
+                .map_err(ManagedPointerError::from)
+                .map_err(CommitErrorV1::Failed)?,
+            execution: prepared.context.clone(),
+            target: fields.target.clone(),
+            reference: fields.reference.to_owned(),
+            operation_id: fields.operation_id.clone(),
+            prepared_candidate: fields.prepared_candidate.clone(),
+            candidate_ratification: prepared.evidence.candidate_ratification.clone(),
+            exact_basis: fields.exact_basis.clone(),
+            artifact: fields.artifact.clone(),
+            candidate_pack: fields.candidate_pack_digest.clone(),
+            preparation_checkpoint: prepared.checkpoint.clone(),
+            repository_identity: fields.repository_identity.clone(),
+            previous_object: fields.expected_object.to_owned(),
+            previous_tree: fields.expected_tree.to_owned(),
+            installed_object: fields.new_object.to_owned(),
+            installed_tree: fields.expected_post_tree.to_owned(),
+            commit: commit_evidence.clone(),
+            poststate: poststate_evidence_record.clone(),
+        };
+        activation_receipt
+            .identity(&prepared.effect)
+            .map_err(|error| CommitErrorV1::Indeterminate {
+                detail: format!("activation receipt could not be verified: {error}"),
+                phase: ExecutionPhaseV1::ReceiptValidation,
+                evidence: Some(evidence.clone()),
+            })?;
         Ok(ManagedPointerCommitSuccessV1 {
             success: EffectSuccessV1::ManagedPointerPromotion {
                 operation_id: fields.operation_id.clone(),
@@ -1597,6 +1749,7 @@ impl ManagedPointerRuntimeV1 {
             },
             commit_evidence,
             poststate_evidence: poststate_evidence_record,
+            activation_receipt,
         })
     }
 
@@ -4319,6 +4472,22 @@ mod tests {
             "unexpected promotion outcome: {:?}",
             receipt.receipt.outcome
         );
+        let activation = receipt
+            .activation_receipt
+            .as_ref()
+            .expect("durable activation explanation");
+        activation
+            .identity(&effect)
+            .expect("activation receipt binds canonical effect");
+        assert_eq!(activation.previous_object, fixture.expected_object);
+        assert_eq!(activation.installed_object, fixture.new_object);
+        assert!(activation.commit.reference_fsynced);
+        let mut substituted_activation = activation.clone();
+        substituted_activation.installed_tree = "substituted-tree".to_owned();
+        assert!(matches!(
+            substituted_activation.verify(&effect),
+            Err(ManagedPointerError::BindingMismatch)
+        ));
         let observed = fixture
             .runtime
             .observe_canonical(&effect)

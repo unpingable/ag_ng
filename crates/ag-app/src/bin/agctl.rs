@@ -6,7 +6,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
 use ag_app::api::{
-    AgdRequestV1, AgdResponseV1, ApiResultV1, EFFECT_RECORD_SCHEMA_V2, EffectAdminRequestV1,
+    AgdRequestV1, AgdResponseV1, ApiResultV1, EFFECT_RECORD_SCHEMA_V3, EffectAdminRequestV1,
     EffectAdminResponseV1, HealthV1,
 };
 use ag_app::config::{
@@ -521,7 +521,7 @@ fn inspect_effect_record(client: &ClientV1, proposal: &Digest) -> anyhow::Result
     let EffectAdminResponseV1::Record { record } = response else {
         bail!("ag-effectd returned an unexpected response");
     };
-    if record.schema != EFFECT_RECORD_SCHEMA_V2 {
+    if record.schema != EFFECT_RECORD_SCHEMA_V3 {
         bail!("ag-effectd returned an unsupported effect record schema");
     }
     record

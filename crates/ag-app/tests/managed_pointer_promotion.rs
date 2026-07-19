@@ -846,6 +846,29 @@ fn independently_ratified_bundle_promotes_exact_ref_once() {
         0
     );
     assert_eq!(record.step_receipts.len(), 1);
+    let activation = record
+        .managed_pointer_activation
+        .as_ref()
+        .expect("inspectable durable activation explanation");
+    activation
+        .identity(&record.canonical.body().effects[0])
+        .expect("activation explanation binds canonical effect");
+    assert_eq!(activation.execution.proposal, proposal);
+    assert_eq!(activation.prepared_candidate, candidate.identity().unwrap());
+    assert_eq!(
+        activation.candidate_ratification,
+        binding.identity().expect("candidate ratification identity")
+    );
+    assert_eq!(activation.artifact, Digest::hash_bytes(&fixture.bundle));
+    assert_eq!(activation.previous_object, fixture.base_object);
+    assert_eq!(activation.previous_tree, fixture.base_tree);
+    assert_eq!(activation.installed_object, fixture.candidate_object);
+    assert_eq!(activation.installed_tree, fixture.candidate_tree);
+    assert!(activation.commit.reference_fsynced);
+    assert_eq!(
+        activation.poststate.state.current_object,
+        fixture.candidate_object
+    );
 
     let replay_challenge = inspect_pointer(&mut harness, &fixture, &proposal, "replay-display");
     assert!(matches!(
@@ -931,6 +954,10 @@ fn restart_preserves_ratification_history_without_reexecution() {
     assert_eq!(after.prepared_candidates, before.prepared_candidates);
     assert_eq!(after.candidate_ratification, before.candidate_ratification);
     assert_eq!(after.authorization, before.authorization);
+    assert_eq!(
+        after.managed_pointer_activation,
+        before.managed_pointer_activation
+    );
     assert_eq!(after.terminal_receipt, terminal_receipt);
     assert_eq!(after.execution_attempt, execution_attempt);
     assert!(matches!(after.state, ProposalStateV1::Succeeded { .. }));

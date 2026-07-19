@@ -18,10 +18,11 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::managed_pointer::ManagedPointerActivationReceiptV1;
 use crate::rpc_auth::{RpcPeerKeyPolicyV1, SignedRequestEnvelopeV1, SignedServerChallengeV1};
 
 /// Exact direct effect-plane record projection schema.
-pub const EFFECT_RECORD_SCHEMA_V2: &str = "ag.effect-record/v2";
+pub const EFFECT_RECORD_SCHEMA_V3: &str = "ag.effect-record/v3";
 
 /// Exact opaque bytes encoded as canonical padded RFC 4648 base64 on JSON wires.
 ///
@@ -500,6 +501,9 @@ pub struct EffectRecordV1 {
     pub execution_attempt: Option<Digest>,
     /// Full broker-owned reconciliation record, once committed.
     pub reconciliation: Option<ReconciliationRecordV1>,
+    /// Full durable managed-pointer activation explanation, present only for
+    /// a verified successful promotion.
+    pub managed_pointer_activation: Option<ManagedPointerActivationReceiptV1>,
 }
 
 /// Responses on the direct effect-plane admin/inspection socket.
