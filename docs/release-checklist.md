@@ -24,6 +24,12 @@ qualifies the existing loop—not production readiness—as follows:
 - Hostile tests cover executable, inode/layout, ref, artifact, helper, expiry,
   replay, ownership, hook/filter, and repository-command substitution.
 
+The subsequent compact preparation/ratification campaign adds bounded
+pre-ratification standing, exact candidate/basis/input/receipt custody,
+candidate-specific ratification, durable pre-burn basis refusals, and restart
+non-resurrection tests. It does not expand the deployment-qualification claim
+of the fixed `10b7aa9` baseline.
+
 Explicit qualification gaps are real power-loss/torn-write testing, live
 multi-process daemon restart under the packaged sandbox, package
 install/upgrade/rollback across the support matrix, SQLite/WAL/disk-full/fsync
@@ -159,12 +165,13 @@ worktrees, and classic command/API/database compatibility are out of scope.
 ## Authority-membrane gates
 
 The development managed-pointer slice exercises exact bundle custody,
-broker-owned canonicalization, independent exact ratification, target-owner
-managed-ref CAS, verified poststate, single-use consumption, and explicit
-reconciliation. It supports only an existing loose ref in a bare repository or
-a loose managed ref not checked out in any attached worktree. A packed-ref-only
-target refuses. It does not synchronize a live worktree and does not close the
-production gates below.
+bounded candidate preparation, exact basis/input/receipt custody,
+broker-owned canonicalization, independent candidate-and-basis ratification,
+target-owner managed-ref CAS, verified poststate, single-use consumption, and
+explicit reconciliation. It supports only an existing loose ref in a bare
+repository or a loose managed ref not checked out in any attached worktree. A
+packed-ref-only target refuses. It does not synchronize a live worktree and
+does not close the production gates below.
 
 - [ ] `agd` can submit only intent plus admitted artifact references; only
   effectd compiles and persists canonical proposal bytes.
@@ -186,10 +193,17 @@ production gates below.
 - [ ] Ratification burns durably before execution; timeout/crash/uncertain
   external outcome becomes indeterminate/reconciliation and never auto-retry.
 - [ ] Managed-pointer promotion admits only the exact self-contained Git
-  bundle contract and binds its artifact/pack, base and post trees, repository
+  bundle contract and binds its prepared-candidate, exact-basis,
+  complete-input, preparation-receipt, artifact/pack, base and post trees, repository
   and Git-directory device/inode identity, owner, ref, catalog/profile, pinned
   Git executable/launch profile, expiry, and one-shot operation ID into the
   broker-owned proposal.
+- [ ] Pre-ratification preparation standing is target/profile/epoch/expiry and
+  budget scoped; preparation proves the protected repository projection
+  unchanged, and its receipt cannot reconstruct live standing after restart.
+- [ ] Candidate ratification cannot transport across byte-identical candidates
+  prepared on different bases. Fresh basis mismatch is durably refused before
+  authorization burn, while post-boundary ambiguity remains reconciliation.
 - [ ] The promotion adapter runs only fixed Git plumbing under the target
   owner with isolated configuration, no hooks/filters/helpers/protocols or
   implicit `PATH`; it revalidates immediately before mutation and issues

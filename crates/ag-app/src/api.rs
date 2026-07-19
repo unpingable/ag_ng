@@ -1,10 +1,11 @@
 //! Strict local API message families.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use ag_effect::{
-    CanonicalEffectProposalV1, ProposalIntentV1, ProposalStateV1, RatificationV1,
-    ReconciliationEvidenceV1, ReconciliationRecordV1,
+    CanonicalEffectProposalV1, ManagedPointerCandidateRatificationV1,
+    ManagedPointerPromotionRefusalV1, PreparedManagedPointerCandidateV1, ProposalIntentV1,
+    ProposalStateV1, RatificationV1, ReconciliationEvidenceV1, ReconciliationRecordV1, TargetId,
 };
 use ag_primitives::{
     Digest, InferenceCapabilityId, JcsDocument, JcsError, LifecycleNonce, PrincipalChainV1,
@@ -20,7 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::rpc_auth::{RpcPeerKeyPolicyV1, SignedRequestEnvelopeV1, SignedServerChallengeV1};
 
 /// Exact direct effect-plane record projection schema.
-pub const EFFECT_RECORD_SCHEMA_V1: &str = "ag.effect-record/v1";
+pub const EFFECT_RECORD_SCHEMA_V2: &str = "ag.effect-record/v2";
 
 /// Exact opaque bytes encoded as canonical padded RFC 4648 base64 on JSON wires.
 ///
@@ -481,6 +482,12 @@ pub struct EffectRecordV1 {
     pub schema: String,
     /// Exact broker-owned canonical proposal.
     pub canonical: CanonicalEffectProposalV1,
+    /// Exact pre-ratification preparation history by promotion target.
+    pub prepared_candidates: BTreeMap<TargetId, PreparedManagedPointerCandidateV1>,
+    /// Exact candidate-and-basis ratification, once promotion authority burns.
+    pub candidate_ratification: Option<ManagedPointerCandidateRatificationV1>,
+    /// Typed failed attempts to mint current promotion standing.
+    pub promotion_refusals: Vec<ManagedPointerPromotionRefusalV1>,
     /// Durable burn-before-effect lifecycle.
     pub state: ProposalStateV1,
     /// Exact accepted authority record, when burned.

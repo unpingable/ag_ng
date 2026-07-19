@@ -24,10 +24,16 @@ use ag_effect::executor::{
     ExecutionReceiptV1,
 };
 use ag_effect::{
-    CanonicalEffectV1, GitObjectFormatV1, MANAGED_POINTER_PROMOTION_SCHEMA_V1, TargetId,
+    CanonicalEffectV1, GitObjectFormatV1, MANAGED_POINTER_CANDIDATE_PREPARATION_SCHEMA_V1,
+    MANAGED_POINTER_COMPLETE_INPUTS_SCHEMA_V1, MANAGED_POINTER_EXACT_BASIS_SCHEMA_V1,
+    MANAGED_POINTER_PREPARATION_EFFECTS_SCHEMA_V1, MANAGED_POINTER_PREPARATION_STANDING_SCHEMA_V1,
+    MANAGED_POINTER_PREPARED_CANDIDATE_SCHEMA_V1, MANAGED_POINTER_PROMOTION_SCHEMA_V2,
+    ManagedPointerCandidatePreparationReceiptV1, ManagedPointerCandidateRatificationV1,
+    ManagedPointerCompleteInputsV1, ManagedPointerExactBasisV1, ManagedPointerPreparationEffectsV1,
+    ManagedPointerPreparationStandingReceiptV1, PreparedManagedPointerCandidateV1, TargetId,
     TargetObservationV1,
 };
-use ag_primitives::Digest;
+use ag_primitives::{AuthorityDomain, Digest, Epoch};
 use ag_store::Store;
 use rustix::fd::OwnedFd;
 use rustix::fs::{FileType, Gid, MemfdFlags, Mode, OFlags, ResolveFlags, SealFlags, Uid};
@@ -55,8 +61,8 @@ pub const MANAGED_REPOSITORY_IDENTITY_SCHEMA_V1: &str = "ag.managed-pointer.repo
 /// Versioned identity for one descriptor-opened repository state cut.
 pub const MANAGED_REPOSITORY_STATE_SCHEMA_V1: &str = "ag.managed-pointer.repository-state/v1";
 
-/// Versioned preparation checkpoint retained before the ref boundary is armed.
-pub const MANAGED_POINTER_PREPARATION_SCHEMA_V1: &str = "ag.managed-pointer.preparation/v1";
+/// Versioned preparation checkpoint with candidate ratification and live-standing evidence.
+pub const MANAGED_POINTER_PREPARATION_SCHEMA_V2: &str = "ag.managed-pointer.preparation/v2";
 
 /// Versioned helper evidence emitted after a commit attempt.
 pub const MANAGED_POINTER_COMMIT_EVIDENCE_SCHEMA_V1: &str = "ag.managed-pointer.commit-evidence/v1";
@@ -64,6 +70,11 @@ pub const MANAGED_POINTER_COMMIT_EVIDENCE_SCHEMA_V1: &str = "ag.managed-pointer.
 /// Versioned independent post-CAS evidence retained with the terminal step.
 pub const MANAGED_POINTER_POSTSTATE_EVIDENCE_SCHEMA_V1: &str =
     "ag.managed-pointer.poststate-evidence/v1";
+
+/// Evidence emitted only when a live, non-serializable promotion standing is
+/// minted from exact ratification and a fresh basis observation.
+pub const MANAGED_POINTER_PROMOTION_STANDING_RECEIPT_SCHEMA_V1: &str =
+    "ag.managed-pointer.promotion-standing-receipt/v1";
 
 /// Exact descriptor metadata for one named node in the enrolled repository layout.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -99,6 +110,81 @@ pub struct ManagedPointerExecutionContextV1 {
     pub effect_index: u32,
 }
 
+/// Broker context from which one bounded preparation standing may be minted.
+/// The resulting live value is deliberately non-cloneable and non-serializable.
+pub(crate) struct ManagedPointerPreparationStandingContextV1 {
+    pub authority_domain: AuthorityDomain,
+    pub epoch: Epoch,
+    pub catalog_identity: Digest,
+    pub security_profile_identity: Digest,
+    pub max_artifact_bytes: u64,
+    pub now_unix_ms: u64,
+}
+
+/// Live target-scoped preparation authority. Persisted bytes expose only its
+/// receipt, which cannot recreate this value after restart.
+pub(crate) struct ManagedPointerPreparationStandingV1 {
+    receipt: ManagedPointerPreparationStandingReceiptV1,
+}
+
+/// Candidate plus the broker observation compiled into canonical effect bytes.
+pub(crate) struct ManagedPointerPreparedObservationV1 {
+    pub observation: TargetObservationV1,
+    pub candidate: PreparedManagedPointerCandidateV1,
+}
+
+/// Durable evidence that live promotion standing was constructed and consumed.
+/// It records the bridge; it is not itself standing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerPromotionStandingReceiptV1 {
+    /// Receipt schema.
+    pub schema: String,
+    /// Exact canonical proposal.
+    pub proposal: Digest,
+    /// Burned independent authorization.
+    pub authorization: Digest,
+    /// Candidate-and-basis ratification record.
+    pub candidate_ratification: Digest,
+    /// Exact prepared candidate.
+    pub candidate: Digest,
+    /// Ratified exact basis.
+    pub exact_basis: Digest,
+    /// Fresh live basis observed immediately before authority burn.
+    pub current_basis: Digest,
+    /// Standing issue time.
+    pub issued_at_unix_ms: u64,
+    /// Exclusive canonical promotion expiry.
+    pub expires_at_unix_ms: u64,
+    /// One-use broker nonce.
+    pub nonce: String,
+}
+
+impl ManagedPointerPromotionStandingReceiptV1 {
+    fn identity(&self) -> Result<Digest, ManagedPointerError> {
+        if self.schema != MANAGED_POINTER_PROMOTION_STANDING_RECEIPT_SCHEMA_V1
+            || self.nonce.is_empty()
+            || self.issued_at_unix_ms >= self.expires_at_unix_ms
+            || self.exact_basis != self.current_basis
+        {
+            return Err(ManagedPointerError::PromotionStandingMismatch);
+        }
+        Ok(Digest::from_serializable(self)?)
+    }
+}
+
+/// Live single-use promotion authority. It has no serialization or clone path
+/// and is consumed by reversible preparation.
+pub(crate) struct ManagedPointerPromotionStandingV1 {
+    receipt: ManagedPointerPromotionStandingReceiptV1,
+}
+
+fn require_preparation_standing(
+    standing: Option<ManagedPointerPreparationStandingV1>,
+) -> Result<ManagedPointerPreparationStandingV1, ManagedPointerError> {
+    standing.ok_or(ManagedPointerError::PreparationStandingAbsent)
+}
+
 /// Durable evidence returned after all reversible preparation completed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -109,6 +195,12 @@ pub struct ManagedPointerPreparationEvidenceV1 {
     pub execution: ManagedPointerExecutionContextV1,
     /// Exact one-shot operation in the ratified effect.
     pub operation_id: Digest,
+    /// Exact prepared candidate ratified for this operation.
+    pub prepared_candidate: Digest,
+    /// Exact candidate-and-basis ratification record.
+    pub candidate_ratification: Digest,
+    /// Evidence preimage for the consumed live promotion standing.
+    pub promotion_standing: ManagedPointerPromotionStandingReceiptV1,
     /// Exact candidate bundle.
     pub artifact: Digest,
     /// Exact PACK section extracted from the strict bundle.
@@ -274,6 +366,9 @@ impl ManagedPointerPreparationEvidenceV1 {
     ///
     /// Returns an error when strict canonical encoding fails.
     pub fn checkpoint(&self) -> Result<Digest, ManagedPointerError> {
+        if self.schema != MANAGED_POINTER_PREPARATION_SCHEMA_V2 {
+            return Err(ManagedPointerError::BindingMismatch);
+        }
         Ok(Digest::from_serializable(self)?)
     }
 }
@@ -436,6 +531,21 @@ pub enum ManagedPointerError {
     /// The configured target is absent or has the wrong family.
     #[error("managed-pointer target is unavailable")]
     TargetUnavailable,
+    /// Candidate preparation was attempted without live bounded standing.
+    #[error("managed-pointer preparation standing is absent")]
+    PreparationStandingAbsent,
+    /// Preparation standing does not cover target, epoch, profile, or time.
+    #[error("managed-pointer preparation standing scope mismatch")]
+    PreparationStandingScopeMismatch,
+    /// Preparation input or charged quarantine work exceeds standing.
+    #[error("managed-pointer preparation budget exceeded")]
+    PreparationBudgetExceeded,
+    /// Quarantine preparation altered the protected authoritative projection.
+    #[error("managed-pointer preparation changed protected authoritative state")]
+    ProtectedProjectionChanged,
+    /// Ratification and fresh basis could not mint exact promotion standing.
+    #[error("managed-pointer promotion standing mismatch")]
+    PromotionStandingMismatch,
     /// Configuration or canonical bytes disagree with the retained target.
     #[error("managed-pointer binding mismatch")]
     BindingMismatch,
@@ -448,6 +558,9 @@ pub enum ManagedPointerError {
     /// The trusted wall clock could not be refreshed before the pointer CAS.
     #[error("managed-pointer trusted clock is unavailable")]
     ClockUnavailable,
+    /// The trusted clock reached expiry before the CAS helper was spawned.
+    #[error("managed-pointer promotion expired immediately before ref CAS")]
+    PromotionExpiredBeforeCas,
     /// The helper process could not be confined below the no-new-privileges floor.
     #[error("managed-pointer helper privilege floor is unavailable")]
     PrivilegeFloorUnavailable,
@@ -552,6 +665,223 @@ impl ManagedPointerRuntimeV1 {
         &self.security_profile_identity
     }
 
+    /// Mints one non-serializable, target-scoped preparation standing from the
+    /// active broker context. Only its receipt can cross a durable boundary.
+    pub(crate) fn preparation_standing(
+        &self,
+        target: &TargetId,
+        context: ManagedPointerPreparationStandingContextV1,
+    ) -> Result<ManagedPointerPreparationStandingV1, ManagedPointerError> {
+        let target_runtime = self
+            .targets
+            .get(target)
+            .ok_or(ManagedPointerError::TargetUnavailable)?;
+        if context.security_profile_identity != self.security_profile_identity
+            || context.max_artifact_bytes == 0
+        {
+            return Err(ManagedPointerError::PreparationStandingScopeMismatch);
+        }
+        let quarantine_budget_bytes = context
+            .max_artifact_bytes
+            .checked_mul(2)
+            .ok_or(ManagedPointerError::PreparationBudgetExceeded)?;
+        let expires_at_unix_ms = context
+            .now_unix_ms
+            .checked_add(target_runtime.promotion_ttl_ms)
+            .ok_or(ManagedPointerError::PreparationStandingScopeMismatch)?;
+        let receipt = ManagedPointerPreparationStandingReceiptV1 {
+            schema: MANAGED_POINTER_PREPARATION_STANDING_SCHEMA_V1.to_owned(),
+            authority_domain: context.authority_domain,
+            epoch: context.epoch,
+            target: target.clone(),
+            catalog_identity: context.catalog_identity,
+            security_profile_identity: context.security_profile_identity,
+            issued_at_unix_ms: context.now_unix_ms,
+            expires_at_unix_ms,
+            max_artifact_bytes: context.max_artifact_bytes,
+            quarantine_budget_bytes,
+            nonce: uuid::Uuid::new_v4().to_string(),
+        };
+        receipt
+            .identity()
+            .map_err(|_| ManagedPointerError::PreparationStandingScopeMismatch)?;
+        Ok(ManagedPointerPreparationStandingV1 { receipt })
+    }
+
+    /// Consumes live preparation standing, performs the existing strict
+    /// quarantine preparation, and proves the protected repository projection
+    /// was identical before and after it.
+    pub(crate) fn prepare_candidate_from_store(
+        &self,
+        standing: Option<ManagedPointerPreparationStandingV1>,
+        store: &Store,
+        artifact: &Digest,
+        now_unix_ms: u64,
+    ) -> Result<ManagedPointerPreparedObservationV1, ManagedPointerError> {
+        let standing = require_preparation_standing(standing)?;
+        let receipt = &standing.receipt;
+        receipt
+            .identity()
+            .map_err(|_| ManagedPointerError::PreparationStandingScopeMismatch)?;
+        if now_unix_ms < receipt.issued_at_unix_ms
+            || now_unix_ms >= receipt.expires_at_unix_ms
+            || receipt.security_profile_identity != self.security_profile_identity
+        {
+            return Err(ManagedPointerError::PreparationStandingScopeMismatch);
+        }
+        let bytes = store.read_blob(artifact, receipt.max_artifact_bytes)?;
+        self.prepare_candidate_bytes(standing, artifact, &bytes, now_unix_ms)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn prepare_candidate_bytes(
+        &self,
+        standing: ManagedPointerPreparationStandingV1,
+        artifact: &Digest,
+        bytes: &[u8],
+        now_unix_ms: u64,
+    ) -> Result<ManagedPointerPreparedObservationV1, ManagedPointerError> {
+        let receipt = standing.receipt;
+        let target_runtime = self
+            .targets
+            .get(&receipt.target)
+            .ok_or(ManagedPointerError::TargetUnavailable)?;
+        let artifact_byte_length = u64::try_from(bytes.len())
+            .map_err(|_| ManagedPointerError::PreparationBudgetExceeded)?;
+        if now_unix_ms < receipt.issued_at_unix_ms
+            || now_unix_ms >= receipt.expires_at_unix_ms
+            || artifact_byte_length == 0
+            || artifact_byte_length > receipt.max_artifact_bytes
+            || Digest::hash_bytes(bytes) != *artifact
+        {
+            return Err(ManagedPointerError::PreparationBudgetExceeded);
+        }
+
+        let before_repository = target_runtime.open_repository()?;
+        target_runtime.require_enrolled_repository(&before_repository)?;
+        let before = target_runtime.observe_repository_state(&before_repository)?;
+        if !before.clean || before.reference_checked_out {
+            return Err(ManagedPointerError::PrestateDrift(
+                "candidate basis is dirty or checked out".to_owned(),
+            ));
+        }
+        let mut staged = target_runtime.stage_candidate(artifact, bytes, before.object_format)?;
+        let pack_byte_length = staged.pack.metadata()?.len();
+        let charged_quarantine_bytes = artifact_byte_length
+            .checked_add(pack_byte_length)
+            .ok_or(ManagedPointerError::PreparationBudgetExceeded)?;
+        if charged_quarantine_bytes > receipt.quarantine_budget_bytes {
+            return Err(ManagedPointerError::PreparationBudgetExceeded);
+        }
+
+        let after_repository = target_runtime.open_repository()?;
+        target_runtime.require_enrolled_repository(&after_repository)?;
+        let after = target_runtime.observe_repository_state(&after_repository)?;
+        let before_repository_identity = before_repository.identity_evidence.identity()?;
+        let after_repository_identity = after_repository.identity_evidence.identity()?;
+        let before_prestate_identity = before.evidence.identity()?;
+        let after_prestate_identity = after.evidence.identity()?;
+        if before_repository_identity != after_repository_identity
+            || before_prestate_identity != after_prestate_identity
+            || before.current_object != after.current_object
+            || before.current_tree != after.current_tree
+            || before.clean != after.clean
+            || before.reference_checked_out != after.reference_checked_out
+        {
+            return Err(ManagedPointerError::ProtectedProjectionChanged);
+        }
+
+        let exact_basis = ManagedPointerExactBasisV1 {
+            schema: MANAGED_POINTER_EXACT_BASIS_SCHEMA_V1.to_owned(),
+            authority_domain: receipt.authority_domain.clone(),
+            epoch: receipt.epoch,
+            target: receipt.target.clone(),
+            catalog_identity: receipt.catalog_identity.clone(),
+            security_profile_identity: receipt.security_profile_identity.clone(),
+            reference: target_runtime.reference.clone(),
+            repository_identity: before_repository_identity,
+            prestate_identity: before_prestate_identity,
+            repository_device: before_repository.identity_evidence.repository_device,
+            repository_inode: before_repository.identity_evidence.repository_inode,
+            git_directory_device: before_repository.identity_evidence.git_directory_device,
+            git_directory_inode: before_repository.identity_evidence.git_directory_inode,
+            uid: before_repository.identity_evidence.uid,
+            gid: before_repository.identity_evidence.gid,
+            object_format: before.object_format,
+            current_object: before.current_object.clone(),
+            current_tree: before.current_tree.clone(),
+        };
+        let exact_basis_identity = exact_basis
+            .identity()
+            .map_err(|_| ManagedPointerError::BindingMismatch)?;
+        let git = target_runtime
+            .git
+            .lock()
+            .map_err(|_| ManagedPointerError::GitIdentityMismatch)?;
+        let complete_inputs = ManagedPointerCompleteInputsV1 {
+            schema: MANAGED_POINTER_COMPLETE_INPUTS_SCHEMA_V1.to_owned(),
+            exact_basis: exact_basis_identity.clone(),
+            artifact: artifact.clone(),
+            artifact_byte_length,
+            candidate_pack_digest: staged.pack_digest.clone(),
+            candidate_object: staged.candidate_object.clone(),
+            candidate_tree: staged.candidate_tree.clone(),
+            candidate_parent: staged.candidate_parent.clone(),
+            staging_root: utf8_path(&target_runtime.staging_root)?,
+            helper_executable: git.executable.clone(),
+            helper_launch_profile: target_runtime.launch_profile.clone(),
+            max_artifact_bytes: receipt.max_artifact_bytes,
+            quarantine_budget_bytes: receipt.quarantine_budget_bytes,
+        };
+        drop(git);
+        let complete_inputs_identity = complete_inputs
+            .identity(before.object_format)
+            .map_err(|_| ManagedPointerError::BindingMismatch)?;
+        let effects = ManagedPointerPreparationEffectsV1 {
+            schema: MANAGED_POINTER_PREPARATION_EFFECTS_SCHEMA_V1.to_owned(),
+            candidate_custody_bytes: artifact_byte_length,
+            charged_quarantine_bytes,
+            target_object_database_bytes: 0,
+            authoritative_pointer_writes: 0,
+            network_requests: 0,
+        };
+        let standing_identity = receipt
+            .identity()
+            .map_err(|_| ManagedPointerError::PreparationStandingScopeMismatch)?;
+        let preparation_receipt = ManagedPointerCandidatePreparationReceiptV1 {
+            schema: MANAGED_POINTER_CANDIDATE_PREPARATION_SCHEMA_V1.to_owned(),
+            standing: standing_identity,
+            exact_basis: exact_basis_identity,
+            complete_inputs: complete_inputs_identity,
+            artifact: artifact.clone(),
+            protected_prestate: exact_basis
+                .identity()
+                .map_err(|_| ManagedPointerError::BindingMismatch)?,
+            protected_poststate: exact_basis
+                .identity()
+                .map_err(|_| ManagedPointerError::BindingMismatch)?,
+            effects,
+        };
+        let candidate = PreparedManagedPointerCandidateV1 {
+            schema: MANAGED_POINTER_PREPARED_CANDIDATE_SCHEMA_V1.to_owned(),
+            preparation_standing: receipt,
+            exact_basis,
+            complete_inputs,
+            preparation_receipt,
+        };
+        candidate
+            .identity()
+            .map_err(|_| ManagedPointerError::BindingMismatch)?;
+        let observation = target_observation(&before_repository, &before, &staged)?;
+        // Keep the candidate pack alive through observation construction; the
+        // staging guard removes quarantine residue when this function returns.
+        staged.pack.rewind()?;
+        Ok(ManagedPointerPreparedObservationV1 {
+            observation,
+            candidate,
+        })
+    }
+
     /// Observes the exact target and validates one artifact-bearing candidate
     /// in broker-owned staging without writing the governed repository.
     ///
@@ -639,6 +969,106 @@ impl ManagedPointerRuntimeV1 {
         })
     }
 
+    /// Reconstructs live single-use promotion standing from exact persisted
+    /// candidate history, candidate-and-basis ratification, and a fresh target
+    /// observation. The returned value cannot survive restart.
+    pub(crate) fn promotion_standing(
+        &self,
+        context: &ManagedPointerExecutionContextV1,
+        effect: &CanonicalEffectV1,
+        candidate: &PreparedManagedPointerCandidateV1,
+        ratification: &ManagedPointerCandidateRatificationV1,
+        now_unix_ms: u64,
+    ) -> Result<ManagedPointerPromotionStandingV1, ManagedPointerError> {
+        let fields = CanonicalPointerFieldsV1::from_effect(effect)?;
+        let candidate_identity = candidate
+            .identity()
+            .map_err(|_| ManagedPointerError::PromotionStandingMismatch)?;
+        let exact_basis = candidate
+            .exact_basis
+            .identity()
+            .map_err(|_| ManagedPointerError::PromotionStandingMismatch)?;
+        let complete_inputs = candidate
+            .complete_inputs
+            .identity(candidate.exact_basis.object_format)
+            .map_err(|_| ManagedPointerError::PromotionStandingMismatch)?;
+        let preparation_receipt = candidate
+            .preparation_receipt
+            .identity()
+            .map_err(|_| ManagedPointerError::PromotionStandingMismatch)?;
+        ratification
+            .verify_bindings(&context.proposal, candidate, &context.authorization)
+            .map_err(|_| ManagedPointerError::PromotionStandingMismatch)?;
+        if candidate_identity != *fields.prepared_candidate
+            || exact_basis != *fields.exact_basis
+            || complete_inputs != *fields.complete_inputs
+            || preparation_receipt != *fields.candidate_preparation_receipt
+            || candidate.exact_basis.target != *fields.target
+            || candidate.exact_basis.repository_identity != *fields.repository_identity
+            || candidate.exact_basis.prestate_identity != *fields.prestate_identity
+            || candidate.exact_basis.current_object != fields.expected_object
+            || candidate.exact_basis.current_tree != fields.expected_tree
+            || candidate.complete_inputs.artifact != *fields.artifact
+            || candidate.complete_inputs.candidate_pack_digest != *fields.candidate_pack_digest
+            || candidate.complete_inputs.candidate_object != fields.new_object
+            || candidate.complete_inputs.candidate_tree != fields.expected_post_tree
+            || now_unix_ms >= fields.expires_unix_ms
+        {
+            return Err(ManagedPointerError::PromotionStandingMismatch);
+        }
+        let target_runtime = self
+            .targets
+            .get(fields.target)
+            .ok_or(ManagedPointerError::TargetUnavailable)?;
+        target_runtime.verify_canonical_bindings(&fields)?;
+        let repository = target_runtime.open_repository()?;
+        target_runtime.require_canonical_repository(&fields, &repository)?;
+        let state = target_runtime.observe_repository_state(&repository)?;
+        require_exact_prestate(&fields, &state)?;
+        let current_basis = ManagedPointerExactBasisV1 {
+            schema: MANAGED_POINTER_EXACT_BASIS_SCHEMA_V1.to_owned(),
+            authority_domain: candidate.exact_basis.authority_domain.clone(),
+            epoch: candidate.exact_basis.epoch,
+            target: fields.target.clone(),
+            catalog_identity: candidate.exact_basis.catalog_identity.clone(),
+            security_profile_identity: candidate.exact_basis.security_profile_identity.clone(),
+            reference: fields.reference.to_owned(),
+            repository_identity: repository.identity_evidence.identity()?,
+            prestate_identity: state.evidence.identity()?,
+            repository_device: repository.identity_evidence.repository_device,
+            repository_inode: repository.identity_evidence.repository_inode,
+            git_directory_device: repository.identity_evidence.git_directory_device,
+            git_directory_inode: repository.identity_evidence.git_directory_inode,
+            uid: repository.identity_evidence.uid,
+            gid: repository.identity_evidence.gid,
+            object_format: state.object_format,
+            current_object: state.current_object,
+            current_tree: state.current_tree,
+        }
+        .identity()
+        .map_err(|_| ManagedPointerError::PromotionStandingMismatch)?;
+        if current_basis != exact_basis {
+            return Err(ManagedPointerError::PromotionStandingMismatch);
+        }
+        let candidate_ratification = ratification
+            .identity()
+            .map_err(|_| ManagedPointerError::PromotionStandingMismatch)?;
+        let receipt = ManagedPointerPromotionStandingReceiptV1 {
+            schema: MANAGED_POINTER_PROMOTION_STANDING_RECEIPT_SCHEMA_V1.to_owned(),
+            proposal: context.proposal.clone(),
+            authorization: context.authorization.clone(),
+            candidate_ratification,
+            candidate: candidate_identity,
+            exact_basis,
+            current_basis,
+            issued_at_unix_ms: now_unix_ms,
+            expires_at_unix_ms: fields.expires_unix_ms,
+            nonce: uuid::Uuid::new_v4().to_string(),
+        };
+        receipt.identity()?;
+        Ok(ManagedPointerPromotionStandingV1 { receipt })
+    }
+
     /// Performs all reversible promotion work, revalidates the exact
     /// descriptor-bound prestate, and returns the non-cloneable value that may
     /// cross the ref-CAS boundary only after its checkpoint is durable.
@@ -649,6 +1079,7 @@ impl ManagedPointerRuntimeV1 {
     /// returns success or changes the managed ref; it may import and durably
     /// sync unreachable candidate objects before producing its checkpoint.
     #[allow(clippy::needless_pass_by_value, clippy::result_large_err)]
+    #[cfg(test)]
     pub fn prepare(
         &self,
         context: ManagedPointerExecutionContextV1,
@@ -656,8 +1087,16 @@ impl ManagedPointerRuntimeV1 {
         artifact_bytes: &[u8],
         now_unix_ms: u64,
     ) -> Result<PreparedManagedPointerV1, ExecutionReceiptV1> {
-        self.prepare_inner(context.clone(), effect, artifact_bytes, now_unix_ms)
-            .map_err(|error| failure_receipt(&context, effect, &error))
+        let standing = test_promotion_standing(&context, effect, now_unix_ms)
+            .map_err(|error| failure_receipt(&context, effect, &error))?;
+        self.prepare_inner(
+            standing,
+            context.clone(),
+            effect,
+            artifact_bytes,
+            now_unix_ms,
+        )
+        .map_err(|error| failure_receipt(&context, effect, &error))
     }
 
     /// Loads and rehashes the exact candidate bundle from effectd custody
@@ -668,23 +1107,24 @@ impl ManagedPointerRuntimeV1 {
     /// Returns an exact known-failure receipt for missing, oversized,
     /// substituted, or otherwise invalid custody bytes.
     #[allow(clippy::result_large_err)]
-    pub fn prepare_from_store(
+    pub(crate) fn prepare_from_store(
         &self,
+        standing: ManagedPointerPromotionStandingV1,
         store: &Store,
-        context: ManagedPointerExecutionContextV1,
+        context: &ManagedPointerExecutionContextV1,
         effect: &CanonicalEffectV1,
         maximum_bytes: u64,
         now_unix_ms: u64,
     ) -> Result<PreparedManagedPointerV1, ExecutionReceiptV1> {
         let fields = match CanonicalPointerFieldsV1::from_effect(effect) {
             Ok(fields) => fields,
-            Err(error) => return Err(failure_receipt(&context, effect, &error)),
+            Err(error) => return Err(failure_receipt(context, effect, &error)),
         };
         let bytes = match store.read_blob(fields.artifact, maximum_bytes) {
             Ok(bytes) => bytes,
             Err(error) => {
                 return Err(receipt_with_outcome(
-                    &context,
+                    context,
                     effect,
                     ExecutionOutcomeV1::Failed {
                         failure: ExecutionFailureV1 {
@@ -698,17 +1138,31 @@ impl ManagedPointerRuntimeV1 {
                 ));
             }
         };
-        self.prepare(context, effect, &bytes, now_unix_ms)
+        self.prepare_inner(standing, context.clone(), effect, &bytes, now_unix_ms)
+            .map_err(|error| failure_receipt(context, effect, &error))
     }
 
     fn prepare_inner(
         &self,
+        standing: ManagedPointerPromotionStandingV1,
         context: ManagedPointerExecutionContextV1,
         effect: &CanonicalEffectV1,
         artifact_bytes: &[u8],
         now_unix_ms: u64,
     ) -> Result<PreparedManagedPointerV1, ManagedPointerError> {
         let fields = CanonicalPointerFieldsV1::from_effect(effect)?;
+        let standing_receipt = standing.receipt;
+        if standing_receipt.proposal != context.proposal
+            || standing_receipt.authorization != context.authorization
+            || standing_receipt.candidate != *fields.prepared_candidate
+            || standing_receipt.exact_basis != *fields.exact_basis
+            || standing_receipt.current_basis != *fields.exact_basis
+            || now_unix_ms < standing_receipt.issued_at_unix_ms
+            || now_unix_ms >= standing_receipt.expires_at_unix_ms
+        {
+            return Err(ManagedPointerError::PromotionStandingMismatch);
+        }
+        standing_receipt.identity()?;
         let target_runtime = self
             .targets
             .get(fields.target)
@@ -769,9 +1223,12 @@ impl ManagedPointerRuntimeV1 {
         require_exact_prestate(&fields, &checkpoint_state)?;
         let object_import_evidence = Digest::from_serializable(&imported)?;
         let evidence = ManagedPointerPreparationEvidenceV1 {
-            schema: MANAGED_POINTER_PREPARATION_SCHEMA_V1.to_owned(),
+            schema: MANAGED_POINTER_PREPARATION_SCHEMA_V2.to_owned(),
             execution: context.clone(),
             operation_id: fields.operation_id.clone(),
+            prepared_candidate: fields.prepared_candidate.clone(),
+            candidate_ratification: standing_receipt.candidate_ratification.clone(),
+            promotion_standing: standing_receipt,
             artifact: fields.artifact.clone(),
             candidate_pack: fields.candidate_pack_digest.clone(),
             imported_pack_checksum: imported.pack_checksum.clone(),
@@ -801,7 +1258,7 @@ impl ManagedPointerRuntimeV1 {
     /// at most once. The returned receipt always binds the preparation's
     /// proposal, authorization, attempt, effect index, and canonical effect.
     #[must_use]
-    pub fn commit(
+    pub(crate) fn commit(
         &self,
         prepared: PreparedManagedPointerV1,
         now_unix_ms: u64,
@@ -890,6 +1347,11 @@ impl ManagedPointerRuntimeV1 {
                 "promotion authority expired before commit".to_owned(),
             )));
         }
+        prepared
+            .evidence
+            .promotion_standing
+            .identity()
+            .map_err(CommitErrorV1::Failed)?;
         if prepared.evidence.execution != prepared.context
             || prepared
                 .evidence
@@ -897,6 +1359,11 @@ impl ManagedPointerRuntimeV1 {
                 .map_err(CommitErrorV1::Failed)?
                 != prepared.checkpoint
             || prepared.evidence.operation_id != *fields.operation_id
+            || prepared.evidence.prepared_candidate != *fields.prepared_candidate
+            || prepared.evidence.candidate_ratification
+                != prepared.evidence.promotion_standing.candidate_ratification
+            || prepared.evidence.promotion_standing.candidate != *fields.prepared_candidate
+            || prepared.evidence.promotion_standing.exact_basis != *fields.exact_basis
             || prepared.evidence.repository_identity != *fields.repository_identity
             || prepared
                 .evidence
@@ -978,6 +1445,9 @@ impl ManagedPointerRuntimeV1 {
         );
         let cas_output = match cas {
             Ok(output) => output,
+            Err(error @ ManagedPointerError::PromotionExpiredBeforeCas) => {
+                return Err(CommitErrorV1::Failed(error));
+            }
             Err(error) => {
                 return Err(CommitErrorV1::Indeterminate {
                     detail: format!("ref CAS transport failed: {error}"),
@@ -1538,6 +2008,10 @@ fn target_observation(
 struct CanonicalPointerFieldsV1<'a> {
     schema: &'a str,
     operation_id: &'a Digest,
+    prepared_candidate: &'a Digest,
+    exact_basis: &'a Digest,
+    complete_inputs: &'a Digest,
+    candidate_preparation_receipt: &'a Digest,
     target: &'a TargetId,
     allowed_root: &'a str,
     repository: &'a str,
@@ -1568,6 +2042,10 @@ impl<'a> CanonicalPointerFieldsV1<'a> {
         let CanonicalEffectV1::ManagedPointerPromotion {
             schema,
             operation_id,
+            prepared_candidate,
+            exact_basis,
+            complete_inputs,
+            candidate_preparation_receipt,
             target,
             allowed_root,
             repository,
@@ -1598,6 +2076,10 @@ impl<'a> CanonicalPointerFieldsV1<'a> {
         Ok(Self {
             schema,
             operation_id,
+            prepared_candidate,
+            exact_basis,
+            complete_inputs,
+            candidate_preparation_receipt,
             target,
             allowed_root,
             repository,
@@ -1626,6 +2108,22 @@ impl<'a> CanonicalPointerFieldsV1<'a> {
 }
 
 impl ManagedPointerTargetV1 {
+    fn require_enrolled_repository(
+        &self,
+        repository: &OpenRepositoryV1,
+    ) -> Result<(), ManagedPointerError> {
+        let evidence = &repository.identity_evidence;
+        if evidence.identity()? != self.repository_identity
+            || evidence.uid != self.uid
+            || evidence.gid != self.gid
+        {
+            return Err(ManagedPointerError::PrestateDrift(
+                "descriptor-bound repository differs from its enrollment".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn verify_canonical_bindings(
         &self,
         fields: &CanonicalPointerFieldsV1<'_>,
@@ -1638,7 +2136,7 @@ impl ManagedPointerTargetV1 {
             .repository
             .strip_prefix(&self.allowed_root)
             .map_err(|_| ManagedPointerError::BindingMismatch)?;
-        let matches = fields.schema == MANAGED_POINTER_PROMOTION_SCHEMA_V1
+        let matches = fields.schema == MANAGED_POINTER_PROMOTION_SCHEMA_V2
             && fields.allowed_root == utf8_path(&self.allowed_root)?
             && fields.repository == utf8_path(repository_relative)?
             && fields.reference == self.reference
@@ -1771,6 +2269,11 @@ fn failure_outcome(error: &ManagedPointerError) -> ExecutionOutcomeV1 {
             ExecutionPhaseV1::PrestateCheck,
             Some("managed_pointer_clock".to_owned()),
         ),
+        ManagedPointerError::PromotionExpiredBeforeCas => (
+            ExecutionFailureCodeV1::PrestateDrift,
+            ExecutionPhaseV1::PrestateCheck,
+            Some("managed_pointer_expired_before_cas".to_owned()),
+        ),
         ManagedPointerError::Git { operation, .. } => (
             ExecutionFailureCodeV1::BackendRejected,
             if *operation == "update-ref" {
@@ -1786,6 +2289,11 @@ fn failure_outcome(error: &ManagedPointerError) -> ExecutionOutcomeV1 {
             Some("managed_pointer_io".to_owned()),
         ),
         ManagedPointerError::TargetUnavailable
+        | ManagedPointerError::PreparationStandingAbsent
+        | ManagedPointerError::PreparationStandingScopeMismatch
+        | ManagedPointerError::PreparationBudgetExceeded
+        | ManagedPointerError::ProtectedProjectionChanged
+        | ManagedPointerError::PromotionStandingMismatch
         | ManagedPointerError::BindingMismatch
         | ManagedPointerError::UnsafeRepository(_)
         | ManagedPointerError::InvalidBundle(_)
@@ -2128,9 +2636,7 @@ impl ManagedPointerTargetV1 {
         if let Some(guard) = commit_guard
             && guard.clock.now_unix_ms()? >= guard.expires_unix_ms
         {
-            return Err(ManagedPointerError::PrestateDrift(
-                "promotion authority expired immediately before ref CAS".to_owned(),
-            ));
+            return Err(ManagedPointerError::PromotionExpiredBeforeCas);
         }
         let mut child = command.spawn()?;
         let stdout = child
@@ -3260,6 +3766,31 @@ impl Drop for StagingDirectoryV1 {
 }
 
 #[cfg(test)]
+fn test_promotion_standing(
+    context: &ManagedPointerExecutionContextV1,
+    effect: &CanonicalEffectV1,
+    now_unix_ms: u64,
+) -> Result<ManagedPointerPromotionStandingV1, ManagedPointerError> {
+    let fields = CanonicalPointerFieldsV1::from_effect(effect)?;
+    let receipt = ManagedPointerPromotionStandingReceiptV1 {
+        schema: MANAGED_POINTER_PROMOTION_STANDING_RECEIPT_SCHEMA_V1.to_owned(),
+        proposal: context.proposal.clone(),
+        authorization: context.authorization.clone(),
+        candidate_ratification: Digest::hash_bytes(b"test-candidate-ratification"),
+        candidate: fields.prepared_candidate.clone(),
+        exact_basis: fields.exact_basis.clone(),
+        current_basis: fields.exact_basis.clone(),
+        issued_at_unix_ms: now_unix_ms,
+        expires_at_unix_ms: fields
+            .expires_unix_ms
+            .min(now_unix_ms.saturating_add(60_000)),
+        nonce: "managed-pointer-unit-test-standing".to_owned(),
+    };
+    receipt.identity()?;
+    Ok(ManagedPointerPromotionStandingV1 { receipt })
+}
+
+#[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
     use std::process::Output;
@@ -3608,8 +4139,12 @@ mod tests {
         let target = &fixture.runtime.targets[&fixture.target];
         let git = target.git.lock().expect("Git pin");
         CanonicalEffectV1::ManagedPointerPromotion {
-            schema: MANAGED_POINTER_PROMOTION_SCHEMA_V1.to_owned(),
+            schema: MANAGED_POINTER_PROMOTION_SCHEMA_V2.to_owned(),
             operation_id: Digest::hash_bytes(b"operation"),
+            prepared_candidate: Digest::hash_bytes(b"prepared-candidate"),
+            exact_basis: Digest::hash_bytes(b"exact-basis"),
+            complete_inputs: Digest::hash_bytes(b"complete-inputs"),
+            candidate_preparation_receipt: Digest::hash_bytes(b"candidate-preparation"),
             target: fixture.target.clone(),
             allowed_root: utf8_path(&target.allowed_root).expect("allowed root"),
             repository: utf8_path(
@@ -3636,7 +4171,7 @@ mod tests {
             expected_tree: current_tree,
             new_object: candidate_object,
             expected_post_tree: candidate_tree,
-            expires_unix_ms: u64::MAX,
+            expires_unix_ms: 4_102_444_800_000,
             helper_executable: git.executable.clone(),
             helper_launch_profile: target.launch_profile.clone(),
         }
@@ -3679,6 +4214,86 @@ mod tests {
     }
 
     #[test]
+    fn bounded_candidate_preparation_preserves_the_authoritative_projection() {
+        let fixture = fixture();
+        let standing = fixture
+            .runtime
+            .preparation_standing(
+                &fixture.target,
+                ManagedPointerPreparationStandingContextV1 {
+                    authority_domain: AuthorityDomain::parse("test-host").expect("domain"),
+                    epoch: Epoch::parse("1").expect("epoch"),
+                    catalog_identity: Digest::hash_bytes(b"catalog"),
+                    security_profile_identity: fixture.runtime.security_profile_identity.clone(),
+                    max_artifact_bytes: u64::try_from(fixture.bundle.len()).expect("bundle length"),
+                    now_unix_ms: 1,
+                },
+            )
+            .expect("preparation standing");
+        let prepared = fixture
+            .runtime
+            .prepare_candidate_bytes(standing, &fixture.artifact, &fixture.bundle, 1)
+            .expect("bounded candidate preparation");
+        prepared.candidate.identity().expect("candidate identity");
+        assert_eq!(
+            prepared.candidate.preparation_receipt.protected_prestate,
+            prepared.candidate.preparation_receipt.protected_poststate
+        );
+        assert_eq!(managed_ref(&fixture), fixture.expected_object);
+    }
+
+    #[test]
+    fn candidate_preparation_requires_live_scope_and_budget_standing() {
+        assert!(matches!(
+            require_preparation_standing(None),
+            Err(ManagedPointerError::PreparationStandingAbsent)
+        ));
+
+        let fixture = fixture();
+        let wrong_profile = fixture.runtime.preparation_standing(
+            &fixture.target,
+            ManagedPointerPreparationStandingContextV1 {
+                authority_domain: AuthorityDomain::parse("test-host").expect("domain"),
+                epoch: Epoch::parse("1").expect("epoch"),
+                catalog_identity: Digest::hash_bytes(b"catalog"),
+                security_profile_identity: Digest::hash_bytes(b"wrong-profile"),
+                max_artifact_bytes: 1,
+                now_unix_ms: 1,
+            },
+        );
+        assert!(matches!(
+            wrong_profile,
+            Err(ManagedPointerError::PreparationStandingScopeMismatch)
+        ));
+
+        let standing = fixture
+            .runtime
+            .preparation_standing(
+                &fixture.target,
+                ManagedPointerPreparationStandingContextV1 {
+                    authority_domain: AuthorityDomain::parse("test-host").expect("domain"),
+                    epoch: Epoch::parse("1").expect("epoch"),
+                    catalog_identity: Digest::hash_bytes(b"catalog"),
+                    security_profile_identity: fixture.runtime.security_profile_identity.clone(),
+                    max_artifact_bytes: u64::try_from(fixture.bundle.len() - 1)
+                        .expect("bounded fixture"),
+                    now_unix_ms: 1,
+                },
+            )
+            .expect("bounded standing");
+        assert!(matches!(
+            fixture.runtime.prepare_candidate_bytes(
+                standing,
+                &fixture.artifact,
+                &fixture.bundle,
+                1,
+            ),
+            Err(ManagedPointerError::PreparationBudgetExceeded)
+        ));
+        assert_eq!(managed_ref(&fixture), fixture.expected_object);
+    }
+
+    #[test]
     fn exact_fd_git_path_prepares_and_commits_without_repo_commands() {
         let fixture = fixture();
         let effect = canonical_effect(&fixture);
@@ -3687,6 +4302,12 @@ mod tests {
             .prepare(context(), &effect, &fixture.bundle, 1)
             .expect("reversible preparation");
         assert_eq!(prepared.evidence.execution, context());
+        let mut legacy_evidence = prepared.evidence.clone();
+        legacy_evidence.schema = "ag.managed-pointer.preparation/v1".to_owned();
+        assert!(matches!(
+            legacy_evidence.checkpoint(),
+            Err(ManagedPointerError::BindingMismatch)
+        ));
         let receipt = fixture.runtime.commit(prepared, 2);
         assert!(
             matches!(

@@ -113,8 +113,9 @@ ratification command always requires that challenge explicitly; inspection
 and ratification are never collapsed into one action.
 
 `effect record` is a separate read-only operational view. It returns the
-strict `ag.effect-record/v1` projection directly from effectd: the canonical
-proposal, durable lifecycle state, accepted authorization when present,
+strict `ag.effect-record/v2` projection directly from effectd: the canonical
+proposal, prepared-candidate/basis/input history, typed pre-burn promotion
+refusals, exact candidate ratification and accepted authorization when present,
 terminal and ordered step receipts, execution attempt, and full reconciliation
 record when present. Effectd validates all entity, canonical, lifecycle,
 authorization, attempt, terminal-receipt, and reconciliation bindings before

@@ -777,8 +777,15 @@ fn digest_value<T: Serialize + ?Sized>(
 #[cfg(test)]
 mod tests {
     use ag_effect::{
-        EFFECT_CATALOG_SCHEMA_V1, EFFECT_SCHEMA_V1, EffectCatalogV1, EffectCompilerV1,
-        EffectIntentV1, GitObjectFormatV1, ProposalIntentV1, TargetDefinitionV1,
+        EFFECT_CATALOG_SCHEMA_V1, EFFECT_SCHEMA_V1, EffectCatalogV1, EffectCompilationCutV1,
+        EffectCompilerV1, EffectIntentV1, GitObjectFormatV1,
+        MANAGED_POINTER_CANDIDATE_PREPARATION_SCHEMA_V1, MANAGED_POINTER_COMPLETE_INPUTS_SCHEMA_V1,
+        MANAGED_POINTER_EXACT_BASIS_SCHEMA_V1, MANAGED_POINTER_PREPARATION_EFFECTS_SCHEMA_V1,
+        MANAGED_POINTER_PREPARATION_STANDING_SCHEMA_V1,
+        MANAGED_POINTER_PREPARED_CANDIDATE_SCHEMA_V1, ManagedPointerCandidatePreparationReceiptV1,
+        ManagedPointerCompleteInputsV1, ManagedPointerExactBasisV1,
+        ManagedPointerPreparationEffectsV1, ManagedPointerPreparationStandingReceiptV1,
+        PreparedManagedPointerCandidateV1, ProposalIntentV1, TargetDefinitionV1,
         TargetObservationV1,
     };
     use ag_primitives::{PrincipalChainNodeV1, PrincipalKindV1};
@@ -975,6 +982,87 @@ mod tests {
         )
     }
 
+    fn prepared_candidate(
+        target: &TargetId,
+        catalog_identity: &Digest,
+        artifact: &Digest,
+    ) -> PreparedManagedPointerCandidateV1 {
+        let exact_basis = ManagedPointerExactBasisV1 {
+            schema: MANAGED_POINTER_EXACT_BASIS_SCHEMA_V1.to_owned(),
+            authority_domain: domain(),
+            epoch: epoch(),
+            target: target.clone(),
+            catalog_identity: catalog_identity.clone(),
+            security_profile_identity: digest("effectd-security-profile"),
+            reference: "refs/heads/main".to_owned(),
+            repository_identity: digest("repository-identity"),
+            prestate_identity: digest("repository-layout-and-prestate"),
+            repository_device: 11,
+            repository_inode: 12,
+            git_directory_device: 13,
+            git_directory_inode: 14,
+            uid: 1000,
+            gid: 1000,
+            object_format: GitObjectFormatV1::Sha1,
+            current_object: "b".repeat(40),
+            current_tree: "c".repeat(40),
+        };
+        let exact_basis_identity = exact_basis.identity().unwrap();
+        let complete_inputs = ManagedPointerCompleteInputsV1 {
+            schema: MANAGED_POINTER_COMPLETE_INPUTS_SCHEMA_V1.to_owned(),
+            exact_basis: exact_basis_identity.clone(),
+            artifact: artifact.clone(),
+            artifact_byte_length: 128,
+            candidate_pack_digest: digest("candidate-pack"),
+            candidate_object: "d".repeat(40),
+            candidate_tree: "e".repeat(40),
+            candidate_parent: "b".repeat(40),
+            staging_root: "/var/lib/ag-effectd/promotion-staging".to_owned(),
+            helper_executable: digest("promotion-helper"),
+            helper_launch_profile: digest("promotion-helper-profile"),
+            max_artifact_bytes: 1024,
+            quarantine_budget_bytes: 2048,
+        };
+        let complete_inputs_identity = complete_inputs.identity(GitObjectFormatV1::Sha1).unwrap();
+        let standing = ManagedPointerPreparationStandingReceiptV1 {
+            schema: MANAGED_POINTER_PREPARATION_STANDING_SCHEMA_V1.to_owned(),
+            authority_domain: domain(),
+            epoch: epoch(),
+            target: target.clone(),
+            catalog_identity: catalog_identity.clone(),
+            security_profile_identity: digest("effectd-security-profile"),
+            issued_at_unix_ms: 124,
+            expires_at_unix_ms: 1_125,
+            max_artifact_bytes: 1024,
+            quarantine_budget_bytes: 2048,
+            nonce: "derived-test-preparation".to_owned(),
+        };
+        let preparation_receipt = ManagedPointerCandidatePreparationReceiptV1 {
+            schema: MANAGED_POINTER_CANDIDATE_PREPARATION_SCHEMA_V1.to_owned(),
+            standing: standing.identity().unwrap(),
+            exact_basis: exact_basis_identity.clone(),
+            complete_inputs: complete_inputs_identity,
+            artifact: artifact.clone(),
+            protected_prestate: exact_basis_identity.clone(),
+            protected_poststate: exact_basis_identity,
+            effects: ManagedPointerPreparationEffectsV1 {
+                schema: MANAGED_POINTER_PREPARATION_EFFECTS_SCHEMA_V1.to_owned(),
+                candidate_custody_bytes: 128,
+                charged_quarantine_bytes: 128,
+                target_object_database_bytes: 0,
+                authoritative_pointer_writes: 0,
+                network_requests: 0,
+            },
+        };
+        PreparedManagedPointerCandidateV1 {
+            schema: MANAGED_POINTER_PREPARED_CANDIDATE_SCHEMA_V1.to_owned(),
+            preparation_standing: standing,
+            exact_basis,
+            complete_inputs,
+            preparation_receipt,
+        }
+    }
+
     fn fixture(include_host_effect: bool, max_uses: u32) -> Fixture {
         fixture_named(include_host_effect, max_uses, "proposal-1", "intent-1")
     }
@@ -1041,7 +1129,7 @@ mod tests {
             epoch: epoch(),
             proposer: proposer_chain(),
             judgment: digest("admission-judgment"),
-            admitted_artifacts: BTreeSet::from([candidate_artifact, content]),
+            admitted_artifacts: BTreeSet::from([candidate_artifact.clone(), content]),
             effects,
         };
         let mut observations = BTreeMap::new();
@@ -1067,6 +1155,10 @@ mod tests {
                 reference_checked_out: false,
             },
         );
+        let prepared_candidates = BTreeMap::from([(
+            promotion_target.clone(),
+            prepared_candidate(&promotion_target, &catalog_identity, &candidate_artifact),
+        )]);
         observations.insert(
             file_target,
             TargetObservationV1::ManagedFile {
@@ -1080,8 +1172,11 @@ mod tests {
                 &intent,
                 &intent.proposer,
                 digest("signed-governor-source"),
-                125,
-                &observations,
+                EffectCompilationCutV1 {
+                    compiled_at_unix_ms: 125,
+                    observations: &observations,
+                    prepared_candidates: &prepared_candidates,
+                },
             )
             .unwrap();
         let adapter = adapter_chain(principal("nightshift-root"));

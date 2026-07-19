@@ -61,6 +61,10 @@ struct GitFixtureV1 {
 struct BrokerHarnessV1 {
     _store_root: TempDir,
     broker: EffectBrokerV1<RefusingEffectRunnerV1>,
+    config: EffectdConfigV1,
+    catalog_identity: Digest,
+    activation_identity: StoreActivationIdentityV1,
+    daemon_principal: Digest,
     governor: RpcSignerV1,
     proposer: RpcSignerV1,
     governor_peer: VerifiedRpcPrincipalV1,
@@ -277,14 +281,17 @@ fn git_fixture() -> GitFixtureV1 {
     let config_digest = Digest::hash_bytes(
         &fs::read(repository.join("config")).expect("bounded repository config"),
     );
-    let node = |name: &str| ag_app::managed_pointer::ManagedFilesystemNodeEvidenceV1 {
-        name: name.to_owned(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        uid: metadata.uid(),
-        gid: metadata.gid(),
-        mode: metadata.mode(),
-        link_count: metadata.nlink(),
+    let node = |name: &str, path: &Path| {
+        let node = fs::symlink_metadata(path).expect("managed repository node metadata");
+        ag_app::managed_pointer::ManagedFilesystemNodeEvidenceV1 {
+            name: name.to_owned(),
+            device: node.dev(),
+            inode: node.ino(),
+            uid: node.uid(),
+            gid: node.gid(),
+            mode: node.mode(),
+            link_count: node.nlink(),
+        }
     };
     let evidence = ManagedRepositoryIdentityEvidenceV1 {
         schema: MANAGED_REPOSITORY_IDENTITY_SCHEMA_V1.to_owned(),
@@ -295,13 +302,16 @@ fn git_fixture() -> GitFixtureV1 {
         repository: repository.to_str().expect("UTF-8 repository").to_owned(),
         bare: true,
         object_format: GitObjectFormatV1::Sha1,
-        allowed_root_node: node("allowed-root"),
-        repository_node: node("repository"),
-        git_directory_node: node("git"),
-        config_node: node("config"),
-        objects_node: node("objects"),
-        pack_directory_node: node("pack"),
-        reference_ancestry: vec![node("refs")],
+        allowed_root_node: node("allowed-root", &allowed_root),
+        repository_node: node("repository", &repository),
+        git_directory_node: node("git-directory", &repository),
+        config_node: node("config", &repository.join("config")),
+        objects_node: node("objects", &repository.join("objects")),
+        pack_directory_node: node("objects/pack", &repository.join("objects/pack")),
+        reference_ancestry: vec![
+            node("refs", &repository.join("refs")),
+            node("refs/heads", &repository.join("refs/heads")),
+        ],
         repository_device: metadata.dev(),
         repository_inode: metadata.ino(),
         git_directory_device: metadata.dev(),
@@ -442,26 +452,28 @@ fn broker_harness(fixture: &GitFixtureV1, label: &str) -> BrokerHarnessV1 {
 
     let catalog_identity =
         configured_catalog_identity(&config.targets).expect("exact configured catalog");
+    let activation_identity = StoreActivationIdentityV1 {
+        schema: StoreActivationIdentityV1::SCHEMA.to_owned(),
+        authority_domain: domain.clone(),
+        epoch,
+        config_identity: Digest::hash_domain(
+            "ag-ng/managed-pointer-integration-config/v1",
+            label.as_bytes(),
+        ),
+        security_profile_identity: Digest::hash_domain(
+            "ag-security-profile-identity-v1",
+            b"development",
+        ),
+        build_identity: Digest::hash_bytes(b"managed-pointer-integration-build"),
+        authority_catalog_identity: Some(catalog_identity.clone()),
+    };
+    let daemon_principal = daemon.principal().clone();
     let store = Store::open_activated(
         &config.store.database,
         &config.store.object_store,
         StoreIdentityV1::current(0x4147_4550, "effectd-pointer-integration")
             .expect("store identity"),
-        &StoreActivationIdentityV1 {
-            schema: StoreActivationIdentityV1::SCHEMA.to_owned(),
-            authority_domain: domain.clone(),
-            epoch,
-            config_identity: Digest::hash_domain(
-                "ag-ng/managed-pointer-integration-config/v1",
-                label.as_bytes(),
-            ),
-            security_profile_identity: Digest::hash_domain(
-                "ag-security-profile-identity-v1",
-                b"development",
-            ),
-            build_identity: Digest::hash_bytes(b"managed-pointer-integration-build"),
-            authority_catalog_identity: Some(catalog_identity.clone()),
-        },
+        &activation_identity,
         &WriterIdentityV1 {
             writer_id: format!("effectd-pointer-integration-{label}"),
             principal_digest: daemon.principal().clone(),
@@ -481,6 +493,68 @@ fn broker_harness(fixture: &GitFixtureV1, label: &str) -> BrokerHarnessV1 {
     BrokerHarnessV1 {
         _store_root: store_root,
         broker,
+        config,
+        catalog_identity,
+        activation_identity,
+        daemon_principal,
+        governor,
+        proposer,
+        governor_peer,
+        admin_peer,
+        proposer_chain,
+        admin_chain,
+        domain,
+        epoch,
+    }
+}
+
+fn restart_harness(harness: BrokerHarnessV1) -> BrokerHarnessV1 {
+    let BrokerHarnessV1 {
+        _store_root: store_root,
+        broker,
+        config,
+        catalog_identity,
+        activation_identity,
+        daemon_principal,
+        governor,
+        proposer,
+        governor_peer,
+        admin_peer,
+        proposer_chain,
+        admin_chain,
+        domain,
+        epoch,
+    } = harness;
+    drop(broker);
+    let store = Store::open_activated(
+        &config.store.database,
+        &config.store.object_store,
+        StoreIdentityV1::current(0x4147_4550, "effectd-pointer-integration")
+            .expect("store identity"),
+        &activation_identity,
+        &WriterIdentityV1 {
+            writer_id: "effectd-pointer-integration-restart".to_owned(),
+            principal_digest: daemon_principal.clone(),
+            process_nonce: format!("effectd-pointer-restart-{}", uuid::Uuid::new_v4()),
+            claimed_at_unix_ms: i64::try_from(now_unix_ms()).expect("test clock fits i64"),
+        },
+    )
+    .expect("reopen activated broker store");
+    let broker = EffectBrokerV1::new(
+        &config,
+        &catalog_identity,
+        store,
+        RefusingEffectRunnerV1,
+        Arc::new(RpcReplayGuardV1::new(128).expect("RPC replay guard")),
+    )
+    .expect("restart managed-pointer broker");
+    BrokerHarnessV1 {
+        _store_root: store_root,
+        broker,
+        config,
+        catalog_identity,
+        activation_identity,
+        daemon_principal,
         governor,
         proposer,
         governor_peer,
@@ -736,6 +810,41 @@ fn independently_ratified_bundle_promotes_exact_ref_once() {
         panic!("success record is missing exact human ratification");
     };
     assert_eq!(ratifier, &harness.admin_chain);
+    let candidate = record
+        .prepared_candidates
+        .get(&TargetId::parse(TARGET_ID).expect("target"))
+        .expect("prepared candidate history");
+    let binding = record
+        .candidate_ratification
+        .as_ref()
+        .expect("candidate-and-basis ratification");
+    binding
+        .verify_bindings(
+            &proposal,
+            candidate,
+            &Digest::from_serializable(
+                record
+                    .authorization
+                    .as_ref()
+                    .expect("authorization custody"),
+            )
+            .expect("authorization identity"),
+        )
+        .expect("exact candidate ratification binding");
+    assert_eq!(
+        candidate
+            .preparation_receipt
+            .effects
+            .authoritative_pointer_writes,
+        0
+    );
+    assert_eq!(
+        candidate
+            .preparation_receipt
+            .effects
+            .target_object_database_bytes,
+        0
+    );
     assert_eq!(record.step_receipts.len(), 1);
 
     let replay_challenge = inspect_pointer(&mut harness, &fixture, &proposal, "replay-display");
@@ -754,6 +863,105 @@ fn independently_ratified_bundle_promotes_exact_ref_once() {
     assert_eq!(target_object(&fixture), fixture.candidate_object);
     assert_eq!(target_tree(&fixture), fixture.candidate_tree);
     assert_committed_reference_custody(&fixture);
+}
+
+#[test]
+fn restart_preserves_candidate_history_without_reminting_promotion_standing() {
+    let fixture = git_fixture();
+    let mut harness = broker_harness(&fixture, "restart-history");
+    let proposal = submit_pointer(&mut harness, &fixture, "restart-history");
+    let before = inspect_record(&mut harness, &proposal, "before-restart");
+    assert!(matches!(before.state, ProposalStateV1::Ready { .. }));
+    assert_eq!(before.prepared_candidates.len(), 1);
+    assert!(before.authorization.is_none());
+    assert!(before.candidate_ratification.is_none());
+
+    harness = restart_harness(harness);
+    let after = inspect_record(&mut harness, &proposal, "after-restart");
+    assert_eq!(after.prepared_candidates, before.prepared_candidates);
+    assert_eq!(after.promotion_refusals, before.promotion_refusals);
+    assert!(matches!(after.state, ProposalStateV1::Ready { .. }));
+    assert!(after.authorization.is_none());
+    assert!(after.candidate_ratification.is_none());
+    assert!(after.execution_attempt.is_none());
+    assert!(after.step_receipts.is_empty());
+    assert_eq!(target_object(&fixture), fixture.base_object);
+}
+
+#[test]
+fn restart_preserves_ratification_history_without_reexecution() {
+    if !Path::new(GIT).is_file() {
+        eprintln!("skipping managed-pointer integration: {GIT} is absent");
+        return;
+    }
+    let fixture = git_fixture();
+    let mut harness = broker_harness(&fixture, "restart-ratification-history");
+    let proposal = submit_pointer(&mut harness, &fixture, "restart-ratification-history");
+    let challenge = inspect_pointer(
+        &mut harness,
+        &fixture,
+        &proposal,
+        "restart-ratification-display",
+    );
+    let result = ratify(
+        &mut harness,
+        &proposal,
+        challenge,
+        "restart-ratification-burn",
+    );
+    assert!(matches!(
+        result,
+        ApiResultV1::Ok {
+            response: EffectAdminResponseV1::ExecutionReceipt {
+                ref terminal_state,
+                ..
+            }
+        } if terminal_state == "succeeded"
+    ));
+    let before = inspect_record(&mut harness, &proposal, "before-ratified-restart");
+    assert!(matches!(before.state, ProposalStateV1::Succeeded { .. }));
+    assert!(before.authorization.is_some());
+    assert!(before.candidate_ratification.is_some());
+    assert_eq!(before.prepared_candidates.len(), 1);
+    let terminal_receipt = before.terminal_receipt.clone();
+    let execution_attempt = before.execution_attempt.clone();
+
+    harness = restart_harness(harness);
+    let after = inspect_record(&mut harness, &proposal, "after-ratified-restart");
+    assert_eq!(after.prepared_candidates, before.prepared_candidates);
+    assert_eq!(after.candidate_ratification, before.candidate_ratification);
+    assert_eq!(after.authorization, before.authorization);
+    assert_eq!(after.terminal_receipt, terminal_receipt);
+    assert_eq!(after.execution_attempt, execution_attempt);
+    assert!(matches!(after.state, ProposalStateV1::Succeeded { .. }));
+
+    let replay_challenge = inspect_pointer(
+        &mut harness,
+        &fixture,
+        &proposal,
+        "restart-ratification-replay-display",
+    );
+    assert!(matches!(
+        ratify(
+            &mut harness,
+            &proposal,
+            replay_challenge,
+            "restart-ratification-replay",
+        ),
+        ApiResultV1::Error {
+            code: ApiErrorCodeV1::Conflict,
+            ..
+        }
+    ));
+    let after_replay = inspect_record(&mut harness, &proposal, "after-ratified-replay");
+    assert_eq!(
+        after_replay.candidate_ratification,
+        before.candidate_ratification
+    );
+    assert_eq!(after_replay.execution_attempt, execution_attempt);
+    assert_eq!(after_replay.terminal_receipt, terminal_receipt);
+    assert_eq!(target_object(&fixture), fixture.candidate_object);
+    assert_eq!(target_tree(&fixture), fixture.candidate_tree);
 }
 
 #[test]
@@ -826,18 +1034,23 @@ fn ref_drift_after_canonicalization_is_a_known_no_effect_failure() {
     assert!(
         matches!(
             &result,
-            ApiResultV1::Ok {
-                response: EffectAdminResponseV1::ExecutionReceipt {
-                    terminal_state,
-                    ..
-                }
-            } if terminal_state == "failed"
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::Conflict,
+                ..
+            }
         ),
         "unexpected drift result: {result:?}"
     );
     assert_eq!(target_object(&fixture), foreign);
     assert_ne!(target_object(&fixture), fixture.candidate_object);
     let record = inspect_record(&mut harness, &proposal, "drift-record");
-    assert!(matches!(record.state, ProposalStateV1::Failed { .. }));
-    assert_eq!(record.step_receipts.len(), 1);
+    assert!(matches!(record.state, ProposalStateV1::Ready { .. }));
+    assert!(record.authorization.is_none());
+    assert!(record.candidate_ratification.is_none());
+    assert!(record.step_receipts.is_empty());
+    assert_eq!(record.promotion_refusals.len(), 1);
+    assert_eq!(
+        record.promotion_refusals[0].code,
+        ag_effect::ManagedPointerPromotionRefusalCodeV1::CurrentBasisMismatch
+    );
 }

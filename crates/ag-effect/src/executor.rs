@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    CanonicalEffectV1, GitObjectFormatV1, MANAGED_POINTER_PROMOTION_SCHEMA_V1, SystemdUnitActionV1,
+    CanonicalEffectV1, GitObjectFormatV1, MANAGED_POINTER_PROMOTION_SCHEMA_V2, SystemdUnitActionV1,
 };
 
 /// Canonical schema emitted for terminal execution receipts.
@@ -792,7 +792,7 @@ impl<'a> EffectExecutorV1<'a> {
                 evidence: None,
             });
         };
-        if schema != MANAGED_POINTER_PROMOTION_SCHEMA_V1 {
+        if schema != MANAGED_POINTER_PROMOTION_SCHEMA_V2 {
             return CapabilityOutcomeV1::Failed(CapabilityFailureV1 {
                 code: "promotion_schema_mismatch".to_owned(),
                 detail: "canonical effect names an unsupported promotion contract".to_owned(),
@@ -1421,7 +1421,7 @@ impl<'a> EffectExecutorV1<'a> {
                 None,
             );
         };
-        if schema != MANAGED_POINTER_PROMOTION_SCHEMA_V1 {
+        if schema != MANAGED_POINTER_PROMOTION_SCHEMA_V2 {
             return failure(
                 ExecutionFailureCodeV1::BackendRejected,
                 ExecutionPhaseV1::ReceiptValidation,
@@ -2529,8 +2529,12 @@ mod tests {
 
     fn pointer_promotion(artifact: Digest) -> CanonicalEffectV1 {
         CanonicalEffectV1::ManagedPointerPromotion {
-            schema: MANAGED_POINTER_PROMOTION_SCHEMA_V1.to_owned(),
+            schema: MANAGED_POINTER_PROMOTION_SCHEMA_V2.to_owned(),
             operation_id: Digest::hash_bytes(b"operation"),
+            prepared_candidate: Digest::hash_bytes(b"prepared-candidate"),
+            exact_basis: Digest::hash_bytes(b"exact-basis"),
+            complete_inputs: Digest::hash_bytes(b"complete-inputs"),
+            candidate_preparation_receipt: Digest::hash_bytes(b"candidate-preparation"),
             target: TargetId::parse("release.main").expect("target"),
             allowed_root: "/srv/governed".to_owned(),
             repository: "service.git".to_owned(),

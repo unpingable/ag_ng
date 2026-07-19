@@ -2,16 +2,23 @@
 
 ## Status
 
-This is a dated awareness record for work incubating outside AG-ng. It is not a
-promoted Lean surface, an AG-ng correspondence claim, a runtime requirement, or
-permission to add an authority family. The atlas is a census and extraction
-queue; it does not own the abstractions it indexes and must not become a common
-superclass over independent kernels.
+This is AG-ng's dated runtime implementation map and extraction queue. It is
+not a promoted Lean surface, a generic runtime superclass, or permission to add
+an authority family. Only a row linked to concrete Rust objects and hostile
+fixtures is an implementation claim. The atlas indexes independent kernels; it
+does not own their abstractions.
+
+The first preparation/ratification row is implemented by the compact runtime
+composition documented in
+[`preparation-ratification-kernel.md`](preparation-ratification-kernel.md).
+Inquiry history and authority resurrection remain census entries, not hidden
+parts of that implementation.
 
 The source note reported a clean public baseline with the v14 tag not yet
-minted. At capture time the Lean worktree remained clean, and an annotated
-`v14.0.0` tag had since been created at 2026-07-18 18:41:25 -0400, pointing to
-the already pinned commit `ff491b808ebeab2a132d9ade46d234cf85dcfbe9`.
+minted. The calculus is now formally released: the Lean worktree remained
+clean at capture, and the annotated `v14.0.0` tag created at
+2026-07-18 18:41:25 -0400 points to the already pinned commit
+`ff491b808ebeab2a132d9ade46d234cf85dcfbe9`.
 
 ## Three independent lanes
 
@@ -127,7 +134,8 @@ forcing case.
 - **Hostile fixture:** same bytes, different basis, one ratification.
 - **Existing residence:** AG-ng worker custody and managed-pointer preparation,
   ratification, prestate, CAS, and mismatch refusal.
-- **Disposition:** extract now as a compact sibling kernel.
+- **Disposition:** resident in AG-ng as the compact managed-pointer runtime
+  kernel; later Lean extraction must follow the runtime forcing cases.
 - **Forcing case:** AG-ng's closed promotion loop.
 
 ### 2. Attempt laundering

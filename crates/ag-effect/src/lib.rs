@@ -25,8 +25,38 @@ pub const EFFECT_SCHEMA_V1: &str = "ag.effect/v1";
 /// The exact root-owned effect-catalog contract consumed by this compiler.
 pub const EFFECT_CATALOG_SCHEMA_V1: &str = "ag.effect-catalog/v1";
 
-/// The closed managed-reference promotion contract.
-pub const MANAGED_POINTER_PROMOTION_SCHEMA_V1: &str = "ag.managed-pointer-promotion/v1";
+/// The closed managed-reference promotion contract with exact prepared-candidate bindings.
+pub const MANAGED_POINTER_PROMOTION_SCHEMA_V2: &str = "ag.managed-pointer-promotion/v2";
+
+/// Exact authoritative basis used to prepare one managed-pointer candidate.
+pub const MANAGED_POINTER_EXACT_BASIS_SCHEMA_V1: &str = "ag.managed-pointer.exact-basis/v1";
+
+/// Complete preparation-input preimage whose digest is candidate-bound.
+pub const MANAGED_POINTER_COMPLETE_INPUTS_SCHEMA_V1: &str = "ag.managed-pointer.complete-inputs/v1";
+
+/// Bounded standing receipt emitted when effectd admits preparation work.
+pub const MANAGED_POINTER_PREPARATION_STANDING_SCHEMA_V1: &str =
+    "ag.managed-pointer.preparation-standing-receipt/v1";
+
+/// Closed declaration of preparation-side resource and quarantine effects.
+pub const MANAGED_POINTER_PREPARATION_EFFECTS_SCHEMA_V1: &str =
+    "ag.managed-pointer.preparation-effects/v1";
+
+/// Receipt proving one bounded candidate preparation preserved the target.
+pub const MANAGED_POINTER_CANDIDATE_PREPARATION_SCHEMA_V1: &str =
+    "ag.managed-pointer.candidate-preparation/v1";
+
+/// Exact prepared-candidate record persisted beside the canonical proposal.
+pub const MANAGED_POINTER_PREPARED_CANDIDATE_SCHEMA_V1: &str =
+    "ag.managed-pointer.prepared-candidate/v1";
+
+/// Candidate-and-basis ratification binding persisted at authority burn.
+pub const MANAGED_POINTER_CANDIDATE_RATIFICATION_SCHEMA_V1: &str =
+    "ag.managed-pointer.candidate-ratification/v1";
+
+/// Typed pre-burn promotion-eligibility refusal evidence.
+pub const MANAGED_POINTER_PROMOTION_REFUSAL_SCHEMA_V1: &str =
+    "ag.managed-pointer.promotion-refusal/v1";
 
 /// The exact bounded host-mandate schema.
 pub const HOST_MANDATE_SCHEMA_V1: &str = "ag.host-mandate/v1";
@@ -390,6 +420,312 @@ impl GitObjectFormatV1 {
     }
 }
 
+/// One exact authoritative repository-state basis. Equality of candidate
+/// bytes never transports this identity to another basis.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerExactBasisV1 {
+    /// Basis schema.
+    pub schema: String,
+    /// Authority domain in which preparation was admitted.
+    pub authority_domain: AuthorityDomain,
+    /// Activation epoch in which preparation was admitted.
+    pub epoch: Epoch,
+    /// Exact catalog target.
+    pub target: TargetId,
+    /// Complete active target catalog.
+    pub catalog_identity: Digest,
+    /// Exact broker security profile.
+    pub security_profile_identity: Digest,
+    /// Managed reference.
+    pub reference: String,
+    /// Descriptor-bound repository layout identity.
+    pub repository_identity: Digest,
+    /// Descriptor-bound authoritative state identity.
+    pub prestate_identity: Digest,
+    /// Repository device.
+    pub repository_device: u64,
+    /// Repository inode.
+    pub repository_inode: u64,
+    /// Git-directory device.
+    pub git_directory_device: u64,
+    /// Git-directory inode.
+    pub git_directory_inode: u64,
+    /// Exact target owner.
+    pub uid: u32,
+    /// Exact target group.
+    pub gid: u32,
+    /// Repository object format.
+    pub object_format: GitObjectFormatV1,
+    /// Commit at the managed reference.
+    pub current_object: String,
+    /// Tree reached from the current commit.
+    pub current_tree: String,
+}
+
+impl ManagedPointerExactBasisV1 {
+    /// Validates and computes the exact basis identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a foreign schema, unsafe identity facts, malformed
+    /// object names, or non-canonical encoding.
+    pub fn identity(&self) -> Result<Digest, EffectError> {
+        if self.schema != MANAGED_POINTER_EXACT_BASIS_SCHEMA_V1
+            || self.repository_inode == 0
+            || self.git_directory_inode == 0
+            || self.uid == u32::MAX
+            || self.gid == u32::MAX
+            || !is_canonical_git_reference(&self.reference)
+        {
+            return Err(EffectError::InvalidPreparedCandidate);
+        }
+        validate_git_object(&self.current_object, self.object_format)?;
+        validate_git_object(&self.current_tree, self.object_format)?;
+        digest_serializable(self)
+    }
+}
+
+/// Full preimage of every input the compact preparation kernel treats as
+/// complete. Deterministic construction is deliberately not asserted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerCompleteInputsV1 {
+    /// Input schema.
+    pub schema: String,
+    /// Exact basis identity.
+    pub exact_basis: Digest,
+    /// Candidate artifact custody identity.
+    pub artifact: Digest,
+    /// Exact artifact byte count charged to standing.
+    pub artifact_byte_length: u64,
+    /// Normalized pack identity extracted in quarantine.
+    pub candidate_pack_digest: Digest,
+    /// Candidate commit.
+    pub candidate_object: String,
+    /// Candidate tree.
+    pub candidate_tree: String,
+    /// Candidate's sole parent.
+    pub candidate_parent: String,
+    /// Broker-owned quarantine root.
+    pub staging_root: String,
+    /// Pinned helper executable bytes.
+    pub helper_executable: Digest,
+    /// Pinned helper launch contract.
+    pub helper_launch_profile: Digest,
+    /// Maximum artifact bytes granted for this preparation.
+    pub max_artifact_bytes: u64,
+    /// Maximum charged quarantine bytes granted for this preparation.
+    pub quarantine_budget_bytes: u64,
+}
+
+impl ManagedPointerCompleteInputsV1 {
+    /// Validates and computes the complete-input identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed or unbounded inputs.
+    pub fn identity(&self, object_format: GitObjectFormatV1) -> Result<Digest, EffectError> {
+        if self.schema != MANAGED_POINTER_COMPLETE_INPUTS_SCHEMA_V1
+            || self.artifact_byte_length == 0
+            || self.artifact_byte_length > self.max_artifact_bytes
+            || self.quarantine_budget_bytes < self.max_artifact_bytes
+            || !is_canonical_absolute_root(&self.staging_root)
+        {
+            return Err(EffectError::InvalidPreparedCandidate);
+        }
+        validate_git_object(&self.candidate_object, object_format)?;
+        validate_git_object(&self.candidate_tree, object_format)?;
+        validate_git_object(&self.candidate_parent, object_format)?;
+        digest_serializable(self)
+    }
+}
+
+/// Persisted evidence that effectd held a bounded, target-specific standing
+/// while it prepared candidate material. This receipt is evidence, not bearer
+/// authority and cannot be converted back into live standing after restart.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerPreparationStandingReceiptV1 {
+    /// Standing-receipt schema.
+    pub schema: String,
+    /// Authority domain.
+    pub authority_domain: AuthorityDomain,
+    /// Activation epoch.
+    pub epoch: Epoch,
+    /// Only target in scope.
+    pub target: TargetId,
+    /// Active catalog identity.
+    pub catalog_identity: Digest,
+    /// Exact security profile.
+    pub security_profile_identity: Digest,
+    /// Inclusive issue time.
+    pub issued_at_unix_ms: u64,
+    /// Exclusive expiry.
+    pub expires_at_unix_ms: u64,
+    /// Maximum candidate input bytes.
+    pub max_artifact_bytes: u64,
+    /// Maximum charged quarantine bytes.
+    pub quarantine_budget_bytes: u64,
+    /// Broker-generated one-use receipt nonce.
+    pub nonce: String,
+}
+
+impl ManagedPointerPreparationStandingReceiptV1 {
+    /// Validates and computes this evidence identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty, expired-at-issue, or unbounded standing.
+    pub fn identity(&self) -> Result<Digest, EffectError> {
+        if self.schema != MANAGED_POINTER_PREPARATION_STANDING_SCHEMA_V1
+            || self.nonce.is_empty()
+            || self.max_artifact_bytes == 0
+            || self.quarantine_budget_bytes == 0
+            || self.issued_at_unix_ms >= self.expires_at_unix_ms
+        {
+            return Err(EffectError::InvalidPreparedCandidate);
+        }
+        digest_serializable(self)
+    }
+}
+
+/// Closed accounting declaration for preparation. The values are explicit
+/// charges, not a claim that filesystem quota enforcement is installed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerPreparationEffectsV1 {
+    /// Effects schema.
+    pub schema: String,
+    /// Durable candidate-custody bytes already held by effectd.
+    pub candidate_custody_bytes: u64,
+    /// Artifact plus normalized-pack bytes charged to quarantine.
+    pub charged_quarantine_bytes: u64,
+    /// Bytes durably added to the target object database before ratification.
+    pub target_object_database_bytes: u64,
+    /// Authoritative ref writes performed by preparation.
+    pub authoritative_pointer_writes: u32,
+    /// Network requests performed by preparation.
+    pub network_requests: u32,
+}
+
+impl ManagedPointerPreparationEffectsV1 {
+    fn validate(&self) -> Result<(), EffectError> {
+        if self.schema != MANAGED_POINTER_PREPARATION_EFFECTS_SCHEMA_V1
+            || self.candidate_custody_bytes == 0
+            || self.charged_quarantine_bytes < self.candidate_custody_bytes
+            || self.target_object_database_bytes != 0
+            || self.authoritative_pointer_writes != 0
+            || self.network_requests != 0
+        {
+            return Err(EffectError::InvalidPreparedCandidate);
+        }
+        Ok(())
+    }
+}
+
+/// Exact receipt for pre-ratification preparation in broker-owned quarantine.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerCandidatePreparationReceiptV1 {
+    /// Receipt schema.
+    pub schema: String,
+    /// Evidence identity of the consumed preparation standing.
+    pub standing: Digest,
+    /// Exact basis identity.
+    pub exact_basis: Digest,
+    /// Complete-input identity.
+    pub complete_inputs: Digest,
+    /// Exact artifact identity.
+    pub artifact: Digest,
+    /// Protected state before quarantine work.
+    pub protected_prestate: Digest,
+    /// Protected state after quarantine work and cleanup.
+    pub protected_poststate: Digest,
+    /// Declared and charged side effects.
+    pub effects: ManagedPointerPreparationEffectsV1,
+}
+
+impl ManagedPointerCandidatePreparationReceiptV1 {
+    /// Validates and computes the preparation-receipt identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless preparation preserved the protected projection
+    /// and declared no pre-ratification target or network mutation.
+    pub fn identity(&self) -> Result<Digest, EffectError> {
+        self.effects.validate()?;
+        if self.schema != MANAGED_POINTER_CANDIDATE_PREPARATION_SCHEMA_V1
+            || self.protected_prestate != self.protected_poststate
+            || self.protected_prestate != self.exact_basis
+        {
+            return Err(EffectError::InvalidPreparedCandidate);
+        }
+        digest_serializable(self)
+    }
+}
+
+/// Candidate-specific preparation history. Its identity commits to basis and
+/// complete inputs, so byte-identical artifacts prepared elsewhere remain
+/// distinct candidates.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedManagedPointerCandidateV1 {
+    /// Candidate schema.
+    pub schema: String,
+    /// Full non-authorizing preimage of the consumed preparation standing.
+    pub preparation_standing: ManagedPointerPreparationStandingReceiptV1,
+    /// Full exact basis preimage.
+    pub exact_basis: ManagedPointerExactBasisV1,
+    /// Full complete-input preimage.
+    pub complete_inputs: ManagedPointerCompleteInputsV1,
+    /// Full preparation receipt.
+    pub preparation_receipt: ManagedPointerCandidatePreparationReceiptV1,
+}
+
+impl PreparedManagedPointerCandidateV1 {
+    /// Validates all internal bindings and computes candidate identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any substituted candidate field or receipt.
+    pub fn identity(&self) -> Result<Digest, EffectError> {
+        if self.schema != MANAGED_POINTER_PREPARED_CANDIDATE_SCHEMA_V1 {
+            return Err(EffectError::InvalidPreparedCandidate);
+        }
+        let basis = self.exact_basis.identity()?;
+        let inputs = self
+            .complete_inputs
+            .identity(self.exact_basis.object_format)?;
+        self.preparation_receipt.identity()?;
+        let standing = self.preparation_standing.identity()?;
+        if self.complete_inputs.exact_basis != basis
+            || self.preparation_standing.authority_domain != self.exact_basis.authority_domain
+            || self.preparation_standing.epoch != self.exact_basis.epoch
+            || self.preparation_standing.target != self.exact_basis.target
+            || self.preparation_standing.catalog_identity != self.exact_basis.catalog_identity
+            || self.preparation_standing.security_profile_identity
+                != self.exact_basis.security_profile_identity
+            || self.preparation_standing.max_artifact_bytes
+                != self.complete_inputs.max_artifact_bytes
+            || self.preparation_standing.quarantine_budget_bytes
+                != self.complete_inputs.quarantine_budget_bytes
+            || self.preparation_receipt.standing != standing
+            || self.complete_inputs.candidate_parent != self.exact_basis.current_object
+            || self.preparation_receipt.exact_basis != basis
+            || self.preparation_receipt.complete_inputs != inputs
+            || self.preparation_receipt.artifact != self.complete_inputs.artifact
+            || self.preparation_receipt.effects.candidate_custody_bytes
+                != self.complete_inputs.artifact_byte_length
+            || self.preparation_receipt.effects.charged_quarantine_bytes
+                > self.complete_inputs.quarantine_budget_bytes
+        {
+            return Err(EffectError::PreparedCandidateBindingMismatch);
+        }
+        digest_serializable(self)
+    }
+}
+
 /// Exact evidence an operator submits after independently investigating an
 /// indeterminate execution boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -449,6 +785,14 @@ pub enum CanonicalEffectV1 {
         schema: String,
         /// Broker-derived, proposal-scoped single-use operation identity.
         operation_id: Digest,
+        /// Exact pre-ratification prepared-candidate identity.
+        prepared_candidate: Digest,
+        /// Exact authoritative basis identity carried by that candidate.
+        exact_basis: Digest,
+        /// Complete preparation-input identity.
+        complete_inputs: Digest,
+        /// Exact pre-ratification preparation receipt.
+        candidate_preparation_receipt: Digest,
         /// Target catalog ID.
         target: TargetId,
         /// Descriptor-opened root beneath which the repository must remain.
@@ -647,6 +991,18 @@ pub struct EffectCompilerV1 {
     security_profile_identity: Digest,
 }
 
+/// One broker-observed compilation cut. Prepared-candidate history remains a
+/// separate map so non-promotion observations cannot fabricate it.
+#[derive(Clone, Copy)]
+pub struct EffectCompilationCutV1<'a> {
+    /// Trusted broker clock at the cut.
+    pub compiled_at_unix_ms: u64,
+    /// Exact target observations.
+    pub observations: &'a BTreeMap<TargetId, TargetObservationV1>,
+    /// Exact prepared candidates, one per managed-pointer target.
+    pub prepared_candidates: &'a BTreeMap<TargetId, PreparedManagedPointerCandidateV1>,
+}
+
 impl EffectCompilerV1 {
     /// Creates a compiler from a verified, root-owned catalog.
     #[must_use]
@@ -670,8 +1026,7 @@ impl EffectCompilerV1 {
         intent: &ProposalIntentV1,
         authenticated_proposer: &PrincipalChainV1,
         governor_authentication: Digest,
-        compiled_at_unix_ms: u64,
-        observations: &BTreeMap<TargetId, TargetObservationV1>,
+        cut: EffectCompilationCutV1<'_>,
     ) -> Result<CanonicalEffectProposalV1, EffectError> {
         intent.validate_shape()?;
         if self.catalog.schema != EFFECT_CATALOG_SCHEMA_V1 {
@@ -686,6 +1041,23 @@ impl EffectCompilerV1 {
         {
             return Err(EffectError::MalformedIntent);
         }
+        let expected_prepared_targets = intent
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                EffectIntentV1::ManagedPointerPromotion { target, .. } => Some(target.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if cut
+            .prepared_candidates
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != expected_prepared_targets
+        {
+            return Err(EffectError::PreparedCandidateBindingMismatch);
+        }
         let mut effects = Vec::with_capacity(intent.effects.len());
         for (index, requested) in intent.effects.iter().enumerate() {
             let definition = self
@@ -693,7 +1065,8 @@ impl EffectCompilerV1 {
                 .targets
                 .get(requested.target())
                 .ok_or_else(|| EffectError::UnknownTarget(requested.target().clone()))?;
-            let observation = observations
+            let observation = cut
+                .observations
                 .get(requested.target())
                 .ok_or_else(|| EffectError::MissingObservation(requested.target().clone()))?;
             let operation_id =
@@ -715,8 +1088,15 @@ impl EffectCompilerV1 {
                 requested,
                 definition,
                 observation,
-                operation_id,
-                compiled_at_unix_ms,
+                CompileOneContextV1 {
+                    prepared_candidate: cut.prepared_candidates.get(requested.target()),
+                    authority_domain: &intent.authority_domain,
+                    epoch: intent.epoch,
+                    catalog_identity: &self.catalog.identity,
+                    security_profile_identity: &self.security_profile_identity,
+                    operation_id,
+                    compiled_at_unix_ms: cut.compiled_at_unix_ms,
+                },
             )?);
         }
 
@@ -727,7 +1107,7 @@ impl EffectCompilerV1 {
             governor_authentication,
             authority_domain: intent.authority_domain.clone(),
             epoch: intent.epoch,
-            compiled_at_unix_ms,
+            compiled_at_unix_ms: cut.compiled_at_unix_ms,
             proposer: authenticated_proposer.clone(),
             catalog_schema: self.catalog.schema.clone(),
             catalog_identity: self.catalog.identity.clone(),
@@ -740,13 +1120,22 @@ impl EffectCompilerV1 {
     }
 }
 
+struct CompileOneContextV1<'a> {
+    prepared_candidate: Option<&'a PreparedManagedPointerCandidateV1>,
+    authority_domain: &'a AuthorityDomain,
+    epoch: Epoch,
+    catalog_identity: &'a Digest,
+    security_profile_identity: &'a Digest,
+    operation_id: Option<Digest>,
+    compiled_at_unix_ms: u64,
+}
+
 #[allow(clippy::too_many_lines)]
 fn compile_one(
     intent: &EffectIntentV1,
     definition: &TargetDefinitionV1,
     observation: &TargetObservationV1,
-    operation_id: Option<Digest>,
-    compiled_at_unix_ms: u64,
+    context: CompileOneContextV1<'_>,
 ) -> Result<CanonicalEffectV1, EffectError> {
     match (intent, definition, observation) {
         (
@@ -783,6 +1172,16 @@ fn compile_one(
                 reference_checked_out,
             },
         ) => {
+            let prepared_candidate = context
+                .prepared_candidate
+                .ok_or_else(|| EffectError::MissingPreparedCandidate(target.clone()))?;
+            let prepared_candidate_identity = prepared_candidate.identity()?;
+            let exact_basis_identity = prepared_candidate.exact_basis.identity()?;
+            let complete_inputs_identity = prepared_candidate
+                .complete_inputs
+                .identity(*object_format)?;
+            let candidate_preparation_receipt =
+                prepared_candidate.preparation_receipt.identity()?;
             if repository_identity != observed_identity
                 || uid != repository_uid
                 || gid != repository_gid
@@ -816,13 +1215,53 @@ fn compile_one(
             {
                 return Err(EffectError::InvalidPromotionDefinition(target.clone()));
             }
-            let expires_unix_ms = compiled_at_unix_ms
+            let basis = &prepared_candidate.exact_basis;
+            let inputs = &prepared_candidate.complete_inputs;
+            if basis.authority_domain != *context.authority_domain
+                || basis.epoch != context.epoch
+                || basis.target != *target
+                || basis.catalog_identity != *context.catalog_identity
+                || basis.security_profile_identity != *context.security_profile_identity
+                || basis.reference != *reference
+                || basis.repository_identity != *observed_identity
+                || basis.prestate_identity != *prestate_identity
+                || basis.repository_device != *repository_device
+                || basis.repository_inode != *repository_inode
+                || basis.git_directory_device != *git_directory_device
+                || basis.git_directory_inode != *git_directory_inode
+                || basis.uid != *repository_uid
+                || basis.gid != *repository_gid
+                || basis.object_format != *object_format
+                || basis.current_object != *current_object
+                || basis.current_tree != *current_tree
+                || inputs.exact_basis != exact_basis_identity
+                || inputs.artifact != *artifact
+                || inputs.candidate_pack_digest != *candidate_pack_digest
+                || inputs.candidate_object != *candidate_object
+                || inputs.candidate_tree != *candidate_tree
+                || inputs.candidate_parent != *candidate_parent
+                || inputs.staging_root != *staging_root
+                || inputs.helper_executable != *helper_executable
+                || inputs.helper_launch_profile != *helper_launch_profile
+                || context.compiled_at_unix_ms
+                    < prepared_candidate.preparation_standing.issued_at_unix_ms
+                || context.compiled_at_unix_ms
+                    >= prepared_candidate.preparation_standing.expires_at_unix_ms
+            {
+                return Err(EffectError::PreparedCandidateBindingMismatch);
+            }
+            let expires_unix_ms = context
+                .compiled_at_unix_ms
                 .checked_add(*promotion_ttl_ms)
                 .ok_or(EffectError::PromotionExpiryOverflow)?;
-            let operation_id = operation_id.ok_or(EffectError::MalformedIntent)?;
+            let operation_id = context.operation_id.ok_or(EffectError::MalformedIntent)?;
             Ok(CanonicalEffectV1::ManagedPointerPromotion {
-                schema: MANAGED_POINTER_PROMOTION_SCHEMA_V1.to_owned(),
+                schema: MANAGED_POINTER_PROMOTION_SCHEMA_V2.to_owned(),
                 operation_id,
+                prepared_candidate: prepared_candidate_identity,
+                exact_basis: exact_basis_identity,
+                complete_inputs: complete_inputs_identity,
+                candidate_preparation_receipt,
                 target: target.clone(),
                 allowed_root: allowed_root.clone(),
                 repository: repository.clone(),
@@ -1044,6 +1483,136 @@ impl RatificationV1 {
             | Self::BoundedMandate { proposal, .. }
             | Self::DerivedCodePromotion { proposal, .. } => proposal,
         }
+    }
+}
+
+/// Explicit managed-pointer ratification of one prepared candidate on one
+/// exact basis. The enclosing human/derived authorization still owns the
+/// principal semantics; this record makes the candidate and basis projection
+/// independently inspectable and non-transportable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerCandidateRatificationV1 {
+    /// Binding schema.
+    pub schema: String,
+    /// Exact canonical proposal ratified.
+    pub proposal: Digest,
+    /// Exact prepared-candidate identity.
+    pub candidate: Digest,
+    /// Exact authoritative basis identity.
+    pub exact_basis: Digest,
+    /// Exact complete-input identity.
+    pub complete_inputs: Digest,
+    /// Exact pre-ratification preparation receipt.
+    pub preparation_receipt: Digest,
+    /// Exact accepted human or derived authorization record.
+    pub authorization: Digest,
+}
+
+impl ManagedPointerCandidateRatificationV1 {
+    /// Verifies this record against the persisted candidate and authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any candidate, basis, input, receipt, proposal, or
+    /// authority binding differs.
+    pub fn verify_bindings(
+        &self,
+        proposal: &Digest,
+        candidate: &PreparedManagedPointerCandidateV1,
+        authorization: &Digest,
+    ) -> Result<(), EffectError> {
+        let candidate_identity = candidate.identity()?;
+        let exact_basis = candidate.exact_basis.identity()?;
+        let complete_inputs = candidate
+            .complete_inputs
+            .identity(candidate.exact_basis.object_format)?;
+        let preparation_receipt = candidate.preparation_receipt.identity()?;
+        if self.schema != MANAGED_POINTER_CANDIDATE_RATIFICATION_SCHEMA_V1
+            || &self.proposal != proposal
+            || self.candidate != candidate_identity
+            || self.exact_basis != exact_basis
+            || self.complete_inputs != complete_inputs
+            || self.preparation_receipt != preparation_receipt
+            || &self.authorization != authorization
+        {
+            return Err(EffectError::CandidateRatificationMismatch);
+        }
+        Ok(())
+    }
+
+    /// Computes the evidence identity after structural validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when strict canonical encoding fails.
+    pub fn identity(&self) -> Result<Digest, EffectError> {
+        if self.schema != MANAGED_POINTER_CANDIDATE_RATIFICATION_SCHEMA_V1 {
+            return Err(EffectError::CandidateRatificationMismatch);
+        }
+        digest_serializable(self)
+    }
+}
+
+/// Closed reason why exact promotion standing could not be minted before an
+/// authority burn. These are refusals, never execution receipts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedPointerPromotionRefusalCodeV1 {
+    /// Live authoritative state no longer equals the prepared exact basis.
+    CurrentBasisMismatch,
+    /// Candidate, basis, ratification, catalog, helper, or effect binding differs.
+    CandidateBindingMismatch,
+    /// Live standing could not be safely reconstructed from local observations.
+    StandingUnavailable,
+}
+
+/// Durable, non-authorizing evidence for one failed promotion-standing mint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerPromotionRefusalV1 {
+    /// Refusal schema.
+    pub schema: String,
+    /// Exact proposal presented for promotion.
+    pub proposal: Digest,
+    /// Exact prepared candidate.
+    pub candidate: Digest,
+    /// Exact prepared basis.
+    pub exact_basis: Digest,
+    /// Candidate-specific attempted ratification binding.
+    pub candidate_ratification: ManagedPointerCandidateRatificationV1,
+    /// Full attempted independent authorization. It was not burned.
+    pub attempted_authorization: RatificationV1,
+    /// Trusted broker observation time.
+    pub observed_at_unix_ms: u64,
+    /// Closed refusal family.
+    pub code: ManagedPointerPromotionRefusalCodeV1,
+    /// Sanitized bounded diagnostic.
+    pub detail: String,
+}
+
+impl ManagedPointerPromotionRefusalV1 {
+    /// Validates exact authorization/candidate bindings and computes evidence identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for foreign schema, unbounded detail, or substituted
+    /// proposal/authorization bindings.
+    pub fn identity(&self) -> Result<Digest, EffectError> {
+        let authorization = digest_serializable(&self.attempted_authorization)?;
+        self.candidate_ratification.identity()?;
+        if self.schema != MANAGED_POINTER_PROMOTION_REFUSAL_SCHEMA_V1
+            || self.detail.is_empty()
+            || self.detail.len() > 512
+            || self.attempted_authorization.proposal() != &self.proposal
+            || self.candidate_ratification.proposal != self.proposal
+            || self.candidate_ratification.candidate != self.candidate
+            || self.candidate_ratification.exact_basis != self.exact_basis
+            || self.candidate_ratification.authorization != authorization
+        {
+            return Err(EffectError::CandidateRatificationMismatch);
+        }
+        digest_serializable(self)
     }
 }
 
@@ -1448,6 +2017,18 @@ pub enum EffectError {
     /// Candidate commit is not based directly on the observed managed ref.
     #[error("managed-pointer candidate has the wrong base: {0:?}")]
     PromotionBaseMismatch(TargetId),
+    /// Managed-pointer compilation was attempted without broker preparation.
+    #[error("managed-pointer candidate has no preparation record: {0:?}")]
+    MissingPreparedCandidate(TargetId),
+    /// A prepared candidate is malformed or internally incoherent.
+    #[error("managed-pointer prepared candidate is invalid")]
+    InvalidPreparedCandidate,
+    /// Candidate, basis, complete inputs, receipt, or canonical effect differ.
+    #[error("managed-pointer prepared-candidate binding mismatch")]
+    PreparedCandidateBindingMismatch,
+    /// Ratification does not name the exact candidate and basis being promoted.
+    #[error("managed-pointer candidate ratification mismatch")]
+    CandidateRatificationMismatch,
     /// Root-owned promotion definition is empty or unbounded.
     #[error("invalid managed-pointer definition: {0:?}")]
     InvalidPromotionDefinition(TargetId),
@@ -1511,6 +2092,8 @@ impl EffectError {
                 | Self::PromotionTargetDirty(_)
                 | Self::PromotionReferenceCheckedOut(_)
                 | Self::PromotionBaseMismatch(_)
+                | Self::InvalidPreparedCandidate
+                | Self::PreparedCandidateBindingMismatch
                 | Self::UnsafeTarget(_)
                 | Self::ActionNotAllowed(_)
                 | Self::InvalidGitObject(_)
@@ -1533,6 +2116,94 @@ mod tests {
             )],
         )
         .expect("proposer chain")
+    }
+
+    fn prepared_candidate_for_basis(
+        basis_label: &[u8],
+        artifact: &Digest,
+    ) -> PreparedManagedPointerCandidateV1 {
+        let domain = AuthorityDomain::parse("candidate-host").expect("domain");
+        let epoch = Epoch::parse("9").expect("epoch");
+        let target = TargetId::parse("release.main").expect("target");
+        let exact_basis = ManagedPointerExactBasisV1 {
+            schema: MANAGED_POINTER_EXACT_BASIS_SCHEMA_V1.to_owned(),
+            authority_domain: domain.clone(),
+            epoch,
+            target: target.clone(),
+            catalog_identity: Digest::hash_bytes(b"candidate-catalog"),
+            security_profile_identity: Digest::hash_bytes(b"candidate-profile"),
+            reference: "refs/heads/main".to_owned(),
+            repository_identity: Digest::hash_bytes(basis_label),
+            prestate_identity: Digest::hash_domain("candidate-basis", basis_label),
+            repository_device: 7,
+            repository_inode: 11,
+            git_directory_device: 7,
+            git_directory_inode: 12,
+            uid: 1200,
+            gid: 1200,
+            object_format: GitObjectFormatV1::Sha1,
+            current_object: "1".repeat(40),
+            current_tree: "2".repeat(40),
+        };
+        let exact_basis_identity = exact_basis.identity().expect("basis identity");
+        let complete_inputs = ManagedPointerCompleteInputsV1 {
+            schema: MANAGED_POINTER_COMPLETE_INPUTS_SCHEMA_V1.to_owned(),
+            exact_basis: exact_basis_identity.clone(),
+            artifact: artifact.clone(),
+            artifact_byte_length: 64,
+            candidate_pack_digest: Digest::hash_bytes(b"same-normalized-pack"),
+            candidate_object: "3".repeat(40),
+            candidate_tree: "4".repeat(40),
+            candidate_parent: "1".repeat(40),
+            staging_root: "/var/lib/ag-effectd/promotion-stage".to_owned(),
+            helper_executable: Digest::hash_bytes(b"git"),
+            helper_launch_profile: Digest::hash_bytes(b"git-profile"),
+            max_artifact_bytes: 128,
+            quarantine_budget_bytes: 256,
+        };
+        let complete_inputs_identity = complete_inputs
+            .identity(GitObjectFormatV1::Sha1)
+            .expect("complete inputs");
+        let standing = ManagedPointerPreparationStandingReceiptV1 {
+            schema: MANAGED_POINTER_PREPARATION_STANDING_SCHEMA_V1.to_owned(),
+            authority_domain: domain,
+            epoch,
+            target,
+            catalog_identity: Digest::hash_bytes(b"candidate-catalog"),
+            security_profile_identity: Digest::hash_bytes(b"candidate-profile"),
+            issued_at_unix_ms: 10,
+            expires_at_unix_ms: 20,
+            max_artifact_bytes: 128,
+            quarantine_budget_bytes: 256,
+            nonce: format!(
+                "candidate-standing-{}",
+                String::from_utf8_lossy(basis_label)
+            ),
+        };
+        let preparation_receipt = ManagedPointerCandidatePreparationReceiptV1 {
+            schema: MANAGED_POINTER_CANDIDATE_PREPARATION_SCHEMA_V1.to_owned(),
+            standing: standing.identity().expect("standing receipt"),
+            exact_basis: exact_basis_identity.clone(),
+            complete_inputs: complete_inputs_identity,
+            artifact: artifact.clone(),
+            protected_prestate: exact_basis_identity.clone(),
+            protected_poststate: exact_basis_identity,
+            effects: ManagedPointerPreparationEffectsV1 {
+                schema: MANAGED_POINTER_PREPARATION_EFFECTS_SCHEMA_V1.to_owned(),
+                candidate_custody_bytes: 64,
+                charged_quarantine_bytes: 96,
+                target_object_database_bytes: 0,
+                authoritative_pointer_writes: 0,
+                network_requests: 0,
+            },
+        };
+        PreparedManagedPointerCandidateV1 {
+            schema: MANAGED_POINTER_PREPARED_CANDIDATE_SCHEMA_V1.to_owned(),
+            preparation_standing: standing,
+            exact_basis,
+            complete_inputs,
+            preparation_receipt,
+        }
     }
 
     fn try_compile_with_governor_source(
@@ -1582,8 +2253,11 @@ mod tests {
             &intent,
             &intent.proposer,
             source,
-            1_000,
-            &observations,
+            EffectCompilationCutV1 {
+                compiled_at_unix_ms: 1_000,
+                observations: &observations,
+                prepared_candidates: &BTreeMap::new(),
+            },
         )
     }
 
@@ -1591,6 +2265,7 @@ mod tests {
         try_compile_with_governor_source(source, true).expect("compile")
     }
 
+    #[allow(clippy::too_many_lines)]
     fn try_compile_promotion(
         clean: bool,
         reference_checked_out: bool,
@@ -1635,35 +2310,116 @@ mod tests {
                 artifact,
             }],
         };
-        let observations = BTreeMap::from([(
-            target,
-            TargetObservationV1::ManagedPointer {
-                current_object: "1".repeat(40),
-                current_tree: "2".repeat(40),
-                candidate_object: "3".repeat(40),
-                candidate_tree: "4".repeat(40),
-                candidate_parent,
-                candidate_pack_digest: Digest::hash_bytes(b"normalized-pack"),
-                object_format: GitObjectFormatV1::Sha1,
-                repository_identity: Digest::hash_bytes(b"repository-identity"),
-                prestate_identity: Digest::hash_bytes(b"prestate-layout-identity"),
-                repository_device: 8,
-                repository_inode: 101,
-                git_directory_device: 8,
-                git_directory_inode: 102,
-                repository_uid: 1200,
-                repository_gid: 1200,
-                clean,
-                reference_checked_out,
-            },
-        )]);
+        let observation = TargetObservationV1::ManagedPointer {
+            current_object: "1".repeat(40),
+            current_tree: "2".repeat(40),
+            candidate_object: "3".repeat(40),
+            candidate_tree: "4".repeat(40),
+            candidate_parent: candidate_parent.clone(),
+            candidate_pack_digest: Digest::hash_bytes(b"normalized-pack"),
+            object_format: GitObjectFormatV1::Sha1,
+            repository_identity: Digest::hash_bytes(b"repository-identity"),
+            prestate_identity: Digest::hash_bytes(b"prestate-layout-identity"),
+            repository_device: 8,
+            repository_inode: 101,
+            git_directory_device: 8,
+            git_directory_inode: 102,
+            repository_uid: 1200,
+            repository_gid: 1200,
+            clean,
+            reference_checked_out,
+        };
+        let exact_basis = ManagedPointerExactBasisV1 {
+            schema: MANAGED_POINTER_EXACT_BASIS_SCHEMA_V1.to_owned(),
+            authority_domain: intent.authority_domain.clone(),
+            epoch: intent.epoch,
+            target: target.clone(),
+            catalog_identity: Digest::hash_bytes(b"promotion-catalog"),
+            security_profile_identity: Digest::hash_bytes(b"effectd-security-profile"),
+            reference: "refs/heads/main".to_owned(),
+            repository_identity: Digest::hash_bytes(b"repository-identity"),
+            prestate_identity: Digest::hash_bytes(b"prestate-layout-identity"),
+            repository_device: 8,
+            repository_inode: 101,
+            git_directory_device: 8,
+            git_directory_inode: 102,
+            uid: 1200,
+            gid: 1200,
+            object_format: GitObjectFormatV1::Sha1,
+            current_object: "1".repeat(40),
+            current_tree: "2".repeat(40),
+        };
+        let exact_basis_identity = exact_basis.identity()?;
+        let artifact_byte_length =
+            u64::try_from(b"exact candidate bundle".len()).expect("artifact length");
+        let complete_inputs = ManagedPointerCompleteInputsV1 {
+            schema: MANAGED_POINTER_COMPLETE_INPUTS_SCHEMA_V1.to_owned(),
+            exact_basis: exact_basis_identity.clone(),
+            artifact: Digest::hash_bytes(b"exact candidate bundle"),
+            artifact_byte_length,
+            candidate_pack_digest: Digest::hash_bytes(b"normalized-pack"),
+            candidate_object: "3".repeat(40),
+            candidate_tree: "4".repeat(40),
+            candidate_parent,
+            staging_root: "/var/lib/ag-effectd/promotion-stage".to_owned(),
+            helper_executable: Digest::hash_bytes(b"helper-executable"),
+            helper_launch_profile: Digest::hash_bytes(b"helper-profile"),
+            max_artifact_bytes: 1024,
+            quarantine_budget_bytes: 2048,
+        };
+        let complete_inputs_identity = complete_inputs.identity(GitObjectFormatV1::Sha1)?;
+        let standing = ManagedPointerPreparationStandingReceiptV1 {
+            schema: MANAGED_POINTER_PREPARATION_STANDING_SCHEMA_V1.to_owned(),
+            authority_domain: intent.authority_domain.clone(),
+            epoch: intent.epoch,
+            target: target.clone(),
+            catalog_identity: Digest::hash_bytes(b"promotion-catalog"),
+            security_profile_identity: Digest::hash_bytes(b"effectd-security-profile"),
+            issued_at_unix_ms: compiled_at_unix_ms.saturating_sub(1),
+            expires_at_unix_ms: compiled_at_unix_ms
+                .saturating_add(promotion_ttl_ms.max(1))
+                .min(i64::MAX as u64),
+            max_artifact_bytes: 1024,
+            quarantine_budget_bytes: 2048,
+            nonce: "compiler-test-standing".to_owned(),
+        };
+        let effects = ManagedPointerPreparationEffectsV1 {
+            schema: MANAGED_POINTER_PREPARATION_EFFECTS_SCHEMA_V1.to_owned(),
+            candidate_custody_bytes: artifact_byte_length,
+            charged_quarantine_bytes: artifact_byte_length,
+            target_object_database_bytes: 0,
+            authoritative_pointer_writes: 0,
+            network_requests: 0,
+        };
+        let preparation_receipt = ManagedPointerCandidatePreparationReceiptV1 {
+            schema: MANAGED_POINTER_CANDIDATE_PREPARATION_SCHEMA_V1.to_owned(),
+            standing: standing.identity()?,
+            exact_basis: exact_basis_identity.clone(),
+            complete_inputs: complete_inputs_identity,
+            artifact: Digest::hash_bytes(b"exact candidate bundle"),
+            protected_prestate: exact_basis_identity.clone(),
+            protected_poststate: exact_basis_identity,
+            effects,
+        };
+        let prepared_candidate = PreparedManagedPointerCandidateV1 {
+            schema: MANAGED_POINTER_PREPARED_CANDIDATE_SCHEMA_V1.to_owned(),
+            preparation_standing: standing,
+            exact_basis,
+            complete_inputs,
+            preparation_receipt,
+        };
+        let observations = BTreeMap::from([(target.clone(), observation)]);
+        let prepared_candidates = BTreeMap::from([(target, prepared_candidate)]);
         EffectCompilerV1::new(catalog, Digest::hash_bytes(b"effectd-security-profile")).compile(
             "proposal-promotion-1".to_owned(),
             &intent,
             &intent.proposer,
             Digest::hash_bytes(b"governor-authentication"),
-            compiled_at_unix_ms,
-            &observations,
+            EffectCompilationCutV1 {
+                compiled_at_unix_ms,
+                observations: &observations,
+                prepared_candidates: &prepared_candidates,
+            },
         )
     }
 
@@ -1672,6 +2428,103 @@ mod tests {
         assert!(TargetId::parse("web.production").is_ok());
         assert!(TargetId::parse("../../etc/shadow").is_err());
         assert!(TargetId::parse("unit/name").is_err());
+    }
+
+    #[test]
+    fn byte_identical_candidates_on_different_bases_do_not_share_ratification() {
+        let artifact = Digest::hash_bytes(b"byte-identical-candidate");
+        let first = prepared_candidate_for_basis(b"basis-a", &artifact);
+        let second = prepared_candidate_for_basis(b"basis-b", &artifact);
+        assert_eq!(
+            first.complete_inputs.artifact,
+            second.complete_inputs.artifact
+        );
+        assert_ne!(
+            first.exact_basis.identity().unwrap(),
+            second.exact_basis.identity().unwrap()
+        );
+        assert_ne!(first.identity().unwrap(), second.identity().unwrap());
+
+        let proposal = Digest::hash_bytes(b"ratified-proposal");
+        let authorization = Digest::hash_bytes(b"independent-promotion-standing");
+        let binding = ManagedPointerCandidateRatificationV1 {
+            schema: MANAGED_POINTER_CANDIDATE_RATIFICATION_SCHEMA_V1.to_owned(),
+            proposal: proposal.clone(),
+            candidate: first.identity().unwrap(),
+            exact_basis: first.exact_basis.identity().unwrap(),
+            complete_inputs: first
+                .complete_inputs
+                .identity(first.exact_basis.object_format)
+                .unwrap(),
+            preparation_receipt: first.preparation_receipt.identity().unwrap(),
+            authorization: authorization.clone(),
+        };
+        binding
+            .verify_bindings(&proposal, &first, &authorization)
+            .expect("ratified candidate remains eligible");
+        assert_eq!(
+            binding.verify_bindings(&proposal, &second, &authorization),
+            Err(EffectError::CandidateRatificationMismatch)
+        );
+    }
+
+    #[test]
+    fn post_ratification_candidate_content_or_metadata_substitution_refuses() {
+        let artifact = Digest::hash_bytes(b"ratified-candidate");
+        let candidate = prepared_candidate_for_basis(b"basis-a", &artifact);
+        let proposal = Digest::hash_bytes(b"proposal");
+        let authorization = Digest::hash_bytes(b"authorization");
+        let binding = ManagedPointerCandidateRatificationV1 {
+            schema: MANAGED_POINTER_CANDIDATE_RATIFICATION_SCHEMA_V1.to_owned(),
+            proposal: proposal.clone(),
+            candidate: candidate.identity().unwrap(),
+            exact_basis: candidate.exact_basis.identity().unwrap(),
+            complete_inputs: candidate
+                .complete_inputs
+                .identity(candidate.exact_basis.object_format)
+                .unwrap(),
+            preparation_receipt: candidate.preparation_receipt.identity().unwrap(),
+            authorization: authorization.clone(),
+        };
+
+        let mut content_substitution = candidate.clone();
+        content_substitution.complete_inputs.artifact = Digest::hash_bytes(b"changed-content");
+        assert!(
+            binding
+                .verify_bindings(&proposal, &content_substitution, &authorization)
+                .is_err()
+        );
+        let mut metadata_substitution = candidate;
+        metadata_substitution.complete_inputs.helper_launch_profile =
+            Digest::hash_bytes(b"changed-launch-profile");
+        assert!(
+            binding
+                .verify_bindings(&proposal, &metadata_substitution, &authorization)
+                .is_err()
+        );
+        let mut over_budget = prepared_candidate_for_basis(b"basis-a", &artifact);
+        over_budget
+            .preparation_receipt
+            .effects
+            .charged_quarantine_bytes = over_budget.complete_inputs.quarantine_budget_bytes + 1;
+        assert_eq!(
+            over_budget.identity(),
+            Err(EffectError::PreparedCandidateBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn mechanical_cas_success_is_not_an_authority_transition() {
+        let mechanically_possible = true;
+        let ready = ProposalStateV1::Ready {
+            proposal: Digest::hash_bytes(b"proposal"),
+        };
+        let result = ready.clone().apply(ProposalEventV1::CommitMayProceed {
+            checkpoint: Digest::hash_bytes(b"mechanical-cas-checkpoint"),
+        });
+        assert!(mechanically_possible);
+        assert!(matches!(result, Err(EffectError::InvalidTransition { .. })));
+        assert!(matches!(ready, ProposalStateV1::Ready { .. }));
     }
 
     #[test]
@@ -1757,7 +2610,7 @@ mod tests {
         else {
             panic!("expected managed pointer")
         };
-        assert_eq!(schema, MANAGED_POINTER_PROMOTION_SCHEMA_V1);
+        assert_eq!(schema, MANAGED_POINTER_PROMOTION_SCHEMA_V2);
         assert_ne!(operation_id, artifact);
         assert_eq!(artifact, &Digest::hash_bytes(b"exact candidate bundle"));
         assert_eq!(
@@ -1787,7 +2640,7 @@ mod tests {
         ));
         assert!(matches!(
             try_compile_promotion(true, false, "9".repeat(40), 1, 1),
-            Err(EffectError::PromotionBaseMismatch(_))
+            Err(EffectError::PreparedCandidateBindingMismatch)
         ));
         assert_eq!(
             try_compile_promotion(true, false, "1".repeat(40), 1, u64::MAX),

@@ -9,10 +9,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ag_effect::{
     CanonicalEffectV1, EFFECT_CATALOG_SCHEMA_V1, EFFECT_SCHEMA_V1, EffectCatalogV1,
-    EffectCompilerV1, EffectError, EffectFamilyV1, ProposalEventV1, ProposalIntentV1,
-    ProposalStateV1, RECONCILIATION_EVIDENCE_SCHEMA_V1, RECONCILIATION_RECORD_SCHEMA_V1,
-    RatificationV1, ReconciliationClassificationV1, ReconciliationEvidenceV1,
-    ReconciliationRecordV1, TargetDefinitionV1, TargetId, TargetObservationV1,
+    EffectCompilationCutV1, EffectCompilerV1, EffectError, EffectFamilyV1,
+    MANAGED_POINTER_CANDIDATE_RATIFICATION_SCHEMA_V1, MANAGED_POINTER_PROMOTION_REFUSAL_SCHEMA_V1,
+    ManagedPointerCandidateRatificationV1, ManagedPointerPromotionRefusalCodeV1,
+    ManagedPointerPromotionRefusalV1, PreparedManagedPointerCandidateV1, ProposalEventV1,
+    ProposalIntentV1, ProposalStateV1, RECONCILIATION_EVIDENCE_SCHEMA_V1,
+    RECONCILIATION_RECORD_SCHEMA_V1, RatificationV1, ReconciliationClassificationV1,
+    ReconciliationEvidenceV1, ReconciliationRecordV1, TargetDefinitionV1, TargetId,
+    TargetObservationV1,
 };
 use ag_primitives::{
     AuthorityDomain, Digest, Epoch, PrincipalChainNodeV1, PrincipalChainV1, PrincipalKindV1,
@@ -25,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::api::{
-    AgdRequestV1, ApiErrorCodeV1, ApiResultV1, ArtifactTransferV1, EFFECT_RECORD_SCHEMA_V1,
+    AgdRequestV1, ApiErrorCodeV1, ApiResultV1, ArtifactTransferV1, EFFECT_RECORD_SCHEMA_V2,
     EffectAdminRequestV1, EffectAdminResponseV1, EffectProposalRequestV1, EffectProposalResponseV1,
     EffectRecordV1, GovernedProposalIngressV1, HealthV1, ProposalSummaryV1,
     WorkerCandidateRequestV1, WorkerCandidateSourceProofV1, worker_candidate_ingress_proof_digest,
@@ -35,7 +39,8 @@ use crate::api::{ProposalIngressProofV1, WorkerCandidateIngressProofV1};
 use crate::config::{EffectTargetConfigV1, EffectdConfigV1, PeerPolicyV1};
 use crate::managed_pointer::{
     ManagedPointerCommitEvidenceV1, ManagedPointerCommitResultV1, ManagedPointerError,
-    ManagedPointerPoststateEvidenceV1, ManagedPointerRuntimeV1,
+    ManagedPointerPoststateEvidenceV1, ManagedPointerPreparationStandingContextV1,
+    ManagedPointerRuntimeV1,
 };
 use crate::peer::signed_principal_chain;
 use crate::rpc_auth::{
@@ -55,11 +60,27 @@ use ag_effect::executor::{
 };
 
 /// The broker's durable materialized proposal state.
+pub const BROKER_PROPOSAL_RECORD_SCHEMA_V2: &str = "ag.effect-broker-proposal/v2";
+
+/// The broker's durable materialized proposal state.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerProposalRecordV1 {
+    /// Explicit record schema. Legacy records without v2 candidate bindings
+    /// deserialize only to fail closed during broker validation.
+    #[serde(default)]
+    pub schema: String,
     /// Exact broker-owned proposal.
     pub canonical: ag_effect::CanonicalEffectProposalV1,
+    /// Exact pre-ratification preparation history by managed-pointer target.
+    #[serde(default)]
+    pub prepared_candidates: BTreeMap<TargetId, PreparedManagedPointerCandidateV1>,
+    /// Exact candidate-and-basis ratification persisted at authority burn.
+    #[serde(default)]
+    pub candidate_ratification: Option<ManagedPointerCandidateRatificationV1>,
+    /// Typed pre-burn eligibility refusals. History cannot become standing.
+    #[serde(default)]
+    pub promotion_refusals: Vec<ManagedPointerPromotionRefusalV1>,
     /// Durable burn-before-effect lifecycle.
     pub state: ProposalStateV1,
     /// Exact accepted authority record, when burned.
@@ -92,6 +113,11 @@ pub struct BrokerSubmissionRecordV1 {
     pub evaluation: BrokerEvaluationEvidenceV1,
     /// Durable outcome returned for every retry of this exact source.
     pub response: EffectProposalResponseV1,
+}
+
+struct BrokerPreparedIntentV1 {
+    observations: BTreeMap<TargetId, TargetObservationV1>,
+    prepared_candidates: BTreeMap<TargetId, PreparedManagedPointerCandidateV1>,
 }
 
 /// Exact broker-owned evidence behind one submission result.
@@ -578,8 +604,8 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
 
         let proposal_id = stable_proposal_id(&source);
         let governor_authentication = source.clone();
-        let observations = match self.observe_intent(&intent) {
-            Ok(observations) => observations,
+        let preparation = match self.prepare_intent(&intent) {
+            Ok(preparation) => preparation,
             Err(error) => {
                 let failure_code = match &error {
                     BrokerError::Io(_) => BrokerEvaluationFailureCodeV1::ObservationIo,
@@ -613,8 +639,11 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             &intent,
             &authenticated_proposer,
             governor_authentication,
-            now_u64()?,
-            &observations,
+            EffectCompilationCutV1 {
+                compiled_at_unix_ms: now_u64()?,
+                observations: &preparation.observations,
+                prepared_candidates: &preparation.prepared_candidates,
+            },
         ) {
             Ok(canonical) => canonical,
             Err(error) => {
@@ -659,6 +688,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             authenticated_proposer,
             ingress.clone(),
             &canonical,
+            preparation.prepared_candidates,
         )
     }
 
@@ -1032,9 +1062,68 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                 authorization: authorization_digest.clone(),
                 family: effect.family(),
             })?;
+        let attempt = Digest::from_serializable(&(
+            "ag.effect.execution-attempt/v1",
+            &proposal,
+            uuid::Uuid::new_v4().to_string(),
+        ))?;
+        let context = crate::managed_pointer::ManagedPointerExecutionContextV1 {
+            proposal: proposal.clone(),
+            authorization: authorization_digest.clone(),
+            attempt: attempt.clone(),
+            effect_index: 0,
+        };
+        let (candidate_ratification, promotion_standing) =
+            if let CanonicalEffectV1::ManagedPointerPromotion { target, .. } = &effect {
+                let candidate = loaded
+                    .state
+                    .prepared_candidates
+                    .get(target)
+                    .ok_or_else(|| {
+                        BrokerError::Corrupt(
+                            "managed-pointer proposal is missing prepared-candidate custody"
+                                .to_owned(),
+                        )
+                    })?;
+                let binding = ManagedPointerCandidateRatificationV1 {
+                    schema: MANAGED_POINTER_CANDIDATE_RATIFICATION_SCHEMA_V1.to_owned(),
+                    proposal: proposal.clone(),
+                    candidate: candidate.identity()?,
+                    exact_basis: candidate.exact_basis.identity()?,
+                    complete_inputs: candidate
+                        .complete_inputs
+                        .identity(candidate.exact_basis.object_format)?,
+                    preparation_receipt: candidate.preparation_receipt.identity()?,
+                    authorization: authorization_digest.clone(),
+                };
+                binding.verify_bindings(proposal, candidate, &authorization_digest)?;
+                let standing_observed_at = now_u64()?;
+                let standing = match self.pointer_runtime.promotion_standing(
+                    &context,
+                    &effect,
+                    candidate,
+                    &binding,
+                    standing_observed_at,
+                ) {
+                    Ok(standing) => standing,
+                    Err(error) => {
+                        return self.record_promotion_refusal(
+                            loaded,
+                            authorization,
+                            binding,
+                            standing_observed_at,
+                            &error,
+                        );
+                    }
+                };
+                (Some(binding), Some(standing))
+            } else {
+                (None, None)
+            };
         let mut record = BrokerProposalRecordV1 {
             state,
             authorization: Some(authorization),
+            candidate_ratification,
             ..loaded.state
         };
         let mut revision = self.persist_record(
@@ -1043,14 +1132,13 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             "effect-authorization.burned.v1",
             &authorization_digest,
         )?;
-
-        let attempt = Digest::from_serializable(&(
-            "ag.effect.execution-attempt/v1",
-            &proposal,
-            uuid::Uuid::new_v4().to_string(),
-        ))?;
         record.execution_attempt = Some(attempt.clone());
         if effect.family() == EffectFamilyV1::CodePromotion {
+            let promotion_standing = promotion_standing.ok_or_else(|| {
+                BrokerError::Corrupt(
+                    "promotion authority burn lacks live single-use standing".to_owned(),
+                )
+            })?;
             record.state = record.state.apply(ProposalEventV1::BeginPreparation {
                 attempt: attempt.clone(),
             })?;
@@ -1060,15 +1148,10 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                 "effect-promotion.preparation-began.v1",
                 &attempt,
             )?;
-            let context = crate::managed_pointer::ManagedPointerExecutionContextV1 {
-                proposal: proposal.clone(),
-                authorization: authorization_digest.clone(),
-                attempt: attempt.clone(),
-                effect_index: 0,
-            };
             let prepared = match self.pointer_runtime.prepare_from_store(
+                promotion_standing,
                 &self.store,
-                context,
+                &context,
                 &effect,
                 self.max_artifact_bytes,
                 now_u64()?,
@@ -1144,6 +1227,65 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             &effect,
         );
         self.finish_execution(record, revision, &receipt, None, None)
+    }
+
+    fn record_promotion_refusal(
+        &mut self,
+        loaded: ag_store::MaterializedStateV1<BrokerProposalRecordV1>,
+        attempted_authorization: RatificationV1,
+        candidate_ratification: ManagedPointerCandidateRatificationV1,
+        observed_at_unix_ms: u64,
+        error: &ManagedPointerError,
+    ) -> Result<EffectAdminResponseV1, BrokerError> {
+        let code = match error {
+            ManagedPointerError::PrestateDrift(_)
+            | ManagedPointerError::ProtectedProjectionChanged => {
+                ManagedPointerPromotionRefusalCodeV1::CurrentBasisMismatch
+            }
+            ManagedPointerError::BindingMismatch
+            | ManagedPointerError::PromotionStandingMismatch
+            | ManagedPointerError::TargetUnavailable
+            | ManagedPointerError::GitIdentityMismatch
+            | ManagedPointerError::LaunchProfileMismatch => {
+                ManagedPointerPromotionRefusalCodeV1::CandidateBindingMismatch
+            }
+            _ => ManagedPointerPromotionRefusalCodeV1::StandingUnavailable,
+        };
+        let detail: String = error
+            .to_string()
+            .chars()
+            .map(|character| {
+                if character.is_ascii() && !character.is_ascii_control() {
+                    character
+                } else {
+                    '?'
+                }
+            })
+            .take(512)
+            .collect();
+        let refusal = ManagedPointerPromotionRefusalV1 {
+            schema: MANAGED_POINTER_PROMOTION_REFUSAL_SCHEMA_V1.to_owned(),
+            proposal: candidate_ratification.proposal.clone(),
+            candidate: candidate_ratification.candidate.clone(),
+            exact_basis: candidate_ratification.exact_basis.clone(),
+            candidate_ratification,
+            attempted_authorization,
+            observed_at_unix_ms,
+            code,
+            detail,
+        };
+        let receipt = refusal.identity()?;
+        let mut record = loaded.state;
+        if record.promotion_refusals.len() < 32 {
+            record.promotion_refusals.push(refusal.clone());
+        }
+        self.persist_record(
+            &record,
+            loaded.revision,
+            "effect-promotion.eligibility-refused.v1",
+            &refusal,
+        )?;
+        Err(BrokerError::PromotionEligibilityRefused(receipt))
     }
 
     fn finish_preparation_failure(
@@ -1375,11 +1517,12 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         Ok(EffectAdminResponseV1::Reconciled { receipt })
     }
 
-    fn observe_intent(
+    fn prepare_intent(
         &self,
         intent: &ag_effect::ProposalIntentV1,
-    ) -> Result<BTreeMap<TargetId, TargetObservationV1>, BrokerError> {
+    ) -> Result<BrokerPreparedIntentV1, BrokerError> {
         let mut observations = BTreeMap::new();
+        let mut prepared_candidates = BTreeMap::new();
         for effect in &intent.effects {
             let target = effect.target();
             if observations.contains_key(target) {
@@ -1402,12 +1545,33 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                                 .to_owned(),
                         ));
                     };
-                    self.pointer_runtime.observe_candidate_from_store(
-                        &self.store,
+                    let now_unix_ms = now_u64()?;
+                    let standing = self.pointer_runtime.preparation_standing(
                         target,
+                        ManagedPointerPreparationStandingContextV1 {
+                            authority_domain: self.authority_domain.clone(),
+                            epoch: self.epoch,
+                            catalog_identity: self.catalog_identity.clone(),
+                            security_profile_identity: self.security_profile_identity.clone(),
+                            max_artifact_bytes: self.max_artifact_bytes,
+                            now_unix_ms,
+                        },
+                    )?;
+                    let prepared = self.pointer_runtime.prepare_candidate_from_store(
+                        Some(standing),
+                        &self.store,
                         artifact,
-                        self.max_artifact_bytes,
-                    )?
+                        now_unix_ms,
+                    )?;
+                    if prepared_candidates
+                        .insert(target.clone(), prepared.candidate)
+                        .is_some()
+                    {
+                        return Err(BrokerError::Observation(
+                            "managed-pointer preparation repeated a target".to_owned(),
+                        ));
+                    }
+                    prepared.observation
                 }
                 EffectTargetConfigV1::SystemdUnit { .. }
                 | EffectTargetConfigV1::SystemdManager { .. } => {
@@ -1418,7 +1582,10 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             };
             observations.insert(target.clone(), observation);
         }
-        Ok(observations)
+        Ok(BrokerPreparedIntentV1 {
+            observations,
+            prepared_candidates,
+        })
     }
 
     fn observe_canonical(
@@ -1913,7 +2080,7 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::single_match_else)]
     fn validate_proposal_record(
         &self,
         requested: &Digest,
@@ -1923,6 +2090,10 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             .canonical
             .verify_digest()
             .map_err(|error| BrokerError::Corrupt(error.to_string()))?;
+        require_record_invariant(
+            record.schema == BROKER_PROPOSAL_RECORD_SCHEMA_V2,
+            "proposal record lacks the v2 preparation/ratification schema",
+        )?;
         require_record_invariant(
             requested == record.canonical.digest(),
             "proposal entity does not bind the canonical digest",
@@ -1951,6 +2122,131 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
             record.step_receipts.len() <= record.canonical.body().effects.len(),
             "proposal has more step receipts than canonical effects",
         )?;
+
+        let promotion_candidate = match &record.canonical.body().effects[0] {
+            CanonicalEffectV1::ManagedPointerPromotion {
+                target,
+                prepared_candidate,
+                exact_basis,
+                complete_inputs,
+                candidate_preparation_receipt,
+                repository_identity,
+                prestate_identity,
+                repository_device,
+                repository_inode,
+                git_directory_device,
+                git_directory_inode,
+                uid,
+                gid,
+                reference,
+                artifact,
+                candidate_pack_digest,
+                expected_object,
+                expected_tree,
+                new_object,
+                expected_post_tree,
+                helper_executable,
+                helper_launch_profile,
+                staging_root,
+                ..
+            } => {
+                let candidate = record.prepared_candidates.get(target).ok_or_else(|| {
+                    BrokerError::Corrupt(
+                        "managed-pointer record lacks exact prepared-candidate history".to_owned(),
+                    )
+                })?;
+                require_record_invariant(
+                    record.prepared_candidates.len() == 1
+                        && candidate.identity()? == *prepared_candidate
+                        && candidate.exact_basis.identity()? == *exact_basis
+                        && candidate
+                            .complete_inputs
+                            .identity(candidate.exact_basis.object_format)?
+                            == *complete_inputs
+                        && candidate.preparation_receipt.identity()?
+                            == *candidate_preparation_receipt
+                        && candidate.exact_basis.authority_domain
+                            == record.canonical.body().authority_domain
+                        && candidate.exact_basis.epoch == record.canonical.body().epoch
+                        && candidate.exact_basis.catalog_identity
+                            == record.canonical.body().catalog_identity
+                        && candidate.exact_basis.security_profile_identity
+                            == record.canonical.body().security_profile_identity
+                        && candidate.preparation_standing.max_artifact_bytes
+                            == self.max_artifact_bytes
+                        && self.max_artifact_bytes.checked_mul(2)
+                            == Some(candidate.preparation_standing.quarantine_budget_bytes)
+                        && candidate.exact_basis.target == *target
+                        && candidate.exact_basis.repository_identity == *repository_identity
+                        && candidate.exact_basis.prestate_identity == *prestate_identity
+                        && candidate.exact_basis.repository_device == *repository_device
+                        && candidate.exact_basis.repository_inode == *repository_inode
+                        && candidate.exact_basis.git_directory_device == *git_directory_device
+                        && candidate.exact_basis.git_directory_inode == *git_directory_inode
+                        && candidate.exact_basis.uid == *uid
+                        && candidate.exact_basis.gid == *gid
+                        && candidate.exact_basis.reference == *reference
+                        && candidate.exact_basis.current_object == *expected_object
+                        && candidate.exact_basis.current_tree == *expected_tree
+                        && candidate.complete_inputs.artifact == *artifact
+                        && candidate.complete_inputs.candidate_pack_digest
+                            == *candidate_pack_digest
+                        && candidate.complete_inputs.candidate_object == *new_object
+                        && candidate.complete_inputs.candidate_tree == *expected_post_tree
+                        && candidate.complete_inputs.helper_executable == *helper_executable
+                        && candidate.complete_inputs.helper_launch_profile
+                            == *helper_launch_profile
+                        && candidate.complete_inputs.staging_root == *staging_root,
+                    "managed-pointer prepared candidate differs from canonical effect bindings",
+                )?;
+                Some(candidate)
+            }
+            _ => {
+                require_record_invariant(
+                    record.prepared_candidates.is_empty()
+                        && record.candidate_ratification.is_none()
+                        && record.promotion_refusals.is_empty(),
+                    "non-promotion record contains managed-pointer preparation authority residue",
+                )?;
+                None
+            }
+        };
+        require_record_invariant(
+            record.promotion_refusals.len() <= 32,
+            "proposal contains too many promotion-eligibility refusals",
+        )?;
+        for refusal in &record.promotion_refusals {
+            let candidate = promotion_candidate.ok_or_else(|| {
+                BrokerError::Corrupt(
+                    "promotion refusal is attached to a non-promotion proposal".to_owned(),
+                )
+            })?;
+            refusal
+                .identity()
+                .map_err(|error| BrokerError::Corrupt(error.to_string()))?;
+            let attempted_authorization =
+                Digest::from_serializable(&refusal.attempted_authorization)?;
+            refusal
+                .candidate_ratification
+                .verify_bindings(
+                    record.canonical.digest(),
+                    candidate,
+                    &attempted_authorization,
+                )
+                .map_err(|error| BrokerError::Corrupt(error.to_string()))?;
+            let RatificationV1::HumanExact { ratifier, .. } = &refusal.attempted_authorization
+            else {
+                return Err(BrokerError::Corrupt(
+                    "pre-burn promotion refusal contains a non-human authority path".to_owned(),
+                ));
+            };
+            require_record_invariant(
+                ratifier.authority_domain() == &record.canonical.body().authority_domain
+                    && ratifier.epoch() == record.canonical.body().epoch
+                    && record.canonical.body().proposer.independent_from(ratifier),
+                "promotion refusal ratifier is outside or dependent on proposal context",
+            )?;
+        }
 
         let authorization_digest = record
             .authorization
@@ -1987,6 +2283,22 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
                         "derived adapter is outside or dependent on the proposal authority context",
                     )?;
                 }
+            }
+        }
+        match (
+            promotion_candidate,
+            record.authorization.as_ref(),
+            record.candidate_ratification.as_ref(),
+            authorization_digest.as_ref(),
+        ) {
+            (Some(candidate), Some(_), Some(binding), Some(authorization)) => binding
+                .verify_bindings(record.canonical.digest(), candidate, authorization)
+                .map_err(|error| BrokerError::Corrupt(error.to_string()))?,
+            (Some(_), None, None, None) | (None, _, None, _) => {}
+            _ => {
+                return Err(BrokerError::Corrupt(
+                    "candidate ratification does not match promotion authority custody".to_owned(),
+                ));
             }
         }
 
@@ -2278,13 +2590,18 @@ impl<R: BrokerEffectRunnerV1> EffectBrokerV1<R> {
         proposer: PrincipalChainV1,
         ingress_proof: GovernedProposalIngressV1,
         canonical: &ag_effect::CanonicalEffectProposalV1,
+        prepared_candidates: BTreeMap<TargetId, PreparedManagedPointerCandidateV1>,
     ) -> Result<EffectProposalResponseV1, BrokerError> {
         canonical.verify_digest()?;
         let state = ProposalStateV1::Received.apply(ProposalEventV1::Compiled {
             proposal: canonical.digest().clone(),
         })?;
         let proposal_record = BrokerProposalRecordV1 {
+            schema: BROKER_PROPOSAL_RECORD_SCHEMA_V2.to_owned(),
             canonical: canonical.clone(),
+            prepared_candidates,
+            candidate_ratification: None,
+            promotion_refusals: Vec::new(),
             state,
             authorization: None,
             terminal_receipt: None,
@@ -2635,8 +2952,11 @@ fn classify_reconciliation(
 
 fn effect_record_projection(record: BrokerProposalRecordV1) -> EffectRecordV1 {
     EffectRecordV1 {
-        schema: EFFECT_RECORD_SCHEMA_V1.to_owned(),
+        schema: EFFECT_RECORD_SCHEMA_V2.to_owned(),
         canonical: record.canonical,
+        prepared_candidates: record.prepared_candidates,
+        candidate_ratification: record.candidate_ratification,
+        promotion_refusals: record.promotion_refusals,
         state: record.state,
         authorization: record.authorization,
         terminal_receipt: record.terminal_receipt,
@@ -2883,6 +3203,7 @@ fn broker_api_error<T>(error: &BrokerError) -> ApiResultV1<T> {
         | BrokerError::ActivationNotReady => ApiErrorCodeV1::Indeterminate,
         BrokerError::Effect(EffectError::InvalidTransition { .. })
         | BrokerError::PromotionExpired
+        | BrokerError::PromotionEligibilityRefused(_)
         | BrokerError::ReconciliationStateUnresolved
         | BrokerError::ReconciliationNotRequired => ApiErrorCodeV1::Conflict,
         BrokerError::Effect(_)
@@ -2942,6 +3263,9 @@ pub enum BrokerError {
     /// Exact promotion authority expired before the independent ratification burn.
     #[error("managed-pointer proposal expired before ratification")]
     PromotionExpired,
+    /// Fresh exact basis/candidate checks refused standing before authority burn.
+    #[error("managed-pointer promotion eligibility refused: {0}")]
+    PromotionEligibilityRefused(Digest),
     /// Broker cannot safely observe a target.
     #[error("target observation indeterminate: {0}")]
     Observation(String),
@@ -3673,7 +3997,7 @@ mod tests {
         else {
             panic!("direct record inspection must succeed");
         };
-        assert_eq!(ready_record.schema, EFFECT_RECORD_SCHEMA_V1);
+        assert_eq!(ready_record.schema, EFFECT_RECORD_SCHEMA_V2);
         assert_eq!(ready_record.canonical, *proposal);
         assert!(matches!(ready_record.state, ProposalStateV1::Ready { .. }));
         assert!(matches!(
@@ -3771,6 +4095,12 @@ mod tests {
         let hostile_digest = Digest::hash_bytes(b"hostile-proposal-binding");
         assert!(matches!(
             broker.validate_proposal_record(&hostile_digest, &uncertain),
+            Err(BrokerError::Corrupt(_))
+        ));
+        let mut legacy_unbound_record = uncertain.clone();
+        legacy_unbound_record.schema.clear();
+        assert!(matches!(
+            broker.validate_proposal_record(&proposal_digest, &legacy_unbound_record),
             Err(BrokerError::Corrupt(_))
         ));
         let mut hostile_attempt = uncertain.clone();
@@ -3898,7 +4228,7 @@ mod tests {
         else {
             panic!("reconciled custody record must remain inspectable");
         };
-        assert_eq!(record.schema, EFFECT_RECORD_SCHEMA_V1);
+        assert_eq!(record.schema, EFFECT_RECORD_SCHEMA_V2);
         assert_eq!(record.canonical, reconciled.canonical);
         assert_eq!(record.state, reconciled.state);
         assert_eq!(record.authorization, reconciled.authorization);
@@ -3991,8 +4321,12 @@ mod tests {
         let new_object = "3".repeat(40);
         let new_tree = "4".repeat(40);
         let effect = CanonicalEffectV1::ManagedPointerPromotion {
-            schema: ag_effect::MANAGED_POINTER_PROMOTION_SCHEMA_V1.to_owned(),
+            schema: ag_effect::MANAGED_POINTER_PROMOTION_SCHEMA_V2.to_owned(),
             operation_id: Digest::hash_bytes(b"operation"),
+            prepared_candidate: Digest::hash_bytes(b"prepared-candidate"),
+            exact_basis: Digest::hash_bytes(b"exact-basis"),
+            complete_inputs: Digest::hash_bytes(b"complete-inputs"),
+            candidate_preparation_receipt: Digest::hash_bytes(b"candidate-preparation"),
             target: TargetId::parse("repository.main").expect("target"),
             allowed_root: "/srv/git".to_owned(),
             repository: "repository.git".to_owned(),

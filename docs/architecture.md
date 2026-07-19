@@ -106,9 +106,13 @@ giving either the worker or `agd` write access to the governed target:
 ```text
 authenticated worker candidate Git bundle
 -> agd reconstructs the reviewed effect family and target
--> ag-effectd admits the artifact and observes the managed ref
+-> ag-effectd consumes bounded preparation standing, stages the candidate,
+   and proves the protected managed-ref projection unchanged
 -> ag-effectd compiles and persists the canonical proposal
--> an independent human principal ratifies those exact broker-owned bytes
+-> an independent human principal ratifies the exact candidate and basis in
+   those broker-owned bytes
+-> ag-effectd freshly re-observes that basis and constructs one-use live
+   promotion standing
 -> reversible preparation and a durable commit-may-proceed checkpoint
 -> exact managed-ref compare-and-swap under the configured target owner
 -> independent tree readback and a receipt or reconciliation requirement
@@ -122,6 +126,14 @@ by the managed ref. Candidate bytes remain proposal material; the worker cannot
 name the destination repository or ref, construct canonical bytes, ratify the
 proposal, or execute the promotion.
 
+The pre-ratification preparation standing is target-, domain-, epoch-, catalog-,
+profile-, expiry-, and budget-scoped and is not serializable. Its evidence
+receipt, the full exact basis and complete-input preimage, charged quarantine
+effects, and the before/after protected-projection identities are persisted as
+one prepared candidate. The staging pass performs no target-object-database or
+managed-ref write. Identical artifact bytes prepared against different bases
+produce distinct candidate identities.
+
 `ag-effectd` derives a proposal-scoped, single-use operation ID and binds the
 activation domain and epoch, catalog and security-profile identities, expiry,
 artifact and normalized pack digests, allowed root, repository and Git-directory
@@ -134,8 +146,12 @@ checked-out, stale-base, expired, or already-consumed targets refuse.
 The ratifier is not predicted inside the pre-ratification proposal, which would
 make the digest circular. The signed authorization, durable authority burn, and
 one-shot attempt instead bind that exact canonical proposal to the
-broker-reconstructed ratifier principal. Principal-chain independence from the
-proposer is checked before any preparation or mutation.
+broker-reconstructed ratifier principal. A separate candidate-ratification
+record projects the exact candidate, basis, complete inputs, and preparation
+receipt from those canonical bytes. Principal-chain independence from the
+proposer is checked before live promotion standing, effect preparation, or
+mutation. A fresh basis mismatch is persisted as a typed eligibility refusal;
+it does not burn the attempted authorization.
 
 The closed Git adapter runs an exact retained-descriptor executable with fixed
 plumbing operations, an empty and rebuilt environment, isolated Git
@@ -148,8 +164,10 @@ The commit side changes only the configured ref by compare-and-swap. Success is
 issued only after the ref and resulting tree are independently observed at the
 ratified poststate.
 
-Authority is burned before preparation. `ag-effectd` durably records that
-reversible preparation is complete before entering the externally visible ref boundary.
+Promotion authority is burned after candidate preparation, exact ratification,
+and fresh-basis standing reconstruction, but before effect preparation.
+`ag-effectd` durably records that reversible effect preparation is complete
+before entering the externally visible ref boundary.
 A known pre-boundary failure with an exact unchanged prestate is terminal and
 cannot be retried with the consumed operation. An ambiguous boundary becomes
 reconciliation-required; automatic retry is forbidden. Reconciliation

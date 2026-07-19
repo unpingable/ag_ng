@@ -355,14 +355,17 @@ fn pointer_worker_fixture(root: &Path) -> PointerWorkerFixtureV1 {
     );
 
     let metadata = fs::symlink_metadata(&repository).expect("repository metadata");
-    let node = |name: &str| ag_app::managed_pointer::ManagedFilesystemNodeEvidenceV1 {
-        name: name.to_owned(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        uid: metadata.uid(),
-        gid: metadata.gid(),
-        mode: metadata.mode(),
-        link_count: metadata.nlink(),
+    let node = |name: &str, path: &Path| {
+        let node = fs::symlink_metadata(path).expect("managed repository node metadata");
+        ag_app::managed_pointer::ManagedFilesystemNodeEvidenceV1 {
+            name: name.to_owned(),
+            device: node.dev(),
+            inode: node.ino(),
+            uid: node.uid(),
+            gid: node.gid(),
+            mode: node.mode(),
+            link_count: node.nlink(),
+        }
     };
     assert_eq!(
         exact_git_line([
@@ -382,13 +385,16 @@ fn pointer_worker_fixture(root: &Path) -> PointerWorkerFixtureV1 {
         repository: repository.to_str().expect("UTF-8 repository").to_owned(),
         bare: true,
         object_format: GitObjectFormatV1::Sha1,
-        allowed_root_node: node("allowed-root"),
-        repository_node: node("repository"),
-        git_directory_node: node("git"),
-        config_node: node("config"),
-        objects_node: node("objects"),
-        pack_directory_node: node("pack"),
-        reference_ancestry: vec![node("refs")],
+        allowed_root_node: node("allowed-root", &allowed_root),
+        repository_node: node("repository", &repository),
+        git_directory_node: node("git-directory", &repository),
+        config_node: node("config", &repository.join("config")),
+        objects_node: node("objects", &repository.join("objects")),
+        pack_directory_node: node("objects/pack", &repository.join("objects/pack")),
+        reference_ancestry: vec![
+            node("refs", &repository.join("refs")),
+            node("refs/heads", &repository.join("refs/heads")),
+        ],
         repository_device: metadata.dev(),
         repository_inode: metadata.ino(),
         git_directory_device: metadata.dev(),
@@ -649,9 +655,18 @@ fn agd_core_recovers_custodied_fixture_into_broker_owned_canonical_proposal() {
         database: unused_custody.clone(),
         writer_lock: unused_custody.clone(),
     };
+    let unused_socket_parent = temporary.path().join("unused-socket-parent");
+    fs::create_dir(&unused_socket_parent).expect("unused socket parent");
+    fs::set_permissions(&unused_socket_parent, fs::Permissions::from_mode(0o2700))
+        .expect("unused socket parent mode");
+    let socket_parent_custody = filesystem_custody(&unused_socket_parent);
     let unused_socket_custody = SocketCustodyConfigV1 {
-        parent: unused_custody.clone(),
-        node: unused_custody,
+        parent: socket_parent_custody.clone(),
+        node: FilesystemNodeCustodyV1 {
+            uid: socket_parent_custody.uid,
+            gid: socket_parent_custody.gid,
+            mode: 0o660,
+        },
     };
     let launcher = WorkerLauncherConfigV1 {
         governor_principal_root: governor.principal().clone(),
@@ -931,6 +946,8 @@ fn live_worker_bundle_closes_the_managed_pointer_lifecycle() {
     assert!(Path::new(BWRAP).is_file(), "Bubblewrap fixture is required");
     assert!(Path::new(GIT).is_file(), "exact /usr/bin/git is required");
     let temporary = TempDir::new().expect("temporary joined-lifecycle fixture");
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
+        .expect("private joined-lifecycle root");
     let pointer = pointer_worker_fixture(temporary.path());
     let reviewed = temporary.path().join("reviewed-pointer-worker");
     let workspace_root = temporary.path().join("pointer-workspaces");
@@ -959,9 +976,18 @@ fn live_worker_bundle_closes_the_managed_pointer_lifecycle() {
         database: unused_custody.clone(),
         writer_lock: unused_custody.clone(),
     };
+    let pointer_socket_parent = temporary.path().join("unused-pointer-socket-parent");
+    fs::create_dir(&pointer_socket_parent).expect("unused pointer socket parent");
+    fs::set_permissions(&pointer_socket_parent, fs::Permissions::from_mode(0o2700))
+        .expect("unused pointer socket parent mode");
+    let pointer_socket_parent_custody = filesystem_custody(&pointer_socket_parent);
     let unused_socket_custody = SocketCustodyConfigV1 {
-        parent: unused_custody.clone(),
-        node: unused_custody,
+        parent: pointer_socket_parent_custody.clone(),
+        node: FilesystemNodeCustodyV1 {
+            uid: pointer_socket_parent_custody.uid,
+            gid: pointer_socket_parent_custody.gid,
+            mode: 0o660,
+        },
     };
     let launcher = WorkerLauncherConfigV1 {
         governor_principal_root: governor.principal().clone(),
