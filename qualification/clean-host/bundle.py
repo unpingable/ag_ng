@@ -135,6 +135,7 @@ SSH_BUILD_DEPENDENCY_INSTALL_TAIL = (
     "--yes",
     "--no-install-recommends",
     "install",
+    "build-essential",
     "debhelper",
     "bubblewrap",
     "cargo",

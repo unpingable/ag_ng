@@ -41,13 +41,14 @@ sealed.
 
 The controller fixture requires Python 3, QEMU/KVM, `qemu-img`, `xorriso`,
 OpenSSH `ssh` and `scp`, and coreutils `tail`. The clean guest needs a reachable
-configured Debian package mirror while `/usr/bin/apt-get update` and the exact
-source-build dependency set declared by `debian/control` are installed. These
-are qualification-controller or clean-image prerequisites, not runtime
+configured Debian package mirror while `/usr/bin/apt-get update`, Debian's
+implicit `build-essential` build baseline, and the exact source-build
+dependency set declared by `debian/control` are installed. These are
+qualification-controller or clean-image prerequisites, not runtime
 dependencies of the binary package. The repository contains no policy that
 authorizes a release-wide guest upgrade, so this campaign pins the published
-image and performs only that dependency preparation; it does not run
-`apt full-upgrade` or infer an updated-image claim.
+image and performs only that dependency preparation; it does not run `apt
+full-upgrade` or infer an updated-image claim.
 
 Validate the source contract without root or third-party Python packages:
 
@@ -201,7 +202,7 @@ The source/build chain requires these exact remote tails after literal
 
 ```text
 /usr/bin/sudo /usr/bin/apt-get update
-/usr/bin/sudo /usr/bin/apt-get --yes --no-install-recommends install debhelper bubblewrap cargo git python3 rustc
+/usr/bin/sudo /usr/bin/apt-get --yes --no-install-recommends install build-essential debhelper bubblewrap cargo git python3 rustc
 /usr/bin/sha256sum /home/agqual/agent-governor-ng-0.1.0.tar
 /usr/bin/tar --extract --file=/home/agqual/agent-governor-ng-0.1.0.tar --directory=/home/agqual
 /usr/bin/git init --bare /home/agqual/ag-ng-source-measure.git

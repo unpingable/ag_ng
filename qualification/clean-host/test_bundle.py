@@ -31,6 +31,25 @@ class CleanHostBundleTests(unittest.TestCase):
         with self.assertRaises(BUNDLE.QualificationError):
             callback()
 
+    def test_build_bootstrap_includes_debian_implicit_build_essential(self) -> None:
+        self.assertEqual(
+            BUNDLE.SSH_BUILD_DEPENDENCY_INSTALL_TAIL,
+            (
+                "/usr/bin/sudo",
+                "/usr/bin/apt-get",
+                "--yes",
+                "--no-install-recommends",
+                "install",
+                "build-essential",
+                "debhelper",
+                "bubblewrap",
+                "cargo",
+                "git",
+                "python3",
+                "rustc",
+            ),
+        )
+
     def initialized_bundle(self, temporary: str) -> Path:
         root = Path(temporary) / "bundle"
         BUNDLE.initialize_bundle(root, HERE / "matrix.toml")
