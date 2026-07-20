@@ -1,0 +1,1 @@
+{"manifest":{"length":42719,"path":"manifest.v1.json","sha256":"sha256:3625ffd2b4796aecd5d78093a25f6ba9adfa5df563d2cc78154b1ab80c325efe"},"receipt":{"length":45454,"path":"receipt.v1.json","sha256":"sha256:a1d57540fe1cfc58fc6b82a92aa15fc24d9f6399855acb07944c8d4727aaeacf"},"schema":"ag.clean-host-evidence-verification-result/v1","valid":true,"verdict":"BLOCKED"}
