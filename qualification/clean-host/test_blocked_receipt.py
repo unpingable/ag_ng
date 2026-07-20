@@ -108,9 +108,12 @@ class BlockedReceiptPublisherTests(unittest.TestCase):
             "terminal_observed": {
                 "active_lsms": "capability,landlock",
                 "architecture": "amd64",
-                "cgroup": "unified cgroup v2",
+                "cgroup": "unified-v2:/user.slice/user-1000.slice/session-1.scope",
                 "distribution": "debian",
-                "filesystem": "ext4",
+                "filesystem": (
+                    "ext4 mount_options=rw,relatime source=/dev/vda1 "
+                    "super_options=rw,errors=remount-ro"
+                ),
                 "kernel": "6.1.0-test",
                 "landlock_abi": "3",
                 "release": "12",

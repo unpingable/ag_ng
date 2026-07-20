@@ -5105,14 +5105,17 @@ def _verify_blocked_typed_evidence(
         "supported clean guest requires Linux >= 6.1",
     )
     _require(
-        observed["cgroup"] == "unified cgroup v2",
+        observed["cgroup"].startswith("unified-v2:/"),
         "guest-facts.observed.cgroup",
-        "supported clean guest requires unified cgroup v2",
+        "supported clean guest requires the direct probe's unified-v2 path",
     )
+    filesystem = observed["filesystem"]
     _require(
-        observed["filesystem"] == "ext4",
+        filesystem.startswith("ext4 mount_options=")
+        and " source=" in filesystem
+        and " super_options=" in filesystem,
         "guest-facts.observed.filesystem",
-        "the bounded storage variant requires an ext4 guest root",
+        "the bounded storage variant requires the direct probe's ext4 root facts",
     )
 
     archive_value, archive_record_ref = guest_records[CANDIDATE_ARCHIVE_SCHEMA]
