@@ -99,6 +99,16 @@ done
 [ -f /usr/share/doc/agent-governor-ng/migration/classic-authority-ledger.v1.json ] || \
     fail "machine-consumed migration ledger is missing or compressed"
 
+deployment_contract=/usr/share/doc/agent-governor-ng/deployment.md
+for prerequisite in \
+    '/dev/null' \
+    'security.capability' \
+    'executable memfds through `/proc/self/fd/N`' \
+    '/proc/self/mountinfo'; do
+    grep -Fq "$prerequisite" "$deployment_contract" || \
+        fail "installed deployment contract omits host prerequisite: $prerequisite"
+done
+
 for example in agctl.example.toml agctl-proposer.example.toml agd.example.toml \
     effectd.example.toml managed-pointer-genesis-request.example.toml \
     providerd.example.toml; do

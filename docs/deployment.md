@@ -20,6 +20,29 @@ supported package targets are Debian 12 and Ubuntu 24.04 on amd64 and arm64.
 SELinux/AppArmor policy, filesystem features, cgroup v2 delegation, and D-Bus
 policy still require a host-specific preflight.
 
+Managed-pointer enrollment and activation, together with the relevant
+development-only worker-launch paths, also have four exact host prerequisites
+which are not satisfiable through Debian package dependencies. They are
+mandatory operator preflight inputs, not optional fallbacks:
+
+- `/dev/null` must be a nonsymlink character device with device number `1:3`,
+  owner `root:root`, one link, and mode `0666`;
+- the filesystem containing the pinned `/usr/bin/git` must support descriptor
+  queries for the `security.capability` extended attribute, and an absent
+  attribute must be reported as `ENODATA` (an unsupported query is refusal,
+  not evidence that the capability is absent);
+- the kernel and active LSM policy must permit creation, sealing, and execution
+  of executable memfds through `/proc/self/fd/N`; and
+- procfs must be mounted so the effective service sandbox can read
+  `/proc/self/exe`, `/proc/self/status`, `/proc/self/cgroup`, and
+  `/proc/self/mountinfo`.
+
+The daemon and genesis tooling check these properties through their real
+descriptor-bound paths. A missing property is a typed startup, measurement, or
+readiness refusal; an operator must not replace it with a copied helper,
+unsealed executable, guessed process identity, or manually transcribed
+measurement.
+
 Live configuration belongs in `/etc/agent-governor` and is created by an
 operator from measured enrollment data:
 
