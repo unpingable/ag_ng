@@ -17,7 +17,37 @@ hardened services (or equivalently constrained fixed-name transient units)
 through `LoadCredentialEncrypted=`; neither key is stored in TOML.
 `deployment.md` gives separate launch profiles.
 
-`doctor` is the one deliberate exception to the single-role config flag. It
+## Offline managed-pointer genesis
+
+The `managed-pointer` command family is a second deliberate offline exception
+to `--config`. It loads no signing key and contacts no daemon. It requires
+effective UID/GID 0, clears supplementary groups, and consumes a root-owned
+target request plus a managed-pointer-free effectd template:
+
+```text
+agctl managed-pointer measure-genesis \
+  --request /etc/agent-governor/genesis-request.toml \
+  --effectd-config-template /etc/agent-governor/effectd.template.toml \
+  > /etc/agent-governor/genesis-measurement.json
+```
+
+The result is canonical `ag.managed-pointer.genesis-measurement/v1` evidence,
+not authority. It binds the exact template/domain/epoch/empty-store context and
+the descriptor-observed helper, repository, ref, object, tree, state, and
+staging custody. `enroll-genesis` accepts that root-owned canonical file only
+after a fresh complete measurement matches it. It derives and no-overwrite
+publishes a canonical receipt, the exact systemd capability/write-root drop-in,
+and the complete final effectd config in that order; no fragment is manually
+merged. `verify-genesis-enrollment` reloads the exact reviewed template, hashes
+all published artifacts, rederives the complete final config and drop-in,
+verifies the store is still uninitialized, and repeats live genesis observation
+before service start.
+
+The full commands, publication/recovery rules, and claim limits are in
+`clean-host-activation-qualification.md`.
+
+`doctor` is the other deliberate offline exception to the single-role config
+flag. It
 does not connect to an authority plane or load any private key. Instead it
 requires all three public daemon configurations explicitly:
 

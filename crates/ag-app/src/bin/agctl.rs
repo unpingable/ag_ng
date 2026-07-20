@@ -2,7 +2,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use ag_app::api::{
@@ -10,18 +10,33 @@ use ag_app::api::{
     EffectAdminResponseV1, HealthV1,
 };
 use ag_app::config::{
-    AgctlCommandProfileV1, AgctlConfigV1, AgctlDaemonPeerV1, AgctlSocketPeerCheckV1, load_config,
+    AgctlCommandProfileV1, AgctlConfigV1, AgctlDaemonPeerV1, AgctlSocketPeerCheckV1,
+    EffectTargetConfigV1, EffectdConfigV1, LoadedConfigV1, MAX_CONFIG_BYTES, load_config,
+    load_config_with_identity,
 };
-use ag_app::doctor::{DoctorConfigPathsV1, diagnose_host};
+use ag_app::doctor::{
+    DoctorConfigPathsV1, diagnose_host, required_effectd_capabilities, required_effectd_write_paths,
+};
+use ag_app::effectd::configured_catalog_identity;
+use ag_app::managed_pointer::{
+    MANAGED_POINTER_GENESIS_ENROLLMENT_RECEIPT_SCHEMA_V1, ManagedPointerGenesisContextV1,
+    ManagedPointerGenesisEnrollmentReceiptV1, ManagedPointerGenesisMeasurementV1,
+    ManagedPointerGenesisRequestV1, ManagedPointerRuntimeV1, enroll_managed_pointer_genesis,
+    measure_managed_pointer_genesis,
+};
 use ag_app::rpc_auth::{RpcPeerEnrollmentV1, RpcReplayGuardV1, RpcSignerV1, SystemRpcClockV1};
+use ag_app::runtime::require_uninitialized_component_store;
 use ag_app::signed_transport::{SocketPeerCheckV1, call_signed};
 use ag_effect::{ProposalIntentV1, ReconciliationEvidenceV1};
 use ag_primitives::{Digest, SessionId};
 use ag_protocol::{RequestId, canonical_json, strict_json_from_slice};
 use anyhow::{Context as _, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use rustix::fs::{CWD, RenameFlags, renameat_with};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+const MAX_EFFECTD_UNIT_DROP_IN_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -55,6 +70,12 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         providerd_config: PathBuf,
     },
+    /// Measure and enroll one initial managed Git head before effectd startup.
+    ManagedPointer {
+        /// Closed offline managed-pointer enrollment operation.
+        #[command(subcommand)]
+        command: ManagedPointerCommand,
+    },
     /// Read authenticated daemon readiness.
     Health {
         /// Exact component to inspect.
@@ -78,6 +99,58 @@ enum Command {
         /// Governor worker operation.
         #[command(subcommand)]
         command: WorkerCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ManagedPointerCommand {
+    /// Emit exact repository-read-only genesis evidence for independent review.
+    MeasureGenesis {
+        /// Root-owned strict enrollment request in TOML.
+        #[arg(long, value_name = "PATH")]
+        request: PathBuf,
+        /// Root-owned complete effectd config before adding this target.
+        #[arg(long, value_name = "PATH")]
+        effectd_config_template: PathBuf,
+    },
+    /// Remeasure reviewed genesis and create complete deployment artifacts.
+    EnrollGenesis {
+        /// Root-owned strict enrollment request in TOML.
+        #[arg(long, value_name = "PATH")]
+        request: PathBuf,
+        /// Root-owned effectd template used by the reviewed measurement.
+        #[arg(long, value_name = "PATH")]
+        effectd_config_template: PathBuf,
+        /// Root-owned canonical measurement previously emitted for review.
+        #[arg(long, value_name = "PATH")]
+        measurement: PathBuf,
+        /// New root-owned final effectd TOML configuration.
+        #[arg(long, value_name = "PATH")]
+        output: PathBuf,
+        /// New root-owned systemd drop-in derived from the final catalog.
+        #[arg(long, value_name = "PATH")]
+        unit_drop_in_output: PathBuf,
+        /// New root-owned canonical enrollment receipt, published first.
+        #[arg(long, value_name = "PATH")]
+        receipt_output: PathBuf,
+    },
+    /// Verify published genesis artifacts and repeat the exact live measurement.
+    VerifyGenesisEnrollment {
+        /// Root-owned canonical measurement reviewed before enrollment.
+        #[arg(long, value_name = "PATH")]
+        measurement: PathBuf,
+        /// Root-owned managed-pointer-free template bound by the measurement.
+        #[arg(long, value_name = "PATH")]
+        effectd_config_template: PathBuf,
+        /// Root-owned canonical enrollment receipt.
+        #[arg(long, value_name = "PATH")]
+        receipt: PathBuf,
+        /// Published complete effectd configuration.
+        #[arg(long, value_name = "PATH")]
+        effectd_config: PathBuf,
+        /// Published target-derived systemd drop-in.
+        #[arg(long, value_name = "PATH")]
+        unit_drop_in: PathBuf,
     },
 }
 
@@ -298,26 +371,34 @@ fn main() -> anyhow::Result<()> {
         check_config,
         command,
     } = Arguments::parse();
-    if let Some(Command::Doctor {
-        agd_config,
-        effectd_config,
-        providerd_config,
-    }) = command
-    {
-        if config.is_some() || check_config {
-            bail!("doctor cannot be combined with --config or --check-config");
+    let command = match command {
+        Some(Command::Doctor {
+            agd_config,
+            effectd_config,
+            providerd_config,
+        }) => {
+            require_offline_invocation(config.as_deref(), check_config, "doctor")?;
+            let report = diagnose_host(&DoctorConfigPathsV1 {
+                agd: agd_config,
+                effectd: effectd_config,
+                providerd: providerd_config,
+            });
+            write_canonical(&report)?;
+            if !report.ready {
+                bail!("doctor found failed or unavailable required checks");
+            }
+            return Ok(());
         }
-        let report = diagnose_host(&DoctorConfigPathsV1 {
-            agd: agd_config,
-            effectd: effectd_config,
-            providerd: providerd_config,
-        });
-        write_canonical(&report)?;
-        if !report.ready {
-            bail!("doctor found failed or unavailable required checks");
+        Some(Command::ManagedPointer { command }) => {
+            require_offline_invocation(
+                config.as_deref(),
+                check_config,
+                "offline managed-pointer enrollment",
+            )?;
+            return managed_pointer(command);
         }
-        return Ok(());
-    }
+        command => command,
+    };
     let config_path = config.context("--config is required for this operation")?;
     // Custody cannot be selected by a field read from an untrusted file: an
     // attacker could otherwise relabel their own config as `development`.
@@ -333,6 +414,17 @@ fn main() -> anyhow::Result<()> {
     authorize_command(&config.command_profile, &command)?;
     let client = ClientV1::new(config)?;
     dispatch(&client, command)
+}
+
+fn require_offline_invocation(
+    config: Option<&Path>,
+    check_config: bool,
+    operation: &str,
+) -> anyhow::Result<()> {
+    if config.is_some() || check_config {
+        bail!("{operation} cannot be combined with --config or --check-config");
+    }
+    Ok(())
 }
 
 fn authorize_command(profile: &AgctlCommandProfileV1, command: &Command) -> anyhow::Result<()> {
@@ -361,6 +453,9 @@ fn authorize_command(profile: &AgctlCommandProfileV1, command: &Command) -> anyh
 fn dispatch(client: &ClientV1, command: Command) -> anyhow::Result<()> {
     match command {
         Command::Doctor { .. } => bail!("doctor is not a signed command-plane operation"),
+        Command::ManagedPointer { .. } => {
+            bail!("managed-pointer enrollment is not a signed command-plane operation")
+        }
         Command::Health { component } => health(client, component),
         Command::Effect { command } => effect(client, command),
         Command::Intent { command } => match command {
@@ -390,6 +485,416 @@ fn dispatch(client: &ClientV1, command: Command) -> anyhow::Result<()> {
         },
         Command::Worker { command } => worker(client, command),
     }
+}
+
+// Keep the complete offline publication order in one auditable function: the
+// receipt and unit drop-in must precede the final config commit point.
+#[allow(clippy::too_many_lines)]
+fn managed_pointer(command: ManagedPointerCommand) -> anyhow::Result<()> {
+    if !nix::unistd::geteuid().is_root() || nix::unistd::getegid().as_raw() != 0 {
+        bail!("managed-pointer genesis measurement and enrollment require effective UID and GID 0");
+    }
+    nix::unistd::setgroups(&[]).context("cannot clear supplementary groups for enrollment")?;
+    if !nix::unistd::getgroups()?.is_empty() {
+        bail!("supplementary groups remain after the enrollment privilege-floor transition");
+    }
+    match command {
+        ManagedPointerCommand::MeasureGenesis {
+            request,
+            effectd_config_template,
+        } => {
+            let request: ManagedPointerGenesisRequestV1 = load_config(&request, true)
+                .context("cannot load the root-owned genesis request")?;
+            let (template, context) = load_genesis_template(&effectd_config_template, &request)?;
+            require_uninitialized_component_store(&template.store)?;
+            let measurement = measure_managed_pointer_genesis(&request, &context)
+                .context("managed-pointer genesis measurement refused")?;
+            write_canonical(&measurement)
+        }
+        ManagedPointerCommand::EnrollGenesis {
+            request,
+            effectd_config_template,
+            measurement,
+            output,
+            unit_drop_in_output,
+            receipt_output,
+        } => {
+            let request: ManagedPointerGenesisRequestV1 = load_config(&request, true)
+                .context("cannot load the root-owned genesis request")?;
+            let (template, context) = load_genesis_template(&effectd_config_template, &request)?;
+            require_genesis_artifact_isolation(
+                &template,
+                &request,
+                &[&receipt_output, &unit_drop_in_output, &output],
+            )?;
+            require_uninitialized_component_store(&template.store)?;
+            let reviewed: ManagedPointerGenesisMeasurementV1 =
+                read_root_custodied_strict_json_file(
+                    &measurement,
+                    1024 * 1024,
+                    "managed-pointer genesis measurement",
+                )?;
+            let (target, measurement_identity) =
+                enroll_managed_pointer_genesis(&request, &context, &reviewed)
+                    .context("fresh managed-pointer genesis enrollment refused")?;
+            let template = derive_final_effectd_config(template, target)?;
+            let effectd_config = render_final_effectd_config(&template)?;
+            let unit_drop_in = render_effectd_unit_drop_in(&template)?;
+            let receipt = ManagedPointerGenesisEnrollmentReceiptV1 {
+                schema: MANAGED_POINTER_GENESIS_ENROLLMENT_RECEIPT_SCHEMA_V1.to_owned(),
+                authority_domain: context.authority_domain,
+                epoch: context.epoch,
+                target: request.target,
+                measurement: measurement_identity,
+                activation_genesis_object: reviewed.activation_genesis_object.clone(),
+                activation_genesis_tree: reviewed.activation_genesis_tree.clone(),
+                activation_genesis_state: reviewed.activation_genesis_state.clone(),
+                repository_identity: reviewed.repository_identity.clone(),
+                effectd_config: Digest::hash_bytes(&effectd_config),
+                effectd_config_path: normalized_output_path_text(&output)?,
+                effectd_unit_drop_in: Digest::hash_bytes(&unit_drop_in),
+                effectd_unit_drop_in_path: normalized_output_path_text(&unit_drop_in_output)?,
+                receipt_path: normalized_output_path_text(&receipt_output)?,
+            };
+            receipt
+                .verify(&reviewed)
+                .context("derived genesis enrollment receipt is invalid")?;
+            require_distinct_absent_outputs(&[&receipt_output, &unit_drop_in_output, &output])?;
+            let mut receipt_bytes = canonical_json(&receipt)?;
+            receipt_bytes.push(b'\n');
+            // The receipt is deliberately safe to orphan. The unit envelope is
+            // next, and the final effectd config is the publication commit point.
+            atomic_write_new_root_file(&receipt_output, &receipt_bytes)?;
+            atomic_write_new_root_file(&unit_drop_in_output, &unit_drop_in)?;
+            require_uninitialized_component_store(&template.store)?;
+            atomic_write_new_root_file(&output, &effectd_config)?;
+            write_canonical(&receipt)
+        }
+        ManagedPointerCommand::VerifyGenesisEnrollment {
+            measurement,
+            effectd_config_template,
+            receipt,
+            effectd_config,
+            unit_drop_in,
+        } => {
+            let reviewed: ManagedPointerGenesisMeasurementV1 =
+                read_root_custodied_strict_json_file(
+                    &measurement,
+                    1024 * 1024,
+                    "managed-pointer genesis measurement",
+                )?;
+            let receipt_record: ManagedPointerGenesisEnrollmentReceiptV1 =
+                read_root_custodied_strict_json_file(
+                    &receipt,
+                    1024 * 1024,
+                    "managed-pointer genesis enrollment receipt",
+                )?;
+            receipt_record
+                .verify(&reviewed)
+                .context("genesis enrollment receipt is invalid")?;
+            let (template, context) =
+                load_genesis_template(&effectd_config_template, &reviewed.request)?;
+            if context != reviewed.context {
+                bail!("effectd template does not match the reviewed enrollment context");
+            }
+            require_genesis_artifact_isolation(
+                &template,
+                &reviewed.request,
+                &[&receipt, &unit_drop_in, &effectd_config],
+            )?;
+            require_uninitialized_component_store(&template.store)?;
+            let (expected_target, _) =
+                enroll_managed_pointer_genesis(&reviewed.request, &context, &reviewed)?;
+            let expected_config = derive_final_effectd_config(template, expected_target)?;
+            let expected_config_bytes = render_final_effectd_config(&expected_config)?;
+            let expected_config_digest = Digest::hash_bytes(&expected_config_bytes);
+            if receipt_record.receipt_path != normalized_output_path_text(&receipt)?
+                || receipt_record.effectd_config_path
+                    != normalized_output_path_text(&effectd_config)?
+                || receipt_record.effectd_unit_drop_in_path
+                    != normalized_output_path_text(&unit_drop_in)?
+            {
+                bail!("genesis enrollment receipt names different artifact paths");
+            }
+            let LoadedConfigV1 {
+                config,
+                exact_bytes_digest,
+            }: LoadedConfigV1<EffectdConfigV1> = load_config_with_identity(&effectd_config, true)
+                .context("cannot load published effectd config")?;
+            config
+                .validate()
+                .context("published effectd config is invalid")?;
+            if exact_bytes_digest != expected_config_digest
+                || receipt_record.effectd_config != expected_config_digest
+            {
+                bail!(
+                    "published effectd config is not the exact reviewed template plus measured target"
+                );
+            }
+            require_uninitialized_component_store(&config.store)?;
+            configured_catalog_identity(&config.targets)?;
+            ManagedPointerRuntimeV1::from_config(&config)?.require_configured_genesis()?;
+            let drop_in_bytes = read_root_custodied_file_bytes(
+                &unit_drop_in,
+                MAX_EFFECTD_UNIT_DROP_IN_BYTES,
+                "effectd unit drop-in",
+            )?;
+            if Digest::hash_bytes(&drop_in_bytes) != receipt_record.effectd_unit_drop_in
+                || drop_in_bytes != render_effectd_unit_drop_in(&expected_config)?
+            {
+                bail!("published effectd unit drop-in does not match final config");
+            }
+            write_canonical(&receipt_record)
+        }
+    }
+}
+
+fn derive_final_effectd_config(
+    mut template: EffectdConfigV1,
+    target: EffectTargetConfigV1,
+) -> anyhow::Result<EffectdConfigV1> {
+    template.targets.push(target);
+    template
+        .validate()
+        .context("derived final effectd config is invalid")?;
+    configured_catalog_identity(&template.targets)
+        .context("derived final effectd catalog is invalid")?;
+    ManagedPointerRuntimeV1::from_config(&template)
+        .context("derived final managed-pointer runtime is invalid")?;
+    Ok(template)
+}
+
+fn require_genesis_artifact_isolation(
+    template: &EffectdConfigV1,
+    request: &ManagedPointerGenesisRequestV1,
+    artifacts: &[&Path],
+) -> anyhow::Result<()> {
+    let database_parent = template
+        .store
+        .database
+        .parent()
+        .context("effectd database path has no parent")?;
+    let mut authority_roots = vec![
+        database_parent,
+        template.store.object_store.as_path(),
+        request.staging_root.as_path(),
+        request.allowed_root.as_path(),
+        request.repository.as_path(),
+        template
+            .proposal_socket
+            .parent()
+            .context("effectd proposal socket has no parent")?,
+        template
+            .admin_socket
+            .parent()
+            .context("effectd admin socket has no parent")?,
+    ];
+    for target in &template.targets {
+        if let EffectTargetConfigV1::ManagedFile { path, .. } = target {
+            authority_roots.push(path.parent().context("managed-file target has no parent")?);
+        }
+    }
+    for artifact in artifacts {
+        normalized_output_path_text(artifact)?;
+        if authority_roots
+            .iter()
+            .any(|root| *artifact == *root || artifact.starts_with(root))
+        {
+            bail!(
+                "genesis publication artifact overlaps a protected store, socket, target, staging, or repository root"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn load_genesis_template(
+    path: &Path,
+    request: &ManagedPointerGenesisRequestV1,
+) -> anyhow::Result<(EffectdConfigV1, ManagedPointerGenesisContextV1)> {
+    let LoadedConfigV1 {
+        config,
+        exact_bytes_digest,
+    }: LoadedConfigV1<EffectdConfigV1> = load_config_with_identity(path, true)
+        .context("cannot load the root-owned effectd enrollment template")?;
+    config
+        .validate()
+        .context("effectd enrollment template is invalid")?;
+    configured_catalog_identity(&config.targets)
+        .context("effectd enrollment template catalog is invalid")?;
+    request
+        .validate()
+        .context("managed-pointer genesis request is invalid")?;
+    if config.security_profile != request.security_profile {
+        bail!("genesis request and effectd template security profiles differ");
+    }
+    for target in &config.targets {
+        let id = match target {
+            EffectTargetConfigV1::ManagedPointer { .. } => {
+                bail!("effectd genesis template already contains a managed-pointer target")
+            }
+            EffectTargetConfigV1::ManagedFile { id, .. }
+            | EffectTargetConfigV1::SystemdUnit { id, .. }
+            | EffectTargetConfigV1::SystemdManager { id } => id,
+        };
+        if id == &request.target {
+            bail!("effectd genesis template already contains the requested target ID");
+        }
+    }
+    let context = ManagedPointerGenesisContextV1 {
+        authority_domain: config.authority_domain.clone(),
+        epoch: config.epoch.clone(),
+        effectd_config_template: exact_bytes_digest,
+        effectd_database: config.store.database.clone(),
+        effectd_object_store: config.store.object_store.clone(),
+    };
+    Ok((config, context))
+}
+
+fn render_final_effectd_config(config: &EffectdConfigV1) -> anyhow::Result<Vec<u8>> {
+    let text = toml::to_string(config).context("cannot encode final effectd configuration")?;
+    if u64::try_from(text.len())? > MAX_CONFIG_BYTES {
+        bail!("derived final effectd configuration exceeds the loader byte limit");
+    }
+    let round_trip: EffectdConfigV1 =
+        toml::from_str(&text).context("cannot decode derived final effectd configuration")?;
+    round_trip
+        .validate()
+        .context("derived effectd configuration failed round-trip validation")?;
+    Ok(text.into_bytes())
+}
+
+fn render_effectd_unit_drop_in(config: &EffectdConfigV1) -> anyhow::Result<Vec<u8>> {
+    let capabilities = required_effectd_capabilities(config)
+        .into_iter()
+        .map(str::to_ascii_uppercase)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let paths = required_effectd_write_paths(config).map_err(|error| anyhow::anyhow!(error))?;
+    let mut text = format!(
+        "[Service]\nCapabilityBoundingSet=\nCapabilityBoundingSet={capabilities}\nReadWritePaths=\n"
+    );
+    for path in paths {
+        let path = path.to_str().context("effectd write path is not UTF-8")?;
+        if !path.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':')
+        }) {
+            bail!("effectd write path requires unsupported systemd escaping");
+        }
+        text.push_str("ReadWritePaths=");
+        text.push_str(path);
+        text.push('\n');
+    }
+    if u64::try_from(text.len())? > MAX_EFFECTD_UNIT_DROP_IN_BYTES {
+        bail!("derived effectd unit drop-in exceeds the verifier byte limit");
+    }
+    Ok(text.into_bytes())
+}
+
+fn normalized_output_path_text(path: &Path) -> anyhow::Result<String> {
+    let normalized: PathBuf = path.components().collect();
+    if !path.is_absolute()
+        || normalized != *path
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        bail!("genesis enrollment output must be a normalized absolute path");
+    }
+    path.to_str()
+        .map(str::to_owned)
+        .context("genesis enrollment output path is not UTF-8")
+}
+
+fn require_distinct_absent_outputs(paths: &[&Path]) -> anyhow::Result<()> {
+    let mut normalized = std::collections::BTreeSet::new();
+    for path in paths {
+        let path_text = normalized_output_path_text(path)?;
+        if !normalized.insert(path_text) {
+            bail!("genesis enrollment output paths must be distinct");
+        }
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => bail!(
+                "genesis enrollment output already exists: {}",
+                path.display()
+            ),
+            Err(error) => return Err(error).context("cannot inspect enrollment output"),
+        }
+        validate_root_owned_output_ancestry(path)?;
+    }
+    Ok(())
+}
+
+fn validate_root_owned_output_ancestry(path: &Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .context("genesis enrollment output has no parent")?;
+    let mut current = PathBuf::from("/");
+    for component in parent.components() {
+        match component {
+            std::path::Component::RootDir => continue,
+            std::path::Component::Normal(name) => current.push(name),
+            _ => bail!("genesis enrollment output ancestry is not normalized"),
+        }
+        let metadata = std::fs::symlink_metadata(&current)
+            .with_context(|| format!("cannot inspect output ancestor {}", current.display()))?;
+        if !metadata.file_type().is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            bail!(
+                "genesis enrollment output ancestry must be root-owned, nonsymlink, and not group/other writable"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn atomic_write_new_root_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    validate_root_owned_output_ancestry(path)?;
+    let parent = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path.parent().context("enrollment output has no parent")?)?;
+    let file_name = path
+        .file_name()
+        .context("enrollment output has no filename")?
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary)
+            .context("cannot create enrollment staging file")?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != 0
+            || metadata.gid() != 0
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o7777 != 0o600
+            || metadata.len() != u64::try_from(bytes.len())?
+        {
+            bail!("enrollment staging file has unexpected custody");
+        }
+        renameat_with(CWD, &temporary, CWD, path, RenameFlags::NOREPLACE)
+            .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
+        parent.sync_all()?;
+        let final_bytes = std::fs::read(path)?;
+        if final_bytes != bytes {
+            bail!("published enrollment output failed exact readback");
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn worker(client: &ClientV1, command: WorkerCommand) -> anyhow::Result<()> {
@@ -607,11 +1112,35 @@ fn read_strict_json_file<T>(path: &Path, maximum: u64, input_name: &str) -> anyh
 where
     T: DeserializeOwned + Serialize,
 {
+    read_strict_json_file_with_custody(path, maximum, input_name, false, false)
+}
+
+fn read_root_custodied_strict_json_file<T>(
+    path: &Path,
+    maximum: u64,
+    input_name: &str,
+) -> anyhow::Result<T>
+where
+    T: DeserializeOwned + Serialize,
+{
+    read_strict_json_file_with_custody(path, maximum, input_name, true, true)
+}
+
+fn read_strict_json_file_with_custody<T>(
+    path: &Path,
+    maximum: u64,
+    input_name: &str,
+    require_root_custody: bool,
+    require_canonical_line: bool,
+) -> anyhow::Result<T>
+where
+    T: DeserializeOwned + Serialize,
+{
     let mut options = OpenOptions::new();
     options
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    let file = options
+    let mut file = options
         .open(path)
         .with_context(|| format!("cannot open {input_name} file {}", path.display()))?;
     let metadata = file
@@ -620,11 +1149,17 @@ where
     if !metadata.file_type().is_file() {
         bail!("{input_name} input must be a regular file");
     }
+    if metadata.nlink() != 1
+        || (require_root_custody && (metadata.uid() != 0 || metadata.mode() & 0o022 != 0))
+    {
+        bail!("{input_name} input has unsafe custody");
+    }
     if metadata.len() > maximum {
         bail!("{input_name} input exceeds configured byte bound");
     }
     let mut bytes = Vec::new();
-    file.take(maximum.saturating_add(1))
+    std::io::Read::by_ref(&mut file)
+        .take(maximum.saturating_add(1))
         .read_to_end(&mut bytes)
         .with_context(|| format!("cannot read {input_name} file {}", path.display()))?;
     let byte_length = u64::try_from(bytes.len())
@@ -632,8 +1167,67 @@ where
     if byte_length > maximum {
         bail!("{input_name} input exceeds configured byte bound");
     }
-    strict_json_from_slice(&bytes)
-        .with_context(|| format!("{input_name} is not strict JSON of the required schema"))
+    let after = file
+        .metadata()
+        .with_context(|| format!("cannot re-inspect {input_name} file {}", path.display()))?;
+    if metadata.dev() != after.dev()
+        || metadata.ino() != after.ino()
+        || metadata.len() != after.len()
+        || metadata.mtime() != after.mtime()
+        || metadata.mtime_nsec() != after.mtime_nsec()
+        || metadata.ctime() != after.ctime()
+        || metadata.ctime_nsec() != after.ctime_nsec()
+    {
+        bail!("{input_name} changed during exact read");
+    }
+    let decoded: T = strict_json_from_slice(&bytes)
+        .with_context(|| format!("{input_name} is not strict JSON of the required schema"))?;
+    if require_canonical_line {
+        let mut expected = canonical_json(&decoded)?;
+        expected.push(b'\n');
+        if bytes != expected {
+            bail!("{input_name} must be canonical JSON followed by exactly one LF");
+        }
+    }
+    Ok(decoded)
+}
+
+fn read_root_custodied_file_bytes(
+    path: &Path,
+    maximum: u64,
+    input_name: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("cannot open {input_name} {}", path.display()))?;
+    let before = file.metadata()?;
+    if !before.file_type().is_file()
+        || before.uid() != 0
+        || before.mode() & 0o022 != 0
+        || before.nlink() != 1
+        || before.len() > maximum
+    {
+        bail!("{input_name} has unsafe custody or exceeds its byte bound");
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if bytes.len() as u64 > maximum
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.len() != after.len()
+        || before.mtime() != after.mtime()
+        || before.mtime_nsec() != after.mtime_nsec()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        bail!("{input_name} changed during exact read");
+    }
+    Ok(bytes)
 }
 
 fn write_canonical<T: Serialize>(value: &T) -> anyhow::Result<()> {
@@ -1181,6 +1775,259 @@ mod tests {
             .expect("direct health");
         assert!(matches!(response, EffectAdminResponseV1::Health { .. }));
         server.join().expect("server thread");
+    }
+
+    #[test]
+    fn managed_pointer_genesis_commands_have_a_closed_offline_grammar() {
+        let measured = Arguments::try_parse_from([
+            "agctl",
+            "managed-pointer",
+            "measure-genesis",
+            "--request",
+            "/etc/agent-governor/genesis-request.toml",
+            "--effectd-config-template",
+            "/etc/agent-governor/effectd.template.toml",
+        ])
+        .expect("measure grammar");
+        assert!(matches!(
+            measured.command,
+            Some(Command::ManagedPointer {
+                command: ManagedPointerCommand::MeasureGenesis { .. }
+            })
+        ));
+        let enrolled = Arguments::try_parse_from([
+            "agctl",
+            "managed-pointer",
+            "enroll-genesis",
+            "--request",
+            "/etc/agent-governor/genesis-request.toml",
+            "--effectd-config-template",
+            "/etc/agent-governor/effectd.template.toml",
+            "--measurement",
+            "/etc/agent-governor/genesis.json",
+            "--receipt-output",
+            "/etc/agent-governor/genesis-receipt.json",
+            "--unit-drop-in-output",
+            "/etc/systemd/system/ag-effectd.service.d/50-managed-pointer.conf",
+            "--output",
+            "/etc/agent-governor/effectd.toml",
+        ])
+        .expect("enroll grammar");
+        assert!(matches!(
+            enrolled.command,
+            Some(Command::ManagedPointer {
+                command: ManagedPointerCommand::EnrollGenesis { .. }
+            })
+        ));
+        let verified = Arguments::try_parse_from([
+            "agctl",
+            "managed-pointer",
+            "verify-genesis-enrollment",
+            "--measurement",
+            "/etc/agent-governor/genesis.json",
+            "--effectd-config-template",
+            "/etc/agent-governor/effectd.template.toml",
+            "--receipt",
+            "/etc/agent-governor/genesis-receipt.json",
+            "--effectd-config",
+            "/etc/agent-governor/effectd.toml",
+            "--unit-drop-in",
+            "/etc/systemd/system/ag-effectd.service.d/50-managed-pointer.conf",
+        ])
+        .expect("verify grammar");
+        assert!(matches!(
+            verified.command,
+            Some(Command::ManagedPointer {
+                command: ManagedPointerCommand::VerifyGenesisEnrollment { .. }
+            })
+        ));
+        for flag in ["--config", "--check-config"] {
+            let mut arguments = vec!["agctl", flag];
+            if flag == "--config" {
+                arguments.push("/etc/agent-governor/agctl.toml");
+            }
+            arguments.extend([
+                "managed-pointer",
+                "measure-genesis",
+                "--request",
+                "/request",
+                "--effectd-config-template",
+                "/effectd.template.toml",
+            ]);
+            let parsed = Arguments::try_parse_from(arguments).expect("complete conflict grammar");
+            assert!(
+                require_offline_invocation(
+                    parsed.config.as_deref(),
+                    parsed.check_config,
+                    "offline managed-pointer enrollment"
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn generated_effectd_config_and_unit_drop_in_are_complete_and_exact() {
+        let mut config: EffectdConfigV1 =
+            toml::from_str(include_str!("../../../../config/effectd.example.toml"))
+                .expect("effectd example");
+        config.targets.push(EffectTargetConfigV1::ManagedPointer {
+            id: "service-repository".to_owned(),
+            allowed_root: PathBuf::from("/srv/agent-governor/repositories"),
+            repository: PathBuf::from("/srv/agent-governor/repositories/service.git"),
+            reference: "refs/heads/main".to_owned(),
+            activation_genesis_object: "1111111111111111111111111111111111111111".to_owned(),
+            activation_genesis_tree: "2222222222222222222222222222222222222222".to_owned(),
+            activation_genesis_state: Digest::hash_bytes(b"genesis state"),
+            repository_identity: Digest::hash_bytes(b"repository identity"),
+            uid: 1001,
+            gid: 1001,
+            staging_root: PathBuf::from("/var/lib/agent-governor/effectd/promotion-stage"),
+            promotion_ttl_ms: 900_000,
+            helper: PathBuf::from("/usr/bin/git"),
+            helper_executable: Digest::hash_bytes(b"git"),
+            helper_launch_profile: Digest::hash_bytes(b"launch profile"),
+        });
+        config.validate().expect("structurally valid final config");
+        let encoded = render_final_effectd_config(&config).expect("complete config");
+        let decoded: EffectdConfigV1 =
+            toml::from_str(std::str::from_utf8(&encoded).expect("UTF-8 config"))
+                .expect("round-trip config");
+        assert_eq!(decoded.targets.len(), 2);
+
+        let mut altered = config.clone();
+        altered.limits.max_ready_proposals += 1;
+        let altered = render_final_effectd_config(&altered).expect("altered complete config");
+        assert_ne!(Digest::hash_bytes(&encoded), Digest::hash_bytes(&altered));
+
+        let drop_in =
+            String::from_utf8(render_effectd_unit_drop_in(&config).expect("derived exact drop-in"))
+                .expect("UTF-8 drop-in");
+        assert_eq!(
+            drop_in,
+            concat!(
+                "[Service]\n",
+                "CapabilityBoundingSet=\n",
+                "CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETGID CAP_SETUID\n",
+                "ReadWritePaths=\n",
+                "ReadWritePaths=/etc/example-service\n",
+                "ReadWritePaths=/run/agent-governor/effectd/admin\n",
+                "ReadWritePaths=/run/agent-governor/effectd/proposal\n",
+                "ReadWritePaths=/srv/agent-governor/repositories/service.git\n",
+                "ReadWritePaths=/var/lib/agent-governor/effectd\n",
+                "ReadWritePaths=/var/lib/agent-governor/effectd/objects\n",
+                "ReadWritePaths=/var/lib/agent-governor/effectd/promotion-stage\n",
+            )
+        );
+    }
+
+    #[test]
+    fn packaged_genesis_example_has_complete_static_host_scaffolding() {
+        let request: ManagedPointerGenesisRequestV1 = toml::from_str(include_str!(
+            "../../../../config/managed-pointer-genesis-request.example.toml"
+        ))
+        .expect("strict packaged genesis request");
+        request.validate().expect("valid packaged genesis request");
+        let effectd: EffectdConfigV1 =
+            toml::from_str(include_str!("../../../../config/effectd.example.toml"))
+                .expect("strict packaged effectd template");
+
+        let tmpfiles =
+            include_str!("../../../../packaging/systemd/tmpfiles.d/agent-governor-ng.conf");
+        let entry_for = |path: &Path| {
+            let expected = path.to_str().expect("example path is UTF-8");
+            tmpfiles
+                .lines()
+                .map(str::split_whitespace)
+                .map(Iterator::collect::<Vec<_>>)
+                .find(|fields| fields.get(1).is_some_and(|field| *field == expected))
+                .expect("example-required path has a tmpfiles entry")
+        };
+        for path in [
+            effectd.store.database.parent().expect("database parent"),
+            effectd.store.object_store.as_path(),
+            request.staging_root.as_path(),
+        ] {
+            let fields = entry_for(path);
+            assert_eq!(
+                fields,
+                ["d", path.to_str().unwrap(), "0700", "root", "root", "-"]
+            );
+        }
+
+        assert!(
+            include_str!("../../../../debian/agent-governor-ng.dirs")
+                .lines()
+                .any(|line| line == "etc/systemd/system/ag-effectd.service.d")
+        );
+        assert!(
+            include_str!("../../../../docs/clean-host-activation-qualification.md")
+                .contains("systemctl daemon-reload")
+        );
+    }
+
+    #[test]
+    fn genesis_artifacts_cannot_overlap_store_staging_or_repository_roots() {
+        let template: EffectdConfigV1 =
+            toml::from_str(include_str!("../../../../config/effectd.example.toml"))
+                .expect("effectd template");
+        let request: ManagedPointerGenesisRequestV1 = toml::from_str(include_str!(
+            "../../../../config/managed-pointer-genesis-request.example.toml"
+        ))
+        .expect("genesis request");
+        require_genesis_artifact_isolation(
+            &template,
+            &request,
+            &[
+                Path::new("/etc/agent-governor/genesis-receipt.json"),
+                Path::new("/etc/systemd/system/ag-effectd.service.d/50-managed-pointer.conf"),
+                Path::new("/etc/agent-governor/effectd.toml"),
+            ],
+        )
+        .expect("isolated deployment outputs");
+
+        for hostile in [
+            template.store.database.clone(),
+            template.store.database.with_file_name("effectd.db-wal"),
+            template.store.object_store.join("receipt.json"),
+            request.staging_root.join("receipt.json"),
+            request.repository.join("effectd.toml"),
+            template.proposal_socket.clone(),
+            template.admin_socket.clone(),
+            PathBuf::from("/etc/example-service/genesis-receipt.json"),
+        ] {
+            assert!(require_genesis_artifact_isolation(&template, &request, &[&hostile]).is_err());
+        }
+    }
+
+    #[test]
+    fn genesis_store_preflight_refuses_sidecars_and_nonempty_object_custody() {
+        let directory = tempfile::tempdir().expect("temporary root");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("root mode");
+        let object_store = directory.path().join("objects");
+        std::fs::create_dir(&object_store).expect("object store");
+        std::fs::set_permissions(&object_store, std::fs::Permissions::from_mode(0o700))
+            .expect("object mode");
+        let metadata = std::fs::metadata(directory.path()).expect("root metadata");
+        let mut config: EffectdConfigV1 =
+            toml::from_str(include_str!("../../../../config/effectd.example.toml"))
+                .expect("effectd example");
+        config.store.database = directory.path().join("effectd.db");
+        config.store.object_store = object_store.clone();
+        config.store.store_custody.database_parent.uid = metadata.uid();
+        config.store.store_custody.database_parent.gid = metadata.gid();
+        config.store.store_custody.object_store.uid = metadata.uid();
+        config.store.store_custody.object_store.gid = metadata.gid();
+        require_uninitialized_component_store(&config.store).expect("empty uninitialized store");
+
+        std::fs::write(directory.path().join("effectd.db-journal"), b"stale")
+            .expect("stale journal");
+        assert!(require_uninitialized_component_store(&config.store).is_err());
+        std::fs::remove_file(directory.path().join("effectd.db-journal"))
+            .expect("remove test journal");
+        std::fs::write(object_store.join("foreign"), b"foreign").expect("foreign object");
+        assert!(require_uninitialized_component_store(&config.store).is_err());
     }
 
     fn test_identity(

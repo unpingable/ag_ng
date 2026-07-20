@@ -1,0 +1,14 @@
+# Offline, root-owned input to `agctl managed-pointer measure-genesis`.
+# These are reviewed target-selection facts, not measurements. The command
+# derives the helper, repository, object, tree, and state identities itself.
+schema = "ag.managed-pointer.genesis-request/v1"
+security_profile = "production"
+target = "service-repository"
+allowed_root = "/srv/agent-governor/repositories"
+repository = "/srv/agent-governor/repositories/service.git"
+reference = "refs/heads/main"
+uid = 1001
+gid = 1001
+staging_root = "/var/lib/agent-governor/effectd/promotion-stage"
+promotion_ttl_ms = 900000
+helper = "/usr/bin/git"

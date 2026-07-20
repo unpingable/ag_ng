@@ -223,7 +223,7 @@ pub fn candidate_ingress_key_identity(policy: &RpcPeerKeyPolicyV1) -> Result<Dig
 }
 
 /// Local signing identity whose secret half is an explicit credential file.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RpcSigningIdentityConfigV1 {
     /// Stable enrolled principal root represented by this key.

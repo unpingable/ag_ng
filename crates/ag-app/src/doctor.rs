@@ -1001,9 +1001,13 @@ fn inspect_effectd_activation_profile(
     }
 }
 
-pub(crate) fn required_effectd_write_paths(
-    config: &EffectdConfigV1,
-) -> Result<BTreeSet<PathBuf>, String> {
+/// Derive the exact effective `ReadWritePaths=` set from effectd config.
+///
+/// # Errors
+///
+/// Returns an error if any required database, socket, or target path lacks a
+/// normalized absolute parent or root.
+pub fn required_effectd_write_paths(config: &EffectdConfigV1) -> Result<BTreeSet<PathBuf>, String> {
     let mut required = BTreeSet::new();
     insert_parent(&mut required, &config.store.database, "effectd database")?;
     insert_normalized_absolute(
@@ -1045,7 +1049,9 @@ pub(crate) fn required_effectd_write_paths(
     Ok(required)
 }
 
-pub(crate) fn required_effectd_capabilities(config: &EffectdConfigV1) -> BTreeSet<&'static str> {
+/// Derive the exact effective capability set from effectd's target catalog.
+#[must_use]
+pub fn required_effectd_capabilities(config: &EffectdConfigV1) -> BTreeSet<&'static str> {
     let mut capabilities = BTreeSet::from([
         "cap_chown",
         "cap_dac_override",

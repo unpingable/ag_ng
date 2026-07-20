@@ -1,0 +1,37 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        # Never remove the executable and unit payload beneath a still-running
+        # authority process. Cross-root package assembly has no live manager.
+        if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+            deb-systemd-invoke stop \
+                agd.service \
+                ag-providerd.service \
+                ag-effectd.service >/dev/null
+            for unit in agd.service ag-providerd.service ag-effectd.service; do
+                state=$(systemctl show "$unit" -p ActiveState --value) || {
+                    echo "cannot verify stopped state for $unit; refusing removal" >&2
+                    exit 1
+                }
+                main_pid=$(systemctl show "$unit" -p MainPID --value) || {
+                    echo "cannot verify MainPID for $unit; refusing removal" >&2
+                    exit 1
+                }
+                case "$state:$main_pid" in
+                    inactive:0|failed:0)
+                        ;;
+                    *)
+                        echo "refusing removal while $unit still has live authority state ($state, MainPID=$main_pid)" >&2
+                        exit 1
+                        ;;
+                esac
+            done
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

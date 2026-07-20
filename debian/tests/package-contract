@@ -1,0 +1,119 @@
+#!/bin/sh
+set -eu
+
+fail() {
+    echo "package-contract: $*" >&2
+    exit 1
+}
+
+for binary in agd ag-effectd ag-providerd agctl ag-backup ag-migrate; do
+    path="/usr/bin/$binary"
+    [ -x "$path" ] || fail "missing executable $path"
+    [ "$(stat -c '%U:%G:%a' "$path")" = "root:root:755" ] || \
+        fail "unexpected executable custody for $path"
+done
+
+for unit in agd.service ag-effectd.service ag-providerd.service; do
+    path="/usr/lib/systemd/system/$unit"
+    [ -f "$path" ] || fail "missing unit $path"
+    [ "$(stat -c '%U:%G:%a' "$path")" = "root:root:644" ] || \
+        fail "unexpected unit custody for $path"
+    [ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" = "disabled" ] || \
+        fail "$unit is not disabled"
+    [ "$(systemctl is-active "$unit" 2>/dev/null || true)" = "inactive" ] || \
+        fail "$unit is not inactive"
+done
+
+[ ! -e /usr/lib/systemd/system/ag-worker@.service ] || fail "worker unit was packaged"
+[ ! -e /usr/lib/systemd/system/ag-check@.service ] || fail "check unit was packaged"
+[ ! -e /usr/libexec/agent-governor/ag-worker ] || fail "worker helper was packaged"
+[ ! -e /usr/libexec/agent-governor/ag-check-helper ] || fail "check helper was packaged"
+[ ! -e /etc/agent-governor/agd.toml ] || fail "package installed governor authority config"
+[ ! -e /etc/agent-governor/effectd.toml ] || fail "package installed effect authority config"
+[ ! -e /etc/agent-governor/providerd.toml ] || fail "package installed provider authority config"
+[ ! -e /var/lib/agent-governor/agd/agd.db ] || fail "package initialized agd store"
+[ ! -e /var/lib/agent-governor/effectd/effectd.db ] || fail "package initialized effectd store"
+[ ! -e /var/lib/agent-governor/providerd/providerd.db ] || fail "package initialized providerd store"
+
+getent passwd ag-governor >/dev/null || fail "ag-governor user missing"
+getent passwd ag-provider >/dev/null || fail "ag-provider user missing"
+getent group ag-users >/dev/null || fail "ag-users group missing"
+getent group ag-admin >/dev/null || fail "ag-admin group missing"
+
+governor_record=$(getent passwd ag-governor)
+provider_record=$(getent passwd ag-provider)
+governor_uid=$(printf '%s\n' "$governor_record" | cut -d: -f3)
+provider_uid=$(printf '%s\n' "$provider_record" | cut -d: -f3)
+[ "$governor_uid" -ne 0 ] || fail "ag-governor unexpectedly has UID 0"
+[ "$provider_uid" -ne 0 ] || fail "ag-provider unexpectedly has UID 0"
+[ "$governor_uid" != "$provider_uid" ] || fail "daemon UIDs collapse"
+[ "$(printf '%s\n' "$governor_record" | cut -d: -f6-7)" = "/var/lib/agent-governor/agd:/usr/sbin/nologin" ] || \
+    fail "ag-governor home or shell mismatch"
+[ "$(printf '%s\n' "$provider_record" | cut -d: -f6-7)" = "/var/lib/agent-governor/providerd:/usr/sbin/nologin" ] || \
+    fail "ag-provider home or shell mismatch"
+[ "$(id -gn ag-governor)" = "ag-governor" ] || fail "ag-governor primary group mismatch"
+[ "$(id -gn ag-provider)" = "ag-provider" ] || fail "ag-provider primary group mismatch"
+
+assert_node() {
+    path=$1
+    expected=$2
+    [ "$(stat -c '%U:%G:%a' "$path")" = "$expected" ] || \
+        fail "custody mismatch for $path"
+}
+
+assert_node /usr/lib/sysusers.d/agent-governor-ng.conf root:root:644
+assert_node /usr/lib/tmpfiles.d/agent-governor-ng.conf root:root:644
+assert_node /etc/systemd/system/ag-effectd.service.d root:root:755
+assert_node /var/lib/agent-governor root:root:711
+assert_node /var/lib/agent-governor/agd ag-governor:ag-governor:700
+assert_node /var/lib/agent-governor/agd/objects ag-governor:ag-governor:700
+assert_node /var/lib/agent-governor/agd/sessions ag-governor:ag-governor:700
+assert_node /var/lib/agent-governor/effectd root:root:700
+assert_node /var/lib/agent-governor/effectd/objects root:root:700
+assert_node /var/lib/agent-governor/effectd/promotion-stage root:root:700
+assert_node /var/lib/agent-governor/providerd ag-provider:ag-provider:700
+assert_node /var/lib/agent-governor/providerd/objects ag-provider:ag-provider:700
+assert_node /var/lib/agent-governor/backups root:root:700
+assert_node /run/agent-governor root:root:755
+assert_node /run/agent-governor/agd ag-governor:ag-users:2750
+assert_node /run/agent-governor/effectd root:root:711
+assert_node /run/agent-governor/effectd/proposal root:ag-governor:2750
+assert_node /run/agent-governor/effectd/admin root:ag-admin:2750
+assert_node /run/agent-governor/providerd ag-provider:ag-governor:2750
+
+[ ! -e /etc/systemd/system/ag-effectd.service.d/50-managed-pointer.conf ] || \
+    fail "package installed a managed-pointer target drop-in"
+[ ! -e /etc/agent-governor/genesis-enrollment-receipt.json ] || \
+    fail "package installed a genesis enrollment receipt"
+[ -z "$(find /var/lib/agent-governor/effectd/objects -mindepth 1 -print -quit)" ] || \
+    fail "package populated the effectd object store"
+
+for document in architecture.md deployment.md clean-host-activation-qualification.md \
+    formal-calculus-crosswalk.md formal-calculus-obligations.json \
+    preparation-ratification-kernel.md systemd-deployment.md; do
+    [ -f "/usr/share/doc/agent-governor-ng/$document" ] || \
+        fail "installed documentation target $document is missing"
+done
+[ -f /usr/share/doc/agent-governor-ng/README.md ] || fail "installed README is missing"
+[ -f /usr/share/doc/agent-governor-ng/README.Debian ] || fail "README.Debian is missing"
+[ -f /usr/share/doc/agent-governor-ng/migration/classic-authority-ledger.v1.json ] || \
+    fail "machine-consumed migration ledger is missing or compressed"
+
+for example in agctl.example.toml agctl-proposer.example.toml agd.example.toml \
+    effectd.example.toml managed-pointer-genesis-request.example.toml \
+    providerd.example.toml; do
+    [ -f "/usr/share/doc/agent-governor-ng/examples/$example" ] || \
+        fail "installed uncompressed example $example is missing"
+done
+
+systemd-analyze verify \
+    /usr/lib/systemd/system/ag-effectd.service \
+    /usr/lib/systemd/system/ag-providerd.service \
+    /usr/lib/systemd/system/agd.service
+
+dpkg-query -W -f='${Depends}\n' agent-governor-ng | grep -Eq '(^|, )git ' || \
+    fail "runtime dependency does not include Git"
+dpkg-query -W -f='${Depends}\n' agent-governor-ng | grep -Eq '(^|, )bubblewrap([, ]|$)' || \
+    fail "runtime dependency does not include Bubblewrap"
+
+agctl managed-pointer --help >/dev/null

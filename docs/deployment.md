@@ -187,10 +187,13 @@ enrollment facts for the exact loose ref before the authority store has any
 successful history; they are never populated by “latest,” directory order, or
 daemon startup observation. The state value is the digest of AG's
 descriptor-derived repository-state evidence, not the object ID repeated in a
-different field. The tree currently has no packaged measurement/enrollment
-command, so constructing these values is a release blocker rather than an
-invitation to hand-author a digest. Schema v1 and records unable to prove the
-new bindings fail closed.
+different field. The packaged offline `agctl managed-pointer` ceremony now
+measures, independently remeasures, and emits the complete final effectd config
+plus its exact target-derived unit drop-in and non-authorizing receipt. It
+requires an absent database and empty object store and never selects “latest”
+or silently edits an activated config. See
+`clean-host-activation-qualification.md`. Schema v1 and records unable to prove
+the new bindings fail closed.
 
 Effectd stages and inspects the bundle outside the governed repository, then
 compiles canonical bytes that bind the exact artifact and pack, base commit and
@@ -379,7 +382,9 @@ declared helper descriptors, and close every unintended inherited descriptor.
 
 ## Startup and observability
 
-Services are installed disabled. After configuration validation and the entire
+Services are disabled on pristine installation. Package bookkeeping preserves
+an administrator's prior enable state across reinstall/upgrade, while package
+transactions do not start the services. After configuration validation and the entire
 release checklist succeed, start effectd and providerd before agd. Current
 units use `Type=exec`: systemd activation means only that the daemon executable
 was entered. Effectd constructs fresh non-serializable activation standing

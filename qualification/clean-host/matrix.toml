@@ -1,0 +1,45 @@
+schema = "ag.clean-host-package-qualification-matrix/v1"
+mandatory_case_families = [
+  "package_build_and_payload",
+  "fresh_install_and_reboot",
+  "genesis_measure_enroll_verify",
+  "effectd_genesis_start_restart_reboot",
+  "qualification_fixture_pointer_activation",
+  "durable_head_restart_reconstruction",
+  "hostile_systemd_and_process",
+  "hostile_target_and_store",
+  "remove_reinstall_reconstruct",
+  "identical_bytes_packaging_upgrade",
+  "changed_build_safe_refusal",
+]
+per_command_deadline_seconds = 120
+per_case_deadline_seconds = 1800
+mandatory_enrollment_reload = "systemctl daemon-reload before effective-unit comparison and first start"
+
+[[guests]]
+id = "debian-12-amd64"
+distribution = "debian"
+release = "12"
+architecture = "amd64"
+image_digest = "UNENROLLED"
+
+[[guests]]
+id = "debian-12-arm64"
+distribution = "debian"
+release = "12"
+architecture = "arm64"
+image_digest = "UNENROLLED"
+
+[[guests]]
+id = "ubuntu-24.04-amd64"
+distribution = "ubuntu"
+release = "24.04"
+architecture = "amd64"
+image_digest = "UNENROLLED"
+
+[[guests]]
+id = "ubuntu-24.04-arm64"
+distribution = "ubuntu"
+release = "24.04"
+architecture = "arm64"
+image_digest = "UNENROLLED"

@@ -30,6 +30,65 @@ pub struct ComponentActivationContextV1<'a> {
     pub authority_catalog_identity: Option<&'a Digest>,
 }
 
+/// Require the complete pre-activation store cut used by an enrollment
+/// ceremony: protected database nodes are absent, the object store is empty,
+/// and both pre-created directories have their enrolled custody and a
+/// no-symlink ancestor chain.
+///
+/// # Errors
+///
+/// Returns an error for custody drift, symlink ancestry, any database,
+/// `SQLite` sidecar, writer-lock node, object-store entry, or I/O failure.
+pub fn require_uninitialized_component_store(config: &StoreConfigV1) -> anyhow::Result<()> {
+    let database_parent = config
+        .database
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("database path has no parent"))?;
+    validate_node(
+        database_parent,
+        &config.store_custody.database_parent,
+        CustodyNodeKindV1::Directory,
+    )?;
+    validate_node(
+        &config.object_store,
+        &config.store_custody.object_store,
+        CustodyNodeKindV1::Directory,
+    )?;
+
+    for suffix in ["", "-journal", "-wal", "-shm", ".writer.lock"] {
+        let path = database_sibling_path(&config.database, suffix)?;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => anyhow::bail!(
+                "component store is already initialized or has a stale protected node at {}",
+                path.display()
+            ),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if fs::read_dir(&config.object_store)?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        anyhow::bail!("component object store is not empty before initial activation");
+    }
+    // Repeat the descriptor-independent custody checks after enumeration so a
+    // path replacement cannot turn a passing observation into an unchecked
+    // final pathname for the immediately following store open.
+    validate_node(
+        database_parent,
+        &config.store_custody.database_parent,
+        CustodyNodeKindV1::Directory,
+    )?;
+    validate_node(
+        &config.object_store,
+        &config.store_custody.object_store,
+        CustodyNodeKindV1::Directory,
+    )?;
+    Ok(())
+}
+
 /// Opens a component-specific, single-writer store after binding its writer
 /// identity to the descriptor-bound digest of exact config bytes and a fresh
 /// process lifecycle nonce.
@@ -214,11 +273,15 @@ fn component_build_identity(application_name: &str) -> anyhow::Result<Digest> {
 }
 
 fn writer_lock_path(database: &Path) -> anyhow::Result<PathBuf> {
+    database_sibling_path(database, ".writer.lock")
+}
+
+fn database_sibling_path(database: &Path, suffix: &str) -> anyhow::Result<PathBuf> {
     let file_name = database
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("database path must name a file"))?;
     let mut lock_name = file_name.to_os_string();
-    lock_name.push(".writer.lock");
+    lock_name.push(suffix);
     Ok(database.with_file_name(lock_name))
 }
 
@@ -245,7 +308,7 @@ fn validate_sqlite_sidecar_if_present(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
     use crate::config::{FilesystemNodeCustodyV1, StoreCustodyConfigV1};
 
@@ -383,6 +446,43 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::metadata(&config.database).expect("metadata").len(), 0);
+    }
+
+    #[test]
+    fn uninitialized_store_preflight_is_exact_and_read_only() {
+        let (_temporary, _config_identity, config) = fixture();
+        require_uninitialized_component_store(&config).expect("pristine store cut");
+        assert!(!config.database.exists());
+        assert_eq!(
+            fs::read_dir(&config.object_store).expect("objects").count(),
+            0
+        );
+
+        for suffix in ["", "-journal", "-wal", "-shm", ".writer.lock"] {
+            let (_temporary, _config_identity, config) = fixture();
+            let protected = database_sibling_path(&config.database, suffix).expect("sibling path");
+            fs::write(&protected, b"stale").expect("protected node");
+            assert!(require_uninitialized_component_store(&config).is_err());
+        }
+
+        let (_temporary, _config_identity, config) = fixture();
+        fs::write(config.object_store.join("foreign"), b"foreign").expect("foreign object");
+        assert!(require_uninitialized_component_store(&config).is_err());
+
+        let (_temporary, _config_identity, config) = fixture();
+        fs::set_permissions(&config.object_store, fs::Permissions::from_mode(0o755))
+            .expect("drift object-store mode");
+        assert!(require_uninitialized_component_store(&config).is_err());
+    }
+
+    #[test]
+    fn uninitialized_store_preflight_refuses_symlink_ancestry() {
+        let (temporary, _config_identity, mut config) = fixture();
+        let linked_parent = temporary.path().join("linked-state");
+        symlink(temporary.path(), &linked_parent).expect("linked state parent");
+        config.database = linked_parent.join("daemon.db");
+        config.object_store = linked_parent.join("objects");
+        assert!(require_uninitialized_component_store(&config).is_err());
     }
 
     #[test]

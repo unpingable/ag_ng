@@ -19,7 +19,8 @@ use crate::rpc_auth::{
 };
 use crate::signed_transport::SIGNED_RPC_RESPONSE_TIMEOUT_MS;
 
-const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+/// Maximum exact bytes accepted by every TOML configuration loader.
+pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const PROVIDER_RPC_STRUCTURAL_RESERVE_BYTES: u64 = 128 * 1024;
 // Candidate content occurs once in the worker proof on each RPC wire. This
 // reserve covers the complete signed principal/session/intent envelopes around
@@ -32,7 +33,7 @@ const MANAGED_FILE_CANDIDATE_SEMANTIC_V1: &str = "managed_file_content_v1";
 const MANAGED_POINTER_CANDIDATE_SEMANTIC_V1: &str = "git_bundle_promotion_v1";
 
 /// Store paths common to every daemon.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreConfigV1 {
     /// `SQLite` database path.
@@ -60,7 +61,7 @@ pub struct FilesystemNodeCustodyV1 {
 }
 
 /// Store filesystem custody policy.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StoreCustodyConfigV1 {
     /// Immediate parent of the database and writer-lock files.
@@ -74,7 +75,7 @@ pub struct StoreCustodyConfigV1 {
 }
 
 /// Filesystem custody policy for one listening Unix socket.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SocketCustodyConfigV1 {
     /// Pre-created immediate parent. Its exact mode includes the mandatory
@@ -85,7 +86,7 @@ pub struct SocketCustodyConfigV1 {
 }
 
 /// Stable peer enrollment plus optional kernel lifecycle expectations.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerPolicyV1 {
     /// Canonical configured role.
@@ -337,7 +338,7 @@ pub struct AgdConfigV1 {
 }
 
 /// Effect-broker resource limits.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectdLimitsV1 {
     /// Maximum strict local frame.
@@ -353,7 +354,7 @@ pub struct EffectdLimitsV1 {
 }
 
 /// One root-owned effect target.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum EffectTargetConfigV1 {
@@ -421,7 +422,7 @@ pub enum EffectTargetConfigV1 {
 }
 
 /// `ag-effectd` configuration.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectdConfigV1 {
     /// Exact config schema.
@@ -776,7 +777,7 @@ fn validate_signer(signer: &RpcSigningIdentityConfigV1) -> Result<(), ConfigErro
         .map_err(|_| ConfigError::InvalidSigningIdentity)
 }
 
-fn validate_security_profile(profile: &str) -> Result<(), ConfigError> {
+pub(crate) fn validate_security_profile(profile: &str) -> Result<(), ConfigError> {
     if matches!(profile, "development" | "production" | "high_assurance") {
         Ok(())
     } else {
@@ -964,6 +965,40 @@ fn validate_managed_pointer_target(
     promotion_ttl_ms: u64,
     helper: &Path,
 ) -> Result<(), ConfigError> {
+    validate_managed_pointer_enrollment_inputs(
+        id,
+        allowed_root,
+        repository,
+        reference,
+        uid,
+        gid,
+        staging_root,
+        promotion_ttl_ms,
+        helper,
+    )?;
+    if !valid_git_object_name(activation_genesis_object)
+        || !valid_git_object_name(activation_genesis_tree)
+        || activation_genesis_object.len() != activation_genesis_tree.len()
+    {
+        return Err(ConfigError::InvalidLimit("managed-pointer target"));
+    }
+    Ok(())
+}
+
+/// Validate the operator-selected portion of a managed-pointer enrollment
+/// before any live repository measurement is attempted.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_managed_pointer_enrollment_inputs(
+    id: &str,
+    allowed_root: &Path,
+    repository: &Path,
+    reference: &str,
+    uid: u32,
+    gid: u32,
+    staging_root: &Path,
+    promotion_ttl_ms: u64,
+    helper: &Path,
+) -> Result<(), ConfigError> {
     validate_absolute(&[allowed_root, repository, staging_root, helper])?;
     let repository_relative = repository
         .strip_prefix(allowed_root)
@@ -977,9 +1012,6 @@ fn validate_managed_pointer_target(
         || helper.starts_with(allowed_root)
         || helper.starts_with(staging_root)
         || !valid_managed_git_ref(reference)
-        || !valid_git_object_name(activation_genesis_object)
-        || !valid_git_object_name(activation_genesis_tree)
-        || activation_genesis_object.len() != activation_genesis_tree.len()
         || uid == 0
         || gid == 0
         || uid == u32::MAX

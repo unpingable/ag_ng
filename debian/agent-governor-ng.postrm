@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# debhelper's systemd remove autoscript reloads the live host manager without a
+# DPKG_ROOT guard. Cross-root removal has no authority to touch that manager.
+if [ -n "${DPKG_ROOT:-}" ] && [ "$1" = remove ]; then
+    exit 0
+fi
+
+#DEBHELPER#
+
+exit 0

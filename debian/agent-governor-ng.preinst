@@ -1,0 +1,38 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    upgrade)
+        # An upgrade must not replace executable/unit payload beneath a live
+        # authority process. debhelper's no-start stop is best-effort; this is
+        # the strict lifecycle fence.
+        if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+            deb-systemd-invoke stop \
+                agd.service \
+                ag-providerd.service \
+                ag-effectd.service >/dev/null
+            for unit in agd.service ag-providerd.service ag-effectd.service; do
+                state=$(systemctl show "$unit" -p ActiveState --value) || {
+                    echo "cannot verify stopped state for $unit; refusing upgrade" >&2
+                    exit 1
+                }
+                main_pid=$(systemctl show "$unit" -p MainPID --value) || {
+                    echo "cannot verify MainPID for $unit; refusing upgrade" >&2
+                    exit 1
+                }
+                case "$state:$main_pid" in
+                    inactive:0|failed:0)
+                        ;;
+                    *)
+                        echo "refusing upgrade while $unit still has live authority state ($state, MainPID=$main_pid)" >&2
+                        exit 1
+                        ;;
+                esac
+            done
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

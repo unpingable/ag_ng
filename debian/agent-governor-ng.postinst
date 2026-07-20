@@ -2,12 +2,24 @@
 set -e
 
 case "$1" in
-    configure)
-        systemd-sysusers /usr/lib/sysusers.d/agent-governor-ng.conf
-        systemd-tmpfiles --create /usr/lib/tmpfiles.d/agent-governor-ng.conf
+    configure|abort-upgrade|abort-deconfigure|abort-remove)
+        if [ -n "${DPKG_ROOT:-}" ]; then
+            systemd-sysusers --root="$DPKG_ROOT" agent-governor-ng.conf
+            systemd-tmpfiles --root="$DPKG_ROOT" \
+                --create agent-governor-ng.conf
+        else
+            systemd-sysusers agent-governor-ng.conf
+            systemd-tmpfiles --create agent-governor-ng.conf
+        fi
         ;;
 esac
 
 #DEBHELPER#
+
+# `--no-start` deliberately suppresses service activation, but PID1 must not
+# retain a pre-upgrade unit definition before the later explicit start.
+if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload
+fi
 
 exit 0

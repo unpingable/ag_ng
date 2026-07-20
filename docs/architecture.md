@@ -222,9 +222,9 @@ This is a code-enforced and locally tested managed-ref activation claim, not a
 production deployment claim. Fresh effective-unit/process/target readiness
 and the target-owner capability package contract are implemented against an
 explicit checked property cut. Real package-host, expanded syscall-filter,
-Git/systemd/filesystem/LSM qualification, genesis enrollment tooling, the
-power-loss matrix, and the separate activation/upgrade ceremony remain open
-release gates.
+Git/systemd/filesystem/LSM qualification, VM execution of the packaged genesis
+ceremony, the power-loss matrix, and the separate activation/upgrade ceremony
+remain open release gates.
 
 BreakGlass, direct checkout, arbitrary privileged commands, hostile
 multi-tenancy, public TCP APIs, and compatibility aliases are intentionally

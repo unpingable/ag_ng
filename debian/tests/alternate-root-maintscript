@@ -1,0 +1,84 @@
+#!/bin/sh
+set -eu
+
+test_root=$(mktemp -d)
+cleanup() {
+    rm -rf -- "$test_root"
+}
+trap cleanup EXIT HUP INT TERM
+
+fake_bin="$test_root/fake-bin"
+sentinel="$test_root/host-systemctl-called"
+install -d "$fake_bin"
+printf '%s\n' '#!/bin/sh' "touch '$sentinel'" > "$fake_bin/systemctl"
+chmod 0755 "$fake_bin/systemctl"
+
+install -d \
+    "$test_root/etc" \
+    "$test_root/usr/lib/sysusers.d" \
+    "$test_root/usr/lib/tmpfiles.d"
+install -m 0644 packaging/systemd/sysusers.d/agent-governor-ng.conf \
+    "$test_root/usr/lib/sysusers.d/agent-governor-ng.conf"
+install -m 0644 packaging/systemd/tmpfiles.d/agent-governor-ng.conf \
+    "$test_root/usr/lib/tmpfiles.d/agent-governor-ng.conf"
+
+host_passwd=$(sha256sum /etc/passwd)
+host_group=$(sha256sum /etc/group)
+DPKG_ROOT="$test_root" PATH="$fake_bin:$PATH" \
+    sh debian/agent-governor-ng.postinst configure
+
+[ "$host_passwd" = "$(sha256sum /etc/passwd)" ]
+[ "$host_group" = "$(sha256sum /etc/group)" ]
+[ ! -e "$sentinel" ]
+grep -q '^ag-governor:' "$test_root/etc/passwd"
+grep -q '^ag-provider:' "$test_root/etc/passwd"
+
+ag_governor_uid=$(awk -F: '$1 == "ag-governor" { print $3 }' "$test_root/etc/passwd")
+ag_governor_gid=$(awk -F: '$1 == "ag-governor" { print $4 }' "$test_root/etc/passwd")
+ag_provider_uid=$(awk -F: '$1 == "ag-provider" { print $3 }' "$test_root/etc/passwd")
+ag_provider_gid=$(awk -F: '$1 == "ag-provider" { print $4 }' "$test_root/etc/passwd")
+ag_users_gid=$(awk -F: '$1 == "ag-users" { print $3 }' "$test_root/etc/group")
+ag_admin_gid=$(awk -F: '$1 == "ag-admin" { print $3 }' "$test_root/etc/group")
+
+[ -n "$ag_governor_uid" ] && [ "$ag_governor_uid" != 0 ]
+[ -n "$ag_provider_uid" ] && [ "$ag_provider_uid" != 0 ]
+[ "$ag_governor_uid" != "$ag_provider_uid" ]
+[ "$ag_governor_gid" != "$ag_provider_gid" ]
+grep -q '^ag-governor:[^:]*:[^:]*:[^:]*:[^:]*:/var/lib/agent-governor/agd:/usr/sbin/nologin$' \
+    "$test_root/etc/passwd"
+grep -q '^ag-provider:[^:]*:[^:]*:[^:]*:[^:]*:/var/lib/agent-governor/providerd:/usr/sbin/nologin$' \
+    "$test_root/etc/passwd"
+
+assert_node() {
+    path=$1
+    expected=$2
+    [ "$(stat -c '%u:%g:%a' "$test_root$path")" = "$expected" ]
+}
+
+assert_node /var/lib/agent-governor "0:0:711"
+assert_node /var/lib/agent-governor/agd "$ag_governor_uid:$ag_governor_gid:700"
+assert_node /var/lib/agent-governor/agd/objects "$ag_governor_uid:$ag_governor_gid:700"
+assert_node /var/lib/agent-governor/agd/sessions "$ag_governor_uid:$ag_governor_gid:700"
+assert_node /var/lib/agent-governor/effectd "0:0:700"
+assert_node /var/lib/agent-governor/effectd/objects "0:0:700"
+assert_node /var/lib/agent-governor/effectd/promotion-stage "0:0:700"
+assert_node /var/lib/agent-governor/providerd "$ag_provider_uid:$ag_provider_gid:700"
+assert_node /var/lib/agent-governor/providerd/objects "$ag_provider_uid:$ag_provider_gid:700"
+assert_node /var/lib/agent-governor/backups "0:0:700"
+assert_node /run/agent-governor "0:0:755"
+assert_node /run/agent-governor/agd "$ag_governor_uid:$ag_users_gid:2750"
+assert_node /run/agent-governor/effectd "0:0:711"
+assert_node /run/agent-governor/effectd/proposal "0:$ag_governor_gid:2750"
+assert_node /run/agent-governor/effectd/admin "0:$ag_admin_gid:2750"
+assert_node /run/agent-governor/providerd "$ag_provider_uid:$ag_governor_gid:2750"
+
+# Exercise the custom early fence against a stand-in for debhelper's otherwise
+# unguarded postrm systemctl daemon-reload block.
+merged_postrm="$test_root/postrm"
+sed "s|#DEBHELPER#|systemctl --system daemon-reload|" \
+    debian/agent-governor-ng.postrm > "$merged_postrm"
+chmod 0755 "$merged_postrm"
+DPKG_ROOT="$test_root" PATH="$fake_bin:$PATH" "$merged_postrm" remove
+[ ! -e "$sentinel" ]
+PATH="$fake_bin:$PATH" "$merged_postrm" remove
+[ -e "$sentinel" ]

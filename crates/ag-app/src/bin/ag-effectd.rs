@@ -15,13 +15,16 @@ use ag_app::managed_pointer::{ManagedPointerError, ManagedPointerRuntimeV1};
 use ag_app::rpc_auth::{
     RpcPeerEnrollmentV1, RpcReplayGuardV1, RpcSignerV1, SystemRpcClockV1, VerifiedRpcPrincipalV1,
 };
-use ag_app::runtime::{ComponentActivationContextV1, open_component_store};
+use ag_app::runtime::{
+    ComponentActivationContextV1, open_component_store, require_uninitialized_component_store,
+};
 use ag_app::signed_transport::{
     AcceptedSignedRequestV1, SocketPeerCheckV1, accept_signed_request, write_signed_response,
 };
 use ag_app::transport::bind_socket;
 use ag_primitives::Digest;
 use ag_protocol::FrameCodec;
+use anyhow::Context as _;
 use clap::Parser;
 use tracing::{error, info, warn};
 
@@ -72,6 +75,14 @@ fn main() -> anyhow::Result<()> {
         validate_managed_pointer_runtime(&config)?;
         info!(path = %arguments.config.display(), "configuration is valid");
         return Ok(());
+    }
+    if effectd_database_is_absent(&config.store.database)? {
+        require_uninitialized_component_store(&config.store)
+            .context("initial effectd store is not pristine")?;
+        ManagedPointerRuntimeV1::from_config(&config)?
+            .require_configured_genesis()
+            .map_err(anyhow::Error::from)
+            .context("initial managed-pointer genesis changed before store activation")?;
     }
 
     let signer = Arc::new(RpcSignerV1::from_systemd_credential(
@@ -263,6 +274,14 @@ fn validate_managed_pointer_runtime(config: &EffectdConfigV1) -> Result<(), Mana
     Ok(())
 }
 
+fn effectd_database_is_absent(path: &std::path::Path) -> anyhow::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn run_admin_listener(
     listener: &std::os::unix::net::UnixListener,
     codec: FrameCodec,
@@ -396,5 +415,14 @@ mod tests {
         configured_catalog_identity(&config.targets)
             .expect("catalog byte check alone follows the helper symlink");
         assert!(validate_managed_pointer_runtime(&config).is_err());
+    }
+
+    #[test]
+    fn first_start_detection_distinguishes_absent_database_from_any_node() {
+        let directory = tempfile::tempdir().expect("temporary root");
+        let database = directory.path().join("effectd.db");
+        assert!(effectd_database_is_absent(&database).expect("absent observation"));
+        std::fs::write(&database, b"").expect("database node");
+        assert!(!effectd_database_is_absent(&database).expect("present observation"));
     }
 }

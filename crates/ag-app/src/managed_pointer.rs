@@ -42,7 +42,10 @@ use rustix::fs::{FileType, Gid, MemfdFlags, Mode, OFlags, ResolveFlags, SealFlag
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::{EffectTargetConfigV1, EffectdConfigV1};
+use crate::config::{
+    EffectTargetConfigV1, EffectdConfigV1, validate_managed_pointer_enrollment_inputs,
+    validate_security_profile,
+};
 
 const BUNDLE_MAGIC_V2: &[u8] = b"# v2 git bundle\n";
 const BUNDLE_CANDIDATE_REF: &str = "refs/heads/ag-candidate";
@@ -81,10 +84,299 @@ pub const MANAGED_POINTER_ACTIVATION_RECEIPT_SCHEMA_V1: &str =
 /// Versioned fresh target-preflight evidence used only for live broker readiness.
 pub const MANAGED_POINTER_READINESS_SCHEMA_V1: &str = "ag.managed-pointer.production-readiness/v1";
 
+/// Strict offline request for measuring one initial governed Git head.
+pub const MANAGED_POINTER_GENESIS_REQUEST_SCHEMA_V1: &str = "ag.managed-pointer.genesis-request/v1";
+
+/// Inspectable, non-authorizing measurement reviewed before enrollment.
+pub const MANAGED_POINTER_GENESIS_MEASUREMENT_SCHEMA_V1: &str =
+    "ag.managed-pointer.genesis-measurement/v1";
+
+/// Receipt for a fresh measurement that exactly matched the reviewed one.
+pub const MANAGED_POINTER_GENESIS_ENROLLMENT_RECEIPT_SCHEMA_V1: &str =
+    "ag.managed-pointer.genesis-enrollment-receipt/v1";
+
 /// Evidence emitted only when a live, non-serializable promotion standing is
 /// minted from exact ratification and a fresh basis observation.
 pub const MANAGED_POINTER_PROMOTION_STANDING_RECEIPT_SCHEMA_V1: &str =
     "ag.managed-pointer.promotion-standing-receipt/v1";
+
+/// Operator-selected facts for one offline managed-pointer enrollment.
+///
+/// The request deliberately contains no genesis object, tree, repository
+/// identity, helper digest, or launch-profile digest. Those values can only be
+/// supplied by the closed descriptor-bound measurement implementation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerGenesisRequestV1 {
+    /// Exact request schema.
+    pub schema: String,
+    /// Security profile whose fixed Git launch contract will be enrolled.
+    pub security_profile: String,
+    /// Opaque target ID used by the effect catalog.
+    pub target: String,
+    /// Root beneath which the repository must resolve.
+    pub allowed_root: PathBuf,
+    /// Exact repository strictly beneath `allowed_root`.
+    pub repository: PathBuf,
+    /// Existing loose branch ref to govern.
+    pub reference: String,
+    /// Numeric non-root repository owner.
+    pub uid: u32,
+    /// Numeric non-root repository group.
+    pub gid: u32,
+    /// Broker-controlled promotion staging root.
+    pub staging_root: PathBuf,
+    /// Maximum lifetime of one compiled promotion authority.
+    pub promotion_ttl_ms: u64,
+    /// Exact root-owned Git executable to pin.
+    pub helper: PathBuf,
+}
+
+/// Exact not-yet-activated effectd authority into which genesis will enroll.
+///
+/// The template digest binds every peer, custody, limit, and pre-existing
+/// target field. Database and object-store paths make the required empty-store
+/// observation explicit instead of treating a target measurement as reusable
+/// across authority domains.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerGenesisContextV1 {
+    /// Authority domain of the final effectd configuration.
+    pub authority_domain: String,
+    /// Nonzero revocation epoch of the final effectd configuration.
+    pub epoch: String,
+    /// Digest of the exact root-owned effectd template bytes.
+    pub effectd_config_template: Digest,
+    /// Database that must not exist before enrollment or first activation.
+    pub effectd_database: PathBuf,
+    /// Empty object store belonging to that database.
+    pub effectd_object_store: PathBuf,
+}
+
+impl ManagedPointerGenesisContextV1 {
+    fn validate(&self) -> Result<(), ManagedPointerError> {
+        if AuthorityDomain::parse(&self.authority_domain).is_err()
+            || Epoch::parse(&self.epoch).is_err()
+            || !normalized_absolute_path(&self.effectd_database)
+            || !normalized_absolute_path(&self.effectd_object_store)
+        {
+            return Err(ManagedPointerError::GenesisMeasurementInvalid);
+        }
+        Ok(())
+    }
+}
+
+impl ManagedPointerGenesisRequestV1 {
+    /// Validate every operator-selected enrollment field before observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for schema, path, target, owner, ref, profile, helper,
+    /// staging, or lifetime inputs outside the managed-pointer contract.
+    pub fn validate(&self) -> Result<(), ManagedPointerError> {
+        if self.schema != MANAGED_POINTER_GENESIS_REQUEST_SCHEMA_V1 {
+            return Err(ManagedPointerError::GenesisMeasurementInvalid);
+        }
+        validate_security_profile(&self.security_profile)
+            .map_err(|_| ManagedPointerError::GenesisMeasurementInvalid)?;
+        validate_managed_pointer_enrollment_inputs(
+            &self.target,
+            &self.allowed_root,
+            &self.repository,
+            &self.reference,
+            self.uid,
+            self.gid,
+            &self.staging_root,
+            self.promotion_ttl_ms,
+            &self.helper,
+        )
+        .map_err(|_| ManagedPointerError::GenesisMeasurementInvalid)
+    }
+
+    fn identity(&self) -> Result<Digest, ManagedPointerError> {
+        self.validate()?;
+        Ok(Digest::from_serializable(self)?)
+    }
+}
+
+/// Exact descriptor-bound observation reviewed before a target enters config.
+///
+/// This document is evidence only. It neither changes the target nor creates
+/// daemon standing. Enrollment requires a second live measurement to match it
+/// byte-for-byte.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerGenesisMeasurementV1 {
+    /// Exact measurement schema.
+    pub schema: String,
+    /// Exact authority, template, and empty-store destination for enrollment.
+    pub context: ManagedPointerGenesisContextV1,
+    /// Complete operator-selected request.
+    pub request: ManagedPointerGenesisRequestV1,
+    /// Canonical identity of `request`.
+    pub request_identity: Digest,
+    /// Profile identity used by the fixed launch contract.
+    pub security_profile_identity: Digest,
+    /// Exact Git executable bytes.
+    pub helper_executable: Digest,
+    /// Exact code-derived helper launch profile.
+    pub helper_launch_profile: Digest,
+    /// Full descriptor-bound repository layout.
+    pub repository_layout: ManagedRepositoryIdentityEvidenceV1,
+    /// Identity of `repository_layout` copied into effectd config.
+    pub repository_identity: Digest,
+    /// Full exact managed-ref state.
+    pub state: ManagedRepositoryStateEvidenceV1,
+    /// Identity of `state` copied into effectd config.
+    pub activation_genesis_state: Digest,
+    /// Exact commit initially selected by the governed ref.
+    pub activation_genesis_object: String,
+    /// Exact tree reached from the genesis commit.
+    pub activation_genesis_tree: String,
+    /// Descriptor metadata for the admitted staging root.
+    pub staging_root_node: ManagedFilesystemNodeEvidenceV1,
+}
+
+impl ManagedPointerGenesisMeasurementV1 {
+    /// Verify all internal identities and config-bound projections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for any substituted request, evidence, helper,
+    /// repository, ref, owner, object, tree, or state identity.
+    pub fn verify(&self) -> Result<(), ManagedPointerError> {
+        self.context.validate()?;
+        self.request.validate()?;
+        let request_identity = self.request.identity()?;
+        let security_profile_identity = Digest::hash_domain(
+            "ag-security-profile-identity-v1",
+            self.request.security_profile.as_bytes(),
+        );
+        let helper_launch_profile = managed_pointer_launch_profile_identity(
+            &security_profile_identity,
+            &self.helper_executable,
+        )?;
+        let repository_identity = self.repository_layout.identity()?;
+        let state_identity = self.state.identity()?;
+        if self.schema != MANAGED_POINTER_GENESIS_MEASUREMENT_SCHEMA_V1
+            || self.request_identity != request_identity
+            || self.security_profile_identity != security_profile_identity
+            || self.helper_launch_profile != helper_launch_profile
+            || self.repository_identity != repository_identity
+            || self.state.repository_identity != repository_identity
+            || self.activation_genesis_state != state_identity
+            || self.activation_genesis_object != self.state.current_object
+            || self.activation_genesis_tree != self.state.current_tree
+            || !self.state.clean
+            || self.state.reference_checked_out
+            || self.repository_layout.allowed_root != utf8_path(&self.request.allowed_root)?
+            || self.repository_layout.repository != utf8_path(&self.request.repository)?
+            || self.repository_layout.uid != self.request.uid
+            || self.repository_layout.gid != self.request.gid
+            || self.state.reference.name != self.request.reference
+            || self.state.reference.uid != self.request.uid
+            || self.state.reference.gid != self.request.gid
+            || self.staging_root_node.name != "staging-root"
+            || self.staging_root_node.inode == 0
+            || self.staging_root_node.link_count == 0
+        {
+            return Err(ManagedPointerError::GenesisMeasurementInvalid);
+        }
+        Ok(())
+    }
+
+    /// Compute the identity of a verified reviewed measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when verification or canonical encoding fails.
+    pub fn identity(&self) -> Result<Digest, ManagedPointerError> {
+        self.verify()?;
+        Ok(Digest::from_serializable(self)?)
+    }
+}
+
+/// Non-authorizing record that a fresh live observation matched review and
+/// produced one complete effectd configuration and exact systemd drop-in.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPointerGenesisEnrollmentReceiptV1 {
+    /// Exact receipt schema.
+    pub schema: String,
+    /// Authority domain receiving the final configuration.
+    pub authority_domain: String,
+    /// Revocation epoch receiving the final configuration.
+    pub epoch: String,
+    /// Enrolled target ID.
+    pub target: String,
+    /// Identity of the reviewed and freshly reproduced measurement.
+    pub measurement: Digest,
+    /// Exact genesis object copied into target configuration.
+    pub activation_genesis_object: String,
+    /// Exact genesis tree copied into target configuration.
+    pub activation_genesis_tree: String,
+    /// Exact genesis state copied into target configuration.
+    pub activation_genesis_state: Digest,
+    /// Exact repository identity copied into target configuration.
+    pub repository_identity: Digest,
+    /// Digest of the complete no-overwrite final effectd configuration.
+    pub effectd_config: Digest,
+    /// Absolute final effectd configuration path committed by the receipt.
+    pub effectd_config_path: String,
+    /// Digest of the exact target-derived systemd unit drop-in.
+    pub effectd_unit_drop_in: Digest,
+    /// Absolute final systemd drop-in path committed by the receipt.
+    pub effectd_unit_drop_in_path: String,
+    /// Absolute receipt path published before deployment artifacts.
+    pub receipt_path: String,
+}
+
+impl ManagedPointerGenesisEnrollmentReceiptV1 {
+    /// Validate the closed receipt shape and path commitments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for schema drift, invalid authority context, an
+    /// unnormalized path, or a target inconsistent with the reviewed request.
+    pub fn verify(
+        &self,
+        reviewed: &ManagedPointerGenesisMeasurementV1,
+    ) -> Result<(), ManagedPointerError> {
+        reviewed.verify()?;
+        if self.schema != MANAGED_POINTER_GENESIS_ENROLLMENT_RECEIPT_SCHEMA_V1
+            || self.authority_domain != reviewed.context.authority_domain
+            || self.epoch != reviewed.context.epoch
+            || self.target != reviewed.request.target
+            || self.measurement != reviewed.identity()?
+            || self.activation_genesis_object != reviewed.activation_genesis_object
+            || self.activation_genesis_tree != reviewed.activation_genesis_tree
+            || self.activation_genesis_state != reviewed.activation_genesis_state
+            || self.repository_identity != reviewed.repository_identity
+            || !normalized_absolute_path(Path::new(&self.effectd_config_path))
+            || !normalized_absolute_path(Path::new(&self.effectd_unit_drop_in_path))
+            || !normalized_absolute_path(Path::new(&self.receipt_path))
+            || self.effectd_config_path == self.effectd_unit_drop_in_path
+            || self.effectd_config_path == self.receipt_path
+            || self.effectd_unit_drop_in_path == self.receipt_path
+        {
+            return Err(ManagedPointerError::GenesisMeasurementInvalid);
+        }
+        Ok(())
+    }
+
+    /// Compute the identity of a verified enrollment receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when verification or canonical encoding fails.
+    pub fn identity(
+        &self,
+        reviewed: &ManagedPointerGenesisMeasurementV1,
+    ) -> Result<Digest, ManagedPointerError> {
+        self.verify(reviewed)?;
+        Ok(Digest::from_serializable(self)?)
+    }
+}
 
 /// Exact descriptor metadata for one named node in the enrolled repository layout.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -674,6 +966,12 @@ struct CommitLaunchGuardV1<'a> {
 /// Strict managed-pointer runtime failures. No variant contains candidate data.
 #[derive(Debug, Error)]
 pub enum ManagedPointerError {
+    /// An offline genesis request or measurement has invalid or substituted bindings.
+    #[error("managed-pointer genesis measurement is invalid")]
+    GenesisMeasurementInvalid,
+    /// The live target no longer equals the independently reviewed measurement.
+    #[error("managed-pointer genesis changed after review")]
+    GenesisMeasurementDrift,
     /// The configured target is absent or has the wrong family.
     #[error("managed-pointer target is unavailable")]
     TargetUnavailable,
@@ -739,6 +1037,146 @@ pub enum ManagedPointerError {
     /// Strict evidence encoding failed.
     #[error("managed-pointer evidence encoding failed: {0}")]
     Canonical(#[from] ag_primitives::JcsError),
+}
+
+/// Measure one initial managed-pointer head through the same closed Git and
+/// descriptor machinery used by the effect broker.
+///
+/// This operation is read-only with respect to the repository and creates no
+/// authority. A non-bare cleanliness check uses one automatically removed
+/// private directory under the staging root. Production and high-assurance
+/// requests also require the final root-owned staging custody that effectd
+/// will attest at activation.
+///
+/// # Errors
+///
+/// Returns an error for an invalid request, unsafe helper/repository/staging
+/// custody, a dirty or checked-out managed ref, Git failure, or evidence that
+/// cannot be encoded and verified exactly.
+pub fn measure_managed_pointer_genesis(
+    request: &ManagedPointerGenesisRequestV1,
+    context: &ManagedPointerGenesisContextV1,
+) -> Result<ManagedPointerGenesisMeasurementV1, ManagedPointerError> {
+    request.validate()?;
+    context.validate()?;
+    let security_profile_identity = Digest::hash_domain(
+        "ag-security-profile-identity-v1",
+        request.security_profile.as_bytes(),
+    );
+    let git = PinnedGitV1::measure(&request.helper)?;
+    let helper_executable = git.executable.clone();
+    let helper_launch_profile =
+        managed_pointer_launch_profile_identity(&security_profile_identity, &helper_executable)?;
+    let staging = open_absolute_directory(&request.staging_root)?;
+    let staging_stat = rustix::fs::fstat(&staging).map_err(errno_to_io)?;
+    if request.security_profile == "development" {
+        if !FileType::from_raw_mode(staging_stat.st_mode).is_dir()
+            || staging_stat.st_uid != nix::unistd::geteuid().as_raw()
+            || staging_stat.st_mode & 0o022 != 0
+        {
+            return Err(ManagedPointerError::UnsafeRepository(
+                "development staging root is not private caller custody".to_owned(),
+            ));
+        }
+    } else {
+        validate_production_staging_custody(
+            FileType::from_raw_mode(staging_stat.st_mode).is_dir(),
+            staging_stat.st_uid,
+            staging_stat.st_gid,
+            staging_stat.st_mode,
+        )?;
+    }
+    let target = ManagedPointerTargetV1 {
+        allowed_root: request.allowed_root.clone(),
+        repository: request.repository.clone(),
+        reference: request.reference.clone(),
+        // Genesis is the output of this observation, so these retained fields
+        // are deliberately unusable while measurement is in progress.
+        activation_genesis_object: String::new(),
+        activation_genesis_tree: String::new(),
+        activation_genesis_state: Digest::hash_bytes(b"unenrolled-genesis"),
+        repository_identity: Digest::hash_bytes(b"unenrolled-repository"),
+        uid: request.uid,
+        gid: request.gid,
+        staging_root: request.staging_root.clone(),
+        production_staging_custody: request.security_profile != "development",
+        promotion_ttl_ms: request.promotion_ttl_ms,
+        git: Mutex::new(git),
+        launch_profile: helper_launch_profile.clone(),
+    };
+    let repository = target.open_repository()?;
+    let state = target.observe_repository_state(&repository)?;
+    if !state.clean || state.reference_checked_out {
+        return Err(ManagedPointerError::PrestateDrift(
+            "genesis ref is checked out or the repository worktree is dirty".to_owned(),
+        ));
+    }
+    let repository_layout = repository.identity_evidence.clone();
+    let repository_identity = repository_layout.identity()?;
+    if state.evidence.repository_identity != repository_identity {
+        return Err(ManagedPointerError::GenesisMeasurementInvalid);
+    }
+    let measurement = ManagedPointerGenesisMeasurementV1 {
+        schema: MANAGED_POINTER_GENESIS_MEASUREMENT_SCHEMA_V1.to_owned(),
+        context: context.clone(),
+        request: request.clone(),
+        request_identity: request.identity()?,
+        security_profile_identity,
+        helper_executable,
+        helper_launch_profile,
+        repository_layout,
+        repository_identity,
+        activation_genesis_state: state.evidence.identity()?,
+        activation_genesis_object: state.current_object,
+        activation_genesis_tree: state.current_tree,
+        state: state.evidence,
+        staging_root_node: node_evidence("staging-root", &staging_stat),
+    };
+    measurement.verify()?;
+    Ok(measurement)
+}
+
+/// Require a fresh live measurement to equal the reviewed measurement and
+/// derive the exact target record accepted by effectd config v2.
+///
+/// # Errors
+///
+/// Returns an error if the reviewed document is invalid, belongs to another
+/// request, or any helper, staging, repository, ref, object, tree, metadata,
+/// or state evidence changed after review.
+pub fn enroll_managed_pointer_genesis(
+    request: &ManagedPointerGenesisRequestV1,
+    context: &ManagedPointerGenesisContextV1,
+    reviewed: &ManagedPointerGenesisMeasurementV1,
+) -> Result<(EffectTargetConfigV1, Digest), ManagedPointerError> {
+    reviewed.verify()?;
+    context.validate()?;
+    if &reviewed.request != request || &reviewed.context != context {
+        return Err(ManagedPointerError::GenesisMeasurementInvalid);
+    }
+    let reviewed_identity = reviewed.identity()?;
+    let fresh = measure_managed_pointer_genesis(request, context)?;
+    if fresh != *reviewed || fresh.identity()? != reviewed_identity {
+        return Err(ManagedPointerError::GenesisMeasurementDrift);
+    }
+    let target = EffectTargetConfigV1::ManagedPointer {
+        id: request.target.clone(),
+        allowed_root: request.allowed_root.clone(),
+        repository: request.repository.clone(),
+        reference: request.reference.clone(),
+        activation_genesis_object: reviewed.activation_genesis_object.clone(),
+        activation_genesis_tree: reviewed.activation_genesis_tree.clone(),
+        activation_genesis_state: reviewed.activation_genesis_state.clone(),
+        repository_identity: reviewed.repository_identity.clone(),
+        uid: request.uid,
+        gid: request.gid,
+        staging_root: request.staging_root.clone(),
+        promotion_ttl_ms: request.promotion_ttl_ms,
+        helper: request.helper.clone(),
+        helper_executable: reviewed.helper_executable.clone(),
+        helper_launch_profile: reviewed.helper_launch_profile.clone(),
+    };
+    Ok((target, reviewed_identity))
 }
 
 impl ManagedPointerRuntimeV1 {
@@ -834,6 +1272,25 @@ impl ManagedPointerRuntimeV1 {
                 )
             })
             .collect()
+    }
+
+    /// Require every configured target to equal its exact genesis before an
+    /// effectd authority store is created for the first time.
+    ///
+    /// This closes the avoidable interval in which a stale reviewed config
+    /// could initialize an immutable store and only then fail live activation.
+    /// The ordinary post-store governed-history check remains mandatory
+    /// because an external target owner can still race this observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for helper, repository, layout, ref, object, tree,
+    /// cleanliness, checked-out-state, or exact state-identity drift.
+    pub fn require_configured_genesis(&self) -> Result<(), ManagedPointerError> {
+        for (target, expected) in self.activation_geneses() {
+            self.require_activation_state(&target, &expected)?;
+        }
+        Ok(())
     }
 
     /// Require one enrolled target to select the exact object and tree derived
@@ -2614,6 +3071,8 @@ fn failure_outcome(error: &ManagedPointerError) -> ExecutionOutcomeV1 {
             Some("managed_pointer_io".to_owned()),
         ),
         ManagedPointerError::TargetUnavailable
+        | ManagedPointerError::GenesisMeasurementInvalid
+        | ManagedPointerError::GenesisMeasurementDrift
         | ManagedPointerError::PreparationStandingAbsent
         | ManagedPointerError::PreparationStandingScopeMismatch
         | ManagedPointerError::PreparationBudgetExceeded
@@ -3165,6 +3624,14 @@ fn errno_to_io(error: rustix::io::Errno) -> std::io::Error {
 
 impl PinnedGitV1 {
     fn open(path: &Path, expected: &Digest) -> Result<Self, ManagedPointerError> {
+        Self::open_inner(path, Some(expected))
+    }
+
+    fn measure(path: &Path) -> Result<Self, ManagedPointerError> {
+        Self::open_inner(path, None)
+    }
+
+    fn open_inner(path: &Path, expected: Option<&Digest>) -> Result<Self, ManagedPointerError> {
         let mut source = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -3176,7 +3643,7 @@ impl PinnedGitV1 {
         require_no_security_capability(&source)?;
         let bytes = read_exact_git_bytes(&mut source, metadata.len())?;
         let executable = Digest::hash_bytes(&bytes);
-        if executable != *expected {
+        if expected.is_some_and(|expected| executable != *expected) {
             return Err(ManagedPointerError::GitIdentityMismatch);
         }
         let mut snapshot = sealed_executable_snapshot(&bytes)?;
@@ -4238,6 +4705,18 @@ fn utf8_path(path: &Path) -> Result<String, ManagedPointerError> {
         .ok_or(ManagedPointerError::BindingMismatch)
 }
 
+fn normalized_absolute_path(path: &Path) -> bool {
+    let normalized: PathBuf = path.components().collect();
+    path.is_absolute()
+        && normalized == path
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+}
+
 fn validate_production_staging_custody(
     is_directory: bool,
     uid: u32,
@@ -4356,6 +4835,82 @@ mod tests {
 
     use super::*;
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct RepositorySnapshotNodeV1 {
+        path: String,
+        file_type: u32,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        links: u64,
+        device: u64,
+        inode: u64,
+        length: u64,
+        mtime: i64,
+        mtime_nsec: i64,
+        content: Option<Digest>,
+    }
+
+    fn repository_snapshot(root: &Path) -> Vec<RepositorySnapshotNodeV1> {
+        fn visit(root: &Path, path: &Path, nodes: &mut Vec<RepositorySnapshotNodeV1>) {
+            let mut entries = fs::read_dir(path)
+                .expect("snapshot directory")
+                .map(|entry| entry.expect("snapshot entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for entry in entries {
+                let metadata = fs::symlink_metadata(&entry).expect("snapshot metadata");
+                let content = if metadata.file_type().is_file() {
+                    Some(Digest::hash_bytes(
+                        &fs::read(&entry).expect("snapshot content"),
+                    ))
+                } else if metadata.file_type().is_symlink() {
+                    Some(Digest::hash_bytes(
+                        fs::read_link(&entry)
+                            .expect("snapshot link")
+                            .to_string_lossy()
+                            .as_bytes(),
+                    ))
+                } else {
+                    None
+                };
+                nodes.push(RepositorySnapshotNodeV1 {
+                    path: entry
+                        .strip_prefix(root)
+                        .expect("snapshot relative path")
+                        .to_string_lossy()
+                        .into_owned(),
+                    file_type: metadata.mode() & libc::S_IFMT,
+                    mode: metadata.mode() & 0o7777,
+                    uid: metadata.uid(),
+                    gid: metadata.gid(),
+                    links: metadata.nlink(),
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    length: metadata.len(),
+                    mtime: metadata.mtime(),
+                    mtime_nsec: metadata.mtime_nsec(),
+                    content,
+                });
+                if metadata.file_type().is_dir() {
+                    visit(root, &entry, nodes);
+                }
+            }
+        }
+
+        let mut nodes = Vec::new();
+        visit(root, root, &mut nodes);
+        nodes
+    }
+
+    fn assert_staging_root_empty(path: &Path) {
+        assert_eq!(
+            fs::read_dir(path).expect("staging root").count(),
+            0,
+            "genesis observation left staging residue"
+        );
+    }
+
     #[test]
     fn strict_bundle_parser_rejects_prerequisites_extra_refs_and_noncanonical_ids() {
         let oid = "1".repeat(40);
@@ -4425,7 +4980,7 @@ mod tests {
     }
 
     struct GitFixtureV1 {
-        _directory: TempDir,
+        directory: TempDir,
         runtime: ManagedPointerRuntimeV1,
         target: TargetId,
         bundle: Vec<u8>,
@@ -4671,7 +5226,7 @@ mod tests {
             security_profile_identity,
         };
         GitFixtureV1 {
-            _directory: directory,
+            directory,
             runtime,
             target: target_id,
             bundle,
@@ -5243,5 +5798,110 @@ mod tests {
         expect_precondition_failure(&base_receipt);
         assert_eq!(managed_ref(&base), drift_object);
         assert!(!base.sentinel.exists());
+    }
+
+    fn genesis_request(
+        fixture: &GitFixtureV1,
+    ) -> (
+        ManagedPointerGenesisRequestV1,
+        ManagedPointerGenesisContextV1,
+    ) {
+        let target = &fixture.runtime.targets[&fixture.target];
+        (
+            ManagedPointerGenesisRequestV1 {
+                schema: MANAGED_POINTER_GENESIS_REQUEST_SCHEMA_V1.to_owned(),
+                security_profile: "development".to_owned(),
+                target: fixture.target.as_str().to_owned(),
+                allowed_root: target.allowed_root.clone(),
+                repository: target.repository.clone(),
+                reference: target.reference.clone(),
+                uid: target.uid,
+                gid: target.gid,
+                staging_root: target.staging_root.clone(),
+                promotion_ttl_ms: target.promotion_ttl_ms,
+                helper: PathBuf::from("/usr/bin/git"),
+            },
+            ManagedPointerGenesisContextV1 {
+                authority_domain: "domain:genesis-test".to_owned(),
+                epoch: "1".to_owned(),
+                effectd_config_template: Digest::hash_bytes(b"effectd template"),
+                effectd_database: fixture.directory.path().join("effectd.db"),
+                effectd_object_store: fixture.directory.path().join("effectd-objects"),
+            },
+        )
+    }
+
+    #[test]
+    fn genesis_measurement_is_read_only_and_directly_derives_exact_target() {
+        let fixture = fixture();
+        let (request, context) = genesis_request(&fixture);
+        let reference = request.repository.join(".git").join(&request.reference);
+        let before = fs::metadata(&reference).expect("reference metadata");
+        let repository_before = repository_snapshot(&request.repository);
+        assert_staging_root_empty(&request.staging_root);
+        let measurement =
+            measure_managed_pointer_genesis(&request, &context).expect("exact measurement");
+        measurement.verify().expect("verified measurement");
+        assert_eq!(repository_snapshot(&request.repository), repository_before);
+        assert_staging_root_empty(&request.staging_root);
+        let after = fs::metadata(&reference).expect("reference metadata after measurement");
+        assert_eq!(before.dev(), after.dev());
+        assert_eq!(before.ino(), after.ino());
+        assert_eq!(before.mtime(), after.mtime());
+        assert_eq!(before.mtime_nsec(), after.mtime_nsec());
+        assert_eq!(
+            measurement.activation_genesis_object,
+            fixture.expected_object
+        );
+
+        let (target, identity) = enroll_managed_pointer_genesis(&request, &context, &measurement)
+            .expect("fresh exact enrollment");
+        assert_eq!(repository_snapshot(&request.repository), repository_before);
+        assert_staging_root_empty(&request.staging_root);
+        assert_eq!(
+            identity,
+            measurement.identity().expect("measurement identity")
+        );
+        assert!(matches!(
+            target,
+            EffectTargetConfigV1::ManagedPointer {
+                id,
+                activation_genesis_object,
+                activation_genesis_state,
+                repository_identity,
+                ..
+            } if id == request.target
+                && activation_genesis_object == fixture.expected_object
+                && activation_genesis_state == measurement.activation_genesis_state
+                && repository_identity == measurement.repository_identity
+        ));
+    }
+
+    #[test]
+    fn genesis_enrollment_refuses_same_value_ref_inode_replacement_after_review() {
+        let fixture = fixture();
+        let (request, context) = genesis_request(&fixture);
+        let measurement =
+            measure_managed_pointer_genesis(&request, &context).expect("reviewed measurement");
+        let reference = request.repository.join(".git").join(&request.reference);
+        let replacement = reference.with_extension("ag-genesis-replacement");
+        fs::write(&replacement, fs::read(&reference).expect("reference bytes"))
+            .expect("replacement reference");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+            .expect("replacement mode");
+        fs::rename(&replacement, &reference).expect("replace same-value reference inode");
+        let repository_before_refusal = repository_snapshot(&request.repository);
+        assert_staging_root_empty(&request.staging_root);
+
+        assert!(matches!(
+            enroll_managed_pointer_genesis(&request, &context, &measurement),
+            Err(ManagedPointerError::GenesisMeasurementDrift)
+        ));
+        assert_eq!(
+            repository_snapshot(&request.repository),
+            repository_before_refusal
+        );
+        assert_staging_root_empty(&request.staging_root);
+        assert_eq!(managed_ref(&fixture), fixture.expected_object);
     }
 }

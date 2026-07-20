@@ -55,6 +55,7 @@ remain pending.
 See `docs/architecture.md` and `docs/source-baseline.md` for the implementation
 contract and source custody. Operational reviewers should also read
 `docs/deployment.md`, `docs/managed-pointer-activation-readiness.md`,
-`docs/backup-restore.md`, `docs/release-checklist.md`, and
+`docs/clean-host-activation-qualification.md`, `docs/backup-restore.md`,
+`docs/release-checklist.md`, and
 `docs/migration-m8.md`; the current tree is explicitly not production
 deployable until that checklist closes.

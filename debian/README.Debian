@@ -1,0 +1,9 @@
+Agent Governor NG documentation paths
+-------------------------------------
+
+Source-tree references such as `docs/deployment.md` are installed flat under
+`/usr/share/doc/agent-governor-ng/`; read the corresponding
+`/usr/share/doc/agent-governor-ng/deployment.md` file. The systemd deployment
+contract is installed as `systemd-deployment.md` to avoid a README basename
+collision. Configuration examples are uncompressed under the `examples/`
+subdirectory and are inert until copied, site-enrolled, and reviewed.

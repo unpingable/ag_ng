@@ -57,12 +57,16 @@ it does not upgrade the system verdict to production deployable:
   history and exact live-head verdict. A same-object ref-inode substitution
   therefore blocks managed-file authority as well as pointer authority.
 
-Still open: clean-host service/package activation; operator genesis
-measurement/enrollment tooling; simultaneous client and reader specimens;
-expanded `SystemCallFilter` equality; real disk-full, WAL/fsync, power-loss and
-filesystem matrices; applied-reconciliation durability recovery; whole
-store-plus-target anti-rollback; same-inode historical ABA; bounded/cached
-history reconstruction; and a deadline for doctor subprocesses.
+The packaged offline genesis ceremony now binds a managed-pointer-free effectd template,
+authority/epoch/empty-store context, full descriptor measurement, fresh exact
+remeasurement, complete final config, target-derived unit drop-in, and a
+separately verifiable non-authorizing receipt. First-start effectd also checks
+configured genesis before creating its immutable store. Still open:
+clean-host execution of that ceremony; simultaneous client and reader
+specimens; expanded `SystemCallFilter` equality; real disk-full, WAL/fsync,
+power-loss and filesystem matrices; applied-reconciliation durability
+recovery; whole store-plus-target anti-rollback; same-inode historical ABA;
+bounded/cached history reconstruction; and a deadline for doctor subprocesses.
 
 Explicit qualification gaps are real power-loss/torn-write testing, live
 multi-process daemon restart under the packaged sandbox, package
@@ -78,8 +82,8 @@ Known blockers in the current tree include:
   capability/configured-write-root parity, live required/protected mount
   checks, target preflight, and an inspectable durable
   activation receipt, but real packaged-host/Git/Landlock/filesystem
-  qualification, genesis enrollment tooling, expanded syscall-filter
-  attestation, and the power-loss matrix remain open;
+  qualification, execution of the packaged genesis ceremony, expanded
+  syscall-filter attestation, and the power-loss matrix remain open;
 - offline three-writer-fence coordination, sealed SQLite/object capture,
   hostile coherence validation, atomic local publication, and immutable
   evidence restore exist, but there is no live cross-daemon coordinator,

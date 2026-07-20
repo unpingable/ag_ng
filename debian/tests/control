@@ -1,0 +1,7 @@
+Tests: package-contract
+Depends: @, systemd
+Restrictions: isolation-machine, needs-root
+
+Tests: alternate-root-maintscript
+Depends: systemd
+Restrictions: needs-root

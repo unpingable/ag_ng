@@ -15,14 +15,29 @@ override_dh_auto_build:
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	cargo test --locked --offline --workspace --all-targets
+	python3 qualification/clean-host/validate.py
+	python3 -m unittest discover -s qualification/clean-host -p 'test_*.py'
 endif
 
 override_dh_auto_install:
 	# dh_install consumes debian/agent-governor-ng.install.
 	:
 
+execute_after_dh_installdocs:
+	install -m 0644 packaging/systemd/README.md \
+		debian/agent-governor-ng/usr/share/doc/agent-governor-ng/systemd-deployment.md
+
+override_dh_installtmpfiles:
+	# Custody creation is part of the package contract; do not use the default
+	# best-effort (`|| true`) maintainer-script snippet.
+	# dh_install already copied the reviewed file listed in the install manifest.
+	:
+
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start
+
+override_dh_compress:
+	dh_compress -X.md -X.toml -X.json
 
 override_dh_missing:
 	dh_missing --fail-missing

@@ -39,6 +39,11 @@ the proposal policy.
 Run `systemd-sysusers` before `systemd-tmpfiles --create`. Installed production
 configuration is root-owned, not group/other writable, and uses the numeric
 IDs resolved on that host. The example IDs and digests are placeholders.
+Tmpfiles also creates `/var/lib/agent-governor/effectd/objects` and
+`/var/lib/agent-governor/effectd/promotion-stage` as `0700 root:root`. The
+package creates `/etc/systemd/system/ag-effectd.service.d` as `0755 root:root`
+for the no-overwrite enrollment output. Run `systemctl daemon-reload` and check
+the effective unit after publishing that drop-in and before first start.
 
 ## Readiness and process observation
 
@@ -59,6 +64,13 @@ No unit receives `CAP_SYS_PTRACE`—not even effectd, because ptrace would be a
 second generic effect surface.
 
 ## Effects, provider credentials, and workers
+
+For a new managed-pointer authority, do not hand-calculate the genesis fields
+or assemble this drop-in manually. The packaged offline
+`agctl managed-pointer measure-genesis` / `enroll-genesis` ceremony derives the
+complete final effectd config and resets the capability/write-path lists to
+the exact catalog-derived set. The directives below document that generated
+contract and remain useful for review.
 
 For every managed repository, staging root, or file parent, install a
 root-owned effectd drop-in. A managed-pointer catalog must also replace the

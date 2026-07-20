@@ -2074,7 +2074,7 @@ mod tests {
 
     #[test]
     fn activation_pipes_arrive_on_exact_descriptors() {
-        let python = Path::new("/usr/bin/python3.12");
+        let python = Path::new("/usr/bin/python3");
         assert!(python.is_file(), "Python fixture is required");
         let script = concat!(
             "import array,os,socket;",
