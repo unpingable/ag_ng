@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -286,6 +290,24 @@ class ContinuationReceiptTests(unittest.TestCase):
             (root / "unmanifested").write_bytes(b"extra")
             manifest = BUNDLE.load_canonical_json(root / "manifest.v1.json")
             self.assert_refuses(lambda: BUNDLE.verify_manifest_coverage(root, manifest))
+
+    def test_cli_import_does_not_create_bytecode_before_measurement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copy2(HERE / "continuation_receipt.py", root)
+            shutil.copy2(HERE / "bundle.py", root)
+            environment = os.environ.copy()
+            environment.pop("PYTHONDONTWRITEBYTECODE", None)
+            completed = subprocess.run(
+                [sys.executable, str(root / "continuation_receipt.py"), "--help"],
+                cwd=root,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            self.assertFalse((root / "__pycache__").exists())
 
 
 if __name__ == "__main__":

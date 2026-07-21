@@ -19,6 +19,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, Sequence
 
 
+# Initialization measures the invoking worktree.  Prevent the dynamic import
+# below from creating an untracked ``__pycache__`` before that measurement.
+sys.dont_write_bytecode = True
+
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("clean_host_bundle", HERE / "bundle.py")
 assert SPEC is not None and SPEC.loader is not None
