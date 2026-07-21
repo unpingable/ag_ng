@@ -253,3 +253,31 @@ mandatory cell has run or an exact earlier gate has produced the bounded
 `BLOCKED` stop. The aggregate must be a separate receipt-only commit whose
 source/harness/package/image digests refer backward to immutable inputs.
 Private fixture signing keys must never be copied into evidence.
+
+## Debian 12 amd64 continuation
+
+`continuation-claim.v1.json` is a new, narrower claim; it does not amend the
+immutable blocked receipt or make the frozen four-guest claim succeed. It
+qualifies all eleven case families only for Debian 12 amd64. Debian 12 arm64
+and both Ubuntu cells remain structurally empty `not_run_not_claimed` cells,
+and the shipped submit/ratify workflow and compiler-closure/reproducibility
+work remain explicit roadmap exclusions.
+
+Initialize with the committed continuation tool, record commands through the
+copied `bundle.py`, add the canonical continuation metadata and typed build
+record, then seal, publish, and reopen:
+
+```text
+python3 qualification/clean-host/continuation_receipt.py init /tmp/ag-continuation
+python3 /tmp/ag-continuation/inputs/bundle.py record ...
+python3 /tmp/ag-continuation/inputs/bundle.py seal /tmp/ag-continuation
+python3 /tmp/ag-continuation/inputs/continuation_receipt.py publish /tmp/ag-continuation
+python3 /tmp/ag-continuation/inputs/continuation_receipt.py verify --write-result /tmp/ag-continuation
+```
+
+The continuation bundle copies and binds the tracked predecessor receipt,
+manifest, verification result, and evidence locator. `REQUALIFIED` requires
+one exact final amd64 package and every scoped case to pass; it does not invent
+a pre-repair package generation where the predecessor produced none. A
+`BLOCKED` continuation stops at the first exact scoped obstruction and leaves
+all later scoped cases `not_run`.
