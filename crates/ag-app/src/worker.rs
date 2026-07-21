@@ -264,7 +264,7 @@ pub struct WorkerLaunchEvidenceV1 {
     pub sandbox_executable: ExecutableIdentityV1,
     /// Exact worker executable identity.
     pub worker_executable: ExecutableIdentityV1,
-    /// Exact logical argv, including the configured argv zero.
+    /// Exact logical argv, including the fixed synthetic worker path as argv zero.
     pub argv: Vec<String>,
     /// Exact workspace identity.
     pub workspace: Digest,
@@ -786,7 +786,7 @@ where
     let (workspace_fd, workspace) =
         create_workspace(&workspace_root, &launcher.workspace_root, workspace_name)?;
 
-    let argv = std::iter::once(worker_profile.profile_id.clone())
+    let argv = std::iter::once(WORKER_PATH.to_owned())
         .chain(worker_profile.fixed_arguments.iter().cloned())
         .collect::<Vec<_>>();
     let launch_profile = launch_profile_digest(
@@ -897,8 +897,6 @@ where
         .arg(WORKSPACE_PATH)
         .arg("--chdir")
         .arg(WORKSPACE_PATH)
-        .arg("--argv0")
-        .arg(&worker_profile.profile_id)
         .arg("--")
         .arg(WORKER_PATH)
         .args(&worker_profile.fixed_arguments);
@@ -1840,6 +1838,10 @@ mod tests {
     fn fixed_worker_remains_gated_then_returns_candidate() {
         let fixture = fixture(Path::new("/usr/bin/printf"), &["candidate"]);
         let mut prepared = prepare(&fixture, "fixed-worker");
+        assert_eq!(
+            prepared.evidence.argv,
+            [WORKER_PATH.to_owned(), "candidate".to_owned()]
+        );
         thread::sleep(Duration::from_millis(25));
         assert!(
             prepared

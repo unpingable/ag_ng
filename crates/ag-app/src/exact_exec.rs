@@ -254,8 +254,8 @@ mod tests {
     #[test]
     fn child_inherits_only_admitted_fd_without_mutating_parent_flags() {
         let source = File::open("/dev/null").expect("source FD");
-        let admitted = rustix::io::fcntl_dupfd_cloexec(&source, 1900).expect("admitted high FD");
-        let sentinel = rustix::io::fcntl_dupfd_cloexec(&source, 2000).expect("sentinel high FD");
+        let admitted = rustix::io::fcntl_dupfd_cloexec(&source, 190).expect("admitted high FD");
+        let sentinel = rustix::io::fcntl_dupfd_cloexec(&source, 200).expect("sentinel high FD");
         let admitted_fd = admitted.as_raw_fd();
         let sentinel_fd = sentinel.as_raw_fd();
         assert!(
