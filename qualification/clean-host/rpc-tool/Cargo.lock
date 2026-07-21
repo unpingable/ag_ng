@@ -48,6 +48,7 @@ dependencies = [
  "ring",
  "serde",
  "tempfile",
+ "toml",
  "uuid",
 ]
 

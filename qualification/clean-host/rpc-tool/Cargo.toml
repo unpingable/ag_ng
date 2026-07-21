@@ -27,6 +27,7 @@ uuid = { version = "1.23.1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+toml = "0.8.23"
 
 [lints.rust]
 unsafe_code = "deny"
