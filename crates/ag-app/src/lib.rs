@@ -5,6 +5,7 @@ pub mod api;
 pub mod config;
 mod custody;
 pub mod derived;
+pub mod descriptor_path;
 pub mod doctor;
 pub mod effectd;
 pub mod effectd_activation;

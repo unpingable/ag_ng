@@ -3,10 +3,14 @@
 //! This module intentionally has no command runner. Managed pointers are
 //! delegated to an independently pinned helper, and systemd operations are
 //! delegated to a typed D-Bus capability. Managed files are handled directly
-//! through directory file descriptors and Linux `openat2`/`renameat2`.
+//! through directory file descriptors and Linux `openat2`/`renameat2`. When
+//! `openat2` returns `ENOSYS` inside an otherwise admitted sandbox, the same
+//! no-symlink traversal is performed one normal component at a time with
+//! `openat`.
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt as _;
 use std::path::{Component, Path};
 
@@ -1803,12 +1807,11 @@ fn secure_parent(
                 "managed parent contains a non-normal component",
             ));
         };
-        let next = fs::openat2(
+        let next = open_beneath(
             &parent_fd,
-            *component,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Path::new(*component),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
-            ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
         )
         .map_err(|error| {
             LocalExecutionError::new(
@@ -1859,12 +1862,11 @@ fn observe_entry(
     name: &str,
     max_content_bytes: u64,
 ) -> Result<Option<ObservedFile>, LocalExecutionError> {
-    let fd = match fs::openat2(
+    let fd = match open_beneath(
         parent,
-        name,
+        Path::new(name),
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     ) {
         Ok(fd) => fd,
         Err(Errno::NOENT) => return Ok(None),
@@ -1949,6 +1951,88 @@ fn observe_entry(
     Ok(Some(ObservedFile {
         digest: Digest::hash_bytes(&bytes),
     }))
+}
+
+fn open_beneath(
+    parent: &OwnedFd,
+    relative: &Path,
+    flags: OFlags,
+    mode: Mode,
+) -> Result<OwnedFd, Errno> {
+    validate_relative(relative)?;
+    let attempted = fs::openat2(
+        parent,
+        relative,
+        flags,
+        mode,
+        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+    );
+    finish_open_beneath(parent, relative, flags, mode, attempted)
+}
+
+fn finish_open_beneath(
+    parent: &OwnedFd,
+    relative: &Path,
+    flags: OFlags,
+    mode: Mode,
+    attempted: Result<OwnedFd, Errno>,
+) -> Result<OwnedFd, Errno> {
+    validate_relative(relative)?;
+    match attempted {
+        Err(Errno::NOSYS) => open_beneath_with_openat(parent, relative, flags, mode),
+        result => result,
+    }
+}
+
+fn open_beneath_with_openat(
+    parent: &OwnedFd,
+    relative: &Path,
+    flags: OFlags,
+    mode: Mode,
+) -> Result<OwnedFd, Errno> {
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(component) => Ok(component),
+            _ => Err(Errno::INVAL),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if components.is_empty() {
+        return Err(Errno::INVAL);
+    }
+
+    let mut current = None;
+    for (index, component) in components.iter().enumerate() {
+        let directory = current.as_ref().unwrap_or(parent);
+        let final_component = index + 1 == components.len();
+        let opened = if final_component {
+            fs::openat(directory, *component, flags, mode)?
+        } else {
+            fs::openat(
+                directory,
+                *component,
+                OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?
+        };
+        current = Some(opened);
+    }
+    current.ok_or(Errno::INVAL)
+}
+
+fn validate_relative(relative: &Path) -> Result<(), Errno> {
+    let raw = relative.as_os_str().as_bytes();
+    if raw.is_empty()
+        || raw
+            .split(|byte| *byte == b'/')
+            .any(|component| component.is_empty() || component == b"." || component == b"..")
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(Errno::INVAL);
+    }
+    Ok(())
 }
 
 fn ensure_internal_names_absent(
@@ -2559,6 +2643,133 @@ mod tests {
             helper_executable: Digest::hash_bytes(b"helper-executable"),
             helper_launch_profile: Digest::hash_bytes(b"helper-profile"),
         }
+    }
+
+    fn fallback_test_root(path: &Path) -> OwnedFd {
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .expect("open fallback test root")
+    }
+
+    #[test]
+    fn openat_fallback_opens_nested_file_and_preserves_create_mode() {
+        let directory = TempDir::new().expect("temp directory");
+        let nested = directory.path().join("one/two");
+        fs::create_dir_all(&nested).expect("nested directories");
+        fs::write(nested.join("existing"), b"exact bytes").expect("nested file");
+        let root = fallback_test_root(directory.path());
+
+        let opened = finish_open_beneath(
+            &root,
+            Path::new("one/two/existing"),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+            Err(Errno::NOSYS),
+        )
+        .expect("component fallback opens nested file");
+        let mut opened = File::from(opened);
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).expect("read nested file");
+        assert_eq!(bytes, b"exact bytes");
+
+        let created = finish_open_beneath(
+            &root,
+            Path::new("one/two/created"),
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(0o600),
+            Err(Errno::NOSYS),
+        )
+        .expect("component fallback creates exact file");
+        let stat = rustix::fs::fstat(&created).expect("created file metadata");
+        assert!(FileType::from_raw_mode(stat.st_mode).is_file());
+        assert_eq!(stat.st_mode & 0o7777, 0o600);
+    }
+
+    #[test]
+    fn openat_fallback_refuses_intermediate_and_final_symlinks() {
+        let directory = TempDir::new().expect("temp directory");
+        let inside = directory.path().join("inside");
+        let outside = directory.path().join("outside");
+        fs::create_dir(&inside).expect("inside directory");
+        fs::create_dir(&outside).expect("outside directory");
+        fs::write(outside.join("sentinel"), b"outside").expect("outside sentinel");
+        symlink(&outside, directory.path().join("intermediate-link"))
+            .expect("intermediate symlink");
+        symlink(outside.join("sentinel"), inside.join("final-link")).expect("final symlink");
+        let root = fallback_test_root(directory.path());
+        let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+
+        assert!(
+            finish_open_beneath(
+                &root,
+                Path::new("intermediate-link/sentinel"),
+                flags,
+                Mode::empty(),
+                Err(Errno::NOSYS),
+            )
+            .is_err()
+        );
+        assert!(
+            finish_open_beneath(
+                &root,
+                Path::new("inside/final-link"),
+                flags,
+                Mode::empty(),
+                Err(Errno::NOSYS),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(outside.join("sentinel")).expect("sentinel"),
+            b"outside"
+        );
+    }
+
+    #[test]
+    fn openat_fallback_refuses_non_normal_paths_and_other_errors() {
+        let directory = TempDir::new().expect("temp directory");
+        fs::create_dir(directory.path().join("inside")).expect("inside directory");
+        let root = fallback_test_root(directory.path());
+
+        let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        for hostile in [
+            "",
+            "/inside/file",
+            "inside/../outside",
+            "./inside/file",
+            "inside//file",
+            "inside/file/",
+        ] {
+            assert_eq!(
+                finish_open_beneath(
+                    &root,
+                    Path::new(hostile),
+                    flags,
+                    Mode::empty(),
+                    Err(Errno::NOSYS),
+                )
+                .unwrap_err(),
+                Errno::INVAL
+            );
+            assert_eq!(
+                open_beneath(&root, Path::new(hostile), flags, Mode::empty()).unwrap_err(),
+                Errno::INVAL
+            );
+        }
+        assert_eq!(
+            finish_open_beneath(
+                &root,
+                Path::new("inside/file"),
+                flags,
+                Mode::empty(),
+                Err(Errno::PERM),
+            )
+            .unwrap_err(),
+            Errno::PERM
+        );
     }
 
     #[test]

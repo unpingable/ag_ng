@@ -24,6 +24,13 @@ for unit in agd.service ag-effectd.service ag-providerd.service; do
         fail "$unit is not inactive"
 done
 
+for unit in agd.service ag-effectd.service ag-providerd.service; do
+    path="/usr/lib/systemd/system/$unit"
+    restrict_suid_sgid=$(sed -n '/^RestrictSUIDSGID=/p' "$path")
+    [ "$restrict_suid_sgid" = "RestrictSUIDSGID=yes" ] || \
+        fail "$unit does not retain the exact SUID/SGID creation restriction"
+done
+
 [ ! -e /usr/lib/systemd/system/ag-worker@.service ] || fail "worker unit was packaged"
 [ ! -e /usr/lib/systemd/system/ag-check@.service ] || fail "check unit was packaged"
 [ ! -e /usr/libexec/agent-governor/ag-worker ] || fail "worker helper was packaged"

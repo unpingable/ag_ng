@@ -103,6 +103,14 @@ daemon does not yet compare systemd's architecture-expanded
 clean-host qualification must verify it; package text alone is not live
 attestation evidence.
 
+The units also retain `RestrictSUIDSGID=yes`. Systemd enforces that property
+with a separate seccomp rule that returns `ENOSYS` for `openat2`, whose pointed
+`open_how` mode cannot be inspected by classic seccomp. Production
+daemon-owned descriptor path opens therefore retry only that error through
+normalized component-by-component `openat` with `O_NOFOLLOW`; creation flags
+and modes remain visible to the SUID/SGID filter. Other `openat2` errors never
+select the compatibility path.
+
 Each base daemon unit maps a distinct host/TPM-bound blob from
 `/etc/credstore.encrypted` to the runtime ID `rpc-ed25519-pkcs8`. Provider API
 secrets arrive through additional `LoadCredentialEncrypted=` entries in a

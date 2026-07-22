@@ -792,7 +792,7 @@ impl RpcSignerV1 {
 }
 
 fn read_protected_credential(path: &Path) -> Result<Vec<u8>, RpcAuthError> {
-    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    use rustix::fs::{Mode, OFlags};
 
     let root = rustix::fs::open(
         "/",
@@ -804,12 +804,11 @@ fn read_protected_credential(path: &Path) -> Result<Vec<u8>, RpcAuthError> {
     let relative = path
         .strip_prefix("/")
         .map_err(|_| RpcAuthError::UnsafeCredentialPath)?;
-    let descriptor = rustix::fs::openat2(
+    let descriptor = crate::descriptor_path::open_beneath(
         &root,
         relative,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
     .map_err(errno_to_io)
     .map_err(|source| RpcAuthError::CredentialIo { source })?;

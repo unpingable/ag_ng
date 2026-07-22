@@ -18,7 +18,7 @@ use ag_session::ProviderRequestCustodyV1;
 use ag_store::{NewEventV1, Store};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use rustix::fs::{FileType, Mode, OFlags, ResolveFlags};
+use rustix::fs::{FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -26,6 +26,7 @@ use ag_app::api::{
     ApiErrorCodeV1, ApiResultV1, HealthV1, OpaqueBytesV1, ProviderRequestV1, ProviderResponseV1,
 };
 use ag_app::config::{ProviderEndpointConfigV1, ProviderModelPolicyConfigV1, ProviderdConfigV1};
+use ag_app::descriptor_path::open_beneath;
 use ag_app::rpc_auth::VerifiedRpcPrincipalV1;
 
 const TERMINATION_PAGE_SIZE: u32 = 64;
@@ -1007,21 +1008,19 @@ fn read_provider_credential(
         Mode::empty(),
     )
     .map_err(|_| ProviderError::CredentialUnavailable)?;
-    let directory_fd = rustix::fs::openat2(
+    let directory_fd = open_beneath(
         &root,
         relative,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
     .map_err(|_| ProviderError::CredentialUnavailable)?;
     validate_credential_directory(&directory_fd)?;
-    let credential_fd = rustix::fs::openat2(
+    let credential_fd = open_beneath(
         &directory_fd,
-        credential_name,
+        Path::new(credential_name),
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
     .map_err(|_| ProviderError::CredentialUnavailable)?;
     read_credential_fd(credential_fd)

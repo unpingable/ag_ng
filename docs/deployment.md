@@ -331,8 +331,13 @@ variable, argv, logs, SQLite, or an audit export. Providerd may use the secret
 and network but holds no standing, ratification, effect, or target state.
 
 Providerd opens the credential directory and named credential with bounded
-`openat2` descriptor traversal, rejects symlinks and traversal, and reads a
-single-link regular file only from root or its own effective UID. Group/other
+descriptor traversal. It uses `openat2` with beneath/no-symlink resolution
+when admitted. If a service sandbox returns `ENOSYS` for `openat2`, as
+`RestrictSUIDSGID=yes` does so creation modes remain seccomp-inspectable, it
+falls back to one normalized, no-follow `openat` per component. The fallback
+rejects empty, absolute, dot, parent, and symlink components and keeps every
+ancestor anchored by its opened descriptor. The reader accepts only a
+single-link regular file owned by root or its own effective UID. Group/other
 permissions, empty or non-UTF-8 content, a read race, and content above 64 KiB
 all fail closed.
 

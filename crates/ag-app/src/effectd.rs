@@ -24,7 +24,7 @@ use ag_primitives::{
 use ag_session::WorkerCandidateCustodyV1;
 use ag_store::{BlobDescriptorV1, NewEventV1, Store};
 use base64::Engine as _;
-use rustix::fs::{FileType, Mode, OFlags, ResolveFlags};
+use rustix::fs::{FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -37,6 +37,7 @@ use crate::api::{
 #[cfg(test)]
 use crate::api::{ProposalIngressProofV1, WorkerCandidateIngressProofV1};
 use crate::config::{EffectTargetConfigV1, EffectdConfigV1, PeerPolicyV1};
+use crate::descriptor_path::open_beneath;
 use crate::effectd_activation::{
     EFFECTD_ACTIVATION_STATUS_SCHEMA_V1, EffectdActivationReceiptV1, EffectdActivationStatusV1,
     EffectdLiveActivationV1,
@@ -3156,12 +3157,11 @@ fn observe_file(path: &Path, configured_maximum: u64) -> Result<TargetObservatio
         Mode::empty(),
     )
     .map_err(rustix_io_error)?;
-    let fd = match rustix::fs::openat2(
+    let fd = match open_beneath(
         &root,
         relative,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     ) {
         Ok(fd) => fd,
         Err(rustix::io::Errno::NOENT) => {

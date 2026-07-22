@@ -38,7 +38,7 @@ use ag_effect::{
 use ag_primitives::{AuthorityDomain, Digest, Epoch};
 use ag_store::Store;
 use rustix::fd::OwnedFd;
-use rustix::fs::{FileType, Gid, MemfdFlags, Mode, OFlags, ResolveFlags, SealFlags, Uid};
+use rustix::fs::{FileType, Gid, MemfdFlags, Mode, OFlags, SealFlags, Uid};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -46,6 +46,7 @@ use crate::config::{
     EffectTargetConfigV1, EffectdConfigV1, validate_managed_pointer_enrollment_inputs,
     validate_security_profile,
 };
+use crate::descriptor_path::open_beneath;
 
 const BUNDLE_MAGIC_V2: &[u8] = b"# v2 git bundle\n";
 const BUNDLE_CANDIDATE_REF: &str = "refs/heads/ag-candidate";
@@ -2436,12 +2437,11 @@ impl ManagedPointerTargetV1 {
             StagingDirectoryV1::create(&self.staging_root, self.production_staging_custody)?;
         self.initialize_staging(&stage, repository_format)?;
         let mut pack = File::from(
-            rustix::fs::openat2(
+            open_beneath(
                 &stage.directory,
-                "candidate.pack",
+                Path::new("candidate.pack"),
                 OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::from_raw_mode(0o600),
-                ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
             )
             .map_err(errno_to_io)?,
         );
@@ -2722,12 +2722,11 @@ fn sync_imported_object_file(
     uid: u32,
     gid: u32,
 ) -> Result<(Digest, u64), ManagedPointerError> {
-    let descriptor = rustix::fs::openat2(
+    let descriptor = open_beneath(
         parent,
         name,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
     .map_err(errno_to_io)?;
     let stat = rustix::fs::fstat(&descriptor).map_err(errno_to_io)?;
@@ -3176,12 +3175,11 @@ fn open_safe_reference(
         )?;
         current = directory.parent();
     }
-    let reference_file = rustix::fs::openat2(
+    let reference_file = open_beneath(
         git_directory,
         relative,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
     .map_err(errno_to_io)?;
     let reference_stat = rustix::fs::fstat(&reference_file).map_err(errno_to_io)?;
@@ -4349,12 +4347,11 @@ fn open_directory_beneath(
     parent: &OwnedFd,
     relative: &Path,
 ) -> Result<OwnedFd, ManagedPointerError> {
-    rustix::fs::openat2(
+    open_beneath(
         parent,
         relative,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
     .map_err(|error| {
         ManagedPointerError::UnsafeRepository(format!(
@@ -4367,12 +4364,11 @@ fn open_optional_directory_beneath(
     parent: &OwnedFd,
     relative: &Path,
 ) -> Result<Option<OwnedFd>, ManagedPointerError> {
-    match rustix::fs::openat2(
+    match open_beneath(
         parent,
         relative,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     ) {
         Ok(file) => Ok(Some(file)),
         Err(rustix::io::Errno::NOENT) => Ok(None),
@@ -4447,12 +4443,11 @@ fn reference_ancestry_evidence(
 }
 
 fn reject_entry(parent: &OwnedFd, relative: &Path, label: &str) -> Result<(), ManagedPointerError> {
-    match rustix::fs::openat2(
+    match open_beneath(
         parent,
         relative,
         OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     ) {
         Ok(_) => Err(ManagedPointerError::UnsafeRepository(format!(
             "{label} are outside the managed-pointer contract"
@@ -4471,12 +4466,11 @@ fn read_regular_digest_and_node(
     uid: u32,
     gid: u32,
 ) -> Result<(Digest, ManagedFilesystemNodeEvidenceV1, Vec<u8>), ManagedPointerError> {
-    let descriptor = rustix::fs::openat2(
+    let descriptor = open_beneath(
         parent,
         relative,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
     .map_err(|error| {
         ManagedPointerError::UnsafeRepository(format!("could not open exact config: {error}"))
@@ -4600,12 +4594,11 @@ fn read_regular_bytes(
     relative: &Path,
     maximum: u64,
 ) -> Result<Vec<u8>, ManagedPointerError> {
-    let descriptor = rustix::fs::openat2(
+    let descriptor = open_beneath(
         parent,
         relative,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     )
     .map_err(|error| {
         ManagedPointerError::UnsafeRepository(format!("could not open exact file: {error}"))
