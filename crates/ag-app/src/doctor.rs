@@ -23,7 +23,10 @@ use crate::config::{
     ProviderdConfigV1, SocketCustodyConfigV1, StoreConfigV1, load_config_with_identity,
 };
 use crate::custody::{CustodyError, CustodyNodeKindV1, validate_node};
-use crate::effectd_activation::{EFFECTD_UNIT_PROPERTIES, validate_effectd_static_unit};
+use crate::effectd_activation::{
+    EFFECTD_UNIT_PROPERTIES, complete_omitted_unset_systemd_properties,
+    validate_effectd_static_unit,
+};
 
 /// Canonical schema emitted by `agctl doctor`.
 pub const DOCTOR_REPORT_SCHEMA_V1: &str = "ag.doctor-report/v1";
@@ -726,18 +729,8 @@ fn run_bounded_systemd_command(
 
 fn query_systemd() -> Result<Vec<u8>, SystemdQueryErrorV1> {
     let mut command = Command::new(SYSTEMCTL);
-    command.args(["show", "--no-pager"]);
-    for property in SYSTEMD_PROPERTIES {
-        command.arg(format!("--property={property}"));
-    }
-    command
-        .args([
-            "--",
-            "agd.service",
-            "ag-effectd.service",
-            "ag-providerd.service",
-        ])
-        .env_clear();
+    configure_systemd_query(&mut command);
+    command.env_clear();
     let output = run_bounded_systemd_command(&mut command, SYSTEMCTL_TIMEOUT)?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr);
@@ -746,6 +739,19 @@ fn query_systemd() -> Result<Vec<u8>, SystemdQueryErrorV1> {
         });
     }
     Ok(output.stdout)
+}
+
+fn configure_systemd_query(command: &mut Command) {
+    command.args(["show", "--no-pager", "--all"]);
+    for property in SYSTEMD_PROPERTIES {
+        command.arg(format!("--property={property}"));
+    }
+    command.args([
+        "--",
+        "agd.service",
+        "ag-effectd.service",
+        "ag-providerd.service",
+    ]);
 }
 
 #[derive(Clone, Debug)]
@@ -775,6 +781,7 @@ fn parse_systemd_show(bytes: &[u8]) -> Result<BTreeMap<String, SystemdUnitShowV1
             if current.is_empty() {
                 continue;
             }
+            complete_omitted_unset_systemd_properties(&mut current);
             if current.len() != allowed.len() {
                 return Err("systemctl unit block has a missing property".to_owned());
             }
@@ -1464,6 +1471,7 @@ mod tests {
         properties.insert("RestrictAddressFamilies", unit.families.to_owned());
         properties.insert("CapabilityBoundingSet", unit.capabilities.to_owned());
         properties.insert("UMask", "0077".to_owned());
+        properties.insert("SecureBits", "0".to_owned());
         properties.insert("DevicePolicy", "closed".to_owned());
         properties.insert("ProtectClock", "yes".to_owned());
         properties.insert("ProtectHostname", "yes".to_owned());
@@ -1471,7 +1479,7 @@ mod tests {
         properties.insert("RemoveIPC", "yes".to_owned());
         properties.insert("RestrictRealtime", "yes".to_owned());
         properties.insert("SystemCallArchitectures", "native".to_owned());
-        properties.insert("SystemCallErrorNumber", "EPERM".to_owned());
+        properties.insert("SystemCallErrorNumber", "1".to_owned());
         properties.insert("LimitCORE", "0".to_owned());
         properties.insert("LimitNOFILE", "4096".to_owned());
         properties.insert("TasksMax", "128".to_owned());
@@ -1647,6 +1655,58 @@ mod tests {
             exec_start_path(units["ag-effectd.service"].get("ExecStart")).expect("exec path"),
             Path::new("/usr/bin/ag-effectd")
         );
+    }
+
+    #[test]
+    fn systemd_252_omitted_unset_properties_do_not_hide_nonempty_values() {
+        let omitted = [
+            "ExecStartPost=\n",
+            "ExecCondition=\n",
+            "ExecReload=\n",
+            "ExecStop=\n",
+            "ExecStopPost=\n",
+            "EnvironmentFiles=\n",
+        ]
+        .into_iter()
+        .fold(valid_show(), |show, property| show.replace(property, ""));
+        let units = parse_systemd_show(omitted.as_bytes()).expect("systemd 252 output");
+        for unit in units.values() {
+            assert_eq!(unit.get("ExecStop"), "");
+            assert_eq!(unit.get("EnvironmentFiles"), "");
+        }
+
+        let nonempty = omitted.replacen(
+            "ExecStartPre=",
+            "ExecStop={ path=/bin/false ; argv[]=/bin/false ; ignore_errors=no ; }\nExecStartPre=",
+            1,
+        );
+        let units = parse_systemd_show(nonempty.as_bytes()).expect("present property");
+        assert!(!units["agd.service"].get("ExecStop").is_empty());
+
+        let missing_required = omitted.replacen("BindPaths=\n", "", 1);
+        assert!(parse_systemd_show(missing_required.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn systemd_query_requests_empty_properties_for_all_fixed_units() {
+        let mut command = Command::new(SYSTEMCTL);
+        configure_systemd_query(&mut command);
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(&arguments[..3], ["show", "--no-pager", "--all"]);
+        assert_eq!(
+            &arguments[arguments.len() - 4..],
+            [
+                "--",
+                "agd.service",
+                "ag-effectd.service",
+                "ag-providerd.service",
+            ]
+        );
+        assert_eq!(arguments.len(), SYSTEMD_PROPERTIES.len() + 7);
     }
 
     #[test]

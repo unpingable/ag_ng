@@ -107,6 +107,25 @@ pub(crate) const EFFECTD_UNIT_PROPERTIES: &[&str] = &[
     "ConfigurationDirectory",
 ];
 
+// systemd 252 omits these properties entirely when their configured command or
+// environment-file list is empty, including for `systemctl show --all`. A
+// present value is retained and checked normally; only the closed omitted form
+// is normalized to the same empty semantic value.
+const SYSTEMD_OMITTED_WHEN_UNSET_PROPERTIES: &[&str] = &[
+    "ExecStartPost",
+    "ExecCondition",
+    "ExecReload",
+    "ExecStop",
+    "ExecStopPost",
+    "EnvironmentFiles",
+];
+
+pub(crate) fn complete_omitted_unset_systemd_properties(properties: &mut BTreeMap<String, String>) {
+    for property in SYSTEMD_OMITTED_WHEN_UNSET_PROPERTIES {
+        properties.entry((*property).to_owned()).or_default();
+    }
+}
+
 /// Exact current-process evidence behind one readiness decision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,6 +180,9 @@ pub struct EffectdActivationReceiptV1 {
     /// Exact bounded output of the fixed effective-unit query.
     pub systemctl_output: Digest,
     /// Strict complete effective property map for `ag-effectd.service`.
+    ///
+    /// The closed systemd-252 omitted-when-unset set is represented by empty
+    /// values here; [`Self::systemctl_output`] still binds the exact raw bytes.
     pub effective_unit: BTreeMap<String, String>,
     /// Closed capability names derived from the configured target catalog.
     pub required_capabilities: Vec<String>,
@@ -717,6 +739,7 @@ fn parse_effective_unit(bytes: &[u8]) -> Result<BTreeMap<String, String>, Effect
             ));
         }
     }
+    complete_omitted_unset_systemd_properties(&mut properties);
     if properties.len() != allowed.len() {
         return Err(EffectdActivationError::UnitUnavailable(
             "effective unit property cut is incomplete".to_owned(),
@@ -794,7 +817,7 @@ pub(crate) fn validate_effectd_static_unit(
         ("PassEnvironment", ""),
         ("UnsetEnvironment", ""),
         ("UMask", "0077"),
-        ("SecureBits", ""),
+        ("SecureBits", "0"),
         ("NoNewPrivileges", "yes"),
         ("ProtectSystem", "strict"),
         ("ProtectHome", "yes"),
@@ -818,7 +841,7 @@ pub(crate) fn validate_effectd_static_unit(
         ("RemoveIPC", "yes"),
         ("RestrictRealtime", "yes"),
         ("SystemCallArchitectures", "native"),
-        ("SystemCallErrorNumber", "EPERM"),
+        ("SystemCallErrorNumber", "1"),
         ("LimitCORE", "0"),
         ("LimitNOFILE", "4096"),
         ("TasksMax", "128"),
@@ -1248,7 +1271,7 @@ mod tests {
             "PassEnvironment=",
             "UnsetEnvironment=",
             "UMask=0077",
-            "SecureBits=",
+            "SecureBits=0",
             "NoNewPrivileges=yes",
             "ProtectSystem=strict",
             "ProtectHome=yes",
@@ -1272,7 +1295,7 @@ mod tests {
             "RemoveIPC=yes",
             "RestrictRealtime=yes",
             "SystemCallArchitectures=native",
-            "SystemCallErrorNumber=EPERM",
+            "SystemCallErrorNumber=1",
             "LimitCORE=0",
             "LimitNOFILE=4096",
             "TasksMax=128",
@@ -1341,8 +1364,9 @@ mod tests {
             unit_show().replace("ProtectSystem=strict", "ProtectSystem=full"),
             unit_show().replace("Environment=", "Environment=LD_PRELOAD=/tmp/hostile.so"),
             unit_show().replace("UMask=0077", "UMask=0022"),
+            unit_show().replace("SecureBits=0", "SecureBits=1"),
             unit_show().replace("DevicePolicy=closed", "DevicePolicy=auto"),
-            unit_show().replace("SystemCallErrorNumber=EPERM", "SystemCallErrorNumber="),
+            unit_show().replace("SystemCallErrorNumber=1", "SystemCallErrorNumber=2"),
             unit_show().replace("LimitNOFILE=4096", "LimitNOFILE=infinity"),
             unit_show().replace("AmbientCapabilities=", "AmbientCapabilities=cap_sys_admin"),
             unit_show().replace(" cap_setuid", ""),
@@ -1385,6 +1409,57 @@ mod tests {
         assert_eq!(arguments.len(), EFFECTD_UNIT_PROPERTIES.len() + 5);
         for property in EFFECTD_UNIT_PROPERTIES {
             assert!(arguments.contains(&format!("--property={property}")));
+        }
+    }
+
+    #[test]
+    fn systemd_252_omitted_unset_properties_have_a_closed_empty_form() {
+        let mut omitted = unit_show();
+        for property in SYSTEMD_OMITTED_WHEN_UNSET_PROPERTIES {
+            omitted = omitted.replace(&format!("{property}=\n"), "");
+        }
+
+        let parsed = parse_effective_unit(omitted.as_bytes()).expect("systemd 252 output");
+        for property in SYSTEMD_OMITTED_WHEN_UNSET_PROPERTIES {
+            assert_eq!(parsed.get(*property).map(String::as_str), Some(""));
+        }
+
+        for property in EFFECTD_UNIT_PROPERTIES {
+            if SYSTEMD_OMITTED_WHEN_UNSET_PROPERTIES.contains(property) {
+                continue;
+            }
+            let prefix = format!("{property}=");
+            let missing = unit_show()
+                .lines()
+                .filter(|line| !line.starts_with(&prefix))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                parse_effective_unit(missing.as_bytes()).is_err(),
+                "unexpectedly accepted missing property {property}"
+            );
+        }
+
+        let required_paths = BTreeSet::from([
+            "/objects".to_owned(),
+            "/run/ag/admin".to_owned(),
+            "/run/ag/proposal".to_owned(),
+            "/srv/repo".to_owned(),
+            "/stage".to_owned(),
+            "/state".to_owned(),
+        ]);
+        for property in SYSTEMD_OMITTED_WHEN_UNSET_PROPERTIES {
+            let nonempty = omitted.replacen(
+                "ExecStartPre=",
+                &format!("{property}=hostile\nExecStartPre="),
+                1,
+            );
+            let parsed = parse_effective_unit(nonempty.as_bytes()).expect("present property");
+            assert!(
+                validate_effectd_static_unit(&parsed, &required_capabilities(), &required_paths,)
+                    .is_err(),
+                "unexpectedly accepted nonempty property {property}"
+            );
         }
     }
 
