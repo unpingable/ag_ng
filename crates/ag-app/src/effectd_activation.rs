@@ -603,12 +603,8 @@ fn capability_mask(capabilities: &BTreeSet<&str>) -> Result<u64, EffectdActivati
 
 fn query_effective_unit(systemctl: &File) -> Result<Vec<u8>, EffectdActivationError> {
     let mut command = Command::new(format!("/proc/self/fd/{}", systemctl.as_raw_fd()));
-    command.args(["show", "--no-pager"]);
-    for property in EFFECTD_UNIT_PROPERTIES {
-        command.arg(format!("--property={property}"));
-    }
+    configure_effective_unit_query(&mut command);
     command
-        .args(["--", "ag-effectd.service"])
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -655,6 +651,17 @@ fn query_effective_unit(systemctl: &File) -> Result<Vec<u8>, EffectdActivationEr
         ));
     }
     Ok(stdout)
+}
+
+fn configure_effective_unit_query(command: &mut Command) {
+    // systemd 252 suppresses empty properties from `show` unless `--all` is
+    // explicit. Empty Exec* and EnvironmentFiles values are part of the
+    // closed property cut, so omission must not be confused with absence.
+    command.args(["show", "--no-pager", "--all"]);
+    for property in EFFECTD_UNIT_PROPERTIES {
+        command.arg(format!("--property={property}"));
+    }
+    command.args(["--", "ag-effectd.service"]);
 }
 
 fn read_bounded_stream(
@@ -1358,6 +1365,26 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn effective_unit_query_requests_empty_properties() {
+        let mut command = Command::new(SYSTEMCTL);
+        configure_effective_unit_query(&mut command);
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(&arguments[..3], ["show", "--no-pager", "--all"]);
+        assert_eq!(
+            &arguments[arguments.len() - 2..],
+            ["--", "ag-effectd.service"]
+        );
+        assert_eq!(arguments.len(), EFFECTD_UNIT_PROPERTIES.len() + 5);
+        for property in EFFECTD_UNIT_PROPERTIES {
+            assert!(arguments.contains(&format!("--property={property}")));
         }
     }
 
