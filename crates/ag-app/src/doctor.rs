@@ -691,10 +691,11 @@ fn run_bounded_systemd_command(
     let deadline = Instant::now() + timeout;
     let mut status = None;
     loop {
-        if status.is_none() {
+        let readers_finished = stdout_reader.is_finished() && stderr_reader.is_finished();
+        if readers_finished && status.is_none() {
             status = child.child.try_wait().map_err(SystemdQueryErrorV1::Poll)?;
         }
-        if status.is_some() && stdout_reader.is_finished() && stderr_reader.is_finished() {
+        if readers_finished && status.is_some() {
             break;
         }
         let now = Instant::now();
