@@ -2,14 +2,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
-use std::io::Read as _;
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ag_primitives::Digest;
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, killpg};
+use nix::unistd::Pid;
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
+use thiserror::Error;
 
 use crate::config::{
     AgdConfigV1, EffectTargetConfigV1, EffectdConfigV1, FilesystemNodeCustodyV1, LoadedConfigV1,
@@ -22,7 +29,9 @@ use crate::effectd_activation::{EFFECTD_UNIT_PROPERTIES, validate_effectd_static
 pub const DOCTOR_REPORT_SCHEMA_V1: &str = "ag.doctor-report/v1";
 
 const MAX_SYSTEMD_SHOW_BYTES: usize = 1024 * 1024;
+const MAX_SYSTEMD_STDERR_BYTES: usize = 64 * 1024;
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(5);
 const SYSTEMD_PROPERTIES: &[&str] = EFFECTD_UNIT_PROPERTIES;
 const UNIT_IDS: [&str; 3] = ["agd.service", "ag-effectd.service", "ag-providerd.service"];
 
@@ -130,7 +139,7 @@ pub fn diagnose_host(paths: &DoctorConfigPathsV1) -> DoctorReportV1 {
             Ok(units) => inspect_systemd(&configs, &units, &mut checks),
             Err(error) => add_systemd_unavailable(&mut checks, &error),
         },
-        Err(error) => add_systemd_unavailable(&mut checks, &error),
+        Err(error) => add_systemd_unavailable(&mut checks, &error.to_string()),
     }
     DoctorReportV1::new(checks)
 }
@@ -526,34 +535,214 @@ fn hash_executable(path: &Path) -> Result<Digest, String> {
         .map_err(|error| format!("cannot construct executable digest: {error}"))
 }
 
-fn query_systemd() -> Result<Vec<u8>, String> {
+#[derive(Debug, Error)]
+enum SystemdQueryErrorV1 {
+    #[error("fixed systemctl show invocation failed: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("fixed systemctl {stream} pipe is unavailable")]
+    PipeUnavailable { stream: &'static str },
+    #[error("fixed systemctl process ID {process_id} cannot identify its process group")]
+    ProcessIdOutOfRange { process_id: u32 },
+    #[error("fixed systemctl {stream} reader could not start: {source}")]
+    ReaderSpawn {
+        stream: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("fixed systemctl {stream} read failed: {source}")]
+    Read {
+        stream: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("fixed systemctl {stream} output exceeded its diagnostic bound")]
+    OutputTooLarge { stream: &'static str },
+    #[error("fixed systemctl {stream} reader failed")]
+    ReaderFailed { stream: &'static str },
+    #[error("fixed systemctl show status polling failed: {0}")]
+    Poll(#[source] std::io::Error),
+    #[error("fixed systemctl show exceeded its {milliseconds} ms deadline")]
+    DeadlineExceeded { milliseconds: u128 },
+    #[error("fixed systemctl show termination after its deadline failed: {0}")]
+    Termination(#[source] std::io::Error),
+    #[error("systemctl show exited unsuccessfully: {detail}")]
+    Unsuccessful { detail: String },
+}
+
+#[derive(Debug)]
+struct BoundedSystemdOutputV1 {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+struct ReapingSystemdChildV1 {
+    child: Child,
+    process_group: Pid,
+    armed: bool,
+}
+
+impl ReapingSystemdChildV1 {
+    fn terminate(&mut self) -> std::io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        let group_error = match killpg(self.process_group, Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => None,
+            Err(error) => Some(std::io::Error::from_raw_os_error(error as i32)),
+        };
+        if self.child.try_wait()?.is_none()
+            && let Err(error) = self.child.kill()
+            && self.child.try_wait()?.is_none()
+        {
+            return Err(error);
+        }
+        let wait_result = self.child.wait().map(|_| ());
+        if let Some(error) = group_error {
+            return Err(error);
+        }
+        wait_result
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReapingSystemdChildV1 {
+    fn drop(&mut self) {
+        let _ = self.terminate();
+    }
+}
+
+fn read_bounded_systemd_stream(
+    mut stream: impl Read,
+    maximum: usize,
+    stream_name: &'static str,
+) -> Result<Vec<u8>, SystemdQueryErrorV1> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|source| SystemdQueryErrorV1::Read {
+                stream: stream_name,
+                source,
+            })?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len().saturating_add(count) > maximum {
+            return Err(SystemdQueryErrorV1::OutputTooLarge {
+                stream: stream_name,
+            });
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn run_bounded_systemd_command(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<BoundedSystemdOutputV1, SystemdQueryErrorV1> {
+    let mut spawned = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(SystemdQueryErrorV1::Spawn)?;
+    let process_id = spawned.id();
+    let Ok(process_group) = i32::try_from(process_id) else {
+        let _ = spawned.kill();
+        let _ = spawned.wait();
+        return Err(SystemdQueryErrorV1::ProcessIdOutOfRange { process_id });
+    };
+    let mut child = ReapingSystemdChildV1 {
+        child: spawned,
+        process_group: Pid::from_raw(process_group),
+        armed: true,
+    };
+    let stdout = child
+        .child
+        .stdout
+        .take()
+        .ok_or(SystemdQueryErrorV1::PipeUnavailable { stream: "stdout" })?;
+    let stderr = child
+        .child
+        .stderr
+        .take()
+        .ok_or(SystemdQueryErrorV1::PipeUnavailable { stream: "stderr" })?;
+    let stdout_reader = thread::Builder::new()
+        .name("agctl-doctor-systemctl-stdout".to_owned())
+        .spawn(move || read_bounded_systemd_stream(stdout, MAX_SYSTEMD_SHOW_BYTES, "stdout"))
+        .map_err(|source| SystemdQueryErrorV1::ReaderSpawn {
+            stream: "stdout",
+            source,
+        })?;
+    let stderr_reader = thread::Builder::new()
+        .name("agctl-doctor-systemctl-stderr".to_owned())
+        .spawn(move || read_bounded_systemd_stream(stderr, MAX_SYSTEMD_STDERR_BYTES, "stderr"))
+        .map_err(|source| SystemdQueryErrorV1::ReaderSpawn {
+            stream: "stderr",
+            source,
+        })?;
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.child.try_wait().map_err(SystemdQueryErrorV1::Poll)?;
+        }
+        if status.is_some() && stdout_reader.is_finished() && stderr_reader.is_finished() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            child
+                .terminate()
+                .map_err(SystemdQueryErrorV1::Termination)?;
+            return Err(SystemdQueryErrorV1::DeadlineExceeded {
+                milliseconds: timeout.as_millis(),
+            });
+        }
+        thread::sleep(Duration::from_millis(10).min(deadline.saturating_duration_since(now)));
+    }
+    let status = status.expect("completed process status was checked above");
+    child.disarm();
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| SystemdQueryErrorV1::ReaderFailed { stream: "stdout" })??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| SystemdQueryErrorV1::ReaderFailed { stream: "stderr" })??;
+    Ok(BoundedSystemdOutputV1 {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn query_systemd() -> Result<Vec<u8>, SystemdQueryErrorV1> {
     let mut command = Command::new(SYSTEMCTL);
     command.args(["show", "--no-pager"]);
     for property in SYSTEMD_PROPERTIES {
         command.arg(format!("--property={property}"));
     }
-    let output = command
+    command
         .args([
             "--",
             "agd.service",
             "ag-effectd.service",
             "ag-providerd.service",
         ])
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("fixed systemctl show invocation failed: {error}"))?;
-    if output.stdout.len() > MAX_SYSTEMD_SHOW_BYTES || output.stderr.len() > 64 * 1024 {
-        return Err("systemctl output exceeded the fixed diagnostic bound".to_owned());
-    }
+        .env_clear();
+    let output = run_bounded_systemd_command(&mut command, SYSTEMCTL_TIMEOUT)?;
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "systemctl show exited unsuccessfully: {}",
-            terminal_safe(message.trim())
-        ));
+        return Err(SystemdQueryErrorV1::Unsuccessful {
+            detail: terminal_safe(message.trim()),
+        });
     }
     Ok(output.stdout)
 }
@@ -1659,5 +1848,78 @@ mod tests {
             "no systemd evidence",
         )]);
         assert!(!report.ready);
+    }
+
+    #[test]
+    fn hung_systemd_query_has_a_typed_bounded_refusal() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("60").env_clear();
+        let started = Instant::now();
+        let error = run_bounded_systemd_command(&mut command, Duration::from_millis(20))
+            .expect_err("sleep must exceed the diagnostic deadline");
+        assert!(matches!(
+            &error,
+            SystemdQueryErrorV1::DeadlineExceeded { milliseconds: 20 }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let detail = error.to_string();
+        let mut checks = Vec::new();
+        add_systemd_unavailable(&mut checks, &detail);
+        assert_eq!(checks.len(), 3);
+        assert!(checks.iter().all(|check| {
+            check.status == DoctorCheckStatusV1::Unavailable && check.detail == detail
+        }));
+    }
+
+    fn process_is_live(process_id: u32) -> bool {
+        let stat = match std::fs::read_to_string(format!("/proc/{process_id}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(error) => panic!("cannot inspect descendant {process_id}: {error}"),
+        };
+        let state = stat
+            .rsplit_once(") ")
+            .and_then(|(_, fields)| fields.chars().next())
+            .expect("proc stat must contain a process state");
+        !matches!(state, 'Z' | 'X')
+    }
+
+    #[test]
+    fn descendant_holding_systemd_pipes_cannot_extend_the_deadline() {
+        let fixture = tempfile::tempdir().expect("temporary directory");
+        let descendant_pid = fixture.path().join("descendant.pid");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "/bin/sleep 60 & descendant=$!; printf '%s\\n' \"$descendant\" > \"$1\"; exit 0",
+                "agctl-doctor-deadline-test",
+            ])
+            .arg(&descendant_pid)
+            .env_clear();
+
+        let started = Instant::now();
+        let error = run_bounded_systemd_command(&mut command, Duration::from_millis(100))
+            .expect_err("the inherited pipes must remain open until the group is terminated");
+        assert!(matches!(
+            error,
+            SystemdQueryErrorV1::DeadlineExceeded { milliseconds: 100 }
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let process_id: u32 = std::fs::read_to_string(&descendant_pid)
+            .expect("descendant PID record")
+            .trim()
+            .parse()
+            .expect("numeric descendant PID");
+        let retirement_deadline = Instant::now() + Duration::from_secs(2);
+        while process_is_live(process_id) && Instant::now() < retirement_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_is_live(process_id),
+            "descendant {process_id} remained live after process-group termination"
+        );
     }
 }

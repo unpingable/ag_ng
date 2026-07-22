@@ -66,7 +66,7 @@ clean-host execution of that ceremony; simultaneous client and reader
 specimens; expanded `SystemCallFilter` equality; real disk-full, WAL/fsync,
 power-loss and filesystem matrices; applied-reconciliation durability
 recovery; whole store-plus-target anti-rollback; same-inode historical ABA;
-bounded/cached history reconstruction; and a deadline for doctor subprocesses.
+and bounded/cached history reconstruction.
 
 Explicit qualification gaps are real power-loss/torn-write testing, live
 multi-process daemon restart under the packaged sandbox, package

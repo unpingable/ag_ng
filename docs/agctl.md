@@ -81,9 +81,9 @@ Every check is `pass`, `fail`, or `unavailable`; missing or unparseable host
 evidence is never promoted to a pass. The process exits nonzero unless every
 emitted required check passes. Doctor is an operational diagnostic, not daemon
 readiness: it cannot mint the fresh, non-serializable process standing behind
-an `ag-effectd` health response of `ready = true`. Its current systemd queries
-do not have a subprocess deadline, which remains an operational qualification
-gap rather than a bounded-completion claim.
+an `ag-effectd` health response of `ready = true`. The one fixed systemd query
+has a five-second deadline; doctor kills and reaps it on expiry and reports all
+three effective-unit checks as `unavailable` with a stable timeout detail.
 
 The effect authority boundary is visible in the command routing:
 

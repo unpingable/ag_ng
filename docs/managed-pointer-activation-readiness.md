@@ -171,7 +171,8 @@ package install/upgrade behavior, or target resource quotas. The live unit has
 not yet been installed and activated in a clean disposable host, the expanded
 `SystemCallFilter` set is packaged but not compared by live attestation, and
 the newly packaged offline genesis ceremony has not yet run in the declared VM
-matrix. `agctl doctor` also lacks a subprocess deadline.
+matrix. `agctl doctor` now bounds its one fixed systemd subprocess at five
+seconds; that diagnostic bound does not substitute for daemon readiness.
 
 The current state identity detects same-byte loose-ref inode replacement, but
 does not bind file timestamps. An external target-owner writer can therefore
