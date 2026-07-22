@@ -328,7 +328,10 @@ LoadCredentialEncrypted=provider-api-key:/etc/credstore.encrypted/provider-api-k
 The encrypted source is root-custodied; decrypted bytes exist only in the
 service credential mount. The secret never appears in TOML, an environment
 variable, argv, logs, SQLite, or an audit export. Providerd may use the secret
-and network but holds no standing, ratification, effect, or target state.
+and network, but it owns no governed-effect authority and cannot authorize AG
+effects. It may retain bounded provider-access capability, usage,
+dispatch/custody, lifecycle, and revocation state; it holds no governed-effect
+standing, ratification, effect, or target state.
 
 Providerd opens the credential directory and named credential with bounded
 descriptor traversal. It uses `openat2` with beneath/no-symlink resolution
@@ -344,8 +347,11 @@ all fail closed.
 Before acknowledging a provider result, the complete credential-free request,
 sanitized transport headers, and complete response event stream must have
 crossed into agd custody. Digest-only custody is explicitly weaker and cannot
-support exact replay evidence. Providerd deletes plaintext after confirmed
-delivery and burns the peer/session-bound capability when the session ends.
+support exact replay evidence. Exact custody and provider-protocol terminality
+establish neither semantic truth nor testimonial sufficiency, proposal
+admission, effect authority, or execution success. Providerd deletes plaintext
+after confirmed delivery and burns the peer/session-bound capability when the
+session ends.
 
 The current v1 provider socket enrolls only agd's signed proxy identity. The
 implemented generic-worker slice is explicitly offline and cannot select a

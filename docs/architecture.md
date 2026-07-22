@@ -3,7 +3,9 @@
 ## Constitutional boundary
 
 `agd` may judge but may not mutate governed targets. `ag-providerd` may hold
-machine inference credentials but has no authority state. `ag-effectd` may
+machine inference credentials and bounded provider-access capability, usage,
+dispatch/custody, lifecycle, and revocation state, but it owns no
+governed-effect authority and cannot authorize AG effects. `ag-effectd` may
 execute only a closed, broker-compiled effect vocabulary and has no network,
 planner, model, plugin, shell, or arbitrary-command surface.
 
@@ -16,6 +18,45 @@ provider-network code.
 Only `CanonicalEffectProposalV1` bytes compiled and persisted by `ag-effectd`
 may be ratified. `agd` submits `ProposalIntentV1` plus already-admitted artifact
 references; its projections are never ratification inputs.
+
+## Authority Governor and latent judgment seam
+
+AG-ng's governing interpretation is a stateful **Authority Governor**, not a
+general agent framework. AG owns authority domains and epochs, principal
+lineage and independence, standing and scope, ratification, delegation and
+revocation, durable one-use authority spend, closed effect execution,
+uncertain-outcome custody, fresh reconciliation, and managed-pointer
+activation and promotion. Worker, provider, transport, CLI, and packaging code
+are bounded adapters around that authority system; they do not move planning,
+conversation, prompting, semantic memory, retrieval, runtime tool discovery,
+plugin loading, model orchestration, or generalized multi-agent orchestration
+into AG.
+
+A future transport-independent judgment-carriage substrate might carry
+versioned source and target judgment identities, subjects and scopes,
+provenance, typed refusals and operationally indeterminate outcomes, bridge
+descriptors, explicit non-implications, and digest-bound decision or receipt
+envelopes. It must not own authority, testimony, policy standing, bridge
+licensing, institutional independence, execution, or revocation. Testimony
+cannot deserialize or cast into authority, authority cannot manufacture
+testimonial sufficiency, and AG retains fresh local observations where an
+authority spend is vulnerable to current-state drift.
+
+This seam is an architectural constraint, not a roadmap commitment. Extraction
+must wait until a concrete second implementation requires the same executable
+judgment-carriage semantics and demonstrates that the common surface is not
+merely AG-shaped.
+
+Current v1 has bounded transport debt. `BrokerSubmissionRecordV1` retains a
+`GovernedProposalIngressV1`, including signed-local-RPC challenge and request
+objects; worker candidate source proofs retain equivalent dynamic RPC evidence;
+and human ratification and reconciliation records bind fields named
+`signed_request`. These bindings preserve the authenticated principal and exact
+request evidence required by current custody, but their wire representation is
+not an authority semantic. This campaign does not migrate those persisted
+schemas. A future second transport must terminate its wire objects at an
+adapter boundary and supply equivalent authenticated-principal and
+exact-request evidence without changing authority semantics.
 
 ## Target v1 surface
 

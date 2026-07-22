@@ -3607,6 +3607,7 @@ fn broker_api_error<T>(error: &BrokerError) -> ApiResultV1<T> {
         | BrokerError::ProposerProofMismatch
         | BrokerError::WorkerSourceProofMismatch
         | BrokerError::WorkerSourceBindingMismatch
+        | BrokerError::Peer(_)
         | BrokerError::RpcAuthentication(_) => ApiErrorCodeV1::Unauthorized,
         BrokerError::UnsupportedAuthorityFamily => ApiErrorCodeV1::UnsupportedAuthorityFamily,
         BrokerError::Observation(_)
@@ -4605,6 +4606,41 @@ mod tests {
             ),
             ApiResultV1::Error {
                 code: ApiErrorCodeV1::InvalidRequest,
+                ..
+            }
+        ));
+
+        fs::write(&target_path, &content).expect("mutate target after reconciliation draft");
+        assert!(matches!(
+            broker.handle_admin(
+                EffectAdminRequestV1::Reconcile {
+                    evidence: Box::new(evidence.clone()),
+                },
+                &admin_peer,
+                &admin_request,
+            ),
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::InvalidRequest,
+                ..
+            }
+        ));
+        fs::remove_file(&target_path).expect("restore exact drafted target state");
+
+        let proposer_reconciliation_request = Digest::from_serializable(&(
+            "effectd-test-proposer-reconciliation-request",
+            &proposer_peer,
+        ))
+        .expect("proposer reconciliation request digest");
+        assert!(matches!(
+            broker.handle_admin(
+                EffectAdminRequestV1::Reconcile {
+                    evidence: Box::new(evidence.clone()),
+                },
+                &proposer_peer,
+                &proposer_reconciliation_request,
+            ),
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::Unauthorized,
                 ..
             }
         ));

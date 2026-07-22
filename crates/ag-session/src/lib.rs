@@ -263,7 +263,10 @@ pub enum ProviderCustodyV1 {
 }
 
 impl ProviderCustodyV1 {
-    /// Whether this is replayable governed custody suitable for native admission.
+    /// Whether exact request and response bytes are available for replay.
+    ///
+    /// This reports custody only. Replayability does not establish semantic
+    /// truth, testimonial sufficiency, admission, authority, or effect success.
     #[must_use]
     pub fn is_replayable(&self) -> bool {
         matches!(self, Self::ExactReplayable { .. })

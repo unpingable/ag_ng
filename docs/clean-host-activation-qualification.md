@@ -1,8 +1,8 @@
 # Clean-host package and activation qualification
 
-Status: campaign contract and genesis enrollment implementation present; no
-clean-host matrix receipt has been produced. The repository remains not
-production deployable.
+Status: campaign contract and genesis enrollment implementation present; one
+immutable bounded `BLOCKED` receipt exists, but no exact package has passed the
+clean-host matrix. The repository remains not production deployable.
 
 ## Claim boundary
 
@@ -197,13 +197,25 @@ daemon does not yet attest systemd's expanded effective `SystemCallFilter=`.
 
 ## Package-build gates exposed by this campaign
 
-The checked-in Debian skeleton is not yet a clean offline source-build claim.
-`debian/rules` requires locked offline Cargo resolution, but no vendored source
-set or Debian crate-source closure is enrolled. Supported guests also do not
-currently supply the declared Rust 1.94 build packages. Build and runtime-host
-qualification must therefore use separately pinned builders, and packages for
-Debian 12 must be built against its oldest supported ABI rather than copied
-from Ubuntu 24.04.
+The checked-in Debian skeleton currently invokes Cargo with `--locked --offline`.
+That invocation can use a deliberate Cargo home already containing
+the locked dependencies, but it is not a claim that this repository carries an
+independently sealed compiler, registry, or native-tool closure. A separately
+enrolled, hash-complete Rust compiler closure and byte-for-byte reproducible
+second build are not gates for this stage.
+
+The builder may be a controlled development or build environment distinct from
+the runtime VM. Before building, record the exact source commit and tree,
+worktree state, verbose Rust and Cargo versions, target triple, `Cargo.lock`
+digest, relevant native compiler/linker/packaging versions, material environment
+variables, network availability, and exact build command. Use a clean Cargo
+target directory and a deliberate Cargo home, or otherwise demonstrate that no
+stale output can be selected. The resulting package is admissible only by its
+exact path, size, and SHA-256 and must pass on a genuinely clean supported
+runtime host. Rust and Cargo remain build-time tools and must not become package
+runtime dependencies. If the current offline invocation prevents an otherwise
+admissible clean build, that is a concrete build or packaging defect to repair,
+not a reason to expand this campaign into compiler-provenance research.
 
 The package now declares the Git and development-only Bubblewrap runtimes used
 by shipped command paths,
@@ -237,8 +249,15 @@ any mandatory result other than `pass` prevents a `qualified` verdict. Even
 after every runnable case passes, the aggregate remains `blocked` while the
 required shipped-stranger-workflow layer is blocked.
 
-No receipt exists yet. The present campaign verdict is `not_run`, not partial
-evidence promoted by documentation.
+The immutable historical receipt at
+`qualification/receipts/clean-host/20260720-debian12-amd64-9a5f140/receipt.v1.json`
+has verdict `BLOCKED` and `authority_use = evidence_only`. It records successful
+Debian 12 runtime-prerequisite exercise through the package-build boundary, then
+the absence of a package because the guest repository Rust/Cargo versions were
+too old. Installation and every later runtime gate remain `not_run`. The
+continuation campaign incorporates that receipt by reference and resumes at the
+package-build boundary; documentation cannot promote the historical result or
+reinterpret it as activation readiness.
 
 ## Exclusions
 
