@@ -7,7 +7,10 @@ Build-Depends:
  bubblewrap,
  cargo (>= 1.94.0),
  git (>= 1:2.39.0),
+ openssh-client,
  python3,
+ qemu-system-x86,
+ qemu-utils,
  rustc (>= 1.94.0),
  xorriso
 Standards-Version: 4.7.2

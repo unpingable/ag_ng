@@ -27,10 +27,12 @@ EMPTY_SHA256 = "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7
 
 
 class CleanHostBundleTests(unittest.TestCase):
-    def test_package_build_declares_xorriso_used_by_vm_fixture_tests(self) -> None:
+    def test_package_build_declares_tools_used_by_vm_fixture_tests(self) -> None:
         control = (HERE.parents[1] / "debian/control").read_text(encoding="utf-8")
         source_stanza = control.split("\n\n", 1)[0]
-        self.assertIn("\n xorriso", source_stanza)
+        for package in ("openssh-client", "qemu-system-x86", "qemu-utils", "xorriso"):
+            with self.subTest(package=package):
+                self.assertIn(f"\n {package}", source_stanza)
 
     def assert_qualification_error(self, callback) -> None:
         with self.assertRaises(BUNDLE.QualificationError):
