@@ -1865,6 +1865,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
 
         let detail = error.to_string();
+        assert_eq!(detail, "fixed systemctl show exceeded its 20 ms deadline");
         let mut checks = Vec::new();
         add_systemd_unavailable(&mut checks, &detail);
         assert_eq!(checks.len(), 3);
@@ -1889,38 +1890,50 @@ mod tests {
     #[test]
     fn descendant_holding_systemd_pipes_cannot_extend_the_deadline() {
         let fixture = tempfile::tempdir().expect("temporary directory");
-        let descendant_pid = fixture.path().join("descendant.pid");
+        let process_ids = fixture.path().join("process-ids");
         let mut command = Command::new("/bin/sh");
         command
             .args([
                 "-c",
-                "/bin/sleep 60 & descendant=$!; printf '%s\\n' \"$descendant\" > \"$1\"; exit 0",
+                "/bin/sleep 60 & descendant=$!; printf '%s %s\\n' \"$$\" \"$descendant\" > \"$1\"; exit 0",
                 "agctl-doctor-deadline-test",
             ])
-            .arg(&descendant_pid)
+            .arg(&process_ids)
             .env_clear();
 
         let started = Instant::now();
-        let error = run_bounded_systemd_command(&mut command, Duration::from_millis(100))
+        let error = run_bounded_systemd_command(&mut command, Duration::from_secs(1))
             .expect_err("the inherited pipes must remain open until the group is terminated");
         assert!(matches!(
             error,
-            SystemdQueryErrorV1::DeadlineExceeded { milliseconds: 100 }
+            SystemdQueryErrorV1::DeadlineExceeded { milliseconds: 1000 }
         ));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
 
-        let process_id: u32 = std::fs::read_to_string(&descendant_pid)
-            .expect("descendant PID record")
-            .trim()
+        let recorded = std::fs::read_to_string(&process_ids).expect("process ID record");
+        let mut recorded = recorded.split_whitespace();
+        let leader_id: u32 = recorded
+            .next()
+            .expect("leader PID")
+            .parse()
+            .expect("numeric leader PID");
+        let descendant_id: u32 = recorded
+            .next()
+            .expect("descendant PID")
             .parse()
             .expect("numeric descendant PID");
+        assert!(recorded.next().is_none());
+        assert!(
+            !process_is_live(leader_id),
+            "direct child {leader_id} remained live after wait"
+        );
         let retirement_deadline = Instant::now() + Duration::from_secs(2);
-        while process_is_live(process_id) && Instant::now() < retirement_deadline {
+        while process_is_live(descendant_id) && Instant::now() < retirement_deadline {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            !process_is_live(process_id),
-            "descendant {process_id} remained live after process-group termination"
+            !process_is_live(descendant_id),
+            "descendant {descendant_id} remained live after process-group termination"
         );
     }
 }
