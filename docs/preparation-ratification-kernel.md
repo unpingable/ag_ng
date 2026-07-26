@@ -37,11 +37,13 @@ bounded live preparation standing
 | Basis mismatch is a refusal before burn | `ManagedPointerPromotionRefusalV1` in broker proposal record v2 | The broker persists the attempted authorization, candidate/basis binding, typed reason, and time while leaving the proposal `Ready` and the authorization unburned. |
 | CAS proves coordination, not legitimacy | `ProposalStateV1` plus `ManagedPointerRuntimeV1::commit` | The production commit path is crate-private and accepts only a non-cloneable prepared value produced after live promotion standing. A `Ready` proposal has no transition directly to the CAS checkpoint. |
 
-`BrokerProposalRecordV1` retains its source-level name for compatibility but now
-requires the explicit `ag.effect-broker-proposal/v2` schema. The direct
-inspection projection is `ag.effect-record/v2`. Deserialized legacy records
-default missing v2 fields only so validation can reject them with a typed store
-corruption boundary; they are never migrated by inference. A managed-pointer
+`BrokerProposalRecordV1` keeps its source-level name while its wire schema has
+moved on; it now requires the explicit `ag.effect-broker-proposal/v3` schema,
+and the direct inspection projection is `ag.effect-record/v3`. The Rust type
+name is historical and carries no compatibility behaviour — there is no v1 or
+v2 reader. Deserialized older records default their missing fields only so
+validation can reject them with a typed store corruption boundary; they are
+never migrated by inference. A managed-pointer
 record must carry exactly one matching prepared candidate. The expanded nested
 canonical promotion contract is explicitly
 `ag.managed-pointer-promotion/v2`; old `/v1` payloads cannot enter the new

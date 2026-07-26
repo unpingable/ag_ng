@@ -67,9 +67,10 @@ credential check, but a matching UID/GID still cannot replace a valid
 signature. Every daemon listener in the current production-shaped startup uses
 the UID/GID enrolled for that exact signed peer; the role-specific `agctl`
 profile makes its daemon-side check explicit and the shipped examples require
-it. Production must not call the legacy `authenticate_peer` path: it performs
-process observation for the unsigned bootstrap transport and cannot reliably
-inspect a hardened cross-UID peer.
+it. There is no legacy `authenticate_peer` path to avoid: the process-observation
+routine that once served the unsigned bootstrap transport has been removed, and
+no symbol by that name exists in the tree. Peer authentication is the signed
+three-frame exchange described above; nothing else authenticates a peer.
 
 Clock synchronization is an availability prerequisite. A proof outside its
 peer policy's skew window is rejected, including timestamps too far in the
