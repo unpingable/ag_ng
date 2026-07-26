@@ -4,6 +4,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -58,6 +59,39 @@ const BWRAP: &str = "/usr/bin/bwrap";
 const GIT: &str = "/usr/bin/git";
 const MAXIMUM_CANDIDATE_FRAME_BYTES: u32 = 64 * 1024;
 const CANDIDATE: &[u8] = b"candidate proposal material";
+
+/// Host prerequisites for the live worker suite.
+///
+/// These tests drive a real ELF worker through real bubblewrap confinement against a
+/// real Git repository, so they cannot be made host-independent. Name the unmet
+/// prerequisite here rather than failing partway through a test body.
+fn require_live_worker_host() {
+    assert!(
+        Path::new(BWRAP).is_file(),
+        "{BWRAP} is required: this suite launches a real worker under bubblewrap \
+         confinement, and bubblewrap is already a Build-Depends of this package"
+    );
+    assert!(
+        Path::new(GIT).is_file(),
+        "{GIT} is required: this suite builds and reads a real Git repository"
+    );
+}
+
+/// The kernel bounds `sun_path`, and this suite places its sockets under `TMPDIR`.
+///
+/// Report the actual cause and the remedy instead of an opaque bind refusal several
+/// hundred lines into a test. The limit is a kernel constant, not something the suite
+/// can engineer away.
+fn require_bindable_socket_path(socket: &Path) {
+    const SUN_PATH_LIMIT: usize = 108;
+    let length = socket.as_os_str().as_bytes().len();
+    assert!(
+        length < SUN_PATH_LIMIT,
+        "socket path is {length} bytes but the kernel limits sun_path to {SUN_PATH_LIMIT}: \
+         {}; set TMPDIR to a shorter directory",
+        socket.display()
+    );
+}
 
 fn executable_identity(path: &Path) -> ExecutableIdentityV1 {
     let bytes = fs::read(path).expect("read executable fixture");
@@ -457,7 +491,7 @@ fn managed_ref_object(fixture: &PointerWorkerFixtureV1, suffix: &str) -> String 
 // in one linear test so the live authority boundary remains directly auditable.
 #[allow(clippy::too_many_lines)]
 fn real_fixed_elf_enters_only_through_signed_candidate_ingress() {
-    assert!(Path::new(BWRAP).is_file(), "Bubblewrap fixture is required");
+    require_live_worker_host();
     let temporary = TempDir::new().expect("temporary live worker fixture");
     let reviewed = temporary.path().join("reviewed");
     let workspace_root = temporary.path().join("workspaces");
@@ -640,7 +674,7 @@ fn real_fixed_elf_enters_only_through_signed_candidate_ingress() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn agd_core_recovers_custodied_fixture_into_broker_owned_canonical_proposal() {
-    assert!(Path::new(BWRAP).is_file(), "Bubblewrap fixture is required");
+    require_live_worker_host();
     let temporary = TempDir::new().expect("temporary core worker fixture");
     let reviewed = temporary.path().join("reviewed");
     let workspace_root = temporary.path().join("workspaces");
@@ -800,6 +834,8 @@ fn agd_core_recovers_custodied_fixture_into_broker_owned_canonical_proposal() {
         .expect("admin socket parent mode");
     let proposal_socket = proposal_parent.join("proposal.sock");
     let admin_socket = admin_parent.join("admin.sock");
+    require_bindable_socket_path(&proposal_socket);
+    require_bindable_socket_path(&admin_socket);
     let managed_target = temporary.path().join("broker-managed-target");
     let effectd_store_root = TempDir::new().expect("effectd store root");
     let effectd_enrollment = effectd.enrollment(30_000).expect("effectd enrollment");
@@ -956,7 +992,7 @@ fn agd_core_recovers_custodied_fixture_into_broker_owned_canonical_proposal() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn live_worker_bundle_closes_the_managed_pointer_lifecycle() {
-    assert!(Path::new(BWRAP).is_file(), "Bubblewrap fixture is required");
+    require_live_worker_host();
     assert!(Path::new(GIT).is_file(), "exact /usr/bin/git is required");
     let temporary = TempDir::new().expect("temporary joined-lifecycle fixture");
     fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700))
@@ -1128,6 +1164,8 @@ fn live_worker_bundle_closes_the_managed_pointer_lifecycle() {
     effectd_config.proposal_socket_custody = socket_custody(&proposal_parent);
     effectd_config.admin_socket = admin_parent.join("admin.sock");
     effectd_config.admin_socket_custody = socket_custody(&admin_parent);
+    require_bindable_socket_path(&effectd_config.proposal_socket);
+    require_bindable_socket_path(&effectd_config.admin_socket);
     effectd_config.rpc_signing_identity = RpcSigningIdentityConfigV1 {
         principal: effectd_enrollment.principal,
         key_id: effectd_enrollment.key.key_id,
@@ -1413,7 +1451,7 @@ fn live_worker_bundle_closes_the_managed_pointer_lifecycle() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn wrong_live_semantic_is_fenced_before_candidate_custody() {
-    assert!(Path::new(BWRAP).is_file(), "Bubblewrap fixture is required");
+    require_live_worker_host();
     let temporary = TempDir::new().expect("temporary hostile worker fixture");
     let reviewed = temporary.path().join("reviewed");
     let workspace_root = temporary.path().join("workspaces");
@@ -1548,7 +1586,7 @@ fn wrong_live_semantic_is_fenced_before_candidate_custody() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn supervisor_timeout_tombstones_reaps_and_releases_fresh_capacity() {
-    assert!(Path::new(BWRAP).is_file(), "Bubblewrap fixture is required");
+    require_live_worker_host();
     let temporary = TempDir::new().expect("temporary timeout worker fixture");
     let reviewed = temporary.path().join("reviewed");
     let workspace_root = temporary.path().join("workspaces");
