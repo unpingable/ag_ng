@@ -5,3 +5,7 @@
 *.db-shm
 *.db-wal
 *.sock
+
+# Python bytecode from the qualification harness test step.
+__pycache__/
+*.pyc

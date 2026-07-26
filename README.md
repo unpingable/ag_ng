@@ -69,6 +69,15 @@ See `docs/architecture.md` and `docs/source-baseline.md` for the implementation
 contract and source custody. Operational reviewers should also read
 `docs/deployment.md`, `docs/managed-pointer-activation-readiness.md`,
 `docs/clean-host-activation-qualification.md`, `docs/backup-restore.md`,
-`docs/release-checklist.md`, and
+`docs/release-checklist.md`, `docs/worker-qualification.md`, and
 `docs/migration-m8.md`; the current tree is explicitly not production
 deployable until that checklist closes.
+
+The live worker ingress substrate has its own qualified gate,
+`scripts/run-worker-qualification.sh`, described in
+`docs/worker-qualification.md`. It exercises the ingress path end to end against
+a feature-gated fixture worker under real bubblewrap confinement, and it is
+separate from the packaged test step because it needs host prerequisites a
+package builder cannot guarantee. It qualifies the **ingress substrate**, not a
+production worker; production worker qualification remains pending as stated
+above.
