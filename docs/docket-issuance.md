@@ -76,6 +76,11 @@ Three digests are kept deliberately distinct and none is derived from another:
 | produced | `ag.docket-issuance:v1` | current |
 | consumed effect class | `git-ref-update:v1` | the only class this office authorizes |
 
+This path has carried real governed work twice: the three-office vertical
+(2026-07-25) and the four-office pilot (2026-07-26, target: the Nightshift
+repository — declared publicly in Nightshift's `docs/FOUR_OFFICE_PILOT_01.md`),
+each with exactly one decision admitted and one authority burn.
+
 ## Residual obligations and escalation
 
 Issuances carry a residual-obligation **status** that distinguishes *no residuals

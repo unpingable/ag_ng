@@ -1,5 +1,28 @@
 # Agent Governor NG
 
+## Status (2026-07-26)
+
+AG-ng is the **canonical authority office** of a four-office governed
+constellation: it authorizes exact prepared work and burns one-use decision
+authority; **Docket** executes and settles; **NQ** evaluates testimony,
+claims, and consumer reliance; **Nightshift** proposes and holds read-only
+orchestration posture. AG-ng owns its decision law and the issuance producer;
+it does **not** own the authorization wire contracts (`gwr:authz-request:v1`
+and `ag.docket-issuance:v1` are Docket-owned, with Docket's conformance
+vectors), execution, settlement, repository state, claim admissibility, or
+orchestration.
+
+Maturity: part of an **operationally reusable governed vertical** — its
+issuance path authorized both the three-office vertical (2026-07-25) and the
+four-office pilot (2026-07-26). That is not a production claim: the issuance
+surface is a library face exercised by harness, the decision-burn ledger is
+in-memory per process, and the tree remains explicitly **not production
+deployable** until its own checklist closes ("not production deployable" is a
+deployment-maturity statement, not a statement about which office is
+canonical). New authority features land here; the classic Python
+implementation (`agent_gov`) is legacy-historical, retained for its
+diagnostic drill helpers and archives, and receives no new authority work.
+
 Agent Governor NG is a Rust hard successor to the classic Python Agent
 Governor. Its authority boundary is deliberately narrow:
 

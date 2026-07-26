@@ -5,6 +5,11 @@ for the public calculus release. A source revision is an input witness, not a
 runtime dependency. Implementations never chase these repositories
 automatically.
 
+*(Status note, 2026-07-26: the peers below are listed as pinned input
+witnesses only. Their current dispositions differ — e.g. transition-kernel is
+a research specimen and NQ-ng an experimental mechanism branch, neither a
+live constellation office — and this table implies nothing about that.)*
+
 | Source | Revision | Worktree state |
 | --- | --- | --- |
 | classic Agent Governor | `5d7089b1fd26510adddab808a7322e8ada4bf8bd` | clean |

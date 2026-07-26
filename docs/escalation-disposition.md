@@ -5,9 +5,13 @@ and the criteria for any future work. Nothing here is an implementation order.
 
 ## What exists now
 
-Nothing. A whole-repository search for `escalat*` returns **zero hits in code** and zero
-in documentation. There is no escalation type, verdict, wire field, refusal kind, or
-test. There is no dead scaffolding to remove and no partial implementation to finish.
+Nothing. A whole-repository search for `escalat*` returns **zero hits in code**. There
+is no escalation type, verdict, wire field, refusal kind, or test. There is no dead
+scaffolding to remove and no partial implementation to finish. (In documentation the
+term appears only in the records that state its absence — this file,
+`docket-issuance.md`, and the README pointer — which is the intended shape; an earlier
+revision of this sentence claimed "zero in documentation," which those records
+themselves falsified.)
 
 The sixteen `BreakGlass` references in `docs/` are a **different concept** — an
 exceptional *authority family*, not an escalation channel. BreakGlass is likewise
