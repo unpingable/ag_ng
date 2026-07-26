@@ -197,12 +197,6 @@ impl LifecycleNonce {
         Self(bytes)
     }
 
-    /// Alias for [`Self::new`].
-    #[must_use]
-    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self::new(bytes)
-    }
-
     /// Allocates a nonce from the operating system random source.
     #[must_use]
     pub fn random() -> Self {
