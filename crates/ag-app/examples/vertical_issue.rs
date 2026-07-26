@@ -89,7 +89,7 @@ fn main() {
         },
     );
     eprintln!("second_issuance_refused: {}", second.is_err());
-    eprintln!("decision_id: {}", decision.decision_id);
+    eprintln!("decision_id: {}", decision.decision_id());
     std::fs::write(out_path, serde_json::to_vec_pretty(&env).unwrap()).unwrap();
     std::fs::write(
         trust_out,

@@ -123,7 +123,7 @@ fn issue_ok(bytes: &[u8]) -> (ag_app::docket_issuance::DocketIssuanceEnvelopeV1,
             residuals_unrepresented(),
         )
         .unwrap();
-    (env, decision.decision_id)
+    (env, decision.decision_id().to_string())
 }
 
 #[test]
@@ -252,7 +252,7 @@ fn decision_authority_burns_exactly_once() {
         residuals_unrepresented(),
     );
     assert!(first.is_ok());
-    assert!(ledger.prior_use(&decision.decision_id).is_some());
+    assert!(ledger.prior_use(decision.decision_id()).is_some());
     // The same decision cannot mint a second issuance.
     let second = off.issue(
         &req,
@@ -281,7 +281,7 @@ fn a_repeated_exact_request_is_a_repeated_decision_and_refuses_reissue() {
     let req = decode_request(&bytes).unwrap();
     let d1 = off.decide(&req).unwrap();
     let d2 = off.decide(&req).unwrap();
-    assert_eq!(d1.decision_id, d2.decision_id);
+    assert_eq!(d1.decision_id(), d2.decision_id());
     let mut ledger = IssuanceDecisionLedger::new();
     let s = signer();
     assert!(
@@ -552,4 +552,26 @@ fn shipped_tampered_vectors_fail_this_offices_verifier() {
             "{name}: tampered vector must not verify"
         );
     }
+}
+
+// The decision token is unconstructable outside the checked decision path.
+// This is the same law the kernel applies to `Authority`: without it, a caller
+// could fabricate a decision and reach `issue` while bypassing effect-class,
+// catalog, actor, scope, and principal-chain validation. Compile-fail rather
+// than runtime, because the guarantee is structural.
+//
+// ```compile_fail
+// use ag_app::docket_issuance::DocketDecision;
+// let _ = DocketDecision { decision_id: "forged".into(), target_id: "any".into() };
+// ```
+#[test]
+fn a_decision_token_exposes_only_readers() {
+    let bytes = request_json(|_| {});
+    let cat = catalog();
+    let off = office(&cat);
+    let req = decode_request(&bytes).unwrap();
+    let decision = off.decide(&req).unwrap();
+    // Readers exist and name the checked decision; no setter or constructor does.
+    assert!(!decision.decision_id().is_empty());
+    assert_eq!(decision.target_id(), "docket-vertical");
 }

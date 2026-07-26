@@ -20,6 +20,12 @@
 //! domain-separated signature prefixes over strict canonical JSON) with one
 //! new prefix for this statement kind. No new cryptography, no shared secret.
 //!
+//! **The decision token is sealed.** [`DocketDecision`] has private fields and
+//! no public constructor, so it can only come from
+//! [`DocketIssuanceOffice::decide`]. A caller cannot fabricate one and reach
+//! [`DocketIssuanceOffice::issue`] with the catalog, actor, scope, effect-class,
+//! and principal-chain checks skipped.
+//!
 //! **Dual canonical domains.** The request's exact bytes are hashed two ways
 //! and both travel: `raw_sha256` (plain SHA-256 over the exact transported
 //! bytes, the domain Docket also computes) and `ag_canonical_digest` (this
@@ -703,12 +709,32 @@ impl DocketIssuanceOffice<'_> {
 
 /// An admitted decision. Carries no authority: the issuance is produced only
 /// by `issue`, and only after the decision authority is burned.
+///
+/// The fields are private and there is no public constructor, so a decision
+/// token cannot be fabricated outside [`DocketIssuanceOffice::decide`]. This is
+/// the same law the kernel applies to `Authority` and its book references: the
+/// object that unlocks the next stage is unconstructable except through the
+/// checked path. Without it, a caller of this crate could hand `issue` an
+/// arbitrary `decision_id` and `target_id` and bypass effect-class, catalog,
+/// actor, scope, and principal-chain validation entirely.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocketDecision {
+    decision_id: String,
+    target_id: String,
+}
+
+impl DocketDecision {
     /// Identity of this decision over its exact inputs.
-    pub decision_id: String,
-    /// The catalog target admitted.
-    pub target_id: String,
+    #[must_use]
+    pub fn decision_id(&self) -> &str {
+        &self.decision_id
+    }
+
+    /// The catalog target admitted for this decision.
+    #[must_use]
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
 }
 
 /// Ed25519 signing identity for issuances. Debug is unavailable, the key
