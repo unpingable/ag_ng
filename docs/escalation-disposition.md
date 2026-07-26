@@ -12,9 +12,17 @@ test. There is no dead scaffolding to remove and no partial implementation to fi
 The sixteen `BreakGlass` references in `docs/` are a **different concept** — an
 exceptional *authority family*, not an escalation channel. BreakGlass is likewise
 absent by decision: it has no runtime schema, catalog entry, mandate, or execution path,
-its exclusion is tracked in `docs/formal-calculus-crosswalk.md` and the release
-checklist, and the runtime refuses it as an unsupported authority family. Do not
-conflate the two.
+and its exclusion is tracked in `docs/formal-calculus-crosswalk.md` and the release
+checklist. Do not conflate the two.
+
+An earlier revision of this record added that "the runtime refuses it as an unsupported
+authority family." That was wrong, and it is corrected here rather than quietly dropped.
+`BrokerError::UnsupportedAuthorityFamily` exists and maps to an API error code, but
+nothing in the workspace constructs it — the refusal is declared, not reachable.
+`docs/release-checklist.md:183` records the absence of a BreakGlass path as **checked**;
+line 231, "BreakGlass and every unsupported authority family refuse before burn", is
+**unchecked**. The earlier sentence merged the two. BreakGlass is absent, which is
+stronger than refused, but no runtime witness demonstrates the refusal.
 
 ## What the current outcome vocabulary is
 

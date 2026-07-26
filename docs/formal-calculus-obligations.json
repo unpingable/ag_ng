@@ -125,8 +125,8 @@
       "claim": "exceptional origin and audit history remain load-bearing",
       "rust_surface": "none",
       "status": "unmapped",
-      "runtime_evidence": ["breakglass_refuses_as_unsupported_family"],
-      "gaps": ["origin_allocator", "attestor_honesty", "history_correspondence", "recovery_semantics"],
+      "runtime_evidence": [],
+      "gaps": ["origin_allocator", "attestor_honesty", "history_correspondence", "recovery_semantics", "no_runtime_witness"],
       "campaign": "deferred_breakglass_model"
     },
     {
