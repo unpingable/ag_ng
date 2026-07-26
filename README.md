@@ -2,11 +2,17 @@
 
 ## Status (2026-07-26)
 
-AG-ng is the **canonical authority office** of a four-office governed
-constellation: it authorizes exact prepared work and burns one-use decision
-authority; **Docket** executes and settles; **NQ** evaluates testimony,
-claims, and consumer reliance; **Nightshift** proposes and holds read-only
-orchestration posture. AG-ng owns its decision law and the issuance producer;
+AG-ng is the **canonical exact-work admissibility and issuance
+implementation** — the authority-bearing decision of a four-office governed
+constellation: it decides whether exact prepared work may receive authority
+and burns one-use decision authority; **Docket** executes and settles;
+**NQ** evaluates testimony, claims, and consumer reliance; **Nightshift**
+proposes and holds read-only orchestration posture. It is not a universal
+authority office: mandate custody (delegation, revocation, lineage — the
+`standing` repository's jurisdiction) and spendability accounting (the
+`linearaccountant` jurisdiction) are separately defined offices that AG-ng
+neither owns nor absorbed, and which the current vertical does not
+exercise. AG-ng owns its decision law and the issuance producer;
 it does **not** own the authorization wire contracts (`gwr:authz-request:v1`
 and `ag.docket-issuance:v1` are Docket-owned, with Docket's conformance
 vectors), execution, settlement, repository state, claim admissibility, or
