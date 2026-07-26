@@ -5,10 +5,10 @@
 //! produced for a refusal, and the decision's authority burns exactly once.
 
 use ag_app::docket_issuance::{
-    AuthorizationPremiseV1, DocketAuthzRequestV1, DocketIssuanceOffice, DocketTargetCatalogV1,
-    DocketTargetDefinitionV1, ISSUANCE_SCHEMA, IssuanceDecisionContextV1, IssuanceDecisionLedger,
-    IssuanceRefusal, IssuanceSigner, ResidualObligationsV1, ResidualStatusV1, decode_request,
-    verify_envelope,
+    AuthorizationPremiseV1, DocketAuthzRequestV1, DocketIssuanceEnvelopeV1, DocketIssuanceOffice,
+    DocketTargetCatalogV1, DocketTargetDefinitionV1, ISSUANCE_SCHEMA, IssuanceDecisionContextV1,
+    IssuanceDecisionLedger, IssuanceRefusal, IssuanceSigner, ResidualObligationsV1,
+    ResidualStatusV1, decode_request, verify_envelope,
 };
 use ring::rand::SystemRandom;
 use ring::signature::Ed25519KeyPair;
@@ -489,4 +489,67 @@ fn premises_survive_verbatim_and_are_not_docket_settlement_premises() {
     let text = serde_json::to_string(&body.premises).unwrap();
     assert!(!text.contains("exclusive_ref_custody"));
     assert!(!text.contains("atomic_compare_and_swap"));
+}
+
+// --- cross-repository conformance vectors ---
+//
+// The consumer (Docket) is the authoritative home of these wire contracts and
+// ships the vectors. This office verifies the *consumer's* shipped artifacts
+// with its own independent implementation; no code is shared between the two.
+
+fn vector(name: &str) -> Vec<u8> {
+    let path = std::path::Path::new("/home/jbeck/git/docket/runtime/conformance/authz").join(name);
+    std::fs::read(path).unwrap()
+}
+
+#[test]
+fn shipped_request_vector_decodes_under_this_office() {
+    let bytes = vector("request.json");
+    let req = decode_request(&bytes).expect("the shipped request vector decodes");
+    assert_eq!(req.effect_class, "git-ref-update:v1");
+    assert_eq!(req.requested_actor, "operator");
+    assert!(!req.prepared_attempt_digest.is_empty());
+}
+
+#[test]
+fn shipped_unsupported_effect_class_vector_refuses_here() {
+    let bytes = vector("request-unsupported-effect-class.json");
+    let req = decode_request(&bytes).expect("decodes as a request");
+    let cat = catalog();
+    // The catalog in this test admits the fixture repository, not the vector's,
+    // so either refusal is correct — what matters is that it is refused and no
+    // issuance is produced.
+    assert!(office(&cat).decide(&req).is_err());
+}
+
+#[test]
+fn shipped_issuance_vector_verifies_under_this_offices_verifier() {
+    let env: DocketIssuanceEnvelopeV1 =
+        serde_json::from_slice(&vector("issuance.json")).expect("envelope parses");
+    let body = verify_envelope(&env).expect("the shipped issuance verifies");
+    assert_eq!(body.decision, "admitted");
+    assert_ne!(
+        body.request_source.raw_sha256,
+        body.request_source.ag_canonical_digest
+    );
+}
+
+#[test]
+fn shipped_tampered_vectors_fail_this_offices_verifier() {
+    for name in [
+        "issuance-changed-prepared-digest.json",
+        "issuance-changed-ag-digest.json",
+        "issuance-changed-scope.json",
+        "issuance-changed-actor.json",
+        "issuance-changed-premise.json",
+        "issuance-changed-residual.json",
+        "issuance-not-admitted.json",
+        "issuance-bad-authentication.json",
+    ] {
+        let env: DocketIssuanceEnvelopeV1 = serde_json::from_slice(&vector(name)).unwrap();
+        assert!(
+            verify_envelope(&env).is_err(),
+            "{name}: tampered vector must not verify"
+        );
+    }
 }
