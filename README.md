@@ -19,6 +19,19 @@ context; it cannot deserialize or convert them into runtime authority. See
 `docs/formal-calculus-crosswalk.md` for correspondence and non-correspondence
 claims.
 
+AG-ng also produces authenticated authorization issuances for an external
+governed-work runtime. That producer is deliberately narrow: it decides through
+this office's own catalog and principal checks, burns its own decision authority
+once, and emits an immutable authenticated record. The record is not authority —
+`Authority` remains non-serializable and process-local — and it makes no claim
+that anything executed or that any downstream claim is admissible. See
+[`docs/docket-issuance.md`](docs/docket-issuance.md).
+
+Residual obligations and escalation are both deliberately absent from the live
+surface today, and both say so where it matters rather than being silently
+missing: see [`docs/residual-obligations-disposition.md`](docs/residual-obligations-disposition.md)
+and [`docs/escalation-disposition.md`](docs/escalation-disposition.md).
+
 This repository does not preserve the classic command, API, database, or
 authority-token surfaces. The Rust-only frozen archive verifier treats classic
 files as bounded opaque evidence and never imports them as runtime authority.
