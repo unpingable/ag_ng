@@ -11,8 +11,10 @@ authors.workspace = true
 ag-kernel = { path = "../ag-kernel" }
 ag-primitives = { path = "../ag-primitives" }
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

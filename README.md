@@ -56,6 +56,19 @@ once, and emits an immutable authenticated record. The record is not authority â
 that anything executed or that any downstream claim is admissible. See
 [`docs/docket-issuance.md`](docs/docket-issuance.md).
 
+The `ag-campaign` crate adds a deliberately bounded **campaign orchestration
+office** layer, consumed by `agctl campaign` against a local event-sourced
+store: exact campaign identity from the human-authorized intent, an
+operator/reviewer-separated stage projection, digest-bound opaque Docket
+standing records, burn-before-effect dispatch envelopes for the
+authority-neutral execution sidecar, verdict receipts, bounded repairs,
+residuals, and campaign recomposition wired through the kernel's existing
+`recompose()` accounting. A campaign grants no authority; candidate and
+qualification actions refuse pending distinct future authority; the real
+`agd`/`ag-effectd` broker wiring for stage execution is a recorded bounded
+residual, not a hidden claim. See
+[`docs/campaign-orchestration-office.md`](docs/campaign-orchestration-office.md).
+
 Residual obligations and escalation are both deliberately absent from the live
 surface today, and both say so where it matters rather than being silently
 missing: see [`docs/residual-obligations-disposition.md`](docs/residual-obligations-disposition.md)
