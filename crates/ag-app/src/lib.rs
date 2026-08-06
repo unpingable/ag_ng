@@ -2,6 +2,7 @@
 
 pub mod agd;
 pub mod api;
+pub mod campaign;
 pub mod config;
 mod custody;
 pub mod derived;

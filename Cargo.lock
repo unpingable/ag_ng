@@ -6,6 +6,7 @@ version = 4
 name = "ag-app"
 version = "0.1.0"
 dependencies = [
+ "ag-campaign",
  "ag-effect",
  "ag-kernel",
  "ag-primitives",

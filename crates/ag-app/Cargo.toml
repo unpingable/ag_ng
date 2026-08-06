@@ -32,6 +32,7 @@ path = "src/bin/ag-worker-fixture.rs"
 required-features = ["worker-fixture"]
 
 [dependencies]
+ag-campaign = { path = "../ag-campaign" }
 ag-effect = { path = "../ag-effect" }
 ag-kernel = { path = "../ag-kernel" }
 ag-primitives = { path = "../ag-primitives" }
