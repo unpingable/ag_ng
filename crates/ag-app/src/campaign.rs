@@ -16,9 +16,9 @@ use ag_campaign::{
     CampaignEventV1, CampaignId, CampaignIntentV1, CampaignLedgerV1,
     CampaignRecompositionReceiptV1, CampaignRecompositionRefusalV1, CampaignResidualV1,
     CampaignStatusV1, DocketStandingV1, RecordedRefusalV1, RuntimeEnvelopeV1, SidecarOutcomeV1,
-    SidecarRuntimeReceiptV1, StageId, StageProposalV1, StageReceiptV1, VerdictReceiptV1,
-    plan_from_ledger, present_from_ledger, recompose_campaign, stage_receipt_from_execution,
-    verify_sidecar_receipt_against,
+    SidecarRuntimeReceiptV1, StageId, StageKindV1, StageProposalV1, StageReceiptV1,
+    VerdictReceiptV1, plan_from_ledger, present_from_ledger, recompose_campaign,
+    stage_receipt_from_execution, verify_sidecar_receipt_against,
 };
 use ag_kernel::NativeJudgment;
 use ag_primitives::{Digest, LifecycleNonce};
@@ -371,10 +371,17 @@ pub fn admit_stage(
     Ok(stage)
 }
 
-/// Runs the current admitted stage: consumes its standing, renders and
+/// Runs the current runnable stage: consumes its standing, renders and
 /// durably records the exact runtime envelope, and — when a sidecar receipt
 /// is supplied — verifies it against that envelope and records the stage
 /// receipt or a refusal.
+///
+/// The runnable stage is the first proposed stage that still needs the
+/// executor: a stage never dispatched, or a dispatched operator stage
+/// awaiting its sidecar receipt. A receipted operator stage is complete for
+/// dispatch purposes (its verdict arrives through a later review stage), and
+/// a dispatched review stage completes by verdict, never by a receipt, so
+/// neither is selected again.
 ///
 /// # Errors
 ///
@@ -386,11 +393,19 @@ pub fn run(
     now_unix: u64,
 ) -> anyhow::Result<RunOutcomeV1> {
     let ledger = load(dir)?;
-    let status = ledger.status(now_unix);
-    let stage = status
-        .current_stage
-        .as_ref()
+    let stage = ledger
+        .stage_order()
+        .iter()
+        .filter_map(|stage| ledger.stage(stage).map(|entry| (stage, entry)))
+        .find(|(_, entry)| {
+            if entry.dispatch().is_none() {
+                return true;
+            }
+            entry.receipt().is_none() && matches!(entry.proposal().kind(), StageKindV1::Operator(_))
+        })
+        .map(|(stage, _)| stage.clone())
         .context("campaign has no non-terminal stage to run")?;
+    let stage = &stage;
     let current = ledger
         .stage(stage)
         .context("current stage is missing from the ledger")?;

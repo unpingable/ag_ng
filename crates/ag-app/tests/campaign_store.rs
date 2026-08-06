@@ -186,6 +186,116 @@ fn store_runs_the_envelope_loop_and_doctor_verifies_it() {
 }
 
 #[test]
+fn store_advances_to_the_review_stage_after_operator_completion() {
+    let temporary = tempfile::tempdir().unwrap();
+    let dir = temporary.path().join("campaign");
+    let campaign_id = campaign::init(&dir, &intent()).unwrap();
+    let stage = campaign::propose_stage(&dir, proposal(&campaign_id)).unwrap();
+    campaign::admit_stage(
+        &dir,
+        DocketStandingV1 {
+            schema: ag_campaign::DOCKET_STANDING_SCHEMA_V1.to_owned(),
+            stage: stage.clone(),
+            standing_digest: digest("docket-standing-fixture"),
+            expiry_unix: EXPIRY,
+        },
+        NOW,
+    )
+    .unwrap();
+    let RunOutcomeV1::EnvelopeDispatched {
+        envelope_file_digest,
+        envelope_path,
+        ..
+    } = campaign::run(&dir, None, NOW).unwrap()
+    else {
+        panic!("first run must dispatch the envelope");
+    };
+    let envelope_record: RuntimeEnvelopeV1 = campaign::read_record_file(&envelope_path).unwrap();
+    let receipt = SidecarRuntimeReceiptV1 {
+        schema: RUNTIME_RECEIPT_SCHEMA_V1.to_owned(),
+        envelope_digest: envelope_file_digest,
+        campaign: campaign_id.clone(),
+        stage: stage.clone(),
+        standing_digest: envelope_record.standing_digest().clone(),
+        nonce: *envelope_record.nonce(),
+        outcome: SidecarOutcomeV1::Completed,
+        post_tree: Some(digest("post-tree-1")),
+        artifacts: vec![EvidenceArtifactV1 {
+            schema: "ag.test.report/v1".to_owned(),
+            digest: digest("artifact-1"),
+        }],
+    };
+    campaign::run(&dir, Some(receipt), NOW).unwrap();
+
+    // The operator stage is receipted; its verdict arrives through the
+    // review stage. The next runnable stage is the review stage, even
+    // though the operator stage is not yet verdict-terminal.
+    let review = StageProposalV1::review(
+        &campaign_id,
+        2,
+        basis(),
+        ag_campaign::ReviewScopeV1 {
+            subject_stage: stage.clone(),
+            read_paths: vec![PathGrantV1 {
+                repository: "repo:governed".to_owned(),
+                path_prefix: "/src".to_owned(),
+            }],
+        },
+        EvidenceContractV1 {
+            required: vec![EvidenceRequirementV1 {
+                schema: "ag.test.report/v1".to_owned(),
+            }],
+        },
+    )
+    .unwrap();
+    let review_stage = review.id();
+    campaign::propose_stage(&dir, review).unwrap();
+    campaign::admit_stage(
+        &dir,
+        DocketStandingV1 {
+            schema: ag_campaign::DOCKET_STANDING_SCHEMA_V1.to_owned(),
+            stage: review_stage.clone(),
+            standing_digest: digest("docket-standing-reviewer"),
+            expiry_unix: EXPIRY,
+        },
+        NOW,
+    )
+    .unwrap();
+    let RunOutcomeV1::EnvelopeDispatched {
+        stage: dispatched, ..
+    } = campaign::run(&dir, None, NOW).unwrap()
+    else {
+        panic!("the review stage must dispatch once the operator stage is receipted");
+    };
+    assert_eq!(dispatched, review_stage);
+
+    // A dispatched review stage completes by verdict, never by a worker
+    // receipt: a completed sidecar receipt for it refuses at recording.
+    let review_envelope_path = dir.join("envelopes").join(format!(
+        "{}.json",
+        &review_stage.as_str()["sha256:".len()..]
+    ));
+    let review_bytes = fs::read(&review_envelope_path).unwrap();
+    let review_envelope: RuntimeEnvelopeV1 =
+        campaign::read_record_file(&review_envelope_path).unwrap();
+    let review_receipt = SidecarRuntimeReceiptV1 {
+        schema: RUNTIME_RECEIPT_SCHEMA_V1.to_owned(),
+        envelope_digest: Digest::of_bytes(&review_bytes),
+        campaign: campaign_id.clone(),
+        stage: review_stage.clone(),
+        standing_digest: review_envelope.standing_digest().clone(),
+        nonce: *review_envelope.nonce(),
+        outcome: SidecarOutcomeV1::Completed,
+        post_tree: None,
+        artifacts: vec![EvidenceArtifactV1 {
+            schema: "ag.test.report/v1".to_owned(),
+            digest: digest("artifact-review"),
+        }],
+    };
+    assert!(campaign::run(&dir, Some(review_receipt), NOW).is_err());
+}
+
+#[test]
 fn abort_and_resume_are_effectful_and_audited() {
     let temporary = tempfile::tempdir().unwrap();
     let dir = temporary.path().join("campaign");
