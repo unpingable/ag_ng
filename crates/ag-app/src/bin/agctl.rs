@@ -1024,6 +1024,7 @@ fn atomic_write_new_root_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     result
 }
 
+#[allow(clippy::too_many_lines)]
 fn campaign(command: CampaignCommand) -> anyhow::Result<()> {
     match command {
         CampaignCommand::Init {
