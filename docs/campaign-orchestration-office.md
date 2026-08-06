@@ -122,3 +122,12 @@ envelope is rendered.
 All produced digests are SHA-256 over strict integer-only JCS transcripts under the
 repository's existing `Digest::hash_domain` separation; no digest is derived from
 another domain's digest.
+
+Cross-repository artifact rule (interop with Docket and the campaign-driver
+sidecar): when an artifact crosses a repository boundary as a file, its artifact
+digest is SHA-256 over the exact file bytes — `ag.campaign.runtime-envelope/v1`
+files carry no embedded digest, and `campaign run` reports the file-bytes digest
+as `envelope_file_digest` alongside the typed transcript digest (which remains
+the in-domain identity recorded in the dispatch event). A sidecar receipt
+answering a dispatched envelope must bind the file-bytes digest; the typed-field
+digests are unchanged and continue to anchor the in-ledger identities.

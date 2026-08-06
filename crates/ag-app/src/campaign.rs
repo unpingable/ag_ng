@@ -18,7 +18,7 @@ use ag_campaign::{
     CampaignStatusV1, DocketStandingV1, RecordedRefusalV1, RuntimeEnvelopeV1, SidecarOutcomeV1,
     SidecarRuntimeReceiptV1, StageId, StageProposalV1, StageReceiptV1, VerdictReceiptV1,
     plan_from_ledger, present_from_ledger, recompose_campaign, stage_receipt_from_execution,
-    verify_sidecar_receipt,
+    verify_sidecar_receipt_against,
 };
 use ag_kernel::NativeJudgment;
 use ag_primitives::{Digest, LifecycleNonce};
@@ -73,8 +73,11 @@ pub enum RunOutcomeV1 {
     EnvelopeDispatched {
         /// Dispatched stage.
         stage: StageId,
-        /// Exact envelope digest.
+        /// Exact envelope digest (typed transcript identity).
         envelope: Digest,
+        /// SHA-256 over the exact envelope file bytes; the cross-repository
+        /// artifact identity the sidecar's receipt must bind.
+        envelope_file_digest: Digest,
         /// Envelope file path.
         envelope_path: PathBuf,
     },
@@ -421,12 +424,14 @@ pub fn run(
         let path = envelope_path(dir, stage);
         let mut bytes = canonical_json(&envelope)?;
         bytes.push(b'\n');
-        fs::write(&path, bytes)
+        fs::write(&path, &bytes)
             .with_context(|| format!("cannot write runtime envelope {}", path.display()))?;
+        let file_digest = Digest::of_bytes(&bytes);
         if receipt.is_none() {
             return Ok(RunOutcomeV1::EnvelopeDispatched {
                 stage: stage.clone(),
                 envelope: digest,
+                envelope_file_digest: file_digest,
                 envelope_path: path,
             });
         }
@@ -442,8 +447,11 @@ pub fn run(
             .unwrap_or(&envelope_bytes),
     )
     .context("dispatched runtime envelope is not a strict canonical record")?;
-    let verified =
-        verify_sidecar_receipt(&envelope, &receipt).context("sidecar receipt refused")?;
+    // Cross-repository artifact rule: the receipt binds the exact envelope
+    // file bytes (SHA-256), not a re-canonicalization across implementations.
+    let envelope_file_digest = Digest::of_bytes(&envelope_bytes);
+    let verified = verify_sidecar_receipt_against(&envelope, &envelope_file_digest, &receipt)
+        .context("sidecar receipt refused")?;
     let proposal = ledger
         .stage(stage)
         .context("current stage is missing from the ledger")?

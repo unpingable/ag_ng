@@ -294,6 +294,11 @@ impl VerifiedSidecarExecutionV1 {
 
 /// Verifies a sidecar runtime receipt against the exact envelope it answers.
 ///
+/// This is the typed-field form: the receipt must bind the envelope's
+/// transcript digest. Kept for in-domain verification; the cross-repository
+/// artifact rule uses [`verify_sidecar_receipt_against`] with the envelope
+/// file-bytes digest.
+///
 /// # Errors
 ///
 /// Returns a typed [`SidecarVerificationErrorV1`] for any identity mismatch,
@@ -303,10 +308,31 @@ pub fn verify_sidecar_receipt(
     envelope: &RuntimeEnvelopeV1,
     receipt: &SidecarRuntimeReceiptV1,
 ) -> Result<VerifiedSidecarExecutionV1, SidecarVerificationErrorV1> {
+    verify_sidecar_receipt_against(envelope, &envelope.digest(), receipt)
+}
+
+/// Verifies a sidecar runtime receipt against an explicit envelope digest.
+///
+/// Cross-repository artifact rule: artifact digests bind the exact artifact
+/// file bytes, so the caller passes the digest of the envelope artifact as
+/// received (SHA-256 over its bytes); every other check is identical to
+/// [`verify_sidecar_receipt`]. No party re-canonicalizes across
+/// implementations.
+///
+/// # Errors
+///
+/// Returns a typed [`SidecarVerificationErrorV1`] as in
+/// [`verify_sidecar_receipt`]; [`SidecarVerificationErrorV1::EnvelopeMismatch`]
+/// when the receipt answers a different envelope artifact digest.
+pub fn verify_sidecar_receipt_against(
+    envelope: &RuntimeEnvelopeV1,
+    envelope_digest: &Digest,
+    receipt: &SidecarRuntimeReceiptV1,
+) -> Result<VerifiedSidecarExecutionV1, SidecarVerificationErrorV1> {
     if receipt.schema != RUNTIME_RECEIPT_SCHEMA_V1 {
         return Err(SidecarVerificationErrorV1::Schema);
     }
-    if receipt.envelope_digest != envelope.digest() {
+    if receipt.envelope_digest != *envelope_digest {
         return Err(SidecarVerificationErrorV1::EnvelopeMismatch);
     }
     if receipt.campaign != *envelope.campaign() {
@@ -357,7 +383,11 @@ pub fn stage_receipt_from_execution(
         stage_seq: proposal.stage_seq(),
         role: envelope.role(),
         standing: envelope.standing_digest().clone(),
-        envelope: verified.envelope_digest.clone(),
+        // The ledger-facing receipt binds the in-domain typed envelope
+        // identity recorded at dispatch; the cross-repository file-bytes
+        // binding (verified.envelope_digest) is enforced at the seam and
+        // does not replace the in-domain identity.
+        envelope: envelope.digest(),
         basis: proposal.basis().clone(),
         post_tree: verified.post_tree.clone(),
         artifacts: verified.artifacts.clone(),

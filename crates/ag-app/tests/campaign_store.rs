@@ -115,6 +115,7 @@ fn store_runs_the_envelope_loop_and_doctor_verifies_it() {
     // Dispatch: consumes standing and renders the exact envelope.
     let RunOutcomeV1::EnvelopeDispatched {
         envelope,
+        envelope_file_digest,
         envelope_path,
         ..
     } = campaign::run(&dir, None, NOW).unwrap()
@@ -125,12 +126,21 @@ fn store_runs_the_envelope_loop_and_doctor_verifies_it() {
     // A second dispatch refuses: the standing is already burned.
     assert!(campaign::run(&dir, None, NOW).is_err());
 
-    // The mock sidecar answers the exact envelope.
+    // The mock sidecar answers the exact envelope artifact. The
+    // cross-repository rule binds the envelope FILE bytes: the outcome's
+    // file digest is SHA-256 over the bytes on disk, while the typed
+    // transcript digest remains the in-domain identity.
+    let envelope_bytes = fs::read(&envelope_path).unwrap();
+    assert_eq!(envelope_file_digest, Digest::of_bytes(&envelope_bytes));
     let envelope_record: RuntimeEnvelopeV1 = campaign::read_record_file(&envelope_path).unwrap();
     assert_eq!(envelope_record.digest(), envelope);
+    assert_ne!(
+        envelope_file_digest, envelope,
+        "the file-bytes artifact digest is a distinct binding from the typed digest"
+    );
     let receipt = SidecarRuntimeReceiptV1 {
         schema: RUNTIME_RECEIPT_SCHEMA_V1.to_owned(),
-        envelope_digest: envelope,
+        envelope_digest: envelope_file_digest.clone(),
         campaign: campaign_id.clone(),
         stage: stage.clone(),
         standing_digest: envelope_record.standing_digest().clone(),
@@ -142,6 +152,15 @@ fn store_runs_the_envelope_loop_and_doctor_verifies_it() {
             digest: digest("artifact-1"),
         }],
     };
+
+    // A receipt binding the typed transcript digest instead of the exact
+    // file bytes refuses: cross-repository artifacts bind bytes only.
+    let typed_binding = SidecarRuntimeReceiptV1 {
+        envelope_digest: envelope.clone(),
+        ..receipt.clone()
+    };
+    assert!(campaign::run(&dir, Some(typed_binding), NOW).is_err());
+
     let RunOutcomeV1::StageReceiptRecorded {
         receipt: receipt_digest,
         ..
