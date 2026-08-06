@@ -14,12 +14,19 @@
 
 #![forbid(unsafe_code)]
 
+mod envelope;
 mod identity;
 mod ledger;
 mod recomposition;
 mod stage;
 mod transcript;
 
+pub use envelope::{
+    RUNTIME_ENVELOPE_DOMAIN_V1, RUNTIME_ENVELOPE_SCHEMA_V1, RUNTIME_RECEIPT_DOMAIN_V1,
+    RUNTIME_RECEIPT_SCHEMA_V1, RuntimeEnvelopeV1, SidecarOutcomeV1, SidecarRuntimeReceiptV1,
+    SidecarVerificationErrorV1, VerifiedSidecarExecutionV1, stage_receipt_from_execution,
+    verify_sidecar_receipt,
+};
 pub use identity::{
     CAMPAIGN_IDENTITY_DOMAIN_V1, CAMPAIGN_INTENT_SCHEMA_V1, CampaignId, CampaignIntentError,
     CampaignIntentV1, CampaignLabelError, WorkerRoleV1,
