@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ag-app",
+    "crates/ag-campaign",
     "crates/ag-effect",
     "crates/ag-kernel",
     "crates/ag-migrate",

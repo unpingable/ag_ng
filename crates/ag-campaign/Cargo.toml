@@ -1,0 +1,18 @@
+[package]
+name = "ag-campaign"
+description = "Campaign orchestration office semantics for Agent Governor NG"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ag-kernel = { path = "../ag-kernel" }
+ag-primitives = { path = "../ag-primitives" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
