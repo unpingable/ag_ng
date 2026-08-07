@@ -85,6 +85,12 @@ pub enum CampaignLabelError {
         /// Actual byte length.
         actual: usize,
     },
+    /// A path prefix exceeds the independently bounded canonical-path capacity.
+    #[error("path prefix exceeds 256 bytes (got {actual})")]
+    PathTooLong {
+        /// Actual UTF-8 byte length of the canonical leading-slash form.
+        actual: usize,
+    },
     /// The label contains an ASCII control character.
     #[error("{kind} contains an ASCII control character")]
     ControlCharacter {

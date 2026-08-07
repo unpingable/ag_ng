@@ -74,6 +74,13 @@ family (the kernel's, unchanged).
     output without review, reviewer output after repository mutation, repair without
     admitted repair standing, historical identity presented as current standing, and
     broadened path scope.
+14. **Path-grant representation is bounded without changing grant meaning.**
+    `PathGrantV1` retains its V1 wire shape and exact canonical string bytes. The
+    canonical leading-slash `path_prefix` may occupy at most 256 UTF-8 bytes; a
+    longer value refuses without truncation, aliasing, hashing, coalescing, or
+    parent substitution. This is an implementation representability capacity,
+    independent from the unchanged 128-byte free-text-label bound. Increasing
+    capacity does not add a grant to any proposal or alter exact scope equality.
 
 ## Nonclaims
 

@@ -5,7 +5,7 @@ use ag_campaign::{
     CampaignEventV1, CampaignIntentV1, CampaignLedgerV1, CampaignResidualV1, CandidateActionV1,
     DOCKET_STANDING_SCHEMA_V1, DocketStandingV1, EvidenceArtifactV1, EvidenceContractV1,
     EvidenceRequirementV1, FindingId, FindingV1, LedgerErrorV1, MutationScopeV1, PathGrantV1,
-    PresentedReceiptV1, RUNTIME_RECEIPT_SCHEMA_V1, ReviewScopeV1, RuntimeEnvelopeV1,
+    PlanRefusalV1, PresentedReceiptV1, RUNTIME_RECEIPT_SCHEMA_V1, ReviewScopeV1, RuntimeEnvelopeV1,
     SidecarOutcomeV1, SidecarRuntimeReceiptV1, SidecarVerificationErrorV1, StageBasisV1, StageId,
     StageKindV1, StageProposalV1, StageReceiptV1, VerdictReceiptV1, VerdictV1, WorkerRoleV1,
     plan_from_ledger, present_from_ledger, recompose_campaign, stage_receipt_from_execution,
@@ -17,6 +17,7 @@ use ag_primitives::{Digest, LifecycleNonce};
 const NOW: u64 = 1_000_000;
 const EXPIRY: u64 = 2_000_000;
 const EVIDENCE_SCHEMA: &str = "ag.test.report/v1";
+const C1_PROCESS_STANDING_PATH: &str = "/audits/nq-host-role-runtime-seam-v1/c1-gen5-c2-guarded-store-generation/C1-GEN5-C2-DEVELOPMENT-PROCESS-STANDING-INVENTORY-V1.json";
 
 fn digest(value: &str) -> Digest {
     Digest::hash_bytes(value.as_bytes())
@@ -237,6 +238,115 @@ fn stage_projection_binds_exactly_one_campaign_and_one_role() {
     .unwrap();
     assert_eq!(review.role(), WorkerRoleV1::Reviewer);
     assert!(matches!(review.kind(), StageKindV1::Review(_)));
+}
+
+#[test]
+fn exact_130_byte_c1_path_round_trips_without_rewriting_or_widening() {
+    assert_eq!(C1_PROCESS_STANDING_PATH.len(), 130);
+    let grant = PathGrantV1 {
+        repository: "records".to_owned(),
+        path_prefix: C1_PROCESS_STANDING_PATH.to_owned(),
+    };
+    grant
+        .validate()
+        .expect("the exact 130-byte canonical path must validate");
+
+    let campaign = intent().campaign_id();
+    let proposal = StageProposalV1::operator(
+        &campaign,
+        1,
+        basis(),
+        MutationScopeV1 {
+            grants: vec![grant.clone()],
+        },
+        evidence(),
+    )
+    .unwrap();
+    let encoded = serde_json::to_vec(&proposal).unwrap();
+    let decoded: StageProposalV1 = serde_json::from_slice(&encoded).unwrap();
+    let reencoded = serde_json::to_vec(&decoded).unwrap();
+
+    assert_eq!(decoded, proposal);
+    assert_eq!(decoded.id(), proposal.id());
+    assert_eq!(reencoded, encoded);
+    let StageKindV1::Operator(scope) = decoded.kind() else {
+        panic!("the stage role must remain operator");
+    };
+    assert_eq!(scope.grants, vec![grant]);
+    assert_eq!(
+        scope.grants[0].path_prefix.as_bytes(),
+        C1_PROCESS_STANDING_PATH.as_bytes()
+    );
+}
+
+fn assert_dispatch_scope_change_refuses(altered_paths: Vec<PathGrantV1>) {
+    let mut ledger = CampaignLedgerV1::create(intent()).unwrap();
+    let campaign = ledger.campaign().clone();
+    let proposal = StageProposalV1::operator(
+        &campaign,
+        1,
+        basis(),
+        MutationScopeV1 {
+            grants: vec![PathGrantV1 {
+                repository: "records".to_owned(),
+                path_prefix: C1_PROCESS_STANDING_PATH.to_owned(),
+            }],
+        },
+        evidence(),
+    )
+    .unwrap();
+    let stage = ledger.propose_stage(proposal).unwrap();
+    ledger
+        .admit_stage(&stage, standing(&stage, "long-path-standing"), NOW)
+        .unwrap();
+    let consumed = ledger.consume_standing(&stage, NOW).unwrap();
+    ledger
+        .record_dispatch(&consumed, &digest("long-path-envelope"), altered_paths)
+        .unwrap();
+    assert!(matches!(
+        plan_from_ledger(&ledger),
+        Err(PlanRefusalV1::BroadenedPathScope { stage: refused }) if refused == stage
+    ));
+}
+
+#[test]
+fn increased_capacity_does_not_launder_scope_changes() {
+    let parent = C1_PROCESS_STANDING_PATH
+        .rsplit_once('/')
+        .expect("the exact path has a parent")
+        .0;
+    let altered = [
+        format!("{parent}/UNDECLARED-SIBLING.json"),
+        format!("{C1_PROCESS_STANDING_PATH}/undeclared-child"),
+        parent.to_owned(),
+        C1_PROCESS_STANDING_PATH[..128].to_owned(),
+        format!("{C1_PROCESS_STANDING_PATH}-prefix-collision"),
+        C1_PROCESS_STANDING_PATH.replacen("/c1-gen5-c2", "//c1-gen5-c2", 1),
+        format!("{parent}/*"),
+    ];
+    for path_prefix in altered {
+        assert_dispatch_scope_change_refuses(vec![PathGrantV1 {
+            repository: "records".to_owned(),
+            path_prefix,
+        }]);
+    }
+
+    assert_dispatch_scope_change_refuses(vec![
+        PathGrantV1 {
+            repository: "records".to_owned(),
+            path_prefix: C1_PROCESS_STANDING_PATH.to_owned(),
+        },
+        PathGrantV1 {
+            repository: "records".to_owned(),
+            path_prefix: C1_PROCESS_STANDING_PATH.to_owned(),
+        },
+    ]);
+
+    let traversal = PathGrantV1 {
+        repository: "records".to_owned(),
+        path_prefix: "/audits/../outside".to_owned(),
+    };
+    assert!(traversal.validate().is_err());
 }
 
 #[test]
