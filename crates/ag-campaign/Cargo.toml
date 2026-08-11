@@ -8,10 +8,10 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-ag-kernel = { path = "../ag-kernel" }
 ag-primitives = { path = "../ag-primitives" }
 serde.workspace = true
 thiserror.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

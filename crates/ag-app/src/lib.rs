@@ -2,16 +2,18 @@
 
 pub mod agd;
 pub mod api;
-pub mod campaign;
 pub mod config;
 mod custody;
 pub mod derived;
 pub mod descriptor_path;
 pub mod docket_issuance;
 pub mod doctor;
+pub mod effect_executor_adapter;
 pub mod effectd;
 pub mod effectd_activation;
 mod exact_exec;
+pub mod governed_loop;
+pub mod governed_ports;
 pub mod managed_pointer;
 pub mod peer;
 pub mod rpc_auth;

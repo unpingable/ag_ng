@@ -21,6 +21,7 @@ dependencies = [
  "nix",
  "rand",
  "ring",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_jcs",
@@ -38,11 +39,11 @@ dependencies = [
 name = "ag-campaign"
 version = "0.1.0"
 dependencies = [
- "ag-kernel",
  "ag-primitives",
  "serde",
  "serde_json",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -141,6 +142,7 @@ dependencies = [
 name = "ag-store"
 version = "0.1.0"
 dependencies = [
+ "ag-campaign",
  "ag-primitives",
  "anyhow",
  "clap",

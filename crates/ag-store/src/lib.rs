@@ -24,6 +24,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
+pub mod campaign;
 mod offline_backup;
 
 pub use offline_backup::{

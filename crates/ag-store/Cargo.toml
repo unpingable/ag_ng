@@ -8,6 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+ag-campaign = { path = "../ag-campaign" }
 ag-primitives = { path = "../ag-primitives" }
 anyhow.workspace = true
 clap.workspace = true

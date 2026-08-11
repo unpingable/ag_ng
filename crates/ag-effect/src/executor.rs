@@ -27,6 +27,9 @@ use crate::{
 
 /// Canonical schema emitted for terminal execution receipts.
 pub const EXECUTION_RECEIPT_SCHEMA_V1: &str = "ag.effect.execution-receipt/v1";
+/// Canonical schema emitted by the authority-neutral Docket executor adapter.
+pub const DOCKET_EXECUTION_RECEIPT_SCHEMA_V1: &str =
+    "ag.effect.docket-custodied-execution-receipt/v1";
 
 const STAGE_PREFIX: &str = ".ag-stage-";
 const QUARANTINE_PREFIX: &str = ".ag-quarantine-";
@@ -81,6 +84,93 @@ impl BurnedExecutionPermitV1 {
             effect_index,
             preparation_checkpoint: Some(preparation_checkpoint),
         }
+    }
+}
+
+/// One exact Docket-custodied physical attempt.
+///
+/// This consuming value is mechanics-only.  `executor_marker` is neither an
+/// AG decision authorization nor Docket execution standing, and this value
+/// exposes no campaign transition operation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DocketCustodiedExecutionPermitV1 {
+    work: Digest,
+    executor_marker: Digest,
+    attempt: Digest,
+    effect_index: u32,
+    preparation_checkpoint: Option<Digest>,
+}
+
+impl DocketCustodiedExecutionPermitV1 {
+    /// Constructs the consuming mechanics permit for an already durable
+    /// Docket attempt and executor-local idempotency marker.
+    #[must_use]
+    pub fn from_docket_custody(
+        work: Digest,
+        executor_marker: Digest,
+        attempt: Digest,
+        effect_index: u32,
+    ) -> Self {
+        Self {
+            work,
+            executor_marker,
+            attempt,
+            effect_index,
+            preparation_checkpoint: None,
+        }
+    }
+
+    /// Constructs the consuming mechanics permit for an already prepared
+    /// managed-pointer attempt.
+    #[must_use]
+    pub fn from_docket_preparation(
+        work: Digest,
+        executor_marker: Digest,
+        attempt: Digest,
+        effect_index: u32,
+        preparation_checkpoint: Digest,
+    ) -> Self {
+        Self {
+            work,
+            executor_marker,
+            attempt,
+            effect_index,
+            preparation_checkpoint: Some(preparation_checkpoint),
+        }
+    }
+}
+
+trait ExecutionCoordinatesV1 {
+    fn attempt(&self) -> &Digest;
+    fn effect_index(&self) -> u32;
+    fn preparation_checkpoint(&self) -> Option<&Digest>;
+}
+
+impl ExecutionCoordinatesV1 for BurnedExecutionPermitV1 {
+    fn attempt(&self) -> &Digest {
+        &self.attempt
+    }
+
+    fn effect_index(&self) -> u32 {
+        self.effect_index
+    }
+
+    fn preparation_checkpoint(&self) -> Option<&Digest> {
+        self.preparation_checkpoint.as_ref()
+    }
+}
+
+impl ExecutionCoordinatesV1 for DocketCustodiedExecutionPermitV1 {
+    fn attempt(&self) -> &Digest {
+        &self.attempt
+    }
+
+    fn effect_index(&self) -> u32 {
+        self.effect_index
+    }
+
+    fn preparation_checkpoint(&self) -> Option<&Digest> {
+        self.preparation_checkpoint.as_ref()
     }
 }
 
@@ -469,6 +559,66 @@ pub struct ExecutionReceiptV1 {
     pub effect: CanonicalEffectV1,
     /// Terminal result; callers must not reinterpret one class as another.
     pub outcome: ExecutionOutcomeV1,
+}
+
+/// Exact terminal mechanics receipt for a Docket-custodied attempt.
+///
+/// No field in this record is campaign authority.  In particular, the
+/// executor marker is only the adapter's idempotency identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocketEffectExecutionReceiptV1 {
+    /// Receipt schema.
+    pub schema: String,
+    /// Exact Docket-bound work identity.
+    pub work: Digest,
+    /// Executor-local idempotency marker for the exact Docket attempt.
+    pub executor_marker: Digest,
+    /// Docket-owned execution-attempt identity.
+    pub attempt: Digest,
+    /// Effect position in the exact work plan.
+    pub effect_index: u32,
+    /// Exact canonical effect consumed by this attempt.
+    pub effect: CanonicalEffectV1,
+    /// Terminal result; callers must not reinterpret one class as another.
+    pub outcome: ExecutionOutcomeV1,
+}
+
+impl DocketEffectExecutionReceiptV1 {
+    /// Computes the identity of the exact canonical receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the receipt cannot be represented as canonical JCS.
+    pub fn digest(&self) -> Result<Digest, ExecutionReceiptError> {
+        Digest::from_serializable(self)
+            .map_err(|error| ExecutionReceiptError::Canonical(error.to_string()))
+    }
+
+    /// Verifies exact work/marker/attempt/effect bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionReceiptError::BindingMismatch`] for any substitution.
+    pub fn verify_bindings(
+        &self,
+        work: &Digest,
+        executor_marker: &Digest,
+        attempt: &Digest,
+        effect_index: u32,
+        effect: &CanonicalEffectV1,
+    ) -> Result<(), ExecutionReceiptError> {
+        if self.schema != DOCKET_EXECUTION_RECEIPT_SCHEMA_V1
+            || &self.work != work
+            || &self.executor_marker != executor_marker
+            || &self.attempt != attempt
+            || self.effect_index != effect_index
+            || &self.effect != effect
+        {
+            return Err(ExecutionReceiptError::BindingMismatch);
+        }
+        Ok(())
+    }
 }
 
 impl ExecutionReceiptV1 {
@@ -907,9 +1057,46 @@ impl<'a> EffectExecutorV1<'a> {
         permit: BurnedExecutionPermitV1,
         effect: &CanonicalEffectV1,
     ) -> ExecutionReceiptV1 {
+        let outcome = self.execute_permitted(&permit, effect);
+        ExecutionReceiptV1 {
+            schema: EXECUTION_RECEIPT_SCHEMA_V1.to_owned(),
+            proposal: permit.proposal,
+            authorization: permit.authorization,
+            attempt: permit.attempt,
+            effect_index: permit.effect_index,
+            effect: effect.clone(),
+            outcome,
+        }
+    }
+
+    /// Executes one exact effect as mechanics for an already Docket-custodied
+    /// attempt.  The returned receipt carries no campaign authority.
+    #[must_use]
+    pub fn execute_docket_custodied_once(
+        &self,
+        permit: DocketCustodiedExecutionPermitV1,
+        effect: &CanonicalEffectV1,
+    ) -> DocketEffectExecutionReceiptV1 {
+        let outcome = self.execute_permitted(&permit, effect);
+        DocketEffectExecutionReceiptV1 {
+            schema: DOCKET_EXECUTION_RECEIPT_SCHEMA_V1.to_owned(),
+            work: permit.work,
+            executor_marker: permit.executor_marker,
+            attempt: permit.attempt,
+            effect_index: permit.effect_index,
+            effect: effect.clone(),
+            outcome,
+        }
+    }
+
+    fn execute_permitted(
+        &self,
+        permit: &impl ExecutionCoordinatesV1,
+        effect: &CanonicalEffectV1,
+    ) -> ExecutionOutcomeV1 {
         let promotion = matches!(effect, CanonicalEffectV1::ManagedPointerPromotion { .. });
-        let checkpoint_binding_valid = promotion == permit.preparation_checkpoint.is_some();
-        let outcome = if checkpoint_binding_valid {
+        let checkpoint_binding_valid = promotion == permit.preparation_checkpoint().is_some();
+        if checkpoint_binding_valid {
             match effect {
                 CanonicalEffectV1::ManagedFilePut {
                     path,
@@ -920,7 +1107,7 @@ impl<'a> EffectExecutorV1<'a> {
                     gid,
                     ..
                 } => self.execute_file_put(
-                    &permit,
+                    permit,
                     path,
                     expected_content.as_ref(),
                     content,
@@ -932,9 +1119,9 @@ impl<'a> EffectExecutorV1<'a> {
                     path,
                     expected_content,
                     ..
-                } => self.execute_file_delete(&permit, path, expected_content),
+                } => self.execute_file_delete(permit, path, expected_content),
                 CanonicalEffectV1::ManagedPointerPromotion { .. } => {
-                    self.execute_pointer(&permit, effect)
+                    self.execute_pointer(permit, effect)
                 }
                 CanonicalEffectV1::SystemdUnit {
                     unit,
@@ -961,23 +1148,13 @@ impl<'a> EffectExecutorV1<'a> {
                 "execution permit preparation checkpoint does not match effect family",
                 None,
             )
-        };
-
-        ExecutionReceiptV1 {
-            schema: EXECUTION_RECEIPT_SCHEMA_V1.to_owned(),
-            proposal: permit.proposal,
-            authorization: permit.authorization,
-            attempt: permit.attempt,
-            effect_index: permit.effect_index,
-            effect: effect.clone(),
-            outcome,
         }
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn execute_file_put(
         &self,
-        permit: &BurnedExecutionPermitV1,
+        permit: &impl ExecutionCoordinatesV1,
         path: &str,
         expected_content: Option<&Digest>,
         desired_content: &Digest,
@@ -1297,7 +1474,7 @@ impl<'a> EffectExecutorV1<'a> {
 
     fn execute_file_delete(
         &self,
-        permit: &BurnedExecutionPermitV1,
+        permit: &impl ExecutionCoordinatesV1,
         path: &str,
         expected_content: &Digest,
     ) -> ExecutionOutcomeV1 {
@@ -1387,7 +1564,7 @@ impl<'a> EffectExecutorV1<'a> {
     #[allow(clippy::too_many_lines)]
     fn execute_pointer(
         &self,
-        permit: &BurnedExecutionPermitV1,
+        permit: &impl ExecutionCoordinatesV1,
         effect: &CanonicalEffectV1,
     ) -> ExecutionOutcomeV1 {
         let CanonicalEffectV1::ManagedPointerPromotion {
@@ -1433,7 +1610,7 @@ impl<'a> EffectExecutorV1<'a> {
                 None,
             );
         }
-        let Some(preparation_checkpoint) = permit.preparation_checkpoint.as_ref() else {
+        let Some(preparation_checkpoint) = permit.preparation_checkpoint() else {
             return failure(
                 ExecutionFailureCodeV1::BackendRejected,
                 ExecutionPhaseV1::ReceiptValidation,
@@ -1682,15 +1859,15 @@ struct InternalNames {
 }
 
 impl InternalNames {
-    fn new(permit: &BurnedExecutionPermitV1) -> Self {
+    fn new(permit: &impl ExecutionCoordinatesV1) -> Self {
         let suffix = permit
-            .attempt
+            .attempt()
             .as_str()
             .strip_prefix("sha256:")
-            .unwrap_or(permit.attempt.as_str());
+            .unwrap_or(permit.attempt().as_str());
         Self {
-            stage: format!("{STAGE_PREFIX}{suffix}-{}", permit.effect_index),
-            quarantine: format!("{QUARANTINE_PREFIX}{suffix}-{}", permit.effect_index),
+            stage: format!("{STAGE_PREFIX}{suffix}-{}", permit.effect_index()),
+            quarantine: format!("{QUARANTINE_PREFIX}{suffix}-{}", permit.effect_index()),
         }
     }
 }

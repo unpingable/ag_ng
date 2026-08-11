@@ -31,6 +31,10 @@ name = "ag-worker-fixture"
 path = "src/bin/ag-worker-fixture.rs"
 required-features = ["worker-fixture"]
 
+[[bin]]
+name = "ag-loopctl"
+path = "src/bin/ag-loopctl.rs"
+
 [dependencies]
 ag-campaign = { path = "../ag-campaign" }
 ag-effect = { path = "../ag-effect" }
@@ -47,6 +51,7 @@ libc.workspace = true
 nix = { workspace = true, features = ["uio"] }
 rand.workspace = true
 ring.workspace = true
+rusqlite.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true

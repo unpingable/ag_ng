@@ -9,7 +9,6 @@ use ag_app::api::{
     AgdRequestV1, AgdResponseV1, ApiResultV1, EFFECT_RECORD_SCHEMA_V3, EffectAdminRequestV1,
     EffectAdminResponseV1, HealthV1,
 };
-use ag_app::campaign::{self, IntentValidationV1};
 use ag_app::config::{
     AgctlCommandProfileV1, AgctlConfigV1, AgctlDaemonPeerV1, AgctlSocketPeerCheckV1,
     EffectTargetConfigV1, EffectdConfigV1, LoadedConfigV1, MAX_CONFIG_BYTES, load_config,
@@ -28,10 +27,6 @@ use ag_app::managed_pointer::{
 use ag_app::rpc_auth::{RpcPeerEnrollmentV1, RpcReplayGuardV1, RpcSignerV1, SystemRpcClockV1};
 use ag_app::runtime::require_uninitialized_component_store;
 use ag_app::signed_transport::{SocketPeerCheckV1, call_signed};
-use ag_campaign::{
-    CampaignIntentV1, CampaignResidualV1, DocketStandingV1, SidecarRuntimeReceiptV1,
-    StageProposalV1, VerdictReceiptV1,
-};
 use ag_effect::{ProposalIntentV1, ReconciliationEvidenceV1};
 use ag_primitives::{Digest, SessionId};
 use ag_protocol::{RequestId, canonical_json, strict_json_from_slice};
@@ -104,123 +99,6 @@ enum Command {
         /// Governor worker operation.
         #[command(subcommand)]
         command: WorkerCommand,
-    },
-    /// Operate a local campaign orchestration store. Local-only; no daemon
-    /// contact and no authority movement.
-    Campaign {
-        /// Campaign operation.
-        #[command(subcommand)]
-        command: CampaignCommand,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum CampaignCommand {
-    /// Create a local campaign store from a human-authorized intent.
-    Init {
-        /// Strict `CampaignIntentV1` JSON file.
-        #[arg(long, value_name = "PATH")]
-        intent: PathBuf,
-        /// New campaign store directory; must not exist.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-    },
-    /// Validate a campaign intent and print its exact identity. Read-only.
-    Validate {
-        /// Strict `CampaignIntentV1` JSON file.
-        #[arg(long, value_name = "PATH")]
-        intent: PathBuf,
-    },
-    /// Audit campaign store integrity and replay. Read-only.
-    Doctor {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-    },
-    /// Propose a stage; a proposal is a request for Docket admission.
-    ProposeStage {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-        /// Strict `StageProposalV1` JSON file.
-        #[arg(long, value_name = "PATH")]
-        stage: PathBuf,
-    },
-    /// Record Docket admission for a proposed stage from a standing fixture.
-    AdmitStage {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-        /// Strict `DocketStandingV1` JSON fixture.
-        #[arg(long, value_name = "PATH")]
-        standing: PathBuf,
-    },
-    /// Consume the current stage's standing, render the exact runtime
-    /// envelope, and optionally verify a sidecar receipt against it.
-    Run {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-        /// Dispatch the envelope and exit without a receipt.
-        #[arg(long)]
-        detach: bool,
-        /// Strict `SidecarRuntimeReceiptV1` JSON file answering the envelope.
-        #[arg(long, value_name = "PATH")]
-        receipt: Option<PathBuf>,
-    },
-    /// Record a reviewer verdict receipt.
-    RecordVerdict {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-        /// Strict `VerdictReceiptV1` JSON file.
-        #[arg(long, value_name = "PATH")]
-        verdict: PathBuf,
-    },
-    /// Record a bounded residual.
-    RecordResidual {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-        /// Strict `CampaignResidualV1` JSON file.
-        #[arg(long, value_name = "PATH")]
-        residual: PathBuf,
-    },
-    /// Show campaign status. Read-only.
-    Status {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-    },
-    /// Show the most recent stored campaign events. Read-only.
-    Tail {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-        /// Number of events, from 1 through 1000.
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000), default_value_t = 20)]
-        limit: u32,
-    },
-    /// Compute the campaign recomposition judgment. Read-only.
-    Report {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-    },
-    /// Halt the campaign with an exact reason digest.
-    Abort {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
-        /// Digest of the halt reason/evidence.
-        #[arg(long)]
-        reason: Digest,
-    },
-    /// Resume a halted campaign once no consumed stage is in flight.
-    Resume {
-        /// Campaign store directory.
-        #[arg(long, value_name = "PATH")]
-        campaign_dir: PathBuf,
     },
 }
 
@@ -519,10 +397,6 @@ fn main() -> anyhow::Result<()> {
             )?;
             return managed_pointer(command);
         }
-        Some(Command::Campaign { command }) => {
-            require_offline_invocation(config.as_deref(), check_config, "campaign")?;
-            return campaign(command);
-        }
         command => command,
     };
     let config_path = config.context("--config is required for this operation")?;
@@ -582,7 +456,6 @@ fn dispatch(client: &ClientV1, command: Command) -> anyhow::Result<()> {
         Command::ManagedPointer { .. } => {
             bail!("managed-pointer enrollment is not a signed command-plane operation")
         }
-        Command::Campaign { .. } => bail!("campaign is not a signed command-plane operation"),
         Command::Health { component } => health(client, component),
         Command::Effect { command } => effect(client, command),
         Command::Intent { command } => match command {
@@ -1022,112 +895,6 @@ fn atomic_write_new_root_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     result
-}
-
-#[allow(clippy::too_many_lines)]
-fn campaign(command: CampaignCommand) -> anyhow::Result<()> {
-    match command {
-        CampaignCommand::Init {
-            intent,
-            campaign_dir,
-        } => {
-            let intent: CampaignIntentV1 = campaign::read_record_file(&intent)?;
-            campaign::init(&campaign_dir, &intent)?;
-            write_canonical(&campaign::status(&campaign_dir, campaign::now_unix()?)?)
-        }
-        CampaignCommand::Validate { intent } => {
-            let intent: CampaignIntentV1 = campaign::read_record_file(&intent)?;
-            let campaign_id = campaign::validate_intent(&intent)?;
-            write_canonical(&IntentValidationV1 {
-                valid: true,
-                campaign: campaign_id,
-                human_authorization: intent.human_authorization().clone(),
-            })
-        }
-        CampaignCommand::Doctor { campaign_dir } => {
-            let report = campaign::doctor(&campaign_dir)?;
-            write_canonical(&report)?;
-            if !report.healthy {
-                bail!("campaign doctor found failed checks");
-            }
-            Ok(())
-        }
-        CampaignCommand::ProposeStage {
-            campaign_dir,
-            stage,
-        } => {
-            let proposal: StageProposalV1 = campaign::read_record_file(&stage)?;
-            campaign::propose_stage(&campaign_dir, proposal)?;
-            write_canonical(&campaign::status(&campaign_dir, campaign::now_unix()?)?)
-        }
-        CampaignCommand::AdmitStage {
-            campaign_dir,
-            standing,
-        } => {
-            let standing: DocketStandingV1 = campaign::read_record_file(&standing)?;
-            campaign::admit_stage(&campaign_dir, standing, campaign::now_unix()?)?;
-            write_canonical(&campaign::status(&campaign_dir, campaign::now_unix()?)?)
-        }
-        CampaignCommand::Run {
-            campaign_dir,
-            detach,
-            receipt,
-        } => {
-            let receipt = receipt
-                .map(|path| campaign::read_record_file::<SidecarRuntimeReceiptV1>(&path))
-                .transpose()?;
-            if receipt.is_none() && !detach {
-                bail!(
-                    "campaign run requires --detach or --receipt; dispatch burns standing exactly once"
-                );
-            }
-            let outcome = campaign::run(&campaign_dir, receipt, campaign::now_unix()?)?;
-            write_canonical(&outcome)
-        }
-        CampaignCommand::RecordVerdict {
-            campaign_dir,
-            verdict,
-        } => {
-            let verdict: VerdictReceiptV1 = campaign::read_record_file(&verdict)?;
-            campaign::record_verdict(&campaign_dir, verdict)?;
-            write_canonical(&campaign::status(&campaign_dir, campaign::now_unix()?)?)
-        }
-        CampaignCommand::RecordResidual {
-            campaign_dir,
-            residual,
-        } => {
-            let residual: CampaignResidualV1 = campaign::read_record_file(&residual)?;
-            campaign::record_residual(&campaign_dir, residual)?;
-            write_canonical(&campaign::status(&campaign_dir, campaign::now_unix()?)?)
-        }
-        CampaignCommand::Status { campaign_dir } => {
-            write_canonical(&campaign::status(&campaign_dir, campaign::now_unix()?)?)
-        }
-        CampaignCommand::Tail {
-            campaign_dir,
-            limit,
-        } => write_canonical(&campaign::tail(&campaign_dir, limit)?),
-        CampaignCommand::Report { campaign_dir } => {
-            let judgment = campaign::report(&campaign_dir)?;
-            let refused = matches!(&judgment, ag_kernel::NativeJudgment::Refuse(_));
-            write_canonical(&judgment)?;
-            if refused {
-                bail!("campaign recomposition refused; inspect the exact failures");
-            }
-            Ok(())
-        }
-        CampaignCommand::Abort {
-            campaign_dir,
-            reason,
-        } => {
-            campaign::abort(&campaign_dir, reason)?;
-            write_canonical(&campaign::status(&campaign_dir, campaign::now_unix()?)?)
-        }
-        CampaignCommand::Resume { campaign_dir } => {
-            campaign::resume(&campaign_dir)?;
-            write_canonical(&campaign::status(&campaign_dir, campaign::now_unix()?)?)
-        }
-    }
 }
 
 fn worker(client: &ClientV1, command: WorkerCommand) -> anyhow::Result<()> {
