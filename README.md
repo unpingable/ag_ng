@@ -1,39 +1,24 @@
 # Agent Governor NG
 
-## Status (2026-07-26)
+## Implementation status (2026-08-10)
 
-AG-ng is the **canonical exact-work admissibility and issuance
-implementation** — the authority-bearing decision of a four-office governed
-constellation: it decides whether exact prepared work may receive authority
-and burns one-use decision authority; **Docket** executes and settles;
-**NQ** evaluates testimony, claims, and consumer reliance; **Nightshift**
-proposes and holds read-only orchestration posture. It is not a universal
-authority office: mandate custody (delegation, revocation, lineage — the
-`standing` repository's jurisdiction) and spendability accounting (the
-`linearaccountant` jurisdiction) are separately defined offices that AG-ng
-neither owns nor absorbed, and which the current vertical does not
-exercise. AG-ng owns its decision law and the issuance producer;
-it does **not** own the authorization wire contracts (`gwr:authz-request:v1`
-and `ag.docket-issuance:v1` are Docket-owned, with Docket's conformance
-vectors), execution, settlement, repository state, claim admissibility, or
-orchestration.
-
-Maturity: part of an **operationally reusable governed vertical** — its
-issuance path authorized both the three-office vertical (2026-07-25) and the
-four-office pilot (2026-07-26). That is not a production claim: the issuance
-surface is a library face exercised by harness, the decision-burn ledger is
-in-memory per process, and the tree remains explicitly **not production
-deployable** until its own checklist closes ("not production deployable" is a
-deployment-maturity statement, not a statement about which office is
-canonical). New authority features land here; the classic Python
-implementation (`agent_gov`) is legacy-historical, retained for its
-diagnostic drill helpers and archives, and receives no new authority work.
+AG-ng is the canonical durable governor of exact-work occurrences. The
+production-reachable path is `ag-loopctl` -> `CampaignEngineV1` ->
+`GovernedLoopKernelV1` -> `CampaignStoreV1`: AG records the exact proposal,
+resolves fresh observation and current standing, decides admissibility,
+durably spends one AG authorization, issues one exact record to Docket, and
+consumes Docket settlement into observation-required or reconciliation state.
+Docket owns execution custody and attempt identity; executors own mechanics;
+NQ owns diagnostic evaluation; Nightshift owns recurrence. This implementation
+is qualification-ready development code, not an earned qualification or
+deployment claim. Older vertical documents remain valid only for the narrower
+surfaces they explicitly name.
 
 Agent Governor NG is a Rust hard successor to the classic Python Agent
 Governor. Its authority boundary is deliberately narrow:
 
-> Workers propose. `ag-effectd` alone compiles, ratifies, and executes exact
-> effects.
+> Workers propose. AG governs one exact occurrence. Docket custodies one
+> attempt. An authority-neutral executor performs only the exact mechanics.
 
 The workspace is organized around non-convertible judgment-family types, an
 unprivileged governor daemon, a credential-isolated provider daemon, and a
@@ -56,23 +41,14 @@ once, and emits an immutable authenticated record. The record is not authority �
 that anything executed or that any downstream claim is admissible. See
 [`docs/docket-issuance.md`](docs/docket-issuance.md).
 
-The `ag-campaign` crate adds a deliberately bounded **campaign orchestration
-office** layer, consumed by `agctl campaign` against a local event-sourced
-store: exact campaign identity from the human-authorized intent, an
-operator/reviewer-separated stage projection, digest-bound opaque Docket
-standing records, burn-before-effect dispatch envelopes for the
-authority-neutral execution sidecar, verdict receipts, bounded repairs,
-residuals, and campaign recomposition wired through the kernel's existing
-`recompose()` accounting. A campaign grants no authority; candidate and
-qualification actions refuse pending distinct future authority; the real
-`agd`/`ag-effectd` broker wiring for stage execution is a recorded bounded
-residual, not a hidden claim. See
+The `ag-campaign` crate now contains the pure generic occurrence/FSM law; the
+transactional program counter and spend/attempt/settlement journals live in
+`ag-store`, and `ag-app` composes the live observation, standing, Docket, and
+human-authority boundaries. Residual preservation, bounded probe/retry/
+escalation facts, reconciliation, and authority-safe halt/resume are part of
+that path. The former fixed-stage campaign office is retired; its disposition
+record is retained only as history in
 [`docs/campaign-orchestration-office.md`](docs/campaign-orchestration-office.md).
-
-Residual obligations and escalation are both deliberately absent from the live
-surface today, and both say so where it matters rather than being silently
-missing: see [`docs/residual-obligations-disposition.md`](docs/residual-obligations-disposition.md)
-and [`docs/escalation-disposition.md`](docs/escalation-disposition.md).
 
 This repository does not preserve the classic command, API, database, or
 authority-token surfaces. The Rust-only frozen archive verifier treats classic

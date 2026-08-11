@@ -1,7 +1,14 @@
 # Campaign orchestration office — disposition record
 
-Status: **implemented as a bounded, local-only campaign layer** (`crates/ag-campaign`,
-consumed by `ag-app`/`agctl campaign`). This record states what the office owns, the
+Status: **retired historical disposition**. The fixed-stage implementation and
+`agctl campaign` production path described below were removed by
+`AG-GOVERNED-LOOP-C1`. Current transition ownership is the generic governed-loop
+kernel in `crates/ag-campaign/src/governed.rs`, persisted by
+`crates/ag-store/src/campaign.rs` and composed by
+`crates/ag-app/src/governed_loop.rs`/`ag-loopctl`. The remainder of this record
+is preserved only as architectural history; it is not a current runtime contract.
+
+This record originally stated what the bounded office owned, the
 invariants encoded in types, what it deliberately does not claim, and how it relates to
 the constitutional office map. It is doctrine, not a production claim.
 
