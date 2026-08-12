@@ -1,0 +1,41 @@
+{
+  "schema": "ag.operational-plan.v1",
+  "qualification_status": "not_assessed",
+  "environment": "fault_injection",
+  "premises": [
+    "ag.sqlite_wal_power_loss_recovery",
+    "ag.executor_physical_idempotency"
+  ],
+  "preconditions": [
+    "Disposable VM or block-device image with recorded filesystem, mount, cache, SQLite, and kernel versions",
+    "Externally controlled hard-power or block-I/O fault boundary",
+    "A disposable executor target with an independently observed effect counter",
+    "No production authority, data, or target is present"
+  ],
+  "cuts": [
+    "before predecessor transaction",
+    "during WAL append",
+    "after commit acknowledgement before checkpoint",
+    "after durable AG spend before Docket custody acknowledgement",
+    "after Docket attempt assignment before executor delivery acknowledgement",
+    "during executor-local idempotency marker persistence",
+    "after physical effect before executor outcome acknowledgement",
+    "after Docket settlement before AG settlement ingestion"
+  ],
+  "procedure": [
+    "Run preflight.py --profile fault-injection and snapshot the pristine image",
+    "For each cut, restore the same source/configuration basis and arm one externally controlled fault",
+    "Trigger exactly one occurrence and cut power or I/O at the recorded boundary",
+    "Boot read-only for image capture, then clone before recovery",
+    "Run SQLite integrity checks, AG deterministic replay, status classification, and exact spend/attempt/settlement accounting",
+    "Redeliver only when the authoritative recovery law permits it and independently count physical effects",
+    "Record whether recovery is safe replay, exact reconciliation, or safe halt; never coerce ambiguity to success",
+    "Seal images or image hashes, fault-controller trace, journals, databases, and target observations"
+  ],
+  "pass_interpretation_owner": "later qualification campaign",
+  "forbidden_shortcuts": [
+    "kill -9 represented as power loss",
+    "logical SQLite reopen represented as storage durability",
+    "executor receipt represented as independent physical-effect evidence"
+  ]
+}

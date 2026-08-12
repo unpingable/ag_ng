@@ -1,0 +1,32 @@
+{
+  "schema": "ag.operational-plan.v1",
+  "qualification_status": "not_assessed",
+  "environment": "deployed_service",
+  "premises": [
+    "ag.service_currentness_behavior",
+    "ag.clock_and_expiry",
+    "ag.deployed_standing_docket_correspondence"
+  ],
+  "preconditions": [
+    "Exact AG, observation-resolver, Standing, Docket, and executor identities are captured",
+    "A non-production campaign, subject, scope, and disposable executor target are allocated",
+    "Currentness owners publish their clock and endpoint laws",
+    "Test standing and signing material are isolated and revocable"
+  ],
+  "procedure": [
+    "Run preflight.py --profile deployed-service and preserve its manifest",
+    "Open one exact occurrence and record one fresh exact observation",
+    "Resolve current standing at decide and again at authorization; capture exact responses",
+    "Exercise current, equality-expired, revoked, superseded, delayed, wrong-occurrence, wrong-subject, wrong-scope, and wrong-proposal cases",
+    "For one admitted case, verify one AG spend maps to one Docket custody/attempt and one exact settlement",
+    "Replay the issuance, Docket standing, settlement, and serialized resolver results and record refusals",
+    "Restart each office at a declared boundary and verify that currentness and live authority are re-resolved rather than reconstructed",
+    "Hash and seal all request/response records, service versions, configurations, logs, and database replay results"
+  ],
+  "pass_interpretation_owner": "later qualification campaign",
+  "forbidden_shortcuts": [
+    "Replacing deployed services with fixtures while claiming deployed correspondence",
+    "Recording secret key bytes",
+    "Treating a prior resolution or receipt as live authority"
+  ]
+}

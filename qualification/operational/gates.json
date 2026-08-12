@@ -1,0 +1,70 @@
+{
+  "schema": "ag.operational-qualification-gates.v1",
+  "qualification_status": "not_assessed",
+  "gates": [
+    {
+      "id": "ag.sqlite_wal_power_loss_recovery",
+      "classification": "requires_fault_injection_environment",
+      "local_proxy": [
+        "ag-store governed campaign replay and logical crash-cut tests",
+        "ag-loopctl multi-process reopen and replay"
+      ],
+      "closure_evidence": "Abrupt VM or block-device loss at declared WAL/commit/checkpoint cuts, followed by image recovery, integrity checking, deterministic replay, and no recreated dispatchability.",
+      "local_proxy_does_not_establish": "kernel, controller, disk-cache, filesystem, or physical power-loss durability"
+    },
+    {
+      "id": "ag.multi_process_contention",
+      "classification": "runnable_locally_now",
+      "local_proxy": [
+        "multiprocess_contention.py"
+      ],
+      "closure_evidence": "Independent processes competing from one authoritative predecessor yield one legal successor, preserve exact replay, and leave no second spend/dispatch path.",
+      "local_proxy_does_not_establish": "production host load or network-filesystem behavior"
+    },
+    {
+      "id": "ag.service_currentness_behavior",
+      "classification": "requires_deployed_service",
+      "local_proxy": [
+        "governed-loop current/stale/mismatched observation and standing contract tests"
+      ],
+      "closure_evidence": "The deployed observation and Standing resolvers return exact currentness, expiry, subject, scope, proposal, campaign, and occurrence bindings at consequence time, including revocation and timeout cases.",
+      "local_proxy_does_not_establish": "service freshness, deployment identity, clock relation, or revocation propagation"
+    },
+    {
+      "id": "ag.clock_and_expiry",
+      "classification": "requires_deployed_service",
+      "local_proxy": [
+        "exact expiry-boundary and restart-noninheritance tests"
+      ],
+      "closure_evidence": "Each deployed currentness owner declares its clock, endpoint law, and qualified comparison boundary; boundary, skew, timeout, restart, and rollback cases refuse safely.",
+      "local_proxy_does_not_establish": "wall-clock correctness or cross-service clock comparability"
+    },
+    {
+      "id": "ag.process_isolation",
+      "classification": "requires_trusted_host",
+      "local_proxy": [
+        "scripts/verify-effectd-isolation.sh"
+      ],
+      "closure_evidence": "The exact packaged service and worker run under the declared systemd/sandbox/LSM identity and cannot reach forbidden network, filesystem, process, or credential surfaces.",
+      "local_proxy_does_not_establish": "live kernel, systemd, namespace, LSM, or packaging enforcement"
+    },
+    {
+      "id": "ag.executor_physical_idempotency",
+      "classification": "requires_fault_injection_environment",
+      "local_proxy": [
+        "executor adapter duplicate-delivery and exact attempt-marker tests"
+      ],
+      "closure_evidence": "A disposable physical target observes one effect under duplicate delivery and declared crashes before, during, and after executor-local marker persistence; indeterminate cuts reconcile without repeat.",
+      "local_proxy_does_not_establish": "provider-specific physical idempotency or device durability"
+    },
+    {
+      "id": "ag.deployed_standing_docket_correspondence",
+      "classification": "requires_deployed_service",
+      "local_proxy": [
+        "AG issuance/Docket custody exact-binding integration tests"
+      ],
+      "closure_evidence": "Deployed Standing and Docket accept only exact current bindings, one AG issuance creates at most one Docket attempt, settlement names that attempt, and instrument-substitution attacks refuse.",
+      "local_proxy_does_not_establish": "deployed service configuration, signer custody, or operational currentness"
+    }
+  ]
+}
