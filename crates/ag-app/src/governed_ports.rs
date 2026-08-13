@@ -20,16 +20,18 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::JcsDocument;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 /// Schema for the authenticated canonical AG issuance handed to Docket.
-pub const SIGNED_AG_ISSUANCE_SCHEMA_V1: &str = "ag.governed-loop.signed-issuance/v1";
+pub const SIGNED_AG_ISSUANCE_SCHEMA_V2: &str = "ag.governed-loop.signed-issuance/v2";
 /// Schema for process observation-resolution requests.
 pub const OBSERVATION_REQUEST_SCHEMA_V1: &str = "ag.governed-loop.observation-request/v1";
 /// Schema for process standing-resolution requests.
@@ -41,12 +43,13 @@ pub const HUMAN_VERIFICATION_REQUEST_SCHEMA_V1: &str =
 pub const HUMAN_VERIFICATION_RESPONSE_SCHEMA_V1: &str =
     "ag.governed-loop.human-verification-response/v1";
 
-const SIGNATURE_PREFIX_V1: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v1\0";
+/// Exact closed signature-domain prefix for the V2 issuance wire contract.
+pub const SIGNATURE_PREFIX_V2: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v2\0";
 
 /// Authentication metadata for one exact canonical issuance body.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AgIssuanceAuthenticationV1 {
+pub struct AgIssuanceAuthenticationV2 {
     /// AG principal trusted by the Docket deployment.
     pub issuer_principal: String,
     /// Exact configured signing-key identity.
@@ -60,24 +63,24 @@ pub struct AgIssuanceAuthenticationV1 {
 /// Authenticated immutable envelope for one already-spent AG issuance.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SignedAgIssuanceEnvelopeV1 {
+pub struct SignedAgIssuanceEnvelopeV2 {
     /// Exact envelope schema.
     pub schema: String,
-    /// Canonical `AgIssuanceV1` bytes, base64url-no-pad.
+    /// Canonical `AgIssuanceV2` bytes, base64url-no-pad.
     pub body_b64: String,
     /// Exact authentication over `body_b64`'s decoded bytes.
-    pub authentication: AgIssuanceAuthenticationV1,
+    pub authentication: AgIssuanceAuthenticationV2,
 }
 
 /// AG's configured issuance signer.  It does not create or spend authority;
 /// it authenticates an issuance that already exists in the spend journal.
-pub struct AgIssuanceSignerV1 {
+pub struct AgIssuanceSignerV2 {
     issuer_principal: String,
     key_id: String,
     key_pair: Ed25519KeyPair,
 }
 
-impl AgIssuanceSignerV1 {
+impl AgIssuanceSignerV2 {
     /// Loads one explicit PKCS#8 v2 Ed25519 credential.
     pub fn from_pkcs8_file(
         issuer_principal: impl Into<String>,
@@ -113,18 +116,18 @@ impl AgIssuanceSignerV1 {
     /// Authenticates an exact durable issuance without changing it.
     pub fn sign(
         &self,
-        issuance: &AgIssuanceV1,
-    ) -> Result<SignedAgIssuanceEnvelopeV1, GovernedPortErrorV1> {
+        issuance: &AgIssuanceV2,
+    ) -> Result<SignedAgIssuanceEnvelopeV2, GovernedPortErrorV1> {
         let body = JcsDocument::canonicalize(issuance)
             .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
-        let mut signed = Vec::with_capacity(SIGNATURE_PREFIX_V1.len() + body.as_bytes().len());
-        signed.extend_from_slice(SIGNATURE_PREFIX_V1);
+        let mut signed = Vec::with_capacity(SIGNATURE_PREFIX_V2.len() + body.as_bytes().len());
+        signed.extend_from_slice(SIGNATURE_PREFIX_V2);
         signed.extend_from_slice(body.as_bytes());
         let signature = self.key_pair.sign(&signed);
-        Ok(SignedAgIssuanceEnvelopeV1 {
-            schema: SIGNED_AG_ISSUANCE_SCHEMA_V1.to_owned(),
+        Ok(SignedAgIssuanceEnvelopeV2 {
+            schema: SIGNED_AG_ISSUANCE_SCHEMA_V2.to_owned(),
             body_b64: URL_SAFE_NO_PAD.encode(body.as_bytes()),
-            authentication: AgIssuanceAuthenticationV1 {
+            authentication: AgIssuanceAuthenticationV2 {
                 issuer_principal: self.issuer_principal.clone(),
                 signer_key_id: self.key_id.clone(),
                 signer_public_key: URL_SAFE_NO_PAD.encode(self.key_pair.public_key().as_ref()),
@@ -174,6 +177,190 @@ struct HumanVerificationCommandRequestV1<'a> {
 struct HumanVerificationCommandResponseV1 {
     schema: String,
     verification: HumanVerificationRefV1,
+}
+
+const DOCKET_SCOPE_REQUIREMENT_SCHEMA_V1: &str =
+    "docket.governed-repair.scope-expansion-required/v1";
+const DOCKET_READJUDICATION_REQUIREMENT_SCHEMA_V1: &str =
+    "docket.governed-repair.readjudication-required/v1";
+const DOCKET_CHECKPOINT_SCHEMA_V1: &str = "docket.governed-repair.checkpoint/v1";
+const DOCKET_SEALED_RESULT_SCHEMA_V1: &str = "docket.governed-repair.sealed-result/v1";
+
+/// Strict private wire mirror of Docket's richer post-spend result.  AG never
+/// deserializes this directly into authority-sensitive campaign types.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketGovernedRepairBindingWireV1 {
+    campaign: CampaignId,
+    occurrence: String,
+    proposal: ProposalRefV1,
+    observation: ObservationRefV1,
+    standing_resolution: StandingResolutionRefV1,
+    admission_decision: AdmissionDecisionRefV1,
+    spend: AgSpendRefV1,
+    issuance: AgIssuanceRefV1,
+    custody: DocketCustodyRefV1,
+    attempt: DocketAttemptRefV1,
+    executor_result: ag_primitives::Digest,
+    executor_binding: ag_primitives::Digest,
+    original_scope: CanonicalEffectScopeV1,
+    original_scope_digest: ag_primitives::Digest,
+    effect_journal_digest: ag_primitives::Digest,
+    authorized_effects_occurred: bool,
+    created_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+    idempotency: ag_primitives::Digest,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketBlockedEffectWireV1 {
+    effect_class: String,
+    resource: String,
+    path: String,
+    operation: CanonicalEffectOperationV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketScopeExpansionWireV1 {
+    schema: String,
+    requirement_identity: ag_primitives::Digest,
+    binding: DocketGovernedRepairBindingWireV1,
+    requested_delta: CanonicalEffectScopeV1,
+    requested_delta_digest: ag_primitives::Digest,
+    blocked_effect: DocketBlockedEffectWireV1,
+    reason: ag_primitives::Digest,
+    dependency_evidence: Vec<ag_primitives::Digest>,
+    unauthorized_effect_not_performed: bool,
+    limitations: Vec<ag_primitives::Digest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketReadjudicationWireV1 {
+    schema: String,
+    requirement_identity: ag_primitives::Digest,
+    binding: DocketGovernedRepairBindingWireV1,
+    question: ag_primitives::Digest,
+    evidence_census: Vec<ag_primitives::Digest>,
+    diagnostic_census: Vec<ag_primitives::Digest>,
+    bounded_alternatives: Vec<ag_primitives::Digest>,
+    unresolved_facts: Vec<ag_primitives::Digest>,
+    adjudication_scope: CanonicalEffectScopeV1,
+    unauthorized_effect_not_performed: bool,
+    limitations: Vec<ag_primitives::Digest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", content = "requirement", rename_all = "snake_case")]
+enum DocketSealedRequirementWireV1 {
+    ScopeExpansionRequired(DocketScopeExpansionWireV1),
+    ReadjudicationRequired(DocketReadjudicationWireV1),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketImmutableCheckpointWireV1 {
+    repository_identity: ag_primitives::Digest,
+    commit: String,
+    tree: String,
+    diff_identity: Option<ag_primitives::Digest>,
+    content_manifest_identity: Option<ag_primitives::Digest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketCheckpointWireV1 {
+    schema: String,
+    checkpoint: DocketCheckpointRefV1,
+    issuance: AgIssuanceRefV1,
+    custody: DocketCustodyRefV1,
+    attempt: DocketAttemptRefV1,
+    executor_binding: ag_primitives::Digest,
+    executor_result: ag_primitives::Digest,
+    executor_receipt: ReceiptRefV1,
+    requirement_kind: String,
+    requirement_identity: ag_primitives::Digest,
+    effect_journal_digest: ag_primitives::Digest,
+    immutable_work_checkpoint: Option<DocketImmutableCheckpointWireV1>,
+    idempotency: ag_primitives::Digest,
+    created_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketSealedResultWireV1 {
+    schema: String,
+    sealed_result: DocketSealedResultRefV1,
+    checkpoint: DocketCheckpointWireV1,
+    outcome: DocketSealedRequirementWireV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DocketIssuanceRefusalClassWireV1 {
+    IssuanceInvalid,
+    IssuanceExpired,
+    CheckpointInvalid,
+    StandingInvalid,
+    InstrumentSubstitution,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketIssuanceRefusalWireV1 {
+    schema: String,
+    refusal: ag_primitives::Digest,
+    issuance: AgIssuanceRefV1,
+    campaign: CampaignId,
+    occurrence: OccurrenceId,
+    refusal_class: DocketIssuanceRefusalClassWireV1,
+    reason_code: String,
+    evidence: ag_primitives::Digest,
+    refused_at_unix_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "status",
+    content = "record",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum DocketAcceptanceWireV1 {
+    Refused(DocketIssuanceRefusalWireV1),
+    Custody(DocketCustodyV1),
+    GovernedRepairRequired {
+        custody: DocketCustodyV1,
+        result: Box<DocketSealedResultWireV1>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "status",
+    content = "record",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum DocketReconciliationWireV1 {
+    NotAccepted,
+    Refused(DocketIssuanceRefusalWireV1),
+    Accepted(DocketCustodyV1),
+    Settled {
+        custody: DocketCustodyV1,
+        settlement: DocketSettlementV1,
+    },
+    Indeterminate {
+        custody: DocketCustodyV1,
+        indeterminate: IndeterminateOutcomeV1,
+    },
+    GovernedRepairRequired {
+        custody: DocketCustodyV1,
+        result: Box<DocketSealedResultWireV1>,
+    },
 }
 
 /// Fresh process adapter for an external observation owner.
@@ -298,7 +485,8 @@ pub struct CommandDocketCustodyPortV1 {
     standing_resolver: PathBuf,
     executor_adapter: PathBuf,
     executor_config: PathBuf,
-    signer: AgIssuanceSignerV1,
+    checkpoint_verifier: Option<PathBuf>,
+    signer: AgIssuanceSignerV2,
 }
 
 impl CommandDocketCustodyPortV1 {
@@ -312,7 +500,8 @@ impl CommandDocketCustodyPortV1 {
         standing_resolver: impl Into<PathBuf>,
         executor_adapter: impl Into<PathBuf>,
         executor_config: impl Into<PathBuf>,
-        signer: AgIssuanceSignerV1,
+        checkpoint_verifier: Option<PathBuf>,
+        signer: AgIssuanceSignerV2,
     ) -> Self {
         Self {
             docket_program: docket_program.into(),
@@ -321,12 +510,13 @@ impl CommandDocketCustodyPortV1 {
             standing_resolver: standing_resolver.into(),
             executor_adapter: executor_adapter.into(),
             executor_config: executor_config.into(),
+            checkpoint_verifier,
             signer,
         }
     }
 
     fn arguments(&self, operation: &str) -> Vec<String> {
-        vec![
+        let mut arguments = vec![
             "governed-loop".to_owned(),
             operation.to_owned(),
             "--state".to_owned(),
@@ -339,23 +529,36 @@ impl CommandDocketCustodyPortV1 {
             self.executor_adapter.display().to_string(),
             "--executor-config".to_owned(),
             self.executor_config.display().to_string(),
-        ]
+        ];
+        if let Some(verifier) = &self.checkpoint_verifier {
+            arguments.push("--checkpoint-verifier".to_owned());
+            arguments.push(verifier.display().to_string());
+        }
+        arguments
     }
 }
 
 impl DocketCustodyPortV1 for CommandDocketCustodyPortV1 {
     fn accept_issuance(
         &mut self,
-        issuance: &AgIssuanceV1,
-    ) -> Result<DocketCustodyV1, ExternalBoundaryErrorV1> {
+        issuance: &AgIssuanceV2,
+    ) -> Result<DocketIssuanceAcceptanceV1, ExternalBoundaryErrorV1> {
+        if issuance.governed_repair_checkpoint.is_some() && self.checkpoint_verifier.is_none() {
+            return Err(ExternalBoundaryErrorV1::Unavailable {
+                code: "checkpoint-verifier-not-configured".to_owned(),
+            });
+        }
         let envelope = self.signer.sign(issuance).map_err(external_error)?;
         let arguments = self.arguments("accept");
-        run_json_program(&self.docket_program, &arguments, &envelope).map_err(external_error)
+        let wire: DocketAcceptanceWireV1 =
+            run_json_program(&self.docket_program, &arguments, &envelope)
+                .map_err(external_error)?;
+        adapt_docket_acceptance(issuance, wire).map_err(external_error)
     }
 
     fn reconcile_issuance(
         &mut self,
-        issuance: &AgIssuanceV1,
+        issuance: &AgIssuanceV2,
     ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
         #[derive(Serialize)]
         #[serde(deny_unknown_fields)]
@@ -363,18 +566,20 @@ impl DocketCustodyPortV1 for CommandDocketCustodyPortV1 {
             issuance: &'a AgIssuanceRefV1,
         }
         let arguments = self.arguments("reconcile-issuance");
-        run_json_program(
+        let wire: DocketReconciliationWireV1 = run_json_program(
             &self.docket_program,
             &arguments,
             &Request {
                 issuance: &issuance.issuance,
             },
         )
-        .map_err(external_error)
+        .map_err(external_error)?;
+        adapt_docket_reconciliation(issuance, wire).map_err(external_error)
     }
 
     fn reconcile_attempt(
         &mut self,
+        issuance: &AgIssuanceV2,
         custody: &DocketCustodyV1,
     ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
         #[derive(Serialize)]
@@ -384,7 +589,7 @@ impl DocketCustodyPortV1 for CommandDocketCustodyPortV1 {
             attempt: &'a DocketAttemptRefV1,
         }
         let arguments = self.arguments("reconcile-attempt");
-        run_json_program(
+        let wire: DocketReconciliationWireV1 = run_json_program(
             &self.docket_program,
             &arguments,
             &Request {
@@ -392,8 +597,539 @@ impl DocketCustodyPortV1 for CommandDocketCustodyPortV1 {
                 attempt: &custody.attempt,
             },
         )
-        .map_err(external_error)
+        .map_err(external_error)?;
+        if issuance.issuance != custody.issuance {
+            return Err(ExternalBoundaryErrorV1::Refused {
+                code: "reconciliation-issuance-custody-substitution".to_owned(),
+                evidence: None,
+            });
+        }
+        adapt_docket_reconciliation(issuance, wire).map_err(external_error)
     }
+}
+
+struct DocketTranscriptV1(Sha256);
+
+impl DocketTranscriptV1 {
+    fn new(domain: &str) -> Self {
+        let mut digest = Sha256::new();
+        digest.update(
+            u64::try_from(domain.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        digest.update(domain.as_bytes());
+        Self(digest)
+    }
+
+    fn field(mut self, label: &str, value: &[u8]) -> Self {
+        self.0
+            .update(u64::try_from(label.len()).unwrap_or(u64::MAX).to_be_bytes());
+        self.0.update(label.as_bytes());
+        self.0
+            .update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+        self.0.update(value);
+        self
+    }
+
+    fn text(self, label: &str, value: &str) -> Self {
+        self.field(label, value.as_bytes())
+    }
+
+    fn finish(self) -> ag_primitives::Digest {
+        ag_primitives::Digest::parse(&format!("sha256:{}", hex::encode(self.0.finalize())))
+            .expect("SHA-256 output is always a canonical qualified digest")
+    }
+}
+
+fn docket_digest_list(values: &[ag_primitives::Digest]) -> [u8; 32] {
+    let mut transcript = DocketTranscriptV1::new("docket.governed-repair.digest-list/v1");
+    for value in values {
+        transcript = transcript.field("item", &value.raw_bytes());
+    }
+    transcript.finish().raw_bytes()
+}
+
+fn docket_scope_identity(
+    scope: &CanonicalEffectScopeV1,
+) -> Result<ag_primitives::Digest, GovernedPortErrorV1> {
+    scope
+        .validate()
+        .map_err(|error| GovernedPortErrorV1::MalformedResponse(error.to_string()))?;
+    let mut transcript = DocketTranscriptV1::new("ag.governed-loop.canonical-effect-scope/v1")
+        .text("schema", CANONICAL_EFFECT_SCOPE_SCHEMA_V1)
+        .text("effect_class", scope.effect_class());
+    for resource in scope.resources() {
+        transcript = transcript
+            .text("resource", &resource.resource)
+            .text("path", &resource.path);
+        for operation in &resource.operations {
+            transcript = transcript.text("operation", docket_operation_tag(*operation));
+        }
+    }
+    Ok(transcript.finish())
+}
+
+fn docket_operation_tag(operation: CanonicalEffectOperationV1) -> &'static str {
+    match operation {
+        CanonicalEffectOperationV1::Read => "read",
+        CanonicalEffectOperationV1::Create => "create",
+        CanonicalEffectOperationV1::Modify => "modify",
+        CanonicalEffectOperationV1::Delete => "delete",
+        CanonicalEffectOperationV1::Execute => "execute",
+    }
+}
+
+fn docket_requirement_transcript(
+    domain: &str,
+    binding: &DocketGovernedRepairBindingWireV1,
+) -> DocketTranscriptV1 {
+    DocketTranscriptV1::new(domain)
+        .field("campaign", &binding.campaign.as_digest().raw_bytes())
+        .text("occurrence", &binding.occurrence)
+        .field("proposal", &binding.proposal.as_digest().raw_bytes())
+        .field("observation", &binding.observation.as_digest().raw_bytes())
+        .field(
+            "standing_resolution",
+            &binding.standing_resolution.as_digest().raw_bytes(),
+        )
+        .field(
+            "decision",
+            &binding.admission_decision.as_digest().raw_bytes(),
+        )
+        .field("spend", &binding.spend.as_digest().raw_bytes())
+        .field("issuance", &binding.issuance.as_digest().raw_bytes())
+        .field("custody", &binding.custody.as_digest().raw_bytes())
+        .field("attempt", &binding.attempt.as_digest().raw_bytes())
+        .field("executor_result", &binding.executor_result.raw_bytes())
+        .field("executor_binding", &binding.executor_binding.raw_bytes())
+        .field("original_scope", &binding.original_scope_digest.raw_bytes())
+        .field("effect_journal", &binding.effect_journal_digest.raw_bytes())
+        .text(
+            "authorized_effects_occurred",
+            if binding.authorized_effects_occurred {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .text(
+            "created_at_unix_ms",
+            &binding.created_at_unix_ms.to_string(),
+        )
+        .text(
+            "expires_at_unix_ms",
+            &binding.expires_at_unix_ms.to_string(),
+        )
+        .field("idempotency", &binding.idempotency.raw_bytes())
+}
+
+fn docket_scope_requirement_identity(value: &DocketScopeExpansionWireV1) -> ag_primitives::Digest {
+    docket_requirement_transcript(DOCKET_SCOPE_REQUIREMENT_SCHEMA_V1, &value.binding)
+        .field("requested_delta", &value.requested_delta_digest.raw_bytes())
+        .text("blocked_effect_class", &value.blocked_effect.effect_class)
+        .text("blocked_resource", &value.blocked_effect.resource)
+        .text("blocked_path", &value.blocked_effect.path)
+        .text(
+            "blocked_operation",
+            docket_operation_tag(value.blocked_effect.operation),
+        )
+        .field("reason", &value.reason.raw_bytes())
+        .field(
+            "dependency_evidence",
+            &docket_digest_list(&value.dependency_evidence),
+        )
+        .field("limitations", &docket_digest_list(&value.limitations))
+        .finish()
+}
+
+fn docket_readjudication_identity(
+    value: &DocketReadjudicationWireV1,
+) -> Result<ag_primitives::Digest, GovernedPortErrorV1> {
+    Ok(
+        docket_requirement_transcript(DOCKET_READJUDICATION_REQUIREMENT_SCHEMA_V1, &value.binding)
+            .field("question", &value.question.raw_bytes())
+            .field(
+                "evidence_census",
+                &docket_digest_list(&value.evidence_census),
+            )
+            .field(
+                "diagnostic_census",
+                &docket_digest_list(&value.diagnostic_census),
+            )
+            .field(
+                "bounded_alternatives",
+                &docket_digest_list(&value.bounded_alternatives),
+            )
+            .field(
+                "unresolved_facts",
+                &docket_digest_list(&value.unresolved_facts),
+            )
+            .field(
+                "adjudication_scope",
+                &docket_scope_identity(&value.adjudication_scope)?.raw_bytes(),
+            )
+            .field("limitations", &docket_digest_list(&value.limitations))
+            .finish(),
+    )
+}
+
+fn docket_checkpoint_identity(checkpoint: &DocketCheckpointWireV1) -> ag_primitives::Digest {
+    let mut transcript = DocketTranscriptV1::new(DOCKET_CHECKPOINT_SCHEMA_V1)
+        .text("issuance", checkpoint.issuance.as_str())
+        .text("custody", checkpoint.custody.as_str())
+        .text("attempt", checkpoint.attempt.as_str())
+        .text("executor_binding", checkpoint.executor_binding.as_str())
+        .text("executor_result", checkpoint.executor_result.as_str())
+        .text("executor_receipt", checkpoint.executor_receipt.as_str())
+        .text("requirement_kind", &checkpoint.requirement_kind)
+        .text(
+            "requirement_identity",
+            checkpoint.requirement_identity.as_str(),
+        )
+        .text("effect_journal", checkpoint.effect_journal_digest.as_str())
+        .text("idempotency", checkpoint.idempotency.as_str())
+        .text(
+            "created_at_unix_ms",
+            &checkpoint.created_at_unix_ms.to_string(),
+        )
+        .text(
+            "expires_at_unix_ms",
+            &checkpoint.expires_at_unix_ms.to_string(),
+        );
+    if let Some(work) = &checkpoint.immutable_work_checkpoint {
+        transcript = transcript
+            .text("work_repository", work.repository_identity.as_str())
+            .text("work_commit", &work.commit)
+            .text("work_tree", &work.tree)
+            .text(
+                "work_diff",
+                work.diff_identity
+                    .as_ref()
+                    .map_or("", ag_primitives::Digest::as_str),
+            )
+            .text(
+                "work_content_manifest",
+                work.content_manifest_identity
+                    .as_ref()
+                    .map_or("", ag_primitives::Digest::as_str),
+            );
+    }
+    transcript.finish()
+}
+
+fn docket_sealed_result_identity(checkpoint: &DocketCheckpointWireV1) -> ag_primitives::Digest {
+    DocketTranscriptV1::new(DOCKET_SEALED_RESULT_SCHEMA_V1)
+        .text("checkpoint", checkpoint.checkpoint.as_str())
+        .text("issuance", checkpoint.issuance.as_str())
+        .text("custody", checkpoint.custody.as_str())
+        .text("attempt", checkpoint.attempt.as_str())
+        .text("outcome_kind", &checkpoint.requirement_kind)
+        .text("outcome_identity", checkpoint.requirement_identity.as_str())
+        .text(
+            "created_at_unix_ms",
+            &checkpoint.created_at_unix_ms.to_string(),
+        )
+        .text(
+            "expires_at_unix_ms",
+            &checkpoint.expires_at_unix_ms.to_string(),
+        )
+        .finish()
+}
+
+fn malformed(detail: &'static str) -> GovernedPortErrorV1 {
+    GovernedPortErrorV1::MalformedResponse(detail.to_owned())
+}
+
+fn validate_docket_binding(
+    issuance: &AgIssuanceV2,
+    custody: &DocketCustodyV1,
+    binding: &DocketGovernedRepairBindingWireV1,
+) -> Result<(), GovernedPortErrorV1> {
+    if binding.campaign != issuance.key.campaign
+        || binding.occurrence != issuance.key.occurrence.to_string()
+        || binding.proposal != issuance.proposal
+        || binding.observation != issuance.observation
+        || binding.standing_resolution != issuance.standing_resolution
+        || binding.admission_decision != issuance.admission_decision.decision
+        || binding.spend != issuance.spend
+        || binding.issuance != issuance.issuance
+        || binding.custody != custody.reference()
+        || binding.attempt != custody.attempt
+        || binding.original_scope != issuance.effect_scope
+        || binding.original_scope_digest != issuance.effect_scope_digest
+        || binding.created_at_unix_ms >= binding.expires_at_unix_ms
+    {
+        return Err(malformed("Docket governed-repair binding substitution"));
+    }
+    Ok(())
+}
+
+fn validate_work_checkpoint(
+    issuance: &AgIssuanceV2,
+    work: Option<&DocketImmutableCheckpointWireV1>,
+) -> Result<(), GovernedPortErrorV1> {
+    match (issuance.governed_repair_checkpoint.as_ref(), work) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(actual))
+            if actual.repository_identity == expected.repository
+                && actual.commit == expected.commit
+                && actual.tree == expected.tree
+                && actual.diff_identity == expected.diff_identity
+                && actual.content_manifest_identity.as_ref()
+                    == Some(&expected.content_manifest) =>
+        {
+            Ok(())
+        }
+        _ => Err(malformed("Docket immutable work checkpoint substitution")),
+    }
+}
+
+fn adapt_docket_result(
+    issuance: &AgIssuanceV2,
+    custody: &DocketCustodyV1,
+    result: DocketSealedResultWireV1,
+) -> Result<DocketSealedGovernedRepairResultV1, GovernedPortErrorV1> {
+    let (binding, kind, identity) = match &result.outcome {
+        DocketSealedRequirementWireV1::ScopeExpansionRequired(value) => (
+            &value.binding,
+            "scope_expansion_required",
+            &value.requirement_identity,
+        ),
+        DocketSealedRequirementWireV1::ReadjudicationRequired(value) => (
+            &value.binding,
+            "readjudication_required",
+            &value.requirement_identity,
+        ),
+    };
+    validate_docket_binding(issuance, custody, binding)?;
+    validate_work_checkpoint(
+        issuance,
+        result.checkpoint.immutable_work_checkpoint.as_ref(),
+    )?;
+    if result.schema != DOCKET_SEALED_RESULT_SCHEMA_V1
+        || result.checkpoint.schema != DOCKET_CHECKPOINT_SCHEMA_V1
+        || result.checkpoint.issuance != issuance.issuance
+        || result.checkpoint.custody != custody.reference()
+        || result.checkpoint.attempt != custody.attempt
+        || result.checkpoint.executor_binding != binding.executor_binding
+        || result.checkpoint.executor_result != binding.executor_result
+        || result.checkpoint.requirement_kind != kind
+        || &result.checkpoint.requirement_identity != identity
+        || result.checkpoint.effect_journal_digest != binding.effect_journal_digest
+        || result.checkpoint.idempotency != binding.idempotency
+        || result.checkpoint.created_at_unix_ms != binding.created_at_unix_ms
+        || result.checkpoint.expires_at_unix_ms != binding.expires_at_unix_ms
+        || result.checkpoint.checkpoint.as_digest()
+            != &docket_checkpoint_identity(&result.checkpoint)
+        || result.sealed_result.as_digest() != &docket_sealed_result_identity(&result.checkpoint)
+    {
+        return Err(malformed(
+            "Docket governed-repair sealed result substitution",
+        ));
+    }
+    let immutable_work_checkpoint = result
+        .checkpoint
+        .immutable_work_checkpoint
+        .as_ref()
+        .map(
+            |work| -> Result<GovernedRepairCheckpointV1, GovernedPortErrorV1> {
+                Ok(GovernedRepairCheckpointV1 {
+                    repository: work.repository_identity.clone(),
+                    commit: work.commit.clone(),
+                    tree: work.tree.clone(),
+                    diff_identity: work.diff_identity.clone(),
+                    content_manifest: work.content_manifest_identity.clone().ok_or_else(|| {
+                        malformed("Docket immutable work checkpoint lacks content manifest")
+                    })?,
+                    docket_checkpoint: Some(result.checkpoint.checkpoint.clone()),
+                })
+            },
+        )
+        .transpose()?;
+    let outcome = DocketGovernedRepairOutcomeRefV1 {
+        checkpoint: result.checkpoint.checkpoint.clone(),
+        sealed_result: result.sealed_result,
+        outcome: identity.clone(),
+        issuance: issuance.issuance.clone(),
+        custody: custody.reference(),
+        attempt: custody.attempt.clone(),
+        effect_journal: binding.effect_journal_digest.clone(),
+        executor_binding: binding.executor_binding.clone(),
+        executor_result: binding.executor_result.clone(),
+        executor_receipt: result.checkpoint.executor_receipt.clone(),
+        immutable_work_checkpoint,
+        authorized_effects_occurred: binding.authorized_effects_occurred,
+        created_at_unix_ms: binding.created_at_unix_ms,
+        expires_at_unix_ms: binding.expires_at_unix_ms,
+        idempotency: binding.idempotency.clone(),
+    };
+    match result.outcome {
+        DocketSealedRequirementWireV1::ScopeExpansionRequired(value) => {
+            adapt_scope_requirement(value, outcome)
+        }
+        DocketSealedRequirementWireV1::ReadjudicationRequired(value) => {
+            adapt_readjudication_requirement(value, outcome)
+        }
+    }
+}
+
+fn adapt_scope_requirement(
+    value: DocketScopeExpansionWireV1,
+    outcome: DocketGovernedRepairOutcomeRefV1,
+) -> Result<DocketSealedGovernedRepairResultV1, GovernedPortErrorV1> {
+    if value.schema != DOCKET_SCOPE_REQUIREMENT_SCHEMA_V1
+        || value.requirement_identity != docket_scope_requirement_identity(&value)
+        || value.requested_delta_digest != value.requested_delta.digest()
+        || value.blocked_effect.effect_class != value.requested_delta.effect_class()
+    {
+        return Err(malformed("Docket scope requirement identity substitution"));
+    }
+    let requirement = ScopeExpansionRequiredV1 {
+        schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
+        original_scope: value.binding.original_scope,
+        original_scope_digest: value.binding.original_scope_digest,
+        requested_delta: value.requested_delta,
+        requested_delta_digest: value.requested_delta_digest,
+        blocked_operation: BlockedEffectOperationV1 {
+            resource: value.blocked_effect.resource,
+            path: value.blocked_effect.path,
+            operation: value.blocked_effect.operation,
+        },
+        reason: value.reason,
+        dependency_evidence: value.dependency_evidence,
+        limitations: value.limitations,
+        docket_outcome: Some(outcome.clone()),
+        unauthorized_effect_not_performed: value.unauthorized_effect_not_performed,
+    };
+    requirement
+        .validate()
+        .map_err(|error| GovernedPortErrorV1::MalformedResponse(error.to_string()))?;
+    Ok(DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+        outcome,
+        requirement,
+    })
+}
+
+fn adapt_readjudication_requirement(
+    value: DocketReadjudicationWireV1,
+    outcome: DocketGovernedRepairOutcomeRefV1,
+) -> Result<DocketSealedGovernedRepairResultV1, GovernedPortErrorV1> {
+    if value.schema != DOCKET_READJUDICATION_REQUIREMENT_SCHEMA_V1
+        || value.requirement_identity != docket_readjudication_identity(&value)?
+    {
+        return Err(malformed(
+            "Docket readjudication requirement identity substitution",
+        ));
+    }
+    let requirement = ReadjudicationRequiredV1 {
+        schema: READJUDICATION_REQUIRED_SCHEMA_V1.to_owned(),
+        question: value.question,
+        evidence_census: value.evidence_census,
+        diagnostic_census: value.diagnostic_census,
+        bounded_alternatives: value.bounded_alternatives,
+        unresolved_facts: value.unresolved_facts,
+        limitations: value.limitations,
+        adjudication_scope: value.adjudication_scope,
+        docket_outcome: Some(outcome.clone()),
+        unauthorized_effect_not_performed: value.unauthorized_effect_not_performed,
+    };
+    requirement
+        .validate()
+        .map_err(|error| GovernedPortErrorV1::MalformedResponse(error.to_string()))?;
+    Ok(DocketSealedGovernedRepairResultV1::ReadjudicationRequired {
+        outcome,
+        requirement,
+    })
+}
+
+fn adapt_docket_acceptance(
+    issuance: &AgIssuanceV2,
+    wire: DocketAcceptanceWireV1,
+) -> Result<DocketIssuanceAcceptanceV1, GovernedPortErrorV1> {
+    match wire {
+        DocketAcceptanceWireV1::Refused(refusal) => Ok(DocketIssuanceAcceptanceV1::Refused(
+            adapt_docket_refusal(issuance, refusal)?,
+        )),
+        DocketAcceptanceWireV1::Custody(custody) => {
+            Ok(DocketIssuanceAcceptanceV1::Custody(custody))
+        }
+        DocketAcceptanceWireV1::GovernedRepairRequired { custody, result } => {
+            let result = adapt_docket_result(issuance, &custody, *result)?;
+            Ok(DocketIssuanceAcceptanceV1::GovernedRepairRequired { custody, result })
+        }
+    }
+}
+
+fn adapt_docket_reconciliation(
+    issuance: &AgIssuanceV2,
+    wire: DocketReconciliationWireV1,
+) -> Result<DocketIssuanceReconciliationV1, GovernedPortErrorV1> {
+    match wire {
+        DocketReconciliationWireV1::NotAccepted => Ok(DocketIssuanceReconciliationV1::NotAccepted),
+        DocketReconciliationWireV1::Refused(refusal) => Ok(
+            DocketIssuanceReconciliationV1::Refused(adapt_docket_refusal(issuance, refusal)?),
+        ),
+        DocketReconciliationWireV1::Accepted(custody) => {
+            Ok(DocketIssuanceReconciliationV1::Accepted(custody))
+        }
+        DocketReconciliationWireV1::Settled {
+            custody,
+            settlement,
+        } => Ok(DocketIssuanceReconciliationV1::Settled {
+            custody,
+            settlement,
+        }),
+        DocketReconciliationWireV1::Indeterminate {
+            custody,
+            indeterminate,
+        } => Ok(DocketIssuanceReconciliationV1::Indeterminate {
+            custody,
+            indeterminate,
+        }),
+        DocketReconciliationWireV1::GovernedRepairRequired { custody, result } => {
+            let result = adapt_docket_result(issuance, &custody, *result)?;
+            Ok(DocketIssuanceReconciliationV1::GovernedRepairRequired { custody, result })
+        }
+    }
+}
+
+fn adapt_docket_refusal(
+    issuance: &AgIssuanceV2,
+    wire: DocketIssuanceRefusalWireV1,
+) -> Result<DocketIssuanceRefusalV1, GovernedPortErrorV1> {
+    let refusal_class = match wire.refusal_class {
+        DocketIssuanceRefusalClassWireV1::IssuanceInvalid => {
+            DocketIssuanceRefusalClassV1::IssuanceInvalid
+        }
+        DocketIssuanceRefusalClassWireV1::IssuanceExpired => {
+            DocketIssuanceRefusalClassV1::IssuanceExpired
+        }
+        DocketIssuanceRefusalClassWireV1::CheckpointInvalid => {
+            DocketIssuanceRefusalClassV1::CheckpointInvalid
+        }
+        DocketIssuanceRefusalClassWireV1::StandingInvalid => {
+            DocketIssuanceRefusalClassV1::StandingInvalid
+        }
+        DocketIssuanceRefusalClassWireV1::InstrumentSubstitution => {
+            DocketIssuanceRefusalClassV1::InstrumentSubstitution
+        }
+    };
+    let refusal = DocketIssuanceRefusalV1 {
+        schema: wire.schema,
+        refusal: wire.refusal,
+        issuance: wire.issuance,
+        campaign: wire.campaign,
+        occurrence: wire.occurrence,
+        refusal_class,
+        reason_code: wire.reason_code,
+        evidence: wire.evidence,
+        refused_at_unix_ms: wire.refused_at_unix_ms,
+    };
+    refusal
+        .validate_for(issuance)
+        .map_err(|error| GovernedPortErrorV1::MalformedResponse(error.to_string()))?;
+    Ok(refusal)
 }
 
 /// Concrete-process boundary failures.  They never grant authority.

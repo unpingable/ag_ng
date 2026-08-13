@@ -43,10 +43,11 @@
       "id": "ag.process_isolation",
       "classification": "requires_trusted_host",
       "local_proxy": [
-        "scripts/verify-effectd-isolation.sh"
+        "scripts/verify-effectd-isolation.sh",
+        "pinned deployment-file type/mode/byte-identity checks before external adapter construction"
       ],
       "closure_evidence": "The exact packaged service and worker run under the declared systemd/sandbox/LSM identity and cannot reach forbidden network, filesystem, process, or credential surfaces.",
-      "local_proxy_does_not_establish": "live kernel, systemd, namespace, LSM, or packaging enforcement"
+      "local_proxy_does_not_establish": "live kernel, systemd, namespace, LSM, packaging enforcement, filesystem-name stability between measurement and use, or the identity and semantics of the process ultimately executed"
     },
     {
       "id": "ag.executor_physical_idempotency",
@@ -61,10 +62,36 @@
       "id": "ag.deployed_standing_docket_correspondence",
       "classification": "requires_deployed_service",
       "local_proxy": [
-        "AG issuance/Docket custody exact-binding integration tests"
+        "product API genesis-pinned Docket adapter-root and per-call premise-exclusion tests",
+        "AG issuance/Docket custody exact-binding integration tests",
+        "governed-repair Docket outcome and altered-binding refusal tests",
+        "adjacent-process governed-repair test through the service-owned Docket root"
       ],
-      "closure_evidence": "Deployed Standing and Docket accept only exact current bindings, one AG issuance creates at most one Docket attempt, settlement names that attempt, and instrument-substitution attacks refuse.",
-      "local_proxy_does_not_establish": "deployed service configuration, signer custody, or operational currentness"
+      "closure_evidence": "The genesis-committed deployment root and deployed Standing/Docket services accept only exact current Docket, trust, Standing, executor, checkpoint, signer, and issuance bindings; product clients cannot substitute those premises per operation; one AG issuance creates at most one Docket attempt; settlement names that attempt; and instrument-substitution attacks refuse.",
+      "local_proxy_does_not_establish": "coherent or locked deployment files, freedom from path replacement between measurement and external process execution, deployed executable semantics, signer custody, service configuration, or operational currentness"
+    },
+    {
+      "id": "ag.governed_repair_durable_halt_successor",
+      "classification": "runnable_locally_now",
+      "local_proxy": [
+        "governed-loop kernel, store, and application exact scope-expansion/readjudication tests",
+        "AG-owned occurrence projection wire tests excluding raw nested kernel/store state",
+        "NQ C1 immutable hostile-specimen parser and nonauthority tests",
+        "retired repair-path structural exclusivity tests"
+      ],
+      "closure_evidence": "Exact pre-spend discovery records no spend or attempt; exact post-spend Docket outcomes durably halt the immutable predecessor; verified approval opens only a fresh authority-empty successor; rejection terminalizes; restart, replay, collision, concurrency, and checkpoint substitution fail closed.",
+      "local_proxy_does_not_establish": "real human authority, deployed Docket identity, physical-effect absence, or production durability"
+    },
+    {
+      "id": "ag.governed_repair_external_human_verification",
+      "classification": "requires_deployed_service",
+      "local_proxy": [
+        "pinned verifier-root identity and executable remeasurement tests",
+        "exact request/state/delta/checkpoint/profile/expiry/one-use refusal tests",
+        "qualification-fixture-not-human-authority test verifier"
+      ],
+      "closure_evidence": "A declared externally governed verifier root authenticates one exact current disposition for one live unexpired request; wrong executable, profile, principal, mandate, state, scope delta, checkpoint, replay, and changed bytes refuse; no caller-supplied verifier or raw operator yes reaches a consequence.",
+      "local_proxy_does_not_establish": "human identity, mandate currentness, verifier deployment security, cryptographic custody, or a real human decision"
     }
   ]
 }

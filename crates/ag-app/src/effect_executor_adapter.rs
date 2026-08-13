@@ -11,6 +11,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use ag_campaign::governed::{CanonicalEffectOperationV1, CanonicalEffectScopeV1};
 use ag_effect::CanonicalEffectV1;
 use ag_effect::executor::{
     ArtifactReadErrorV1, ArtifactSourceV1, CapabilityFailureV1, CapabilityOutcomeV1,
@@ -62,9 +63,49 @@ pub struct EffectExecutorDispatchV1 {
     pub work: Digest,
     /// Exact standing-bound subject.
     pub subject: Digest,
-    /// Exact standing-bound scope.
-    pub scope: Digest,
+    /// Exact structured standing-bound effect scope.
+    pub effect_scope: CanonicalEffectScopeV1,
+    /// Mechanically derived identity of `effect_scope`.
+    pub effect_scope_digest: Digest,
 }
+
+/// Exact logical scope row that the sealed plan associates with its one
+/// physical effect.  Docket independently verifies the emitted journal row
+/// against the AG-issued canonical scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectExecutorJournalBindingV1 {
+    /// Exact resource class from the canonical scope.
+    pub resource: String,
+    /// Exact normalized resource-relative path from the canonical scope.
+    pub path: String,
+    /// Exact closed operation from the canonical scope.
+    pub operation: CanonicalEffectOperationV1,
+}
+
+/// One observed effect journal row returned to Docket.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectExecutorJournalEntryV1 {
+    /// Exact logical resource class.
+    pub resource: String,
+    /// Exact normalized resource-relative path.
+    pub path: String,
+    /// Exact closed operation.
+    pub operation: CanonicalEffectOperationV1,
+    /// Canonical identity of the physical effect consumed by the executor.
+    pub effect_identity: Digest,
+}
+
+/// Uninhabited marker: this ordinary mechanics adapter cannot emit an
+/// immutable governed-repair checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum NoGovernedRepairCheckpointV1 {}
+
+/// Uninhabited marker: this ordinary mechanics adapter cannot classify or
+/// emit a governed-repair requirement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum NoGovernedRepairRequirementV1 {}
 
 /// Closed mechanics outcome returned to Docket.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -90,6 +131,13 @@ pub struct EffectExecutorOutcomeV1 {
     pub receipt: Digest,
     /// Closed outcome class.
     pub outcome: EffectExecutorOutcomeClassV1,
+    /// Exact successful effects. Known no-effect failures and indeterminate
+    /// outcomes emit an empty journal.
+    pub effect_journal: Vec<EffectExecutorJournalEntryV1>,
+    /// Always `None`; governed checkpoints belong to a dedicated executor.
+    pub immutable_work_checkpoint: Option<NoGovernedRepairCheckpointV1>,
+    /// Always `None`; this adapter never interprets diagnostic meaning.
+    pub governed_repair: Option<NoGovernedRepairRequirementV1>,
 }
 
 /// One exact artifact file bound into a sealed effect plan.
@@ -139,6 +187,9 @@ pub struct EffectExecutorPlanV1 {
     pub subject: Digest,
     /// Exact Docket standing scope required by this plan.
     pub scope: Digest,
+    /// Exact logical effect row this plan may report after successful
+    /// mechanics. The Store-issued structured scope must contain it.
+    pub journal_binding: EffectExecutorJournalBindingV1,
     /// Effect position in the exact plan.
     pub effect_index: u32,
     /// One exact canonical effect.
@@ -294,6 +345,34 @@ fn validate_plan(plan: &EffectExecutorPlanV1) -> Result<(), String> {
     if !plan.attempt_store.is_absolute() || plan.file_policy.max_content_bytes == 0 {
         return Err("effect-executor-plan-store-or-limit".to_owned());
     }
+    CanonicalEffectScopeV1::new(
+        "executor-journal-binding/v1".to_owned(),
+        vec![ag_campaign::governed::CanonicalEffectResourceV1 {
+            resource: plan.journal_binding.resource.clone(),
+            path: plan.journal_binding.path.clone(),
+            operations: vec![plan.journal_binding.operation],
+        }],
+    )
+    .map_err(|_| "effect-executor-plan-journal-binding".to_owned())?;
+    let required_operation = match &plan.effect {
+        CanonicalEffectV1::ManagedFilePut {
+            expected_content, ..
+        } => {
+            if expected_content.is_some() {
+                CanonicalEffectOperationV1::Modify
+            } else {
+                CanonicalEffectOperationV1::Create
+            }
+        }
+        CanonicalEffectV1::ManagedFileDelete { .. } => CanonicalEffectOperationV1::Delete,
+        CanonicalEffectV1::ManagedPointerPromotion { .. } => CanonicalEffectOperationV1::Modify,
+        CanonicalEffectV1::SystemdUnit { .. } | CanonicalEffectV1::SystemdManagerReload { .. } => {
+            CanonicalEffectOperationV1::Execute
+        }
+    };
+    if plan.journal_binding.operation != required_operation {
+        return Err("effect-executor-plan-journal-operation".to_owned());
+    }
     let is_promotion = matches!(
         &plan.effect,
         CanonicalEffectV1::ManagedPointerPromotion { .. }
@@ -319,14 +398,46 @@ fn validate_dispatch(
     dispatch: &EffectExecutorDispatchV1,
 ) -> Result<(), String> {
     validate_plan(plan)?;
+    let journal_admitted = dispatch.effect_scope.resources().iter().any(|row| {
+        row.resource == plan.journal_binding.resource
+            && row.path == plan.journal_binding.path
+            && row.operations.contains(&plan.journal_binding.operation)
+    });
     if dispatch.work_schema != EFFECT_EXECUTOR_WORK_SCHEMA_V1
         || dispatch.work != plan.identity()?
         || dispatch.subject != plan.subject
-        || dispatch.scope != plan.scope
+        || dispatch.effect_scope.validate().is_err()
+        || dispatch.effect_scope.digest() != dispatch.effect_scope_digest
+        || dispatch.effect_scope_digest != plan.scope
+        || !journal_admitted
     {
         return Err("effect-executor-dispatch-plan-binding".to_owned());
     }
     Ok(())
+}
+
+fn effect_identity(effect: &CanonicalEffectV1) -> Result<Digest, String> {
+    let canonical = JcsDocument::canonicalize(effect)
+        .map_err(|error| format!("effect-executor-effect-canonical:{error}"))?;
+    Ok(Digest::hash_domain(
+        "ag-effectd.canonical-effect/v1",
+        canonical.as_bytes(),
+    ))
+}
+
+fn effect_journal(
+    plan: &EffectExecutorPlanV1,
+    outcome: EffectExecutorOutcomeClassV1,
+) -> Result<Vec<EffectExecutorJournalEntryV1>, String> {
+    if outcome != EffectExecutorOutcomeClassV1::Success {
+        return Ok(Vec::new());
+    }
+    Ok(vec![EffectExecutorJournalEntryV1 {
+        resource: plan.journal_binding.resource.clone(),
+        path: plan.journal_binding.path.clone(),
+        operation: plan.journal_binding.operation,
+        effect_identity: effect_identity(&plan.effect)?,
+    }])
 }
 
 struct PlanArtifactSourceV1 {
@@ -462,7 +573,7 @@ impl AttemptRecordV1 {
             && self.marker == dispatch.marker
             && self.work == dispatch.work
             && self.subject == dispatch.subject
-            && self.scope == dispatch.scope
+            && self.scope == dispatch.effect_scope_digest
     }
 
     fn outcome(
@@ -527,6 +638,9 @@ impl AttemptRecordV1 {
             marker: self.marker.clone(),
             receipt: receipt.clone(),
             outcome,
+            effect_journal: effect_journal(plan, outcome)?,
+            immutable_work_checkpoint: None,
+            governed_repair: None,
         }))
     }
 
@@ -652,7 +766,7 @@ impl EffectAttemptStoreV1 {
                             dispatch.marker.as_str(),
                             dispatch.work.as_str(),
                             dispatch.subject.as_str(),
-                            dispatch.scope.as_str()
+                            dispatch.effect_scope_digest.as_str()
                         ],
                     )
                     .map_err(|error| format!("effect-executor-reserve-insert:{error}"))?;
@@ -711,6 +825,9 @@ impl EffectAttemptStoreV1 {
             marker: dispatch.marker.clone(),
             receipt,
             outcome,
+            effect_journal: effect_journal(plan, outcome)?,
+            immutable_work_checkpoint: None,
+            governed_repair: None,
         })
     }
 
@@ -842,6 +959,7 @@ fn checkpoint(connection: &Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ag_campaign::governed::{CanonicalEffectOperationV1, CanonicalEffectResourceV1};
     use ag_effect::TargetId;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -856,12 +974,26 @@ mod tests {
         std::fs::write(&artifact_path, b"governed-loop-effect\n").unwrap();
         let content = Digest::hash_bytes(b"governed-loop-effect\n");
         let subject = Digest::hash_bytes(b"effect-subject");
-        let scope = Digest::hash_bytes(b"effect-scope");
+        let effect_scope = CanonicalEffectScopeV1::new(
+            "repository-write/v1".to_owned(),
+            vec![CanonicalEffectResourceV1 {
+                resource: "repository".to_owned(),
+                path: "fixtures/exact-work".to_owned(),
+                operations: vec![CanonicalEffectOperationV1::Create],
+            }],
+        )
+        .unwrap();
+        let scope = effect_scope.digest();
         let plan = EffectExecutorPlanV1 {
             schema: EFFECT_EXECUTOR_PLAN_SCHEMA_V1.to_owned(),
             attempt_store: directory.path().join("attempt.sqlite3"),
             subject: subject.clone(),
             scope: scope.clone(),
+            journal_binding: EffectExecutorJournalBindingV1 {
+                resource: "repository".to_owned(),
+                path: "fixtures/exact-work".to_owned(),
+                operation: CanonicalEffectOperationV1::Create,
+            },
             effect_index: 0,
             effect: CanonicalEffectV1::ManagedFilePut {
                 target: TargetId::parse("governed-loop-test").unwrap(),
@@ -890,7 +1022,8 @@ mod tests {
             work_schema: EFFECT_EXECUTOR_WORK_SCHEMA_V1.to_owned(),
             work: plan.identity().unwrap(),
             subject,
-            scope,
+            effect_scope,
+            effect_scope_digest: scope,
         };
         (directory, plan, dispatch)
     }

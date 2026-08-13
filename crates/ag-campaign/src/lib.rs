@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod external_repair_specimen;
 pub mod governed;
 mod identity;
 mod transcript;

@@ -170,6 +170,13 @@ pub enum DocketProgressV1 {
     Settled(OccurrenceSnapshotV1),
     /// Exact indeterminate attempt entered/stayed in reconciliation.
     ReconciliationRequired(OccurrenceSnapshotV1),
+    /// Exact Docket-sealed post-spend governed-repair requirement was halted.
+    GovernedRepairRequired {
+        /// Exact halted snapshot.
+        halted: OccurrenceSnapshotV1,
+        /// Exact typed requirement from the sealed Docket outcome.
+        requirement: HumanDecisionRequirementV1,
+    },
 }
 
 /// Exact restart/recovery result.
@@ -180,7 +187,7 @@ pub enum CampaignRecoveryV1 {
     ExternalRevalidation(RecoveryRequirementV1),
     /// Spent issuance is authoritatively absent at Docket and may be submitted
     /// again as the same issuance, never respent.
-    IssuanceNotAccepted(AgIssuanceV1),
+    IssuanceNotAccepted(AgIssuanceV2),
     /// Recovery committed one or more exact transitions.
     Advanced(OccurrenceSnapshotV1),
 }
@@ -214,6 +221,12 @@ pub struct CampaignEngineV1 {
 }
 
 impl CampaignEngineV1 {
+    /// Returns the authoritative store path for stable read-only product views.
+    #[must_use]
+    pub fn store_path(&self) -> &Path {
+        self.store.path()
+    }
+
     /// Creates one campaign with one authority-empty occurrence.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
@@ -228,6 +241,32 @@ impl CampaignEngineV1 {
         let initial =
             GovernedLoopKernelV1::create_initial(campaign, occurrence, program, residuals, budget)?;
         let store = CampaignStoreV1::create(database, &initial, now_unix_ms)?;
+        Ok(Self { store })
+    }
+
+    /// Creates the canonical engine while atomically pinning product genesis
+    /// and deployment verifier-root records.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_with_product_records(
+        database: &Path,
+        campaign: CampaignId,
+        occurrence: OccurrenceId,
+        program: ProgramBasisRefV1,
+        residuals: ResidualSetV1,
+        budget: LoopBudgetV1,
+        now_unix_ms: u64,
+        product_creation: (&Digest, &Digest, &[u8]),
+        verifier_root: Option<(&Digest, &[u8])>,
+    ) -> Result<Self, CampaignEngineErrorV1> {
+        let initial =
+            GovernedLoopKernelV1::create_initial(campaign, occurrence, program, residuals, budget)?;
+        let store = CampaignStoreV1::create_with_product_records(
+            database,
+            &initial,
+            now_unix_ms,
+            Some(product_creation),
+            verifier_root,
+        )?;
         Ok(Self { store })
     }
 
@@ -382,7 +421,35 @@ impl CampaignEngineV1 {
             .issuance()
             .cloned()
             .ok_or(CampaignEngineErrorV1::DocketResponse)?;
-        let custody = docket.accept_issuance(&issuance)?;
+        if now_unix_ms >= issuance.expires_at_unix_ms {
+            return match docket.reconcile_issuance(&issuance)? {
+                DocketIssuanceReconciliationV1::NotAccepted => {
+                    let halted =
+                        GovernedLoopKernelV1::halt_expired_issuance(&current, now_unix_ms)?;
+                    self.store.commit(
+                        &current,
+                        &halted,
+                        CampaignTransitionKindV1::Halted,
+                        now_unix_ms,
+                    )?;
+                    Ok(halted)
+                }
+                DocketIssuanceReconciliationV1::Refused(refusal) => {
+                    self.apply_docket_issuance_refusal(&current, refusal, now_unix_ms)
+                }
+                response => self.apply_recovered_issuance(&current, response, now_unix_ms),
+            };
+        }
+        let acceptance = docket.accept_issuance(&issuance)?;
+        let (custody, governed_result) = match acceptance {
+            DocketIssuanceAcceptanceV1::Refused(refusal) => {
+                return self.apply_docket_issuance_refusal(&current, refusal, now_unix_ms);
+            }
+            DocketIssuanceAcceptanceV1::Custody(custody) => (custody, None),
+            DocketIssuanceAcceptanceV1::GovernedRepairRequired { custody, result } => {
+                (custody, Some(result))
+            }
+        };
         let successor = GovernedLoopKernelV1::accept_docket_custody(&current, custody)?;
         self.store.commit(
             &current,
@@ -390,7 +457,16 @@ impl CampaignEngineV1 {
             CampaignTransitionKindV1::DocketCustodyAccepted,
             now_unix_ms,
         )?;
-        Ok(successor)
+        if let Some(result) = governed_result {
+            let DocketProgressV1::GovernedRepairRequired { halted, .. } =
+                self.apply_sealed_governed_repair(&successor, result, now_unix_ms)?
+            else {
+                return Err(CampaignEngineErrorV1::DocketResponse);
+            };
+            Ok(halted)
+        } else {
+            Ok(successor)
+        }
     }
 
     /// Polls Docket read-only and consumes only exact custody/settlement evidence.
@@ -404,7 +480,11 @@ impl CampaignEngineV1 {
             .docket_custody()
             .cloned()
             .ok_or(CampaignEngineErrorV1::DocketResponse)?;
-        let response = docket.reconcile_attempt(&custody)?;
+        let issuance = current
+            .issuance()
+            .cloned()
+            .ok_or(CampaignEngineErrorV1::DocketResponse)?;
+        let response = docket.reconcile_attempt(&issuance, &custody)?;
         self.apply_docket_progress(&current, response, now_unix_ms)
     }
 
@@ -517,6 +597,79 @@ impl CampaignEngineV1 {
         Ok(effect)
     }
 
+    /// Creates and durably records one exact non-authorizing governed-repair
+    /// request under the current halted-state CAS.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_governed_repair_request(
+        &mut self,
+        expected_state_digest: &Digest,
+        requirement: HumanDecisionRequirementV1,
+        required_verifier_profile: Digest,
+        required_verifier_root: Digest,
+        required_verifier_executable: Digest,
+        decision_consequences: Vec<Digest>,
+        nonclaims: Vec<Digest>,
+        idempotency_key: Digest,
+        now_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> Result<HumanDecisionRequestV1, CampaignEngineErrorV1> {
+        let current = self.store.current()?;
+        if current.state_digest() != expected_state_digest {
+            return Err(CampaignStoreErrorV1::StalePredecessor {
+                expected: expected_state_digest.clone(),
+                authoritative: current.state_digest().clone(),
+            }
+            .into());
+        }
+        let request = GovernedLoopKernelV1::create_human_decision_request(
+            &current,
+            HumanDecisionRequestParametersV1 {
+                requirement,
+                required_verifier_profile,
+                required_verifier_root,
+                required_verifier_executable,
+                decision_consequences,
+                nonclaims,
+                idempotency_key,
+                created_at_unix_ms: now_unix_ms,
+                expires_at_unix_ms,
+            },
+        )?;
+        self.store
+            .record_human_decision_request(expected_state_digest, &request)?;
+        Ok(request)
+    }
+
+    /// Retrieves one exact durable governed-repair request.
+    pub fn governed_repair_request(
+        &self,
+        request: &HumanDecisionRequestRefV1,
+    ) -> Result<Option<HumanDecisionRequestV1>, CampaignEngineErrorV1> {
+        Ok(self.store.human_decision_request(request)?)
+    }
+
+    /// Applies one exact freshly verified governed-repair disposition and
+    /// atomically consumes its request/decision.  Approval never resumes the
+    /// halted source; it opens the successor embedded in the artifact.
+    pub fn apply_governed_repair_disposition(
+        &mut self,
+        expected_state_digest: &Digest,
+        request: &HumanDecisionRequestRefV1,
+        artifact: GovernedRepairDispositionV1,
+        now_unix_ms: u64,
+    ) -> Result<GovernedRepairDispositionEffectV1, CampaignEngineErrorV1> {
+        let verified = self.store.verify_governed_repair_disposition(
+            expected_state_digest,
+            request,
+            artifact,
+            now_unix_ms,
+        )?;
+        let (effect, _) = self
+            .store
+            .commit_verified_governed_repair_disposition(verified)?;
+        Ok(effect)
+    }
+
     /// Completes from an authority-empty observation boundary only.
     #[allow(clippy::too_many_arguments)]
     pub fn complete<O: ObservationResolverV1>(
@@ -579,7 +732,19 @@ impl CampaignEngineV1 {
                     .ok_or(CampaignEngineErrorV1::DocketResponse)?;
                 match docket.reconcile_issuance(&issuance)? {
                     DocketIssuanceReconciliationV1::NotAccepted => {
-                        Ok(CampaignRecoveryV1::IssuanceNotAccepted(issuance))
+                        if now_unix_ms >= issuance.expires_at_unix_ms {
+                            let halted =
+                                GovernedLoopKernelV1::halt_expired_issuance(&current, now_unix_ms)?;
+                            self.store.commit(
+                                &current,
+                                &halted,
+                                CampaignTransitionKindV1::Halted,
+                                now_unix_ms,
+                            )?;
+                            Ok(CampaignRecoveryV1::Advanced(halted))
+                        } else {
+                            Ok(CampaignRecoveryV1::IssuanceNotAccepted(issuance))
+                        }
                     }
                     response => {
                         let advanced =
@@ -600,13 +765,20 @@ impl CampaignEngineV1 {
                     .docket_custody()
                     .cloned()
                     .ok_or(CampaignEngineErrorV1::DocketResponse)?;
-                let response = docket.reconcile_attempt(&custody)?;
+                let issuance = reconciling
+                    .issuance()
+                    .cloned()
+                    .ok_or(CampaignEngineErrorV1::DocketResponse)?;
+                let response = docket.reconcile_attempt(&issuance, &custody)?;
                 match self.apply_docket_progress(&reconciling, response, now_unix_ms)? {
                     DocketProgressV1::Pending | DocketProgressV1::ReconciliationRequired(_) => {
                         Ok(CampaignRecoveryV1::Advanced(self.store.current()?))
                     }
                     DocketProgressV1::Settled(snapshot) => {
                         Ok(CampaignRecoveryV1::Advanced(snapshot))
+                    }
+                    DocketProgressV1::GovernedRepairRequired { halted, .. } => {
+                        Ok(CampaignRecoveryV1::Advanced(halted))
                     }
                 }
             }
@@ -615,13 +787,20 @@ impl CampaignEngineV1 {
                     .docket_custody()
                     .cloned()
                     .ok_or(CampaignEngineErrorV1::DocketResponse)?;
-                let response = docket.reconcile_attempt(&custody)?;
+                let issuance = current
+                    .issuance()
+                    .cloned()
+                    .ok_or(CampaignEngineErrorV1::DocketResponse)?;
+                let response = docket.reconcile_attempt(&issuance, &custody)?;
                 match self.apply_docket_progress(&current, response, now_unix_ms)? {
                     DocketProgressV1::Pending | DocketProgressV1::ReconciliationRequired(_) => {
                         Ok(CampaignRecoveryV1::Advanced(self.store.current()?))
                     }
                     DocketProgressV1::Settled(snapshot) => {
                         Ok(CampaignRecoveryV1::Advanced(snapshot))
+                    }
+                    DocketProgressV1::GovernedRepairRequired { halted, .. } => {
+                        Ok(CampaignRecoveryV1::Advanced(halted))
                     }
                 }
             }
@@ -637,6 +816,22 @@ impl CampaignEngineV1 {
         response: DocketIssuanceReconciliationV1,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+        if let DocketIssuanceReconciliationV1::GovernedRepairRequired { custody, result } = response
+        {
+            let dispatched = GovernedLoopKernelV1::accept_docket_custody(current, custody)?;
+            self.store.commit(
+                current,
+                &dispatched,
+                CampaignTransitionKindV1::DocketCustodyAccepted,
+                now_unix_ms,
+            )?;
+            let DocketProgressV1::GovernedRepairRequired { halted, .. } =
+                self.apply_sealed_governed_repair(&dispatched, result, now_unix_ms)?
+            else {
+                return Err(CampaignEngineErrorV1::DocketResponse);
+            };
+            return Ok(halted);
+        }
         let (custody, after) = match response {
             DocketIssuanceReconciliationV1::Accepted(custody) => (custody, None),
             DocketIssuanceReconciliationV1::Settled {
@@ -650,6 +845,12 @@ impl CampaignEngineV1 {
             DocketIssuanceReconciliationV1::NotAccepted => {
                 return Err(CampaignEngineErrorV1::DocketResponse);
             }
+            DocketIssuanceReconciliationV1::Refused(refusal) => {
+                return self.apply_docket_issuance_refusal(current, refusal, now_unix_ms);
+            }
+            DocketIssuanceReconciliationV1::GovernedRepairRequired { .. } => unreachable!(
+                "governed repair recovery response handled before ordinary reconciliation"
+            ),
         };
         let dispatched = GovernedLoopKernelV1::accept_docket_custody(current, custody)?;
         self.store.commit(
@@ -696,6 +897,18 @@ impl CampaignEngineV1 {
         }
     }
 
+    fn apply_docket_issuance_refusal(
+        &mut self,
+        current: &OccurrenceSnapshotV1,
+        refusal: ag_campaign::governed::DocketIssuanceRefusalV1,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+        let halted = GovernedLoopKernelV1::halt_docket_issuance_refusal(current, refusal.clone())?;
+        self.store
+            .commit_docket_issuance_refusal(current, &halted, &refusal, now_unix_ms)?;
+        Ok(halted)
+    }
+
     fn apply_docket_progress(
         &mut self,
         current: &OccurrenceSnapshotV1,
@@ -703,7 +916,11 @@ impl CampaignEngineV1 {
         now_unix_ms: u64,
     ) -> Result<DocketProgressV1, CampaignEngineErrorV1> {
         match response {
-            DocketIssuanceReconciliationV1::NotAccepted => {
+            // Attempt reconciliation is only legal after custody. A
+            // pre-custody refusal on this boundary is a cross-phase
+            // substitution, not a second terminal transition.
+            DocketIssuanceReconciliationV1::NotAccepted
+            | DocketIssuanceReconciliationV1::Refused(_) => {
                 Err(CampaignEngineErrorV1::DocketResponse)
             }
             DocketIssuanceReconciliationV1::Accepted(custody) => {
@@ -777,7 +994,60 @@ impl CampaignEngineV1 {
                 )?;
                 Ok(DocketProgressV1::ReconciliationRequired(successor))
             }
+            DocketIssuanceReconciliationV1::GovernedRepairRequired { custody, result } => {
+                if current.docket_custody() != Some(&custody) {
+                    return Err(CampaignEngineErrorV1::DocketResponse);
+                }
+                self.apply_sealed_governed_repair(current, result, now_unix_ms)
+            }
         }
+    }
+
+    fn apply_sealed_governed_repair(
+        &mut self,
+        current: &OccurrenceSnapshotV1,
+        result: DocketSealedGovernedRepairResultV1,
+        now_unix_ms: u64,
+    ) -> Result<DocketProgressV1, CampaignEngineErrorV1> {
+        let exact_result = result.clone();
+        let (outcome, requirement, domain) = match result {
+            DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+                outcome,
+                requirement,
+            } => (
+                outcome,
+                HumanDecisionRequirementV1::ScopeExpansion(requirement),
+                "ag.governed-loop.docket-scope-expansion-required/v1",
+            ),
+            DocketSealedGovernedRepairResultV1::ReadjudicationRequired {
+                outcome,
+                requirement,
+            } => (
+                outcome,
+                HumanDecisionRequirementV1::Readjudication(requirement),
+                "ag.governed-loop.docket-readjudication-required/v1",
+            ),
+        };
+        let reason = HaltReasonRefV1::from_digest(Digest::hash_domain(
+            domain,
+            outcome.sealed_result.as_digest().as_str().as_bytes(),
+        ));
+        let halted = GovernedLoopKernelV1::halt_from_docket_governed_repair(
+            current,
+            &outcome,
+            &requirement,
+            reason,
+        )?;
+        self.store.commit_docket_governed_repair_halt(
+            current,
+            &halted,
+            &exact_result,
+            now_unix_ms,
+        )?;
+        Ok(DocketProgressV1::GovernedRepairRequired {
+            halted,
+            requirement,
+        })
     }
 
     fn halt_for_exhausted_budget(

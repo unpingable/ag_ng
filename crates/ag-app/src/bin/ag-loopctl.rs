@@ -15,19 +15,18 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use ag_app::governed_loop::{CampaignEngineV1, ExactWorkCatalogV1};
-use ag_app::governed_ports::{
-    AgIssuanceSignerV1, CommandDocketCustodyPortV1, CommandHumanDispositionVerifierV1,
-    CommandObservationResolverV1, CommandStandingResolverV1,
+use ag_app::governed_product::{
+    CreateCampaignV1, CreateDecisionRequestV1, GovernedAgPolicyRootV1, GovernedCampaignServiceV1,
+    GovernedDocketAdapterRootV1, GovernedRepairVerifierRootV1, OccurrencePageRequestV1,
+    PageRequestV1, SubmitGovernedDispositionV1,
 };
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::{Digest, JcsDocument};
 use ag_protocol::strict_json_from_slice;
 use anyhow::{Context as _, bail};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Parser)]
@@ -60,54 +59,101 @@ enum Command {
         #[arg(long)]
         database: PathBuf,
     },
+    /// Print the stable product state plus allowed transitions/event cursor.
+    ProductState {
+        #[arg(long)]
+        database: PathBuf,
+    },
+    /// List occurrences through the stable product cursor contract.
+    ListOccurrences {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        #[arg(long, value_enum)]
+        program_counter: Option<ProgramCounterArgumentV1>,
+        #[arg(long)]
+        governed_repair_pending: Option<bool>,
+    },
+    /// List ordered events through the stable product cursor contract.
+    ListEvents {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+    /// Create one durable non-authorizing governed-repair request.
+    CreateDecisionRequest {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
+    },
+    /// Submit one exact governed-repair disposition through root-owned profile.
+    SubmitGovernedDisposition {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
+    },
     /// Resolve a fresh observation and record one exact proposal.
     RecordProposal {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
         input: PathBuf,
-        #[arg(long)]
-        observation_resolver: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
     },
     /// Enter the explicit current-standing-required state.
     RequireStanding {
         #[arg(long)]
         database: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
     },
     /// Resolve current premises and record a positive AG decision only.
     Decide {
         #[arg(long)]
         database: PathBuf,
         #[command(flatten)]
-        gate: GateArguments,
+        cas: CasArguments,
     },
     /// Re-resolve current premises and durably spend the one AG authorization.
     Authorize {
         #[arg(long)]
         database: PathBuf,
         #[command(flatten)]
-        gate: GateArguments,
+        cas: CasArguments,
     },
     /// Submit the already-durable exact issuance to Docket custody.
     Dispatch {
         #[arg(long)]
         database: PathBuf,
         #[command(flatten)]
-        docket: DocketArguments,
+        cas: CasArguments,
     },
     /// Read-only reconcile/poll the exact Docket attempt.
     Poll {
         #[arg(long)]
         database: PathBuf,
         #[command(flatten)]
-        docket: DocketArguments,
+        cas: CasArguments,
     },
     /// Apply the PC-specific restart law without reconstructing authority.
     Recover {
         #[arg(long)]
         database: PathBuf,
         #[command(flatten)]
-        docket: DocketArguments,
+        cas: CasArguments,
     },
     /// Open a distinct authority-empty occurrence after settlement.
     Continue {
@@ -115,11 +161,15 @@ enum Command {
         database: PathBuf,
         #[arg(long)]
         input: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
     },
     /// Persist one read-only probe-count fact.
     NoteProbe {
         #[arg(long)]
         database: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
     },
     /// Halt from an authority-safe boundary.
     Halt {
@@ -127,6 +177,8 @@ enum Command {
         database: PathBuf,
         #[arg(long)]
         input: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
     },
     /// Consume one escalation budget fact and halt.
     Escalate {
@@ -134,17 +186,8 @@ enum Command {
         database: PathBuf,
         #[arg(long)]
         input: PathBuf,
-    },
-    /// Apply one exact externally verified human disposition.
-    ApplyDisposition {
-        #[arg(long)]
-        database: PathBuf,
-        #[arg(long)]
-        input: PathBuf,
-        #[arg(long)]
-        observation_resolver: PathBuf,
-        #[arg(long)]
-        human_verifier: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
     },
     /// Complete only from a fresh observation boundary with no residuals.
     Complete {
@@ -152,8 +195,8 @@ enum Command {
         database: PathBuf,
         #[arg(long)]
         input: PathBuf,
-        #[arg(long)]
-        observation_resolver: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
     },
     /// Record a typed non-authorizing refusal without advancing the PC.
     Refuse {
@@ -161,41 +204,51 @@ enum Command {
         database: PathBuf,
         #[arg(long)]
         input: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
     },
 }
 
 #[derive(Debug, Args)]
-struct GateArguments {
+struct CasArguments {
+    /// Exact state observed by the caller; stale values fail closed.
     #[arg(long)]
-    catalog: PathBuf,
-    #[arg(long)]
-    observation_resolver: PathBuf,
-    #[arg(long)]
-    standing_resolver: PathBuf,
-    #[arg(long)]
-    controlling_review: Option<PathBuf>,
+    expected_state: String,
 }
 
-#[derive(Debug, Args)]
-struct DocketArguments {
-    #[arg(long)]
-    docket: PathBuf,
-    #[arg(long)]
-    docket_state: PathBuf,
-    #[arg(long)]
-    docket_trust: PathBuf,
-    #[arg(long)]
-    docket_standing_resolver: PathBuf,
-    #[arg(long)]
-    executor: PathBuf,
-    #[arg(long)]
-    executor_config: PathBuf,
-    #[arg(long)]
-    issuer_principal: String,
-    #[arg(long)]
-    issuer_key_id: String,
-    #[arg(long)]
-    issuer_key: PathBuf,
+#[derive(Clone, Debug, ValueEnum)]
+enum ProgramCounterArgumentV1 {
+    ObservationRequired,
+    ProposalRecorded,
+    StandingRequired,
+    AdmissiblePendingAuthorization,
+    AuthorizationConsumed,
+    Dispatched,
+    ReconciliationRequired,
+    SettledObservationRequired,
+    Halted,
+    Completed,
+}
+
+impl From<ProgramCounterArgumentV1> for ProgramCounterV1 {
+    fn from(value: ProgramCounterArgumentV1) -> Self {
+        match value {
+            ProgramCounterArgumentV1::ObservationRequired => Self::ObservationRequired,
+            ProgramCounterArgumentV1::ProposalRecorded => Self::ProposalRecorded,
+            ProgramCounterArgumentV1::StandingRequired => Self::StandingRequired,
+            ProgramCounterArgumentV1::AdmissiblePendingAuthorization => {
+                Self::AdmissiblePendingAuthorization
+            }
+            ProgramCounterArgumentV1::AuthorizationConsumed => Self::AuthorizationConsumed,
+            ProgramCounterArgumentV1::Dispatched => Self::Dispatched,
+            ProgramCounterArgumentV1::ReconciliationRequired => Self::ReconciliationRequired,
+            ProgramCounterArgumentV1::SettledObservationRequired => {
+                Self::SettledObservationRequired
+            }
+            ProgramCounterArgumentV1::Halted => Self::Halted,
+            ProgramCounterArgumentV1::Completed => Self::Completed,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -206,6 +259,10 @@ struct GenesisInputV1 {
     program: ProgramBasisRefV1,
     residuals: ResidualSetV1,
     budget: LoopBudgetV1,
+    idempotency_key: Digest,
+    governed_ag_policy_root: GovernedAgPolicyRootV1,
+    governed_repair_verifier_root: Option<GovernedRepairVerifierRootV1>,
+    governed_docket_adapter_root: Option<GovernedDocketAdapterRootV1>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -230,15 +287,6 @@ struct HaltInputV1 {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct HumanDispositionInputV1 {
-    artifact: HumanDispositionV1,
-    expected_principal: HumanPrincipalRefV1,
-    expected_mandate: MandateRefV1,
-    new_occurrence: Option<OccurrenceId>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 struct CompletionInputV1 {
     observation: ObservationRefV1,
     subject: Digest,
@@ -254,179 +302,192 @@ struct RefusalInputV1 {
 
 fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
-    let now = now_unix_ms()?;
     match arguments.command {
         Command::Init { database, genesis } => {
             let input: GenesisInputV1 = read_exact_record(&genesis)?;
-            let engine = CampaignEngineV1::create(
+            let service = GovernedCampaignServiceV1::create(
                 &database,
-                input.campaign,
-                input.occurrence,
-                input.program,
-                input.residuals,
-                input.budget,
-                now,
+                CreateCampaignV1 {
+                    campaign: input.campaign,
+                    occurrence: input.occurrence,
+                    program: input.program,
+                    residuals: input.residuals,
+                    budget: input.budget,
+                    idempotency_key: input.idempotency_key,
+                    governed_ag_policy_root: input.governed_ag_policy_root,
+                    governed_repair_verifier_root: input.governed_repair_verifier_root,
+                    governed_docket_adapter_root: input.governed_docket_adapter_root,
+                },
             )?;
-            write_exact(&engine.current()?)
+            write_exact(&service.state()?.current)
         }
-        Command::Status { database } => write_exact(&CampaignEngineV1::open(&database)?.current()?),
-        Command::Replay { database } => write_exact(&CampaignEngineV1::open(&database)?.replay()?),
+        Command::Status { database } => {
+            write_exact(&GovernedCampaignServiceV1::open(&database)?.state()?.current)
+        }
+        Command::Replay { database } => {
+            write_exact(&GovernedCampaignServiceV1::open(&database)?.replay()?)
+        }
+        Command::ProductState { database } => {
+            write_exact(&GovernedCampaignServiceV1::open(&database)?.state()?)
+        }
+        Command::ListOccurrences {
+            database,
+            after,
+            limit,
+            program_counter,
+            governed_repair_pending,
+        } => write_exact(
+            &GovernedCampaignServiceV1::open(&database)?.list_occurrences(
+                &OccurrencePageRequestV1 {
+                    after,
+                    limit,
+                    program_counter: program_counter.map(Into::into),
+                    governed_repair_pending,
+                },
+            )?,
+        ),
+        Command::ListEvents {
+            database,
+            after,
+            limit,
+        } => write_exact(
+            &GovernedCampaignServiceV1::open(&database)?
+                .list_events(&PageRequestV1 { after, limit })?,
+        ),
+        Command::CreateDecisionRequest {
+            database,
+            input,
+            cas,
+        } => {
+            let request: CreateDecisionRequestV1 = read_exact_record(&input)?;
+            let expected = parse_expected_state(&cas)?;
+            if request.expected_state_digest != expected {
+                bail!("input and --expected-state differ");
+            }
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            write_exact(&service.create_decision_request(request)?)
+        }
+        Command::SubmitGovernedDisposition {
+            database,
+            input,
+            cas,
+        } => {
+            let request: SubmitGovernedDispositionV1 = read_exact_record(&input)?;
+            let expected = parse_expected_state(&cas)?;
+            if request.expected_state_digest != expected {
+                bail!("input and --expected-state differ");
+            }
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            write_exact(&service.submit_governed_disposition(request)?)
+        }
         Command::RecordProposal {
             database,
             input,
-            observation_resolver,
+            cas,
         } => {
             let input: ProposalInputV1 = read_exact_record(&input)?;
-            let mut engine = CampaignEngineV1::open(&database)?;
-            let mut observation = CommandObservationResolverV1::new(observation_resolver);
-            let state = engine.record_proposal(
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            let state = service.record_proposal(
+                &expected,
                 input.observation,
                 input.proposal,
                 input.class,
-                &mut observation,
-                now,
             )?;
             write_exact(&state)
         }
-        Command::RequireStanding { database } => {
-            let mut engine = CampaignEngineV1::open(&database)?;
-            write_exact(&engine.require_standing(now)?)
+        Command::RequireStanding { database, cas } => {
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.require_standing(&expected)?)
         }
-        Command::Decide { database, gate } => {
-            let mut engine = CampaignEngineV1::open(&database)?;
-            let mut observation = CommandObservationResolverV1::new(gate.observation_resolver);
-            let mut standing = CommandStandingResolverV1::new(gate.standing_resolver);
-            let catalog: ExactWorkCatalogV1 = read_exact_record(&gate.catalog)?;
-            let review = gate
-                .controlling_review
-                .as_deref()
-                .map(read_exact_record)
-                .transpose()?;
-            write_exact(&engine.decide(
-                &mut observation,
-                &mut standing,
-                &catalog,
-                review.as_ref(),
-                now,
-            )?)
+        Command::Decide { database, cas } => {
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.decide(&expected)?)
         }
-        Command::Authorize { database, gate } => {
-            let mut engine = CampaignEngineV1::open(&database)?;
-            let mut observation = CommandObservationResolverV1::new(gate.observation_resolver);
-            let mut standing = CommandStandingResolverV1::new(gate.standing_resolver);
-            let catalog: ExactWorkCatalogV1 = read_exact_record(&gate.catalog)?;
-            let review = gate
-                .controlling_review
-                .as_deref()
-                .map(read_exact_record)
-                .transpose()?;
-            write_exact(&engine.authorize(
-                &mut observation,
-                &mut standing,
-                &catalog,
-                review.as_ref(),
-                now,
-            )?)
+        Command::Authorize { database, cas } => {
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.authorize(&expected)?)
         }
-        Command::Dispatch { database, docket } => {
-            let mut engine = CampaignEngineV1::open(&database)?;
-            let mut docket = docket_port(docket)?;
-            write_exact(&engine.dispatch(&mut docket, now)?)
+        Command::Dispatch { database, cas } => {
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.dispatch(&expected)?)
         }
-        Command::Poll { database, docket } => {
-            let mut engine = CampaignEngineV1::open(&database)?;
-            let mut docket = docket_port(docket)?;
-            let _ = engine.poll_docket(&mut docket, now)?;
-            write_exact(&engine.current()?)
+        Command::Poll { database, cas } => {
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.reconcile_docket(&expected)?)
         }
-        Command::Recover { database, docket } => {
-            let mut engine = CampaignEngineV1::open(&database)?;
-            let mut docket = docket_port(docket)?;
-            write_exact(&engine.recover(&mut docket, now)?)
+        Command::Recover { database, cas } => {
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.recover(&expected)?)
         }
-        Command::Continue { database, input } => {
-            let input: ContinuationInputV1 = read_exact_record(&input)?;
-            let mut engine = CampaignEngineV1::open(&database)?;
-            write_exact(&engine.open_continuation(input.occurrence, now)?)
-        }
-        Command::NoteProbe { database } => {
-            let mut engine = CampaignEngineV1::open(&database)?;
-            write_exact(&engine.note_probe(now)?)
-        }
-        Command::Halt { database, input } => {
-            let input: HaltInputV1 = read_exact_record(&input)?;
-            let mut engine = CampaignEngineV1::open(&database)?;
-            write_exact(&engine.halt(input.reason, now)?)
-        }
-        Command::Escalate { database, input } => {
-            let input: HaltInputV1 = read_exact_record(&input)?;
-            let mut engine = CampaignEngineV1::open(&database)?;
-            write_exact(&engine.escalate(input.reason, now)?)
-        }
-        Command::ApplyDisposition {
+        Command::Continue {
             database,
             input,
-            observation_resolver,
-            human_verifier,
+            cas,
         } => {
-            let input: HumanDispositionInputV1 = read_exact_record(&input)?;
-            let mut engine = CampaignEngineV1::open(&database)?;
-            let mut observation = CommandObservationResolverV1::new(observation_resolver);
-            let mut verifier = CommandHumanDispositionVerifierV1::new(human_verifier);
-            let scope = HumanAuthorityScopeV1 {
-                principal: input.expected_principal,
-                mandate: input.expected_mandate,
-            };
-            let _ = engine.apply_human_disposition(
-                input.artifact,
-                &scope,
-                input.new_occurrence,
-                &mut observation,
-                &mut verifier,
-                now,
-            )?;
-            write_exact(&engine.current()?)
+            let input: ContinuationInputV1 = read_exact_record(&input)?;
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.open_continuation(&expected, input.occurrence)?)
+        }
+        Command::NoteProbe { database, cas } => {
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.note_probe(&expected)?)
+        }
+        Command::Halt {
+            database,
+            input,
+            cas,
+        } => {
+            let input: HaltInputV1 = read_exact_record(&input)?;
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.halt(&expected, input.reason)?)
+        }
+        Command::Escalate {
+            database,
+            input,
+            cas,
+        } => {
+            let input: HaltInputV1 = read_exact_record(&input)?;
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.escalate(&expected, input.reason)?)
         }
         Command::Complete {
             database,
             input,
-            observation_resolver,
+            cas,
         } => {
             let input: CompletionInputV1 = read_exact_record(&input)?;
-            let mut engine = CampaignEngineV1::open(&database)?;
-            let mut observation = CommandObservationResolverV1::new(observation_resolver);
-            write_exact(&engine.complete(
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            write_exact(&service.complete(
+                &expected,
                 input.observation,
                 &input.subject,
                 input.terminal_witness,
-                &mut observation,
-                now,
             )?)
         }
-        Command::Refuse { database, input } => {
+        Command::Refuse {
+            database,
+            input,
+            cas,
+        } => {
             let input: RefusalInputV1 = read_exact_record(&input)?;
-            let mut engine = CampaignEngineV1::open(&database)?;
-            let refusal = engine.record_refusal(input.code, input.evidence, now)?;
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            let expected = parse_expected_state(&cas)?;
+            let refusal = service.record_refusal(&expected, input.code, input.evidence)?;
             write_exact(&refusal)
         }
     }
-}
-
-fn docket_port(arguments: DocketArguments) -> anyhow::Result<CommandDocketCustodyPortV1> {
-    let signer = AgIssuanceSignerV1::from_pkcs8_file(
-        arguments.issuer_principal,
-        arguments.issuer_key_id,
-        &arguments.issuer_key,
-    )?;
-    Ok(CommandDocketCustodyPortV1::new(
-        arguments.docket,
-        arguments.docket_state,
-        arguments.docket_trust,
-        arguments.docket_standing_resolver,
-        arguments.executor,
-        arguments.executor_config,
-        signer,
-    ))
 }
 
 fn read_exact_record<T>(path: &Path) -> anyhow::Result<T>
@@ -454,9 +515,6 @@ fn write_exact<T: Serialize + ?Sized>(value: &T) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn now_unix_ms() -> anyhow::Result<u64> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?;
-    u64::try_from(duration.as_millis()).context("system clock exceeds u64 milliseconds")
+fn parse_expected_state(arguments: &CasArguments) -> anyhow::Result<Digest> {
+    Digest::parse(&arguments.expected_state).context("parse --expected-state")
 }

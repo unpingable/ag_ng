@@ -4,7 +4,7 @@ use std::sync::{Arc, Barrier};
 
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
-use ag_primitives::Digest;
+use ag_primitives::{Digest, JcsDocument};
 use ag_store::campaign::{CampaignStoreErrorV1, CampaignStoreV1, CampaignTransitionKindV1};
 
 const NOW: u64 = 20_000;
@@ -40,15 +40,158 @@ fn initial() -> OccurrenceSnapshotV1 {
 }
 
 fn proposal(work: &str) -> ExactWorkProposalV1 {
+    let scope = CanonicalEffectScopeV1::new(
+        "test-effect".to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/exact-work".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap();
     ExactWorkProposalV1::new(
         campaign(),
         digest("subject"),
-        digest("scope"),
+        scope,
         "test.store-work/v1".to_owned(),
         digest(work),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
         None,
     )
     .unwrap()
+}
+
+fn sorted(labels: &[&str]) -> Vec<Digest> {
+    let mut values = labels.iter().map(|label| digest(label)).collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn canonical_bytes<T: serde::Serialize + ?Sized>(value: &T) -> Vec<u8> {
+    JcsDocument::canonicalize(value)
+        .unwrap()
+        .as_bytes()
+        .to_vec()
+}
+
+struct DirectRowSubstitution<'a> {
+    table: &'a str,
+    key_column: &'a str,
+    key: &'a str,
+    bytes_column: &'a str,
+    artifact_identity: &'a Digest,
+    field: &'a str,
+    replacement: serde_json::Value,
+}
+
+fn assert_direct_row_substitution_refuses(
+    store: &CampaignStoreV1,
+    database: &std::path::Path,
+    case: DirectRowSubstitution<'_>,
+) {
+    let DirectRowSubstitution {
+        table,
+        key_column,
+        key,
+        bytes_column,
+        artifact_identity,
+        field,
+        replacement,
+    } = case;
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let select = format!("SELECT {bytes_column} FROM {table} WHERE {key_column}=?1");
+    let original: Vec<u8> = connection
+        .query_row(&select, rusqlite::params![key], |row| row.get(0))
+        .unwrap();
+    let mut substituted: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    substituted
+        .as_object_mut()
+        .expect("direct artifact is a canonical object")
+        .insert(field.to_owned(), replacement);
+    let changed = canonical_bytes(&substituted);
+    assert_ne!(changed, original);
+    let update = format!("UPDATE {table} SET {bytes_column}=?1 WHERE {key_column}=?2");
+    connection
+        .execute(&update, rusqlite::params![changed, key])
+        .unwrap();
+    assert!(
+        store.artifact_bytes(artifact_identity).is_err(),
+        "{table}.{bytes_column} substitution must fail closed"
+    );
+    connection
+        .execute(&update, rusqlite::params![original.clone(), key])
+        .unwrap();
+    assert_eq!(
+        store.artifact_bytes(artifact_identity).unwrap(),
+        Some(original),
+        "restored exact {table}.{bytes_column} must remain retrievable"
+    );
+}
+
+#[cfg(unix)]
+fn verifier_root(directory: &std::path::Path) -> (Digest, Vec<u8>) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let executable = directory.join("qualification-fixture-not-human-authority.py");
+    std::fs::write(
+        &executable,
+        r#"#!/usr/bin/env python3
+import hashlib
+import json
+import sys
+
+def domain_hash(domain, payload):
+    prefix = b"ag-ng\x00digest\x00v1\x00"
+    raw = (prefix + len(domain.encode()).to_bytes(16, "big") + domain.encode()
+           + len(payload).to_bytes(16, "big") + payload)
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+def value_hash(domain, value):
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+    return domain_hash(domain, payload)
+
+request = json.load(sys.stdin)
+artifact = request["artifact"]
+decision_request = request["request"]
+now = request["now_unix_ms"]
+response = {
+    "schema": "ag.governed-loop.governed-repair-verification/v1",
+    "disposition": value_hash("ag.governed-loop.governed-repair-disposition/v1", artifact),
+    "request": value_hash("ag.governed-loop.human-decision-request/v1", decision_request),
+    "halted_state_digest": decision_request["halted_state_digest"],
+    "verifier_profile": request["expected_profile"],
+    "verifier_root": request["expected_root"],
+    "verifier_executable": request["expected_executable"],
+    "verification": domain_hash("qualification-fixture-not-human-authority/v1", artifact["nonce"].encode()),
+    "verified_at_unix_ms": now,
+    "expires_at_unix_ms": now + 5,
+}
+json.dump(response, sys.stdout, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable_identity = Digest::hash_bytes(&std::fs::read(&executable).unwrap());
+    let root = serde_json::json!({
+        "schema": "ag.governed-loop.governed-repair-verifier-root/v1",
+        "verifier_label": "qualification-fixture-not-human-authority",
+        "executable": executable,
+        "executable_identity": executable_identity,
+        "catalog": {
+            "schema": "ag.governed-loop.governed-repair-verifier-catalog/v1",
+            "profiles": [{
+                "profile": digest("verifier-profile"),
+                "principal": HumanPrincipalRefV1::from_digest(digest("verifier-principal")),
+                "mandate": MandateRefV1::from_digest(digest("verifier-mandate")),
+            }]
+        }
+    });
+    let bytes = canonical_bytes(&root);
+    let identity = Digest::hash_domain("ag.governed-loop.governed-repair-verifier-root/v1", &bytes);
+    (identity, bytes)
 }
 
 #[derive(Clone)]
@@ -154,7 +297,109 @@ fn settlement(dispatched: &OccurrenceSnapshotV1) -> DocketSettlementV1 {
     }
 }
 
-fn commit_normal_path(
+fn sealed_scope_result(dispatched: &OccurrenceSnapshotV1) -> DocketSealedGovernedRepairResultV1 {
+    let custody = dispatched.docket_custody().unwrap();
+    let original_scope = dispatched
+        .proposal_contract()
+        .unwrap()
+        .effect_scope()
+        .clone();
+    let requested_delta = CanonicalEffectScopeV1::new(
+        original_scope.effect_class().to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/adjacent-required".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap();
+    let outcome = DocketGovernedRepairOutcomeRefV1 {
+        checkpoint: DocketCheckpointRefV1::from_digest(digest("docket-checkpoint")),
+        sealed_result: DocketSealedResultRefV1::from_digest(digest("docket-sealed-result")),
+        outcome: digest("docket-scope-outcome"),
+        issuance: custody.issuance.clone(),
+        custody: custody.reference(),
+        attempt: custody.attempt.clone(),
+        effect_journal: digest("effect-journal"),
+        executor_binding: digest("executor-binding"),
+        executor_result: digest("executor-result"),
+        executor_receipt: ReceiptRefV1::from_digest(digest("executor-receipt")),
+        immutable_work_checkpoint: None,
+        authorized_effects_occurred: false,
+        created_at_unix_ms: NOW + 2,
+        expires_at_unix_ms: NOW + 100,
+        idempotency: digest("docket-result-idempotency"),
+    };
+    DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+        outcome: outcome.clone(),
+        requirement: ScopeExpansionRequiredV1 {
+            schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
+            original_scope: original_scope.clone(),
+            original_scope_digest: original_scope.digest(),
+            requested_delta: requested_delta.clone(),
+            requested_delta_digest: requested_delta.digest(),
+            blocked_operation: BlockedEffectOperationV1 {
+                resource: "repository".to_owned(),
+                path: "fixtures/adjacent-required".to_owned(),
+                operation: CanonicalEffectOperationV1::Modify,
+            },
+            reason: digest("scope-insufficiency"),
+            dependency_evidence: sorted(&["dependency"]),
+            limitations: sorted(&["limitation"]),
+            docket_outcome: Some(outcome),
+            unauthorized_effect_not_performed: true,
+        },
+    }
+}
+
+fn halt_with_sealed_scope_result(
+    store: &mut CampaignStoreV1,
+    dispatched: &OccurrenceSnapshotV1,
+    result: &DocketSealedGovernedRepairResultV1,
+) -> OccurrenceSnapshotV1 {
+    let (outcome, requirement) = match result {
+        DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+            outcome,
+            requirement,
+        } => (
+            outcome,
+            HumanDecisionRequirementV1::ScopeExpansion(requirement.clone()),
+        ),
+        DocketSealedGovernedRepairResultV1::ReadjudicationRequired { .. } => {
+            panic!("scope fixture changed kind")
+        }
+    };
+    let halted = GovernedLoopKernelV1::halt_from_docket_governed_repair(
+        dispatched,
+        outcome,
+        &requirement,
+        HaltReasonRefV1::from_digest(digest("Docket governed repair required")),
+    )
+    .unwrap();
+    store
+        .commit_docket_governed_repair_halt(dispatched, &halted, result, NOW + 3)
+        .unwrap();
+    halted
+}
+
+fn issuance_refusal(spent: &OccurrenceSnapshotV1) -> DocketIssuanceRefusalV1 {
+    let issuance = spent.issuance().unwrap();
+    let mut refusal = DocketIssuanceRefusalV1 {
+        schema: "docket.governed-loop.issuance-refusal/v1".to_owned(),
+        refusal: digest("placeholder-refusal"),
+        issuance: issuance.issuance.clone(),
+        campaign: issuance.key.campaign.clone(),
+        occurrence: issuance.key.occurrence,
+        refusal_class: DocketIssuanceRefusalClassV1::StandingInvalid,
+        reason_code: "standing_invalid".to_owned(),
+        evidence: digest("negative-standing-evidence"),
+        refused_at_unix_ms: NOW + 1,
+    };
+    refusal.refusal = refusal.derived_identity();
+    refusal
+}
+
+fn commit_to_spent(
     store: &mut CampaignStoreV1,
     start: &OccurrenceSnapshotV1,
 ) -> OccurrenceSnapshotV1 {
@@ -219,6 +464,14 @@ fn commit_normal_path(
             NOW,
         )
         .unwrap();
+    spent
+}
+
+fn commit_to_dispatched(
+    store: &mut CampaignStoreV1,
+    start: &OccurrenceSnapshotV1,
+) -> OccurrenceSnapshotV1 {
+    let spent = commit_to_spent(store, start);
     let dispatched = GovernedLoopKernelV1::accept_docket_custody(&spent, custody(&spent)).unwrap();
     store
         .commit(
@@ -228,6 +481,14 @@ fn commit_normal_path(
             NOW + 1,
         )
         .unwrap();
+    dispatched
+}
+
+fn commit_normal_path(
+    store: &mut CampaignStoreV1,
+    start: &OccurrenceSnapshotV1,
+) -> OccurrenceSnapshotV1 {
+    let dispatched = commit_to_dispatched(store, start);
     let settled =
         GovernedLoopKernelV1::record_settlement(&dispatched, settlement(&dispatched)).unwrap();
     store
@@ -255,6 +516,25 @@ fn one_transactional_path_replays_and_reconstructs_issuance() {
         store.issuance(&issuance.issuance).unwrap().unwrap(),
         *issuance
     );
+    let spend = settled.ag_spend().unwrap();
+    let custody = settled.docket_custody().unwrap();
+    let settlement = settled.settlement().unwrap();
+    assert_eq!(
+        store.artifact_bytes(spend.spend.as_digest()).unwrap(),
+        Some(canonical_bytes(spend))
+    );
+    assert_eq!(
+        store
+            .artifact_bytes(custody.reference().as_digest())
+            .unwrap(),
+        Some(canonical_bytes(custody))
+    );
+    assert_eq!(
+        store
+            .artifact_bytes(settlement.settlement.as_digest())
+            .unwrap(),
+        Some(canonical_bytes(settlement))
+    );
     let report = store.replay().unwrap();
     assert_eq!(report.transitions, 7);
     assert_eq!(report.ag_spends, 1);
@@ -265,6 +545,552 @@ fn one_transactional_path_replays_and_reconstructs_issuance() {
     let reopened = CampaignStoreV1::open(&database).unwrap();
     assert_eq!(reopened.current().unwrap(), settled);
     assert_eq!(reopened.replay().unwrap(), report);
+}
+
+#[cfg(unix)]
+#[test]
+fn every_direct_table_artifact_refuses_canonical_row_byte_substitution() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let (root_identity, root_bytes) = verifier_root(directory.path());
+    let product_key = digest("product-create-idempotency");
+    let product_bytes = canonical_bytes(&serde_json::json!({
+        "schema": "test.product-create/v1",
+        "value": "exact-product-create"
+    }));
+    let product_identity =
+        Digest::hash_domain("ag.governed-loop.product-create/v1", &product_bytes);
+    let start = initial();
+    let mut store = CampaignStoreV1::create_with_product_records(
+        &database,
+        &start,
+        NOW,
+        Some((&product_key, &product_identity, &product_bytes)),
+        Some((&root_identity, &root_bytes)),
+    )
+    .unwrap();
+    let settled = commit_normal_path(&mut store, &start);
+    let spend = settled.ag_spend().unwrap();
+    let issuance = settled.issuance().unwrap();
+    let settlement = settled.settlement().unwrap();
+    let refusal = RefusalOutcomeV1 {
+        key: settled.key().clone(),
+        at_state_digest: settled.state_digest().clone(),
+        code: RefusalCodeV1::RecoveryRequired,
+        evidence: Some(digest("refusal-evidence")),
+    };
+    let refusal_identity = store.record_refusal(&refusal, NOW + 3).unwrap();
+
+    for case in [
+        DirectRowSubstitution {
+            table: "ag_authorization_spends",
+            key_column: "spend_id",
+            key: spend.spend.as_str(),
+            bytes_column: "spend_jcs",
+            artifact_identity: spend.spend.as_digest(),
+            field: "consumed_at_unix_ms",
+            replacement: serde_json::json!(NOW + 77),
+        },
+        DirectRowSubstitution {
+            table: "ag_authorization_spends",
+            key_column: "issuance_id",
+            key: issuance.issuance.as_str(),
+            bytes_column: "issuance_jcs",
+            artifact_identity: issuance.issuance.as_digest(),
+            field: "work",
+            replacement: serde_json::to_value(digest("substituted-work")).unwrap(),
+        },
+        DirectRowSubstitution {
+            table: "docket_settlements",
+            key_column: "settlement_id",
+            key: settlement.settlement.as_str(),
+            bytes_column: "settlement_jcs",
+            artifact_identity: settlement.settlement.as_digest(),
+            field: "receipt",
+            replacement: serde_json::to_value(ReceiptRefV1::from_digest(digest(
+                "substituted-receipt",
+            )))
+            .unwrap(),
+        },
+        DirectRowSubstitution {
+            table: "product_creation_request",
+            key_column: "request_identity",
+            key: product_identity.as_str(),
+            bytes_column: "request_jcs",
+            artifact_identity: &product_identity,
+            field: "value",
+            replacement: serde_json::json!("substituted-product-create"),
+        },
+        DirectRowSubstitution {
+            table: "governed_repair_verifier_root",
+            key_column: "config_identity",
+            key: root_identity.as_str(),
+            bytes_column: "config_jcs",
+            artifact_identity: &root_identity,
+            field: "verifier_label",
+            replacement: serde_json::json!("substituted-verifier"),
+        },
+        DirectRowSubstitution {
+            table: "refusals",
+            key_column: "refusal_id",
+            key: refusal_identity.as_str(),
+            bytes_column: "refusal_jcs",
+            artifact_identity: &refusal_identity,
+            field: "evidence",
+            replacement: serde_json::to_value(Some(digest("substituted-refusal-evidence")))
+                .unwrap(),
+        },
+    ] {
+        assert_direct_row_substitution_refuses(&store, &database, case);
+    }
+}
+
+#[test]
+fn complete_proposal_and_docket_result_artifacts_survive_exact_restart_lookup() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let dispatched = commit_to_dispatched(&mut store, &start);
+    let exact_proposal = dispatched.proposal_contract().unwrap().clone();
+    let proposal_identity = exact_proposal.reference();
+    let result = sealed_scope_result(&dispatched);
+    let result_identity = match &result {
+        DocketSealedGovernedRepairResultV1::ScopeExpansionRequired { outcome, .. }
+        | DocketSealedGovernedRepairResultV1::ReadjudicationRequired { outcome, .. } => {
+            outcome.sealed_result.clone()
+        }
+    };
+    let halted = halt_with_sealed_scope_result(&mut store, &dispatched, &result);
+
+    assert_eq!(
+        store.artifact_bytes(proposal_identity.as_digest()).unwrap(),
+        Some(canonical_bytes(&exact_proposal))
+    );
+    assert_eq!(
+        store.artifact_bytes(result_identity.as_digest()).unwrap(),
+        Some(canonical_bytes(&result))
+    );
+    assert_eq!(store.last_recorded_at_unix_ms().unwrap(), NOW + 3);
+    drop(store);
+
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap(), halted);
+    assert_eq!(
+        reopened
+            .artifact_bytes(proposal_identity.as_digest())
+            .unwrap(),
+        Some(canonical_bytes(&exact_proposal))
+    );
+    assert_eq!(
+        reopened
+            .artifact_bytes(result_identity.as_digest())
+            .unwrap(),
+        Some(canonical_bytes(&result))
+    );
+    assert!(
+        reopened
+            .artifact_bytes(&digest("wrong-artifact"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn docket_issuance_refusal_is_durable_exact_replayable_and_residual_bearing() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let spent = commit_to_spent(&mut store, &start);
+    let spend_identity = spent.ag_spend().unwrap().spend.clone();
+    let issuance = spent.issuance().unwrap().issuance.clone();
+    let refusal = issuance_refusal(&spent);
+    let halted =
+        GovernedLoopKernelV1::halt_docket_issuance_refusal(&spent, refusal.clone()).unwrap();
+
+    let mut pre_spend = refusal.clone();
+    pre_spend.refused_at_unix_ms = spent.ag_spend().unwrap().consumed_at_unix_ms - 1;
+    pre_spend.refusal = pre_spend.derived_identity();
+    assert!(GovernedLoopKernelV1::halt_docket_issuance_refusal(&spent, pre_spend).is_err());
+
+    assert!(
+        store
+            .commit_docket_issuance_refusal(
+                &spent,
+                &halted,
+                &refusal,
+                refusal.refused_at_unix_ms - 1,
+            )
+            .is_err()
+    );
+    assert_eq!(store.current().unwrap(), spent);
+
+    let mut substituted = refusal.clone();
+    substituted.evidence = digest("substituted-standing-evidence");
+    assert!(
+        store
+            .commit_docket_issuance_refusal(&spent, &halted, &substituted, NOW + 1)
+            .is_err()
+    );
+    assert_eq!(store.current().unwrap(), spent);
+    assert_eq!(store.replay().unwrap().ag_spends, 1);
+
+    store
+        .commit_docket_issuance_refusal(&spent, &halted, &refusal, NOW + 1)
+        .unwrap();
+    assert_eq!(store.current().unwrap(), halted);
+    assert_eq!(
+        halted.state().authority_history().ag_spend,
+        Some(spend_identity)
+    );
+    assert!(halted.docket_custody().is_none());
+    let refusal_residual = halted
+        .state()
+        .meta()
+        .residuals()
+        .as_slice()
+        .iter()
+        .find(|residual| residual.statement == refusal.refusal)
+        .expect("exact refusal residual is durable");
+    assert_eq!(refusal_residual.owner, refusal.evidence);
+    assert_eq!(refusal_residual.subject, *issuance.as_digest());
+    assert_eq!(
+        store.artifact_bytes(&refusal.refusal).unwrap(),
+        Some(canonical_bytes(&refusal))
+    );
+    let report = store.replay().unwrap();
+    assert_eq!(report.ag_spends, 1);
+    assert_eq!(report.docket_attempts, 0);
+    assert_eq!(report.settlements, 0);
+    drop(store);
+
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap(), halted);
+    assert_eq!(
+        reopened.artifact_bytes(&refusal.refusal).unwrap(),
+        Some(canonical_bytes(&refusal))
+    );
+    assert_eq!(reopened.replay().unwrap(), report);
+    drop(reopened);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let mut bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT evidence_jcs FROM transitions WHERE transition_kind='docket_issuance_refused'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    bytes.push(b' ');
+    connection
+        .execute(
+            "UPDATE transitions SET evidence_jcs=?1 WHERE transition_kind='docket_issuance_refused'",
+            rusqlite::params![bytes],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(CampaignStoreV1::open(&database).is_err());
+}
+
+#[test]
+fn decision_request_open_and_idempotency_queries_are_expiry_aware_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let dispatched = commit_to_dispatched(&mut store, &start);
+    let result = sealed_scope_result(&dispatched);
+    let halted = halt_with_sealed_scope_result(&mut store, &dispatched, &result);
+    let requirement = halted
+        .halted()
+        .unwrap()
+        .governed_repair_requirement()
+        .unwrap()
+        .clone();
+    let idempotency = digest("decision-request-idempotency");
+    let request = GovernedLoopKernelV1::create_human_decision_request(
+        &halted,
+        HumanDecisionRequestParametersV1 {
+            requirement,
+            required_verifier_profile: digest("verifier-profile"),
+            required_verifier_root: digest("verifier-root"),
+            required_verifier_executable: digest("verifier-executable"),
+            decision_consequences: sorted(&["approve", "reject"]),
+            nonclaims: sorted(&["not-authority", "not-standing"]),
+            idempotency_key: idempotency.clone(),
+            created_at_unix_ms: NOW + 4,
+            expires_at_unix_ms: NOW + 20,
+        },
+    )
+    .unwrap();
+    let request_ref = store
+        .record_human_decision_request(halted.state_digest(), &request)
+        .unwrap();
+    assert_eq!(
+        store
+            .record_human_decision_request(halted.state_digest(), &request)
+            .unwrap(),
+        request_ref
+    );
+    assert_eq!(
+        store
+            .open_human_decision_request_for_state(halted.state_digest(), NOW + 5)
+            .unwrap(),
+        Some(request_ref.clone())
+    );
+    assert_eq!(
+        store
+            .human_decision_request_by_idempotency(&idempotency)
+            .unwrap(),
+        Some(request.clone())
+    );
+    drop(store);
+
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(
+        reopened
+            .open_human_decision_request_for_state(halted.state_digest(), NOW + 19)
+            .unwrap(),
+        Some(request_ref)
+    );
+    assert_eq!(
+        reopened
+            .open_human_decision_request_for_state(halted.state_digest(), NOW + 20)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        reopened
+            .human_decision_request_by_idempotency(&idempotency)
+            .unwrap(),
+        Some(request)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_disposition_receipt_is_exactly_addressable_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let (root_identity, root_bytes) = verifier_root(directory.path());
+    let start = initial();
+    let mut store = CampaignStoreV1::create_with_product_records(
+        &database,
+        &start,
+        NOW,
+        None,
+        Some((&root_identity, &root_bytes)),
+    )
+    .unwrap();
+    let dispatched = commit_to_dispatched(&mut store, &start);
+    let result = sealed_scope_result(&dispatched);
+    let halted = halt_with_sealed_scope_result(&mut store, &dispatched, &result);
+    let request = GovernedLoopKernelV1::create_human_decision_request(
+        &halted,
+        HumanDecisionRequestParametersV1 {
+            requirement: halted
+                .halted()
+                .unwrap()
+                .governed_repair_requirement()
+                .unwrap()
+                .clone(),
+            required_verifier_profile: digest("verifier-profile"),
+            required_verifier_root: root_identity.clone(),
+            required_verifier_executable: Digest::hash_bytes(
+                &std::fs::read(
+                    directory
+                        .path()
+                        .join("qualification-fixture-not-human-authority.py"),
+                )
+                .unwrap(),
+            ),
+            decision_consequences: sorted(&["approve", "reject"]),
+            nonclaims: sorted(&["fixture-not-authority", "fixture-not-standing"]),
+            idempotency_key: digest("verified-request-idempotency"),
+            created_at_unix_ms: NOW + 4,
+            expires_at_unix_ms: NOW + 20,
+        },
+    )
+    .unwrap();
+    let request_ref = store
+        .record_human_decision_request(halted.state_digest(), &request)
+        .unwrap();
+    let artifact = GovernedRepairDispositionV1 {
+        schema: GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1.to_owned(),
+        campaign: halted.key().campaign.clone(),
+        occurrence: halted.key().occurrence,
+        halted_state_digest: halted.state_digest().clone(),
+        disposition: GovernedRepairDispositionKindV1::Reject {
+            request: request_ref.clone(),
+            reason: digest("fixture-rejection"),
+        },
+        decision: HumanDecisionIdV1::from_digest(digest("fixture-decision")),
+        principal: HumanPrincipalRefV1::from_digest(digest("verifier-principal")),
+        mandate: MandateRefV1::from_digest(digest("verifier-mandate")),
+        verifier_profile: digest("verifier-profile"),
+        nonce: HumanNonceRefV1::from_digest(digest("fixture-nonce")),
+        expires_at_unix_ms: NOW + 15,
+    };
+    let disposition = artifact.reference();
+    let verified = store
+        .verify_governed_repair_disposition(halted.state_digest(), &request_ref, artifact, NOW + 5)
+        .unwrap();
+    store
+        .commit_verified_governed_repair_disposition(verified)
+        .unwrap();
+    let verification = store
+        .governed_repair_verification_for_disposition(&disposition)
+        .unwrap()
+        .unwrap();
+    assert_eq!(verification.disposition, disposition);
+    assert_eq!(
+        store
+            .artifact_bytes(verification.verification.as_digest())
+            .unwrap(),
+        Some(canonical_bytes(&verification))
+    );
+    drop(store);
+
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(
+        reopened
+            .governed_repair_verification_for_disposition(&disposition)
+            .unwrap(),
+        Some(verification.clone())
+    );
+    assert_eq!(
+        reopened
+            .artifact_bytes(verification.verification.as_digest())
+            .unwrap(),
+        Some(canonical_bytes(&verification))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn request_and_disposition_direct_rows_refuse_canonical_substitution() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let (root_identity, root_bytes) = verifier_root(directory.path());
+    let start = initial();
+    let mut store = CampaignStoreV1::create_with_product_records(
+        &database,
+        &start,
+        NOW,
+        None,
+        Some((&root_identity, &root_bytes)),
+    )
+    .unwrap();
+    let dispatched = commit_to_dispatched(&mut store, &start);
+    let result = sealed_scope_result(&dispatched);
+    let halted = halt_with_sealed_scope_result(&mut store, &dispatched, &result);
+    let request = GovernedLoopKernelV1::create_human_decision_request(
+        &halted,
+        HumanDecisionRequestParametersV1 {
+            requirement: halted
+                .halted()
+                .unwrap()
+                .governed_repair_requirement()
+                .unwrap()
+                .clone(),
+            required_verifier_profile: digest("verifier-profile"),
+            required_verifier_root: root_identity,
+            required_verifier_executable: Digest::hash_bytes(
+                &std::fs::read(
+                    directory
+                        .path()
+                        .join("qualification-fixture-not-human-authority.py"),
+                )
+                .unwrap(),
+            ),
+            decision_consequences: sorted(&["approve", "reject"]),
+            nonclaims: sorted(&["fixture-not-authority", "fixture-not-standing"]),
+            idempotency_key: digest("hostile-request-idempotency"),
+            created_at_unix_ms: NOW + 4,
+            expires_at_unix_ms: NOW + 20,
+        },
+    )
+    .unwrap();
+    let request_ref = store
+        .record_human_decision_request(halted.state_digest(), &request)
+        .unwrap();
+    let artifact = GovernedRepairDispositionV1 {
+        schema: GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1.to_owned(),
+        campaign: halted.key().campaign.clone(),
+        occurrence: halted.key().occurrence,
+        halted_state_digest: halted.state_digest().clone(),
+        disposition: GovernedRepairDispositionKindV1::Reject {
+            request: request_ref.clone(),
+            reason: digest("hostile-fixture-rejection"),
+        },
+        decision: HumanDecisionIdV1::from_digest(digest("hostile-fixture-decision")),
+        principal: HumanPrincipalRefV1::from_digest(digest("verifier-principal")),
+        mandate: MandateRefV1::from_digest(digest("verifier-mandate")),
+        verifier_profile: digest("verifier-profile"),
+        nonce: HumanNonceRefV1::from_digest(digest("hostile-fixture-nonce")),
+        expires_at_unix_ms: NOW + 15,
+    };
+    let disposition = artifact.reference();
+    let verified = store
+        .verify_governed_repair_disposition(halted.state_digest(), &request_ref, artifact, NOW + 5)
+        .unwrap();
+    store
+        .commit_verified_governed_repair_disposition(verified)
+        .unwrap();
+
+    for case in [
+        DirectRowSubstitution {
+            table: "human_decision_requests",
+            key_column: "request_id",
+            key: request_ref.as_str(),
+            bytes_column: "request_jcs",
+            artifact_identity: request_ref.as_digest(),
+            field: "expires_at_unix_ms",
+            replacement: serde_json::json!(NOW + 19),
+        },
+        DirectRowSubstitution {
+            table: "governed_repair_dispositions",
+            key_column: "disposition_id",
+            key: disposition.as_str(),
+            bytes_column: "artifact_jcs",
+            artifact_identity: disposition.as_digest(),
+            field: "expires_at_unix_ms",
+            replacement: serde_json::json!(NOW + 14),
+        },
+    ] {
+        assert_direct_row_substitution_refuses(&store, &database, case);
+    }
+}
+
+#[test]
+fn restart_refuses_changed_docket_artifact_bytes_under_prior_event_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let dispatched = commit_to_dispatched(&mut store, &start);
+    let result = sealed_scope_result(&dispatched);
+    halt_with_sealed_scope_result(&mut store, &dispatched, &result);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let mut bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT evidence_jcs FROM transitions WHERE transition_kind='docket_governed_repair_halted'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    bytes.push(b' ');
+    connection
+        .execute(
+            "UPDATE transitions SET evidence_jcs=?1 WHERE transition_kind='docket_governed_repair_halted'",
+            rusqlite::params![bytes],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(CampaignStoreV1::open(&database).is_err());
 }
 
 #[test]
@@ -335,6 +1161,42 @@ fn stale_writer_and_duplicate_successor_refuse_without_partial_accounting() {
     ));
     assert_eq!(store.replay().unwrap().transitions, 2);
     assert_eq!(store.accounting_counts().unwrap(), (0, 0, 0));
+}
+
+#[test]
+fn product_state_read_remains_coherent_during_concurrent_transitions() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_database = database.clone();
+    let writer_start = start.clone();
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = std::thread::spawn(move || {
+        let mut store = CampaignStoreV1::open(&writer_database).unwrap();
+        writer_barrier.wait();
+        commit_to_dispatched(&mut store, &writer_start)
+    });
+
+    let reader = CampaignStoreV1::open(&database).unwrap();
+    barrier.wait();
+    for _ in 0..256 {
+        let view = reader.campaign_state_read(NOW + 100).unwrap();
+        assert_eq!(view.current.state_digest(), &view.head.state_digest);
+        assert!(view.head.event_count >= 1);
+        assert!(view.open_human_decision_request.is_none());
+    }
+
+    let dispatched = writer.join().unwrap();
+    let final_view = reader.campaign_state_read(NOW + 100).unwrap();
+    assert_eq!(final_view.current, dispatched);
+    assert_eq!(
+        final_view.current.state_digest(),
+        &final_view.head.state_digest
+    );
 }
 
 #[test]

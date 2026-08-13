@@ -17,7 +17,9 @@ environment. It does not alter the governed-loop law or any production path.
 | clock/expiry behavior | deployed service | exact boundary and noninheritance tests |
 | process isolation | trusted host | release-binary structural isolation scan |
 | executor physical idempotency | fault-injection environment | logical duplicate-delivery and attempt-identity tests |
-| deployed Standing/Docket correspondence | deployed service | command-port binding and refusal tests |
+| deployed Standing/Docket correspondence | deployed service | genesis-pinned adapter-root, command-port binding, adjacent-process, and refusal tests |
+| governed-repair durable halt/successor law | runnable locally now | exact scope, replay, restart, concurrency, successor, rejection, and hostile-fixture tests |
+| external human disposition verification | deployed service | pinned verifier-root and exact-binding fail-closed tests using a fixture explicitly named `qualification-fixture-not-human-authority` |
 
 `gates.json` is the machine-readable version of this matrix. The three plan
 files define the additional evidence that would be needed to close the
@@ -38,8 +40,18 @@ exact dirty-status digest and marking the bundle as development evidence.
 
 The local runner executes focused kernel/store/engine tests, a real
 multi-process SQLite contention scenario, executor-adapter tests, and the
-existing release-binary isolation scan. Its result is always
+existing release-binary isolation scan. It also parses the frozen NQ C1 hostile
+specimens to prove their exact shape remains non-authorizing; it does not
+reconstruct historical governance. Its result is always
 `qualification_status: not_assessed`.
+
+The reusable product surface commits one deployment-owned Docket adapter root
+in the campaign genesis record. Product clients cannot select Docket, trust,
+Standing, executor, checkpoint, state-directory, or issuance-signer premises
+on dispatch, reconciliation, or recovery calls. Occurrence and current-state
+reads use the stable AG-owned `OccurrenceViewV1` projection rather than
+exporting raw nested kernel/store state. Local tests establish those API and
+canonical-binding properties only.
 
 ## Environment preflight
 
@@ -80,6 +92,12 @@ being mistaken for a designated qualification environment.
 Secrets, signing keys, and bearer artifacts are intentionally not captured.
 Path records larger than 32 MiB are not hashed by preflight, and every path
 hash is labeled as an unlocked read rather than a coherent service snapshot.
+The current command adapter also verifies ordinary filesystem paths and then
+starts external processes. Until a declared deployed/trusted-host experiment
+assesses the complete measurement-to-execution boundary, replacement between
+those operations, filesystem namespace integrity, executable semantics,
+signer-key custody, and process isolation remain operational `not_assessed`
+premises.
 
 ## Evidence discipline
 
@@ -88,7 +106,17 @@ hash is labeled as an unlocked read rather than a coherent service snapshot.
 - Source HEAD, branch, dirty-status hash, harness hashes, executable hashes, and
   host identity are captured before an experiment.
 - Local fixtures grant no standing, authorization, or qualification status.
+- The governed-repair loop was built under external human development
+  authorization. The loop did not govern or authorize its own bootstrap.
+- `qualification-fixture-not-human-authority` is a deliberately named test
+  verifier. It is not evidence of a real person, mandate, signer, verifier
+  deployment, or disposition.
 - Filesystem and SQLite logical tests are not represented as power-loss tests.
+- A pinned path-and-digest record is not represented as a locked filesystem
+  object, a coherent deployment snapshot, or proof of the process later
+  executed from that path.
+- Adjacent-process success is not represented as qualification of Docket,
+  Standing, executor, checkpoint-verifier, or signing-key deployment.
 - A deployed service response is required for deployed-currentness and
   Standing/Docket correspondence.
 - Physical effect idempotency requires a disposable target and a declared

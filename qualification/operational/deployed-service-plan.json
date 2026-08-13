@@ -5,27 +5,40 @@
   "premises": [
     "ag.service_currentness_behavior",
     "ag.clock_and_expiry",
-    "ag.deployed_standing_docket_correspondence"
+    "ag.deployed_standing_docket_correspondence",
+    "ag.governed_repair_external_human_verification"
   ],
   "preconditions": [
     "Exact AG, observation-resolver, Standing, Docket, and executor identities are captured",
+    "The campaign genesis record contains one deployment-owned Docket adapter root binding exact Docket, state-directory, trust, Standing-resolver, executor, checkpoint-verifier, and issuance-signer coordinates",
     "A non-production campaign, subject, scope, and disposable executor target are allocated",
     "Currentness owners publish their clock and endpoint laws",
-    "Test standing and signing material are isolated and revocable"
+    "Test standing and signing material are isolated and revocable",
+    "The declared deployment environment can observe and control filesystem namespace replacement and the measurement-to-external-process-execution boundary"
   ],
   "procedure": [
     "Run preflight.py --profile deployed-service and preserve its manifest",
+    "Verify the canonical Docket adapter root is committed by the exact product-creation identity in the genesis event and that product dispatch, reconciliation, and recovery accept no caller-selected Docket premises",
+    "Attempt substitution of each pinned Docket program, state directory, trust configuration, Standing resolver, executor adapter/configuration, checkpoint verifier, and issuance signer coordinate; require exact refusal without a consequence",
+    "Capture the deployment controls and before/use-time identities that make path measurement and external process execution one assessed operational boundary rather than unlocked local reads",
     "Open one exact occurrence and record one fresh exact observation",
     "Resolve current standing at decide and again at authorization; capture exact responses",
     "Exercise current, equality-expired, revoked, superseded, delayed, wrong-occurrence, wrong-subject, wrong-scope, and wrong-proposal cases",
     "For one admitted case, verify one AG spend maps to one Docket custody/attempt and one exact settlement",
     "Replay the issuance, Docket standing, settlement, and serialized resolver results and record refusals",
+    "Configure one exact non-production governed-repair verifier root outside caller input, capture its executable and profile-catalog identities, and demonstrate that missing or substituted roots fail closed",
+    "Exercise one exact non-production scope halt and one externally verified approve or reject disposition while recording request, state, delta or question, checkpoint, profile, verification receipt, expiry, one-use result, and any authority-empty successor",
+    "Attempt wrong occurrence, state, delta, checkpoint, principal, mandate, profile, expiry, replay, and verifier-executable substitution without creating a successor or restoring a spend",
     "Restart each office at a declared boundary and verify that currentness and live authority are re-resolved rather than reconstructed",
     "Hash and seal all request/response records, service versions, configurations, logs, and database replay results"
   ],
   "pass_interpretation_owner": "later qualification campaign",
   "forbidden_shortcuts": [
     "Replacing deployed services with fixtures while claiming deployed correspondence",
+    "Using qualification-fixture-not-human-authority or raw operator prose as a human disposition",
+    "Allowing an operation caller to nominate Docket, state-directory, trust, Standing-resolver, executor, checkpoint-verifier, or issuance-signer premises",
+    "Allowing a request or disposition caller to nominate the verifier executable, principal, mandate, or profile catalog",
+    "Treating an unlocked path hash or a successful adjacent-process test as proof of filesystem coherence, process identity, executable semantics, or signer custody",
     "Recording secret key bytes",
     "Treating a prior resolution or receipt as live authority"
   ]

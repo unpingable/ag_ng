@@ -6,6 +6,7 @@
   "preconditions": [
     "Disposable or explicitly designated host with exact package and unit identities captured",
     "PID 1 is systemd and the declared namespace/LSM controls are observable",
+    "The exact genesis-pinned Docket adapter files, state directory, and filesystem namespace controls are declared",
     "No production campaign, standing, signing key, or provider credential is used",
     "Targets are disposable and all forbidden probes are read-only"
   ],
@@ -14,12 +15,14 @@
     "Run scripts/verify-effectd-isolation.sh against the exact release binary",
     "Run scripts/run-worker-qualification.sh with its declared safe worker fixture",
     "Capture systemctl cat/show, systemd-analyze security, process credentials, namespaces, mounts, cgroup, LSM labels, and network-denial probes",
+    "Relate every pinned Docket adapter path measurement to the exact external process image and configuration actually opened, and exercise controlled path-replacement attempts",
     "Restart the exact unit and repeat identity and denial checks",
     "Seal raw stdout/stderr, source/package/unit hashes, and host boot identity without interpreting them as a claim"
   ],
   "pass_interpretation_owner": "later qualification campaign",
   "forbidden_shortcuts": [
     "Treating a source scan as live process isolation",
+    "Treating unlocked local filesystem hashing as a coherent deployment snapshot or proof of the external process eventually executed",
     "Using production credentials or effect targets",
     "Treating preflight readiness as qualification"
   ]

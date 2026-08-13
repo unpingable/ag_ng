@@ -18,6 +18,11 @@
     "after commit acknowledgement before checkpoint",
     "after durable AG spend before Docket custody acknowledgement",
     "after Docket attempt assignment before executor delivery acknowledgement",
+    "after out-of-scope executor result before Docket result seal",
+    "after Docket governed-repair result seal before AG halt ingestion",
+    "after AG halt before human-decision request retrieval",
+    "after verified disposition before successor creation",
+    "after successor creation before fresh observation, standing, spend, or issuance",
     "during executor-local idempotency marker persistence",
     "after physical effect before executor outcome acknowledgement",
     "after Docket settlement before AG settlement ingestion"

@@ -35,13 +35,50 @@ fn budget() -> LoopBudgetV1 {
     }
 }
 
+#[test]
+fn docket_issuance_refusal_identity_matches_frozen_cross_repository_vector() {
+    let mut refusal = DocketIssuanceRefusalV1 {
+        schema: "docket.governed-loop.issuance-refusal/v1".to_owned(),
+        refusal: Digest::parse(&format!("sha256:{}", "00".repeat(32))).unwrap(),
+        issuance: AgIssuanceRefV1::from_digest(
+            Digest::parse(&format!("sha256:{}", "11".repeat(32))).unwrap(),
+        ),
+        campaign: CampaignId::from_digest(
+            Digest::parse(&format!("sha256:{}", "22".repeat(32))).unwrap(),
+        ),
+        occurrence: occurrence(1),
+        refusal_class: DocketIssuanceRefusalClassV1::StandingInvalid,
+        reason_code: "standing_invalid".to_owned(),
+        evidence: Digest::parse(&format!("sha256:{}", "33".repeat(32))).unwrap(),
+        refused_at_unix_ms: 42,
+    };
+    refusal.refusal = refusal.derived_identity();
+    assert_eq!(
+        refusal.refusal.as_str(),
+        "sha256:14e18c3d74be772ed6e72de25eb735fa26d5154c333a45aba0585f9a09306ce6"
+    );
+}
+
 fn proposal(campaign: &CampaignId, work: &str) -> ExactWorkProposalV1 {
+    let scope = CanonicalEffectScopeV1::new(
+        "test-effect".to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/exact-work".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap();
     ExactWorkProposalV1::new(
         campaign.clone(),
         digest("subject"),
-        digest("scope"),
+        scope,
         "test.exact-work/v1".to_owned(),
         digest(work),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
         None,
     )
     .unwrap()
@@ -204,6 +241,188 @@ fn initial_with(occurrence: OccurrenceId, residuals: ResidualSetV1) -> Occurrenc
 
 fn initial() -> OccurrenceSnapshotV1 {
     initial_with(occurrence(1), ResidualSetV1::default())
+}
+
+#[test]
+fn proposal_nonclaims_and_expiry_are_identity_bound_and_fail_closed() {
+    let base = proposal(&campaign(), "work");
+    let changed_nonclaim = ExactWorkProposalV1::new(
+        campaign(),
+        base.subject().clone(),
+        base.effect_scope().clone(),
+        base.work_schema().to_owned(),
+        base.work().clone(),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("different-nonclaim")],
+            expires_at_unix_ms: base.expires_at_unix_ms(),
+        },
+        None,
+    )
+    .unwrap();
+    let changed_expiry = ExactWorkProposalV1::new(
+        campaign(),
+        base.subject().clone(),
+        base.effect_scope().clone(),
+        base.work_schema().to_owned(),
+        base.work().clone(),
+        ProposalGovernanceTermsV1 {
+            nonclaims: base.nonclaims().to_vec(),
+            expires_at_unix_ms: base.expires_at_unix_ms() + 1,
+        },
+        None,
+    )
+    .unwrap();
+    assert_ne!(base.reference(), changed_nonclaim.reference());
+    assert_ne!(base.reference(), changed_expiry.reference());
+
+    let spent = advance_to_spent(
+        &initial(),
+        base.clone(),
+        ObservationRefV1::from_digest(digest("observation-proposal-contract")),
+        &mut ObservationBoundary::current("preconditions"),
+    );
+    let issuance = spent.issuance().expect("authorization creates issuance");
+    assert_eq!(issuance.nonclaims.as_slice(), base.nonclaims());
+    assert_eq!(issuance.expires_at_unix_ms, base.expires_at_unix_ms());
+
+    assert!(matches!(
+        ExactWorkProposalV1::new(
+            campaign(),
+            base.subject().clone(),
+            base.effect_scope().clone(),
+            base.work_schema().to_owned(),
+            base.work().clone(),
+            ProposalGovernanceTermsV1 {
+                nonclaims: Vec::new(),
+                expires_at_unix_ms: NOW + 1,
+            },
+            None,
+        ),
+        Err(KernelErrorV1::Proposal(_))
+    ));
+    assert!(
+        ExactWorkProposalV1::new(
+            campaign(),
+            base.subject().clone(),
+            base.effect_scope().clone(),
+            base.work_schema().to_owned(),
+            base.work().clone(),
+            ProposalGovernanceTermsV1 {
+                nonclaims: base.nonclaims().to_vec(),
+                expires_at_unix_ms: MAX_CANONICAL_JSON_INTEGER_V1,
+            },
+            None,
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        ExactWorkProposalV1::new(
+            campaign(),
+            base.subject().clone(),
+            base.effect_scope().clone(),
+            base.work_schema().to_owned(),
+            base.work().clone(),
+            ProposalGovernanceTermsV1 {
+                nonclaims: base.nonclaims().to_vec(),
+                expires_at_unix_ms: MAX_CANONICAL_JSON_INTEGER_V1 + 1,
+            },
+            None,
+        ),
+        Err(KernelErrorV1::Proposal(_))
+    ));
+    assert!(matches!(
+        ExactWorkProposalV1::new(
+            campaign(),
+            base.subject().clone(),
+            base.effect_scope().clone(),
+            base.work_schema().to_owned(),
+            base.work().clone(),
+            ProposalGovernanceTermsV1 {
+                nonclaims: base.nonclaims().to_vec(),
+                expires_at_unix_ms: u64::MAX,
+            },
+            None,
+        ),
+        Err(KernelErrorV1::Proposal(_))
+    ));
+
+    let expired = ExactWorkProposalV1::new(
+        campaign(),
+        base.subject().clone(),
+        base.effect_scope().clone(),
+        base.work_schema().to_owned(),
+        base.work().clone(),
+        ProposalGovernanceTermsV1 {
+            nonclaims: base.nonclaims().to_vec(),
+            expires_at_unix_ms: NOW,
+        },
+        None,
+    )
+    .unwrap();
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &initial(),
+            ObservationRefV1::from_digest(digest("observation-expired")),
+            expired,
+            ProposalClassV1::Initial,
+            &mut ObservationBoundary::current("preconditions"),
+            NOW,
+        ),
+        Err(KernelErrorV1::Proposal("proposal expired"))
+    ));
+}
+
+#[test]
+fn scope_expansion_delta_is_strictly_additive_not_partially_redundant() {
+    let original = proposal(&campaign(), "strict-delta").effect_scope().clone();
+    let exact_new = CanonicalEffectScopeV1::new(
+        original.effect_class().to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/new-exact-work".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Create],
+        }],
+    )
+    .unwrap();
+    let requirement = |requested_delta: CanonicalEffectScopeV1| ScopeExpansionRequiredV1 {
+        schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
+        original_scope: original.clone(),
+        original_scope_digest: original.digest(),
+        requested_delta_digest: requested_delta.digest(),
+        requested_delta,
+        blocked_operation: BlockedEffectOperationV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/new-exact-work".to_owned(),
+            operation: CanonicalEffectOperationV1::Create,
+        },
+        reason: digest("strict-delta-reason"),
+        dependency_evidence: vec![digest("strict-delta-dependency")],
+        limitations: vec![digest("strict-delta-limitation")],
+        docket_outcome: None,
+        unauthorized_effect_not_performed: true,
+    };
+    assert!(requirement(exact_new).validate().is_ok());
+
+    let partially_redundant = CanonicalEffectScopeV1::new(
+        original.effect_class().to_owned(),
+        vec![
+            CanonicalEffectResourceV1 {
+                resource: "repository".to_owned(),
+                path: "fixtures/exact-work".to_owned(),
+                operations: vec![CanonicalEffectOperationV1::Modify],
+            },
+            CanonicalEffectResourceV1 {
+                resource: "repository".to_owned(),
+                path: "fixtures/new-exact-work".to_owned(),
+                operations: vec![CanonicalEffectOperationV1::Create],
+            },
+        ],
+    )
+    .unwrap();
+    assert!(matches!(
+        requirement(partially_redundant).validate(),
+        Err(KernelErrorV1::EffectScope(_))
+    ));
 }
 
 fn advance_to_spent(

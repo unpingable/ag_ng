@@ -1,0 +1,4 @@
+sha256:f886416da38cf10a1243f2c1fe8635ff3bce6db28c2ae1a0e1e7c18f7087d8c0  architectural-readjudication.v1.json
+sha256:29fbc178281f9a9256f89def4c904ea124251979ee39a9aad965a4d68ecefedf  consumed-repair-hard-stop.v1.json
+sha256:6f72de0980d193daa01c420ff89e381aac81e53ed5605d3b51405620bf3fde45  rejected-candidate.v1.json
+sha256:c4071eb72f7c80b97c7eb7b9b1abafeaeea515241f5901df43e521806ada443f  scope-discovery-pre-spend.v1.json

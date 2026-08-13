@@ -104,6 +104,10 @@ def main() -> int:
         ("kernel", ["cargo", "test", "--locked", "-p", "ag-campaign", "--test", "governed_loop"]),
         ("store", ["cargo", "test", "--locked", "-p", "ag-store", "--test", "governed_campaign_store"]),
         ("engine", ["cargo", "test", "--locked", "-p", "ag-app", "--test", "governed_loop_engine"]),
+        (
+            "nq-c1-hostile-specimens",
+            ["cargo", "test", "--locked", "-p", "ag-campaign", "--test", "nq_c1_repair_specimens"],
+        ),
         ("executor-adapter", ["cargo", "test", "--locked", "-p", "ag-app", "effect_executor_adapter::tests"]),
         (
             "multiprocess-contention",
@@ -140,6 +144,9 @@ def main() -> int:
             "No deployed service was exercised.",
             "No abrupt power loss or block-I/O fault was injected.",
             "No provider-specific physical effect was qualified.",
+            "No real human disposition verifier or mandate authority was exercised.",
+            "The NQ C1 records are hostile fixtures, not reconstructed AG or Docket authority.",
+            "The loop did not govern or authorize its own construction.",
             "A passing result is development evidence only."
         ],
         "preflight_exit_code": preflight.returncode,

@@ -41,12 +41,25 @@ fn budget() -> LoopBudgetV1 {
 }
 
 fn proposal(label: &str) -> ExactWorkProposalV1 {
+    let scope = CanonicalEffectScopeV1::new(
+        "test-effect".to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/exact-work".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap();
     ExactWorkProposalV1::new(
         campaign(),
         digest("subject"),
-        digest("scope"),
+        scope,
         "test.engine-work/v1".to_owned(),
         digest(label),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
         None,
     )
     .unwrap()
@@ -61,7 +74,7 @@ fn catalog() -> ExactWorkCatalogV1 {
             ExactWorkCatalogEntryV1 {
                 work_schema: "test.engine-work/v1".to_owned(),
                 subject: digest("subject"),
-                scope: digest("scope"),
+                scope: proposal("catalog-scope").effect_scope().digest(),
             },
         )]),
     }
@@ -156,6 +169,7 @@ enum FakeAttemptState {
     Accepted(DocketCustodyV1),
     Settled(DocketCustodyV1, DocketSettlementV1),
     Indeterminate(DocketCustodyV1, IndeterminateOutcomeV1),
+    GovernedRepairRequired(DocketCustodyV1, Box<DocketSealedGovernedRepairResultV1>),
 }
 
 #[derive(Default)]
@@ -171,7 +185,7 @@ struct FakeDocket {
 }
 
 impl FakeDocket {
-    fn custody(issuance: &AgIssuanceV1) -> DocketCustodyV1 {
+    fn custody(issuance: &AgIssuanceV2) -> DocketCustodyV1 {
         DocketCustodyV1 {
             schema: DOCKET_CUSTODY_SCHEMA_V1.to_owned(),
             issuance: issuance.issuance.clone(),
@@ -235,6 +249,72 @@ impl FakeDocket {
         );
     }
 
+    fn require_scope_expansion(
+        &self,
+        issuance: &AgIssuanceRefV1,
+        original_scope: &CanonicalEffectScopeV1,
+    ) {
+        let mut state = self.shared.lock().unwrap();
+        let Some(FakeAttemptState::Accepted(custody) | FakeAttemptState::Indeterminate(custody, _)) =
+            state.attempts.get(issuance).cloned()
+        else {
+            panic!("issuance was not accepted or reconcilable")
+        };
+        let outcome = DocketGovernedRepairOutcomeRefV1 {
+            checkpoint: DocketCheckpointRefV1::from_digest(digest("scope-checkpoint")),
+            sealed_result: DocketSealedResultRefV1::from_digest(digest("scope-sealed-result")),
+            outcome: digest("scope-outcome"),
+            issuance: custody.issuance.clone(),
+            custody: custody.reference(),
+            attempt: custody.attempt.clone(),
+            effect_journal: digest("scope-effect-journal"),
+            executor_binding: digest("scope-executor-binding"),
+            executor_result: digest("scope-executor-result"),
+            executor_receipt: ReceiptRefV1::from_digest(digest("scope-executor-receipt")),
+            immutable_work_checkpoint: None,
+            authorized_effects_occurred: false,
+            created_at_unix_ms: NOW,
+            expires_at_unix_ms: NOW + 1_000,
+            idempotency: digest("scope-requirement-idempotency"),
+        };
+        let requested_delta = CanonicalEffectScopeV1::new(
+            original_scope.effect_class().to_owned(),
+            vec![CanonicalEffectResourceV1 {
+                resource: "repository".to_owned(),
+                path: "fixtures/required-adjacent".to_owned(),
+                operations: vec![CanonicalEffectOperationV1::Modify],
+            }],
+        )
+        .unwrap();
+        let requirement = ScopeExpansionRequiredV1 {
+            schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
+            original_scope: original_scope.clone(),
+            original_scope_digest: original_scope.digest(),
+            requested_delta_digest: requested_delta.digest(),
+            requested_delta,
+            blocked_operation: BlockedEffectOperationV1 {
+                resource: "repository".to_owned(),
+                path: "fixtures/required-adjacent".to_owned(),
+                operation: CanonicalEffectOperationV1::Modify,
+            },
+            reason: digest("scope-expansion-required"),
+            dependency_evidence: sorted_digests(&["scope-dependency"]),
+            limitations: sorted_digests(&["scope-limitation"]),
+            docket_outcome: Some(outcome.clone()),
+            unauthorized_effect_not_performed: true,
+        };
+        state.attempts.insert(
+            issuance.clone(),
+            FakeAttemptState::GovernedRepairRequired(
+                custody,
+                Box::new(DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+                    outcome,
+                    requirement,
+                }),
+            ),
+        );
+    }
+
     fn set_panic_after_accept(&self) {
         self.shared.lock().unwrap().panic_after_accept = true;
     }
@@ -264,6 +344,12 @@ impl FakeDocket {
                     indeterminate: indeterminate.clone(),
                 }
             }
+            Some(FakeAttemptState::GovernedRepairRequired(custody, result)) => {
+                DocketIssuanceReconciliationV1::GovernedRepairRequired {
+                    custody: custody.clone(),
+                    result: result.as_ref().clone(),
+                }
+            }
         }
     }
 }
@@ -271,15 +357,16 @@ impl FakeDocket {
 impl DocketCustodyPortV1 for FakeDocket {
     fn accept_issuance(
         &mut self,
-        issuance: &AgIssuanceV1,
-    ) -> Result<DocketCustodyV1, ExternalBoundaryErrorV1> {
+        issuance: &AgIssuanceV2,
+    ) -> Result<DocketIssuanceAcceptanceV1, ExternalBoundaryErrorV1> {
         let mut state = self.shared.lock().unwrap();
         state.accept_calls += 1;
         let custody = match state.attempts.get(&issuance.issuance) {
             Some(
                 FakeAttemptState::Accepted(custody)
                 | FakeAttemptState::Settled(custody, _)
-                | FakeAttemptState::Indeterminate(custody, _),
+                | FakeAttemptState::Indeterminate(custody, _)
+                | FakeAttemptState::GovernedRepairRequired(custody, _),
             ) => custody.clone(),
             None => {
                 let custody = Self::custody(issuance);
@@ -294,12 +381,12 @@ impl DocketCustodyPortV1 for FakeDocket {
         state.panic_after_accept = false;
         drop(state);
         assert!(!panic_after_accept, "injected crash after Docket custody");
-        Ok(custody)
+        Ok(DocketIssuanceAcceptanceV1::Custody(custody))
     }
 
     fn reconcile_issuance(
         &mut self,
-        issuance: &AgIssuanceV1,
+        issuance: &AgIssuanceV2,
     ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
         let state = self.shared.lock().unwrap();
         Ok(Self::response_for(&state, &issuance.issuance))
@@ -307,9 +394,11 @@ impl DocketCustodyPortV1 for FakeDocket {
 
     fn reconcile_attempt(
         &mut self,
+        issuance: &AgIssuanceV2,
         custody: &DocketCustodyV1,
     ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
         let state = self.shared.lock().unwrap();
+        assert_eq!(&issuance.issuance, &custody.issuance);
         let response = Self::response_for(&state, &custody.issuance);
         match &response {
             DocketIssuanceReconciliationV1::Accepted(actual)
@@ -319,6 +408,13 @@ impl DocketCustodyPortV1 for FakeDocket {
             | DocketIssuanceReconciliationV1::Indeterminate {
                 custody: actual, ..
             } if actual == custody => Ok(response),
+            DocketIssuanceReconciliationV1::GovernedRepairRequired {
+                custody: actual, ..
+            } if actual == custody => Ok(response),
+            DocketIssuanceReconciliationV1::Refused(_) => Err(ExternalBoundaryErrorV1::Refused {
+                code: "pre-custody-refusal-on-attempt-boundary".to_owned(),
+                evidence: None,
+            }),
             _ => Err(ExternalBoundaryErrorV1::Refused {
                 code: "wrong-custody".to_owned(),
                 evidence: None,
@@ -338,6 +434,50 @@ impl HumanDispositionVerifierV1 for HumanVerifier {
             "ag-governed-engine-test/human-verification/v1",
             request.artifact.nonce.as_str().as_bytes(),
         )))
+    }
+}
+
+/// Development/qualification fixture only.  It is deliberately not a human
+/// authority implementation and is never reachable from production wiring.
+struct QualificationFixtureNotHumanAuthority;
+
+impl GovernedRepairDispositionVerifierV1 for QualificationFixtureNotHumanAuthority {
+    fn verify_governed_repair_disposition(
+        &mut self,
+        request: &GovernedRepairVerificationRequestV1<'_>,
+    ) -> Result<GovernedRepairVerificationV1, ExternalBoundaryErrorV1> {
+        Ok(GovernedRepairVerificationV1 {
+            schema: GOVERNED_REPAIR_VERIFICATION_SCHEMA_V1.to_owned(),
+            disposition: request.artifact.reference(),
+            request: request.request.reference(),
+            halted_state_digest: request.request.halted_state_digest.clone(),
+            verifier_profile: request.expected_profile.profile.clone(),
+            verifier_root: request.expected_profile.root.clone(),
+            verifier_executable: request.expected_profile.executable.clone(),
+            verification: HumanVerificationRefV1::from_digest(Digest::hash_domain(
+                "qualification-fixture-not-human-authority/v1",
+                request.artifact.nonce.as_str().as_bytes(),
+            )),
+            verified_at_unix_ms: request.now_unix_ms,
+            expires_at_unix_ms: request.now_unix_ms + 10,
+        })
+    }
+}
+
+fn sorted_digests(labels: &[&str]) -> Vec<Digest> {
+    let mut values = labels.iter().map(|label| digest(label)).collect::<Vec<_>>();
+    values.sort();
+    values
+}
+
+fn repair_checkpoint(label: &str) -> GovernedRepairCheckpointV1 {
+    GovernedRepairCheckpointV1 {
+        repository: digest(&format!("repository-{label}")),
+        commit: "1111111111111111111111111111111111111111".to_owned(),
+        tree: "2222222222222222222222222222222222222222".to_owned(),
+        diff_identity: None,
+        content_manifest: digest(&format!("manifest-{label}")),
+        docket_checkpoint: None,
     }
 }
 
@@ -465,6 +605,93 @@ fn consequence_time_stale_observation_and_revoked_standing_do_not_spend() {
     );
     assert_eq!(engine.current().unwrap(), before);
     assert_eq!(engine.replay().unwrap().ag_spends, 0);
+}
+
+#[derive(Default)]
+struct RefusingDocket {
+    refusal: Option<DocketIssuanceRefusalV1>,
+}
+
+impl DocketCustodyPortV1 for RefusingDocket {
+    fn accept_issuance(
+        &mut self,
+        issuance: &AgIssuanceV2,
+    ) -> Result<DocketIssuanceAcceptanceV1, ExternalBoundaryErrorV1> {
+        let mut refusal = DocketIssuanceRefusalV1 {
+            schema: "docket.governed-loop.issuance-refusal/v1".to_owned(),
+            refusal: digest("placeholder-refusal"),
+            issuance: issuance.issuance.clone(),
+            campaign: issuance.key.campaign.clone(),
+            occurrence: issuance.key.occurrence,
+            refusal_class: DocketIssuanceRefusalClassV1::StandingInvalid,
+            reason_code: "standing_invalid".to_owned(),
+            evidence: digest("standing-negative-evidence"),
+            refused_at_unix_ms: NOW + 5,
+        };
+        refusal.refusal = refusal.derived_identity();
+        self.refusal = Some(refusal.clone());
+        Ok(DocketIssuanceAcceptanceV1::Refused(refusal))
+    }
+
+    fn reconcile_issuance(
+        &mut self,
+        _issuance: &AgIssuanceV2,
+    ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
+        Ok(self.refusal.clone().map_or(
+            DocketIssuanceReconciliationV1::NotAccepted,
+            DocketIssuanceReconciliationV1::Refused,
+        ))
+    }
+
+    fn reconcile_attempt(
+        &mut self,
+        _issuance: &AgIssuanceV2,
+        _custody: &DocketCustodyV1,
+    ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
+        Err(ExternalBoundaryErrorV1::Refused {
+            code: "no-custody-for-refusal".to_owned(),
+            evidence: None,
+        })
+    }
+}
+
+#[test]
+fn docket_pre_custody_refusal_terminalizes_spent_occurrence_and_replays() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current("preconditions");
+    let mut standing = StandingBoundary::current();
+    let spent = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let spend_identity = spent.ag_spend().unwrap().spend.clone();
+    let mut docket = RefusingDocket::default();
+
+    let halted = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    assert_eq!(halted.program_counter(), ProgramCounterV1::Halted);
+    let refusal = halted
+        .halted()
+        .unwrap()
+        .docket_issuance_refusal()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        halted.state().authority_history().ag_spend,
+        Some(spend_identity)
+    );
+    assert!(halted.docket_custody().is_none());
+    assert_eq!(engine.replay().unwrap().ag_spends, 1);
+    drop(engine);
+
+    let reopened = CampaignEngineV1::open(&database).unwrap();
+    assert_eq!(
+        reopened
+            .current()
+            .unwrap()
+            .halted()
+            .unwrap()
+            .docket_issuance_refusal(),
+        Some(&refusal)
+    );
 }
 
 #[test]
@@ -708,6 +935,108 @@ fn indeterminate_attempt_blocks_repeat_until_exact_settlement() {
         settled.program_counter(),
         ProgramCounterV1::SettledObservationRequired
     );
+}
+
+#[test]
+fn reconciled_governed_repair_halt_is_durable_and_replayable() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current("preconditions");
+    let mut standing = StandingBoundary::current();
+    let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let issuance = dispatched.issuance().unwrap().issuance.clone();
+
+    docket.make_indeterminate(&issuance);
+    let DocketProgressV1::ReconciliationRequired(reconciling) =
+        engine.poll_docket(&mut docket, NOW + 6).unwrap()
+    else {
+        panic!("unknown result must enter reconciliation")
+    };
+    assert_eq!(
+        reconciling.program_counter(),
+        ProgramCounterV1::ReconciliationRequired
+    );
+
+    let original_scope = proposal("work-1").effect_scope().clone();
+    docket.require_scope_expansion(&issuance, &original_scope);
+    let DocketProgressV1::GovernedRepairRequired {
+        halted,
+        requirement,
+    } = engine.poll_docket(&mut docket, NOW + 7).unwrap()
+    else {
+        panic!("sealed reconciled requirement must durably halt")
+    };
+    let halted_state = halted.halted().unwrap();
+    assert_eq!(
+        halted_state.source(),
+        ProgramCounterV1::ReconciliationRequired
+    );
+    assert!(halted_state.unresolved_attempt().is_none());
+    assert_eq!(
+        halted_state.governed_repair_requirement(),
+        Some(&requirement)
+    );
+    halted.validate_integrity().unwrap();
+
+    let report = engine.replay().unwrap();
+    assert_eq!(report.ag_spends, 1);
+    assert_eq!(report.docket_attempts, 1);
+    assert_eq!(report.current_state_digest, *halted.state_digest());
+    drop(engine);
+
+    let reopened = CampaignEngineV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap(), halted);
+    let replayed = reopened.replay().unwrap();
+    assert_eq!(replayed.current_state_digest, *halted.state_digest());
+    assert_eq!(replayed.ag_spends, 1);
+    assert_eq!(replayed.docket_attempts, 1);
+}
+
+#[test]
+fn logical_crash_after_docket_seal_before_ag_ingestion_reconciles_to_one_halt() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current("preconditions");
+    let mut standing = StandingBoundary::current();
+    let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let issuance = dispatched.issuance().unwrap().issuance.clone();
+
+    // Docket's sealed result is durable in its own custody boundary while AG
+    // still has only Dispatched. Dropping the engine is the logical crash cut;
+    // physical power-loss durability remains an operational premise.
+    docket.require_scope_expansion(&issuance, proposal("work-1").effect_scope());
+    assert_eq!(
+        engine.current().unwrap().program_counter(),
+        ProgramCounterV1::Dispatched
+    );
+    drop(engine);
+
+    let mut reopened = CampaignEngineV1::open(&database).unwrap();
+    let CampaignRecoveryV1::Advanced(halted) = reopened.recover(&mut docket, NOW + 6).unwrap()
+    else {
+        panic!("sealed Docket result must reconcile to one durable AG halt")
+    };
+    assert_eq!(halted.program_counter(), ProgramCounterV1::Halted);
+    assert!(
+        halted
+            .halted()
+            .unwrap()
+            .governed_repair_requirement()
+            .is_some()
+    );
+    assert_eq!(reopened.replay().unwrap().ag_spends, 1);
+    assert_eq!(reopened.replay().unwrap().docket_attempts, 1);
+    drop(reopened);
+
+    let replayed = CampaignEngineV1::open(&database).unwrap();
+    assert_eq!(replayed.current().unwrap(), halted);
+    assert_eq!(replayed.replay().unwrap().human_decision_requests, 0);
 }
 
 #[test]
@@ -1059,20 +1388,21 @@ fn concurrent_settlement_ingestion_has_one_legal_successor() {
     impl DocketCustodyPortV1 for BarrierDocket {
         fn accept_issuance(
             &mut self,
-            _issuance: &AgIssuanceV1,
-        ) -> Result<DocketCustodyV1, ExternalBoundaryErrorV1> {
+            _issuance: &AgIssuanceV2,
+        ) -> Result<DocketIssuanceAcceptanceV1, ExternalBoundaryErrorV1> {
             unreachable!()
         }
 
         fn reconcile_issuance(
             &mut self,
-            _issuance: &AgIssuanceV1,
+            _issuance: &AgIssuanceV2,
         ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
             unreachable!()
         }
 
         fn reconcile_attempt(
             &mut self,
+            _issuance: &AgIssuanceV2,
             _custody: &DocketCustodyV1,
         ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
             self.barrier.wait();
@@ -1266,4 +1596,493 @@ fn concurrent_human_resume_consumes_one_disposition_and_opens_one_occurrence() {
     assert_eq!(reopened.replay().unwrap().human_dispositions, 1);
     assert_eq!(reopened.current().unwrap().key().occurrence, occurrence(2));
     assert!(reopened.current().unwrap().ag_spend().is_none());
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the end-to-end exact-scope successor specimen keeps all bindings visible"
+)]
+fn governed_scope_expansion_is_durable_exact_one_use_and_opens_only_new_occurrence() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current("precondition-a");
+    let proposed = proposal("work-1");
+    let original_scope = proposed.effect_scope().clone();
+    engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("observation-repair")),
+            proposed,
+            ProposalClassV1::Initial,
+            &mut observation,
+            NOW + 1,
+        )
+        .unwrap();
+    let halted = engine
+        .halt(
+            HaltReasonRefV1::from_digest(digest("scope-insufficient")),
+            NOW + 2,
+        )
+        .unwrap();
+    let delta = CanonicalEffectScopeV1::new(
+        original_scope.effect_class().to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/required-adjacent".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap();
+    let requirement = HumanDecisionRequirementV1::ScopeExpansion(ScopeExpansionRequiredV1 {
+        schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
+        original_scope: original_scope.clone(),
+        original_scope_digest: original_scope.digest(),
+        requested_delta: delta.clone(),
+        requested_delta_digest: delta.digest(),
+        blocked_operation: BlockedEffectOperationV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/required-adjacent".to_owned(),
+            operation: CanonicalEffectOperationV1::Modify,
+        },
+        reason: digest("blocked-operation"),
+        dependency_evidence: sorted_digests(&["dependency-a", "dependency-b"]),
+        limitations: sorted_digests(&["limitation-a"]),
+        docket_outcome: None,
+        unauthorized_effect_not_performed: true,
+    });
+    let profile = GovernedRepairVerifierProfileV1 {
+        profile: digest("qualification-fixture-not-human-authority-profile"),
+        root: digest("qualification-fixture-not-human-authority-root"),
+        executable: digest("qualification-fixture-not-human-authority-executable"),
+        principal: HumanPrincipalRefV1::from_digest(digest("repair-principal")),
+        mandate: MandateRefV1::from_digest(digest("repair-mandate")),
+    };
+    let request = engine
+        .create_governed_repair_request(
+            halted.state_digest(),
+            requirement,
+            profile.profile.clone(),
+            profile.root.clone(),
+            profile.executable.clone(),
+            sorted_digests(&["approve-consequence", "reject-consequence"]),
+            sorted_digests(&["not-standing", "not-qualification"]),
+            digest("request-idempotency"),
+            NOW + 3,
+            NOW + 100,
+        )
+        .unwrap();
+    assert_eq!(engine.replay().unwrap().human_decision_requests, 1);
+    let checkpoint = repair_checkpoint("scope");
+    let successor_scope = original_scope.exact_union(&delta).unwrap();
+    let artifact = GovernedRepairDispositionV1 {
+        schema: GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1.to_owned(),
+        campaign: campaign(),
+        occurrence: occurrence(1),
+        halted_state_digest: halted.state_digest().clone(),
+        disposition: GovernedRepairDispositionKindV1::ApproveExactExpansion {
+            request: request.reference(),
+            successor_occurrence: occurrence(2),
+            approved_delta: delta,
+            successor_scope: successor_scope.clone(),
+            checkpoint: checkpoint.clone(),
+        },
+        decision: HumanDecisionIdV1::from_digest(digest("repair-decision")),
+        principal: profile.principal.clone(),
+        mandate: profile.mandate.clone(),
+        verifier_profile: profile.profile.clone(),
+        nonce: HumanNonceRefV1::from_digest(digest("repair-nonce")),
+        expires_at_unix_ms: NOW + 90,
+    };
+    let mut verifier = QualificationFixtureNotHumanAuthority;
+    let GovernedRepairDispositionEffectV1::OpenedSuccessor {
+        halted: consumed_halt,
+        successor,
+        ..
+    } = GovernedLoopKernelV1::apply_governed_repair_disposition(
+        &halted,
+        &request,
+        artifact.clone(),
+        &profile,
+        &mut verifier,
+        NOW + 4,
+    )
+    .unwrap()
+    else {
+        panic!("approval must open a distinct successor")
+    };
+    assert_eq!(successor.key().occurrence, occurrence(2));
+    assert_eq!(
+        successor.program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+    assert!(successor.ag_spend().is_none());
+    assert!(
+        GovernedLoopKernelV1::apply_governed_repair_disposition(
+            &consumed_halt,
+            &request,
+            artifact,
+            &profile,
+            &mut verifier,
+            NOW + 5,
+        )
+        .is_err()
+    );
+    let hostile = ExactWorkProposalV1::new(
+        campaign(),
+        digest("subject"),
+        original_scope,
+        "test.engine-work/v1".to_owned(),
+        digest("hostile-work"),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
+        None,
+    )
+    .unwrap()
+    .with_governed_repair_checkpoint(checkpoint.clone())
+    .unwrap();
+    assert!(
+        GovernedLoopKernelV1::record_proposal(
+            &successor,
+            ObservationRefV1::from_digest(digest("observation-hostile")),
+            hostile,
+            ProposalClassV1::Successor,
+            &mut ObservationBoundary::current("fresh"),
+            NOW + 6,
+        )
+        .is_err()
+    );
+    let legal = ExactWorkProposalV1::new(
+        campaign(),
+        digest("subject"),
+        successor_scope,
+        "test.engine-work/v1".to_owned(),
+        digest("successor-work"),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
+        None,
+    )
+    .unwrap()
+    .with_governed_repair_checkpoint(checkpoint)
+    .unwrap();
+    let recorded = GovernedLoopKernelV1::record_proposal(
+        &successor,
+        ObservationRefV1::from_digest(digest("observation-successor")),
+        legal,
+        ProposalClassV1::Successor,
+        &mut ObservationBoundary::current("fresh"),
+        NOW + 7,
+    )
+    .unwrap();
+    assert_eq!(
+        recorded.program_counter(),
+        ProgramCounterV1::ProposalRecorded
+    );
+    assert!(
+        recorded.ag_spend().is_none(),
+        "fresh standing/spend remain due"
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the hostile readjudication specimen keeps collision and expiry checks together"
+)]
+fn governed_request_collision_expiry_profile_and_readjudication_mutation_fail_closed() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current("precondition-b");
+    let proposed = proposal("work-2");
+    engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("observation-readjudication")),
+            proposed,
+            ProposalClassV1::Initial,
+            &mut observation,
+            NOW + 1,
+        )
+        .unwrap();
+    let halted = engine
+        .halt(
+            HaltReasonRefV1::from_digest(digest("normative-gap")),
+            NOW + 2,
+        )
+        .unwrap();
+    let read_scope = CanonicalEffectScopeV1::new(
+        "adjudication".to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "evidence".to_owned(),
+            path: "reviews/exact-record.json".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Read],
+        }],
+    )
+    .unwrap();
+    let requirement = HumanDecisionRequirementV1::Readjudication(ReadjudicationRequiredV1 {
+        schema: READJUDICATION_REQUIRED_SCHEMA_V1.to_owned(),
+        question: digest("question"),
+        evidence_census: sorted_digests(&["evidence-a"]),
+        diagnostic_census: sorted_digests(&["diagnostic-a"]),
+        bounded_alternatives: sorted_digests(&["alternative-a"]),
+        unresolved_facts: sorted_digests(&["fact-a"]),
+        limitations: sorted_digests(&["limitation-a"]),
+        adjudication_scope: read_scope.clone(),
+        docket_outcome: None,
+        unauthorized_effect_not_performed: true,
+    });
+    let profile = GovernedRepairVerifierProfileV1 {
+        profile: digest("qualification-fixture-not-human-authority-profile-r"),
+        root: digest("qualification-fixture-not-human-authority-root-r"),
+        executable: digest("qualification-fixture-not-human-authority-executable-r"),
+        principal: HumanPrincipalRefV1::from_digest(digest("principal-r")),
+        mandate: MandateRefV1::from_digest(digest("mandate-r")),
+    };
+    let request = engine
+        .create_governed_repair_request(
+            halted.state_digest(),
+            requirement,
+            profile.profile.clone(),
+            profile.root.clone(),
+            profile.executable.clone(),
+            sorted_digests(&["readjudicate-consequence", "reject-consequence-r"]),
+            sorted_digests(&["not-repair-authority"]),
+            digest("same-idempotency"),
+            NOW + 3,
+            NOW + 20,
+        )
+        .unwrap();
+    assert!(
+        engine
+            .create_governed_repair_request(
+                halted.state_digest(),
+                request.requirement.clone(),
+                profile.profile.clone(),
+                profile.root.clone(),
+                profile.executable.clone(),
+                request.decision_consequences.clone(),
+                request.nonclaims.clone(),
+                digest("same-idempotency"),
+                NOW + 3,
+                NOW + 21,
+            )
+            .is_err(),
+        "same idempotency key with changed bytes must collide"
+    );
+
+    let checkpoint = repair_checkpoint("readjudication");
+    let artifact = GovernedRepairDispositionV1 {
+        schema: GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1.to_owned(),
+        campaign: campaign(),
+        occurrence: occurrence(1),
+        halted_state_digest: halted.state_digest().clone(),
+        disposition: GovernedRepairDispositionKindV1::RequestReadjudication {
+            request: request.reference(),
+            successor_occurrence: occurrence(3),
+            successor_program: ProgramBasisRefV1::from_digest(digest("adjudicator-program")),
+            checkpoint: checkpoint.clone(),
+        },
+        decision: HumanDecisionIdV1::from_digest(digest("decision-r")),
+        principal: profile.principal.clone(),
+        mandate: profile.mandate.clone(),
+        verifier_profile: digest("wrong-profile"),
+        nonce: HumanNonceRefV1::from_digest(digest("nonce-r")),
+        expires_at_unix_ms: NOW + 19,
+    };
+    let mut verifier = QualificationFixtureNotHumanAuthority;
+    assert!(
+        GovernedLoopKernelV1::apply_governed_repair_disposition(
+            &halted,
+            &request,
+            artifact.clone(),
+            &profile,
+            &mut verifier,
+            NOW + 4,
+        )
+        .is_err()
+    );
+    let mut exact = artifact;
+    exact.verifier_profile = profile.profile.clone();
+    assert!(
+        GovernedLoopKernelV1::apply_governed_repair_disposition(
+            &halted,
+            &request,
+            exact.clone(),
+            &profile,
+            &mut verifier,
+            NOW + 20,
+        )
+        .is_err(),
+        "expiry must fail closed"
+    );
+    let GovernedRepairDispositionEffectV1::OpenedSuccessor { successor, .. } =
+        GovernedLoopKernelV1::apply_governed_repair_disposition(
+            &halted,
+            &request,
+            exact,
+            &profile,
+            &mut verifier,
+            NOW + 5,
+        )
+        .unwrap()
+    else {
+        panic!("readjudication must open a distinct successor")
+    };
+    let mutation_scope = CanonicalEffectScopeV1::new(
+        "adjudication".to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "evidence".to_owned(),
+            path: "reviews/exact-record.json".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap();
+    let hostile = ExactWorkProposalV1::new(
+        campaign(),
+        digest("subject"),
+        mutation_scope,
+        "test.engine-work/v1".to_owned(),
+        digest("readjudication-mutation"),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
+        None,
+    )
+    .unwrap()
+    .with_governed_repair_checkpoint(checkpoint)
+    .unwrap();
+    assert!(
+        GovernedLoopKernelV1::record_proposal(
+            &successor,
+            ObservationRefV1::from_digest(digest("readjudication-observation")),
+            hostile,
+            ProposalClassV1::Successor,
+            &mut ObservationBoundary::current("fresh-r"),
+            NOW + 6,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the terminal rejection specimen retains the complete residual/request chain"
+)]
+fn governed_repair_rejection_is_terminal_halted_with_exact_residual() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current("precondition-reject");
+    let proposed = proposal("work-reject");
+    let original_scope = proposed.effect_scope().clone();
+    engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("observation-reject")),
+            proposed,
+            ProposalClassV1::Initial,
+            &mut observation,
+            NOW + 1,
+        )
+        .unwrap();
+    let halted = engine
+        .halt(HaltReasonRefV1::from_digest(digest("reject-halt")), NOW + 2)
+        .unwrap();
+    let delta = CanonicalEffectScopeV1::new(
+        original_scope.effect_class().to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/rejected".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap();
+    let requirement = HumanDecisionRequirementV1::ScopeExpansion(ScopeExpansionRequiredV1 {
+        schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
+        original_scope: original_scope.clone(),
+        original_scope_digest: original_scope.digest(),
+        requested_delta: delta.clone(),
+        requested_delta_digest: delta.digest(),
+        blocked_operation: BlockedEffectOperationV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/rejected".to_owned(),
+            operation: CanonicalEffectOperationV1::Modify,
+        },
+        reason: digest("reject-requirement"),
+        dependency_evidence: sorted_digests(&["reject-dependency"]),
+        limitations: sorted_digests(&["reject-limitation"]),
+        docket_outcome: None,
+        unauthorized_effect_not_performed: true,
+    });
+    let profile = GovernedRepairVerifierProfileV1 {
+        profile: digest("qualification-fixture-not-human-authority-profile-reject"),
+        root: digest("qualification-fixture-not-human-authority-root-reject"),
+        executable: digest("qualification-fixture-not-human-authority-executable-reject"),
+        principal: HumanPrincipalRefV1::from_digest(digest("principal-reject")),
+        mandate: MandateRefV1::from_digest(digest("mandate-reject")),
+    };
+    let request = engine
+        .create_governed_repair_request(
+            halted.state_digest(),
+            requirement,
+            profile.profile.clone(),
+            profile.root.clone(),
+            profile.executable.clone(),
+            sorted_digests(&["approve-reject", "reject-reject"]),
+            sorted_digests(&["reject-nonclaim"]),
+            digest("reject-idempotency"),
+            NOW + 3,
+            NOW + 50,
+        )
+        .unwrap();
+    let artifact = GovernedRepairDispositionV1 {
+        schema: GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1.to_owned(),
+        campaign: campaign(),
+        occurrence: occurrence(1),
+        halted_state_digest: halted.state_digest().clone(),
+        disposition: GovernedRepairDispositionKindV1::Reject {
+            request: request.reference(),
+            reason: digest("human-rejection"),
+        },
+        decision: HumanDecisionIdV1::from_digest(digest("reject-decision")),
+        principal: profile.principal.clone(),
+        mandate: profile.mandate.clone(),
+        verifier_profile: profile.profile.clone(),
+        nonce: HumanNonceRefV1::from_digest(digest("reject-nonce")),
+        expires_at_unix_ms: NOW + 40,
+    };
+    let GovernedRepairDispositionEffectV1::Rejected { halted: closed, .. } =
+        GovernedLoopKernelV1::apply_governed_repair_disposition(
+            &halted,
+            &request,
+            artifact,
+            &profile,
+            &mut QualificationFixtureNotHumanAuthority,
+            NOW + 4,
+        )
+        .unwrap()
+    else {
+        panic!("rejection must not open a successor")
+    };
+    assert!(closed.halted().unwrap().governed_repair_closed().is_some());
+    assert_eq!(closed.state().meta().residuals().len(), 1);
+    assert!(
+        GovernedLoopKernelV1::create_human_decision_request(
+            &closed,
+            HumanDecisionRequestParametersV1 {
+                requirement: request.requirement,
+                required_verifier_profile: profile.profile,
+                required_verifier_root: profile.root,
+                required_verifier_executable: profile.executable,
+                decision_consequences: request.decision_consequences,
+                nonclaims: request.nonclaims,
+                idempotency_key: digest("second-request"),
+                created_at_unix_ms: NOW + 5,
+                expires_at_unix_ms: NOW + 60,
+            },
+        )
+        .is_err()
+    );
 }

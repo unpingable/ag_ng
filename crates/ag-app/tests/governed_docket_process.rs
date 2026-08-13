@@ -18,10 +18,13 @@ use ag_app::effect_executor_adapter::{
     EffectExecutorPlanV1, EffectFilePolicyV1,
 };
 use ag_app::governed_loop::{
-    CampaignEngineV1, DocketProgressV1, EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1,
-    ExactWorkCatalogV1,
+    EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1, ExactWorkCatalogV1,
 };
-use ag_app::governed_ports::{AgIssuanceSignerV1, CommandDocketCustodyPortV1};
+use ag_app::governed_product::{
+    CreateCampaignV1, GOVERNED_AG_POLICY_ROOT_SCHEMA_V1, GOVERNED_DOCKET_ADAPTER_ROOT_SCHEMA_V1,
+    GovernedAgPolicyRootV1, GovernedCampaignServiceV1, GovernedDocketAdapterRootV1,
+    PinnedDeploymentFileV1,
+};
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_effect::{CanonicalEffectV1, TargetId};
@@ -36,48 +39,60 @@ fn digest(label: &str) -> Digest {
     Digest::hash_domain("ag-governed-process-test/v1", label.as_bytes())
 }
 
-struct Observation;
-
-impl ObservationResolverV1 for Observation {
-    fn resolve_observation(
-        &mut self,
-        request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV1, ExternalBoundaryErrorV1> {
-        Ok(ObservationResolutionV1 {
-            schema: OBSERVATION_RESOLUTION_SCHEMA_V1.to_owned(),
-            key: request.key.clone(),
-            observation: request.observation.clone(),
-            currentness: ObservationCurrentnessRefV1::from_digest(digest("observation-current")),
-            normalized_preconditions: PreconditionBasisRefV1::from_digest(digest("preconditions")),
-            subject: request.subject.clone(),
-            status: ObservationStatusV1::Current,
-            resolved_at_unix_ms: request.now_unix_ms,
-            fresh_until_unix_ms: request.now_unix_ms + 60_000,
-        })
+fn pinned(path: PathBuf) -> PinnedDeploymentFileV1 {
+    PinnedDeploymentFileV1 {
+        identity: Digest::hash_bytes(&std::fs::read(&path).unwrap()),
+        path,
     }
 }
 
-struct Standing;
-
-impl StandingResolverV1 for Standing {
-    fn resolve_standing(
-        &mut self,
-        request: &StandingResolutionRequestV1<'_>,
-    ) -> Result<CurrentStandingResolutionV1, ExternalBoundaryErrorV1> {
-        Ok(CurrentStandingResolutionV1 {
-            schema: STANDING_RESOLUTION_SCHEMA_V1.to_owned(),
-            resolution: StandingResolutionRefV1::from_digest(digest("ag-standing-resolution")),
-            currentness: StandingCurrentnessRefV1::from_digest(digest("ag-standing-current")),
-            mandate: MandateRefV1::from_digest(digest("mandate")),
-            key: request.key.clone(),
-            observation: request.observation.clone(),
-            proposal: request.proposal.clone(),
-            subject: request.subject.clone(),
-            scope: request.scope.clone(),
-            status: StandingStatusV1::Current,
-            resolved_at_unix_ms: request.now_unix_ms,
-            expires_at_unix_ms: request.now_unix_ms + 60_000,
-        })
+fn policy_root(
+    directory: &std::path::Path,
+    catalog: &ExactWorkCatalogV1,
+) -> GovernedAgPolicyRootV1 {
+    let clock = directory.join("ag-consequence-clock");
+    std::fs::write(&clock, b"#!/bin/sh\nprintf '10000\\n'\n").unwrap();
+    let observation = directory.join("ag-observation-resolver");
+    std::fs::write(
+        &observation,
+        r#"#!/usr/bin/python3
+import hashlib,json,sys
+r=json.load(sys.stdin)
+def d(label): return "sha256:"+hashlib.sha256(label.encode()).hexdigest()
+o={"schema":"ag.governed-loop.observation-resolution/v1","key":r["key"],"observation":r["observation"],"currentness":d("observation-current"),"normalized_preconditions":d("preconditions"),"subject":r["subject"],"status":"current","resolved_at_unix_ms":r["now_unix_ms"],"fresh_until_unix_ms":r["now_unix_ms"]+60000}
+sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
+"#,
+    )
+    .unwrap();
+    let standing = directory.join("ag-standing-resolver");
+    std::fs::write(
+        &standing,
+        r#"#!/usr/bin/python3
+import hashlib,json,sys
+r=json.load(sys.stdin)
+def d(label): return "sha256:"+hashlib.sha256(label.encode()).hexdigest()
+o={"schema":"ag.governed-loop.standing-resolution/v1","resolution":d("ag-standing-resolution"),"currentness":d("ag-standing-current"),"mandate":d("mandate"),"key":r["key"],"observation":r["observation"],"proposal":r["proposal"],"subject":r["subject"],"scope":r["scope"],"status":"current","resolved_at_unix_ms":r["now_unix_ms"],"expires_at_unix_ms":r["now_unix_ms"]+60000}
+sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
+"#,
+    )
+    .unwrap();
+    for path in [&clock, &observation, &standing] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let catalog_path = directory.join("ag-exact-work-catalog.json");
+    std::fs::write(
+        &catalog_path,
+        JcsDocument::canonicalize(catalog).unwrap().as_bytes(),
+    )
+    .unwrap();
+    GovernedAgPolicyRootV1 {
+        schema: GOVERNED_AG_POLICY_ROOT_SCHEMA_V1.to_owned(),
+        policy_label: "qualification-fixture-not-human-authority".to_owned(),
+        consequence_clock: pinned(clock),
+        observation_resolver: pinned(observation),
+        standing_resolver: pinned(standing),
+        exact_work_catalog: pinned(catalog_path),
+        controlling_review: None,
     }
 }
 
@@ -95,12 +110,25 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
     std::fs::write(&artifact_path, b"governed-process-effect\n").unwrap();
     let content = Digest::hash_bytes(b"governed-process-effect\n");
     let subject = digest("subject");
-    let scope = digest("scope");
+    let scope = CanonicalEffectScopeV1::new(
+        "test-effect".to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/docket-process".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Create],
+        }],
+    )
+    .unwrap();
     let plan = EffectExecutorPlanV1 {
         schema: EFFECT_EXECUTOR_PLAN_SCHEMA_V1.to_owned(),
         attempt_store: root.path().join("effect-attempts.sqlite"),
         subject: subject.clone(),
-        scope: scope.clone(),
+        scope: scope.digest(),
+        journal_binding: ag_app::effect_executor_adapter::EffectExecutorJournalBindingV1 {
+            resource: "repository".to_owned(),
+            path: "fixtures/docket-process".to_owned(),
+            operation: CanonicalEffectOperationV1::Create,
+        },
         effect_index: 0,
         effect: CanonicalEffectV1::ManagedFilePut {
             target: TargetId::parse("governed-process-test").unwrap(),
@@ -134,29 +162,16 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
     let campaign = CampaignId::from_digest(digest("campaign"));
     let occurrence = OccurrenceId::from_uuid(Uuid::from_u128(1));
     let database = root.path().join("ag-campaign.sqlite");
-    let mut engine = CampaignEngineV1::create(
-        &database,
-        campaign.clone(),
-        occurrence,
-        ProgramBasisRefV1::from_digest(digest("program")),
-        ResidualSetV1::default(),
-        LoopBudgetV1 {
-            retry_limit: 1,
-            retries_used: 0,
-            probe_limit: 1,
-            probes_used: 0,
-            escalation_limit: 1,
-            escalations_used: 0,
-        },
-        1,
-    )
-    .unwrap();
     let proposal = ExactWorkProposalV1::new(
-        campaign,
+        campaign.clone(),
         subject.clone(),
         scope.clone(),
         EFFECT_EXECUTOR_WORK_SCHEMA_V1.to_owned(),
         work,
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("development-process-fixture-not-authority")],
+            expires_at_unix_ms: 4_000_000_000_000,
+        },
         None,
     )
     .unwrap();
@@ -168,29 +183,10 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
             ExactWorkCatalogEntryV1 {
                 work_schema: EFFECT_EXECUTOR_WORK_SCHEMA_V1.to_owned(),
                 subject,
-                scope,
+                scope: scope.digest(),
             },
         )]),
     };
-    let mut observation = Observation;
-    let mut standing = Standing;
-    engine
-        .record_proposal(
-            ObservationRefV1::from_digest(digest("observation")),
-            proposal,
-            ProposalClassV1::Initial,
-            &mut observation,
-            2,
-        )
-        .unwrap();
-    engine.require_standing(3).unwrap();
-    engine
-        .decide(&mut observation, &mut standing, &catalog, None, 4)
-        .unwrap();
-    engine
-        .authorize(&mut observation, &mut standing, &catalog, None, 5)
-        .unwrap();
-
     let resolver_path = root.path().join("docket-standing-resolver");
     std::fs::write(
         &resolver_path,
@@ -198,7 +194,7 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
 import hashlib,json,sys
 r=json.load(sys.stdin); i=r["issuance"]
 def d(label): return "sha256:"+hashlib.sha256(label.encode()).hexdigest()
-o={"schema":"docket.governed-loop.execution-standing-resolution/v1","resolution":d("resolution"),"currentness":d("currentness"),"execution_standing":d("execution-standing"),"issuance":i["issuance"],"campaign":i["key"]["campaign"],"occurrence":i["key"]["occurrence"],"subject":i["subject"],"scope":i["scope"],"status":"current","resolved_at_unix_ms":r["now_unix_ms"],"expires_at_unix_ms":r["now_unix_ms"]+60000}
+o={"schema":"docket.governed-loop.execution-standing-resolution/v1","resolution":d("resolution"),"currentness":d("currentness"),"execution_standing":d("execution-standing"),"issuance":i["issuance"],"campaign":i["key"]["campaign"],"occurrence":i["key"]["occurrence"],"subject":i["subject"],"scope":i["effect_scope_digest"],"status":"current","resolved_at_unix_ms":r["now_unix_ms"],"expires_at_unix_ms":r["now_unix_ms"]+60000}
 sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
 "#,
     )
@@ -207,7 +203,9 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
 
     let key_document = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
     let pair = Ed25519KeyPair::from_pkcs8(key_document.as_ref()).unwrap();
-    let signer = AgIssuanceSignerV1::from_pkcs8("ag-test", "key-1", key_document.as_ref()).unwrap();
+    let issuer_key = root.path().join("ag-issuance-key.pkcs8");
+    std::fs::write(&issuer_key, key_document.as_ref()).unwrap();
+    std::fs::set_permissions(&issuer_key, std::fs::Permissions::from_mode(0o600)).unwrap();
     let trust_path = root.path().join("docket-trust.json");
     let trust = serde_json::json!({"issuers":[{
         "issuer_principal":"ag-test",
@@ -215,21 +213,62 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
         "public_key":URL_SAFE_NO_PAD.encode(pair.public_key().as_ref())
     }]});
     std::fs::write(&trust_path, serde_json::to_vec(&trust).unwrap()).unwrap();
-    let mut custody = CommandDocketCustodyPortV1::new(
-        docket,
-        root.path().join("docket-state"),
-        trust_path,
-        resolver_path,
-        effectd,
-        plan_path,
-        signer,
-    );
-
-    let dispatched = engine.dispatch(&mut custody, 6).unwrap();
-    assert_eq!(dispatched.program_counter(), ProgramCounterV1::Dispatched);
-    let DocketProgressV1::Settled(settled) = engine.poll_docket(&mut custody, 7).unwrap() else {
-        panic!("Docket must return its exact terminal executor settlement")
+    let state_directory = root.path().join("docket-state");
+    std::fs::create_dir(&state_directory).unwrap();
+    let docket_root = GovernedDocketAdapterRootV1 {
+        schema: GOVERNED_DOCKET_ADAPTER_ROOT_SCHEMA_V1.to_owned(),
+        adapter_label: "qualification-fixture-not-human-authority".to_owned(),
+        docket_program: pinned(docket),
+        state_directory,
+        trust_config: pinned(trust_path),
+        standing_resolver: pinned(resolver_path),
+        executor_adapter: pinned(effectd),
+        executor_config: pinned(plan_path),
+        checkpoint_verifier: None,
+        issuer_principal: "ag-test".to_owned(),
+        issuer_key_id: "key-1".to_owned(),
+        issuer_key: pinned(issuer_key),
     };
+    let mut service = GovernedCampaignServiceV1::create(
+        &database,
+        CreateCampaignV1 {
+            campaign,
+            occurrence,
+            program: ProgramBasisRefV1::from_digest(digest("program")),
+            residuals: ResidualSetV1::default(),
+            budget: LoopBudgetV1 {
+                retry_limit: 1,
+                retries_used: 0,
+                probe_limit: 1,
+                probes_used: 0,
+                escalation_limit: 1,
+                escalations_used: 0,
+            },
+            idempotency_key: digest("create-idempotency"),
+            governed_ag_policy_root: policy_root(root.path(), &catalog),
+            governed_repair_verifier_root: None,
+            governed_docket_adapter_root: Some(docket_root),
+        },
+    )
+    .unwrap();
+    let state = service.state().unwrap().current;
+    let state = service
+        .record_proposal(
+            state.state_digest(),
+            ObservationRefV1::from_digest(digest("observation")),
+            proposal,
+            ProposalClassV1::Initial,
+        )
+        .unwrap();
+    let state = service.require_standing(state.state_digest()).unwrap();
+    let state = service.decide(state.state_digest()).unwrap();
+    let state = service.authorize(state.state_digest()).unwrap();
+    let dispatched = service.dispatch(state.state_digest()).unwrap();
+    assert_eq!(dispatched.program_counter(), ProgramCounterV1::Dispatched);
+    let settled = service
+        .reconcile_docket(dispatched.state_digest())
+        .unwrap()
+        .current;
     assert_eq!(
         settled.program_counter(),
         ProgramCounterV1::SettledObservationRequired
@@ -238,23 +277,24 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
         std::fs::read(&target_path).unwrap(),
         b"governed-process-effect\n"
     );
-    assert_eq!(engine.replay().unwrap().ag_spends, 1);
-    assert_eq!(engine.replay().unwrap().docket_attempts, 1);
-    assert_eq!(engine.replay().unwrap().settlements, 1);
+    assert_eq!(service.replay().unwrap().ag_spends, 1);
+    assert_eq!(service.replay().unwrap().docket_attempts, 1);
+    assert_eq!(service.replay().unwrap().settlements, 1);
 
     std::fs::write(&target_path, b"must-not-run-again\n").unwrap();
-    assert!(matches!(
-        engine.poll_docket(&mut custody, 8).unwrap(),
-        DocketProgressV1::Settled(_)
-    ));
+    let settled_again = service
+        .reconcile_docket(settled.state_digest())
+        .unwrap()
+        .current;
+    assert_eq!(settled_again.state_digest(), settled.state_digest());
     assert_eq!(
         std::fs::read(&target_path).unwrap(),
         b"must-not-run-again\n"
     );
-    drop(engine);
-    let reopened = CampaignEngineV1::open(&database).unwrap();
+    drop(service);
+    let reopened = GovernedCampaignServiceV1::open(&database).unwrap();
     assert_eq!(
-        reopened.current().unwrap().program_counter(),
+        reopened.state().unwrap().current.program_counter(),
         ProgramCounterV1::SettledObservationRequired
     );
     assert_eq!(reopened.replay().unwrap().ag_spends, 1);

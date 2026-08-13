@@ -16,6 +16,8 @@ EXPECTED = {
     "ag.process_isolation": "requires_trusted_host",
     "ag.executor_physical_idempotency": "requires_fault_injection_environment",
     "ag.deployed_standing_docket_correspondence": "requires_deployed_service",
+    "ag.governed_repair_durable_halt_successor": "runnable_locally_now",
+    "ag.governed_repair_external_human_verification": "requires_deployed_service",
 }
 
 

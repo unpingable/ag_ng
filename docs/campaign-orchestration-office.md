@@ -5,8 +5,10 @@ Status: **retired historical disposition**. The fixed-stage implementation and
 `AG-GOVERNED-LOOP-C1`. Current transition ownership is the generic governed-loop
 kernel in `crates/ag-campaign/src/governed.rs`, persisted by
 `crates/ag-store/src/campaign.rs` and composed by
-`crates/ag-app/src/governed_loop.rs`/`ag-loopctl`. The remainder of this record
-is preserved only as architectural history; it is not a current runtime contract.
+`crates/ag-app/src/governed_loop.rs`/`ag-loopctl`. The current consequence-bearing
+repair contract is [Canonical governed repair](canonical-governed-repair.md).
+The remainder of this record is preserved only as architectural history; it is
+not a current runtime contract or an alternate repair-authority path.
 
 This record originally stated what the bounded office owned, the
 invariants encoded in types, what it deliberately does not claim, and how it relates to
