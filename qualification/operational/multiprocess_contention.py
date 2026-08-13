@@ -92,6 +92,20 @@ def main() -> int:
     database = args.output / "campaign.sqlite"
     genesis_path = args.output / "genesis.json"
     halt_path = args.output / "halt.json"
+    clock_path = args.output / "qualification-fixture-not-authority-clock"
+    catalog_path = args.output / "qualification-fixture-not-authority-catalog.json"
+    clock_bytes = b"#!/bin/sh\nprintf '1000\\n'\n"
+    catalog_bytes = canonical_bytes({
+        "schema": "ag.governed-loop.exact-work-catalog/v1",
+        "policy_basis": "sha256:" + "d" * 64,
+        "entries": {},
+    })
+    write_exclusive(clock_path, clock_bytes, mode=0o700)
+    write_exclusive(catalog_path, catalog_bytes)
+
+    def pinned(path: Path, data: bytes) -> dict[str, str]:
+        return {"path": str(path.resolve()), "identity": sha256(data)}
+
     genesis = {
         "campaign": "sha256:" + "a" * 64,
         "occurrence": "00000000-0000-4000-8000-000000000001",
@@ -105,13 +119,35 @@ def main() -> int:
             "escalation_limit": 1,
             "escalations_used": 0,
         },
+        "idempotency_key": "sha256:" + "e" * 64,
+        "governed_ag_policy_root": {
+            "schema": "ag.governed-loop.ag-policy-root/v1",
+            "policy_label": "qualification-fixture-not-authority",
+            "consequence_clock": pinned(clock_path, clock_bytes),
+            "observation_resolver": pinned(clock_path, clock_bytes),
+            "standing_resolver": pinned(clock_path, clock_bytes),
+            "exact_work_catalog": pinned(catalog_path, catalog_bytes),
+            "controlling_review": None,
+        },
+        "governed_repair_verifier_root": None,
+        "governed_docket_adapter_root": None,
     }
     halt = {"reason": "sha256:" + "c" * 64}
     write_exclusive(genesis_path, canonical_bytes(genesis))
     write_exclusive(halt_path, canonical_bytes(halt))
 
     init = run_or_raise([str(program), "init", "--database", str(database), "--genesis", str(genesis_path)])
-    halt_argv = [str(program), "halt", "--database", str(database), "--input", str(halt_path)]
+    initial_state = json.loads(init["stdout"])["state_digest"]
+    halt_argv = [
+        str(program),
+        "halt",
+        "--database",
+        str(database),
+        "--input",
+        str(halt_path),
+        "--expected-state",
+        initial_state,
+    ]
     first = competing(halt_argv, args.writers)
     first_successes = [item for item in first if item["exit_code"] == 0]
     status_one = run_or_raise([str(program), "status", "--database", str(database)])

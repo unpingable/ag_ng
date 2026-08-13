@@ -89,7 +89,8 @@ The completed AG change set contains these closed groups:
 - Operational nonclaim/evidence harness:
   `qualification/operational/README.md`, `deployed-service-plan.json`,
   `fault-injection-plan.json`, `gates.json`, `run_local.py`, `self_test.py`, and
-  `trusted-host-plan.json`.
+  `trusted-host-plan.json`, plus `multiprocess_contention.py` for the
+  product-genesis-aware independent-writer specimen.
 
 No path outside AG or Docket was modified. Build output and the final external
 development-evidence bundle are not source-tree state.
