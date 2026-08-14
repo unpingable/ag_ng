@@ -166,6 +166,14 @@ durable root record contradicts genesis. These are exact application laws, not
 an operational claim that an unlocked filesystem path cannot change between
 measurement and process execution.
 
+The allowed-transition projection performs the same non-authorizing pinned
+file and key-shape correspondence checks before advertising a Docket-backed
+operation.  An open human-decision request advertises disposition submission
+only while the exact verifier executable still corresponds.  Every mutation
+remeasures at its own consequence boundary; a projection check creates no
+signing permit, custody, verification, or standing and cannot bridge a later
+filesystem change.
+
 AG policy inputs follow the same product-creation rule. The canonical creation
 record binds the complete policy root and its stable idempotency key. Exact
 creation replay reopens the same campaign; changed canonical request bytes or a

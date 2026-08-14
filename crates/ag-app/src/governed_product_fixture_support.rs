@@ -16,6 +16,8 @@ use crate::governed_store::{CampaignStoreV1, CampaignTransitionKindV1};
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::Digest;
+use ring::rand::SystemRandom;
+use ring::signature::Ed25519KeyPair;
 use uuid::Uuid;
 
 // Far enough ahead of the development host clock that an adjacent Docket
@@ -184,6 +186,12 @@ fn dormant_docket_root(directory: &Path) -> GovernedDocketAdapterRootV1 {
     std::fs::create_dir_all(&state_directory).unwrap();
     let config = directory.join("dormant-docket-config.json");
     std::fs::write(&config, b"{}\n").unwrap();
+    let issuer_key = directory.join("dormant-docket-issuer-key.pkcs8");
+    let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+    std::fs::write(&issuer_key, key.as_ref()).unwrap();
+    let mut permissions = std::fs::metadata(&issuer_key).unwrap().permissions();
+    permissions.set_mode(0o600);
+    std::fs::set_permissions(&issuer_key, permissions).unwrap();
     let executable = Path::new("/bin/true");
     GovernedDocketAdapterRootV1 {
         schema: GOVERNED_DOCKET_ADAPTER_ROOT_SCHEMA_V1.to_owned(),
@@ -197,7 +205,7 @@ fn dormant_docket_root(directory: &Path) -> GovernedDocketAdapterRootV1 {
         checkpoint_verifier: None,
         issuer_principal: "qualification-fixture-not-human-authority".to_owned(),
         issuer_key_id: "dormant-not-used".to_owned(),
-        issuer_key: pinned(&config),
+        issuer_key: pinned(&issuer_key),
     }
 }
 

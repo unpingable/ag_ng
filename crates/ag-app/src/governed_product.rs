@@ -196,6 +196,19 @@ impl GovernedRepairVerifierRootV1 {
         self.catalog.validate()?;
         Ok(())
     }
+
+    /// Remeasures the exact verifier executable required by a disposition.
+    /// This is an availability observation only: it invokes no verifier and
+    /// constructs no verification or disposition authority.
+    fn verify_runtime_correspondence(&self) -> Result<(), CampaignEngineErrorV1> {
+        self.validate()?;
+        let executable = PinnedDeploymentFileV1 {
+            path: self.executable.clone(),
+            identity: self.executable_identity.clone(),
+        };
+        let _ = executable.verify_bytes(true)?;
+        Ok(())
+    }
 }
 
 /// Root-owned verifier catalog.  Caller artifacts cannot nominate acceptance
@@ -529,10 +542,10 @@ impl GovernedDocketAdapterRootV1 {
         Ok(())
     }
 
-    fn open_port(
-        &self,
-        signing_permit: Option<crate::governed_store::StoreIssuanceSigningPermitV1>,
-    ) -> Result<CommandDocketCustodyPortV1, CampaignEngineErrorV1> {
+    /// Remeasures every deployment coordinate needed to open the Docket
+    /// custody port. This check is non-authorizing: it creates neither a Store
+    /// signing permit nor an execution-custody value.
+    fn verify_runtime_correspondence(&self) -> Result<(), CampaignEngineErrorV1> {
         self.validate()?;
         let state = std::fs::symlink_metadata(&self.state_directory).map_err(|error| {
             CampaignEngineErrorV1::Canonical(format!(
@@ -553,6 +566,23 @@ impl GovernedDocketAdapterRootV1 {
         if let Some(file) = &self.checkpoint_verifier {
             let _ = file.verify_bytes(true)?;
         }
+        let key = self.issuer_key.verify_bytes(false)?;
+        let _ = AgIssuanceSignerV2::from_pkcs8(
+            self.issuer_principal.clone(),
+            self.issuer_key_id.clone(),
+            &key,
+        )
+        .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        Ok(())
+    }
+
+    fn open_port(
+        &self,
+        signing_permit: Option<crate::governed_store::StoreIssuanceSigningPermitV1>,
+    ) -> Result<CommandDocketCustodyPortV1, CampaignEngineErrorV1> {
+        self.verify_runtime_correspondence()?;
+        // Reread and reparse at the actual port-construction boundary. The
+        // preceding projection check is never inherited as live authority.
         let key = self.issuer_key.verify_bytes(false)?;
         let signer = AgIssuanceSignerV2::from_pkcs8(
             self.issuer_principal.clone(),
@@ -1539,6 +1569,22 @@ impl GovernedCampaignServiceV1 {
             halted.open_human_decision_request.clone_from(&open_request);
         }
         let campaign_artifacts = campaign_artifact_links(&store)?;
+        let docket = if self
+            .docket_root
+            .as_ref()
+            .is_some_and(|root| root.verify_runtime_correspondence().is_ok())
+        {
+            DocketDeploymentStateV1::RuntimeCurrent
+        } else {
+            DocketDeploymentStateV1::Unavailable
+        };
+        let verifier = match &self.verifier_root {
+            None => VerifierDeploymentStateV1::Absent,
+            Some(root) if root.verify_runtime_correspondence().is_ok() => {
+                VerifierDeploymentStateV1::RuntimeCurrent
+            }
+            Some(_) => VerifierDeploymentStateV1::Configured,
+        };
         Ok(CampaignStateViewV1 {
             schema: GOVERNED_CAMPAIGN_PRODUCT_SCHEMA_V1.to_owned(),
             allowed_transitions: allowed_transitions(
@@ -1555,8 +1601,8 @@ impl GovernedCampaignServiceV1 {
                     },
                     budget: current_view.budget,
                     residuals_empty: current_view.residuals.is_empty(),
-                    docket_available: self.docket_root.is_some(),
-                    verifier_available: self.verifier_root.is_some(),
+                    docket,
+                    verifier,
                 },
             ),
             current: current_view,
@@ -2760,13 +2806,26 @@ enum ProposalTimeStateV1 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DocketDeploymentStateV1 {
+    Unavailable,
+    RuntimeCurrent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerifierDeploymentStateV1 {
+    Absent,
+    Configured,
+    RuntimeCurrent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AllowedTransitionStateV1 {
     governed: GovernedDecisionStateV1,
     proposal: ProposalTimeStateV1,
     budget: LoopBudgetV1,
     residuals_empty: bool,
-    docket_available: bool,
-    verifier_available: bool,
+    docket: DocketDeploymentStateV1,
+    verifier: VerifierDeploymentStateV1,
 }
 
 fn governed_decision_state(
@@ -2800,6 +2859,7 @@ fn allowed_transitions(
             names.push(operation);
         }
     };
+    let docket_current = state.docket == DocketDeploymentStateV1::RuntimeCurrent;
     match pc {
         ProgramCounterV1::ObservationRequired => {
             allow(true, GovernedOperationV1::RecordProposal);
@@ -2835,7 +2895,7 @@ fn allowed_transitions(
         }
         ProgramCounterV1::AdmissiblePendingAuthorization => {
             allow(
-                state.proposal == ProposalTimeStateV1::Current && state.docket_available,
+                state.proposal == ProposalTimeStateV1::Current && docket_current,
                 GovernedOperationV1::Authorize,
             );
             allow(true, GovernedOperationV1::Halt);
@@ -2846,18 +2906,18 @@ fn allowed_transitions(
         }
         ProgramCounterV1::AuthorizationConsumed => {
             allow(
-                state.proposal == ProposalTimeStateV1::Current && state.docket_available,
+                state.proposal == ProposalTimeStateV1::Current && docket_current,
                 GovernedOperationV1::Dispatch,
             );
-            allow(state.docket_available, GovernedOperationV1::Recover);
+            allow(docket_current, GovernedOperationV1::Recover);
         }
         ProgramCounterV1::Dispatched => {
-            allow(state.docket_available, GovernedOperationV1::ReconcileDocket);
-            allow(state.docket_available, GovernedOperationV1::Recover);
+            allow(docket_current, GovernedOperationV1::ReconcileDocket);
+            allow(docket_current, GovernedOperationV1::Recover);
         }
         ProgramCounterV1::ReconciliationRequired => {
-            allow(state.docket_available, GovernedOperationV1::ReconcileDocket);
-            allow(state.docket_available, GovernedOperationV1::Recover);
+            allow(docket_current, GovernedOperationV1::ReconcileDocket);
+            allow(docket_current, GovernedOperationV1::Recover);
             allow(true, GovernedOperationV1::Halt);
             allow(
                 state.budget.escalation_available(),
@@ -2869,7 +2929,7 @@ fn allowed_transitions(
             // re-emits the already sealed result and the kernel requires byte
             // equality, so this never repeats executor mechanics or creates a
             // fresh transition.
-            allow(state.docket_available, GovernedOperationV1::ReconcileDocket);
+            allow(docket_current, GovernedOperationV1::ReconcileDocket);
             allow(true, GovernedOperationV1::OpenContinuation);
             allow(
                 state.budget.probe_available(),
@@ -2883,11 +2943,11 @@ fn allowed_transitions(
         }
         ProgramCounterV1::Halted => match state.governed {
             GovernedDecisionStateV1::AwaitingRequest => allow(
-                state.verifier_available,
+                state.verifier != VerifierDeploymentStateV1::Absent,
                 GovernedOperationV1::CreateDecisionRequest,
             ),
             GovernedDecisionStateV1::RequestOpen => allow(
-                state.verifier_available,
+                state.verifier == VerifierDeploymentStateV1::RuntimeCurrent,
                 GovernedOperationV1::SubmitDisposition,
             ),
             GovernedDecisionStateV1::NotGoverned | GovernedDecisionStateV1::Closed => {}
@@ -2922,8 +2982,8 @@ mod tests {
                 escalations_used: 0,
             },
             residuals_empty: true,
-            docket_available: true,
-            verifier_available: true,
+            docket: DocketDeploymentStateV1::RuntimeCurrent,
+            verifier: VerifierDeploymentStateV1::RuntimeCurrent,
         };
         let cases = [
             (

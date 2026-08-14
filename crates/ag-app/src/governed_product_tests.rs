@@ -8,6 +8,8 @@ use crate::governed_store::{CampaignStoreV1, CampaignTransitionKindV1};
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::Digest;
+use ring::rand::SystemRandom;
+use ring::signature::Ed25519KeyPair;
 use rusqlite::Connection;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -181,6 +183,14 @@ fn docket_root(directory: &Path, trust_config: &Path) -> GovernedDocketAdapterRo
     let state_directory = directory.join("docket-state");
     std::fs::create_dir_all(&state_directory).unwrap();
     let executable = Path::new("/bin/true");
+    let issuer_key = directory.join("qualification-fixture-issuance-key.pkcs8");
+    if !issuer_key.exists() {
+        let key = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        std::fs::write(&issuer_key, key.as_ref()).unwrap();
+        let mut permissions = std::fs::metadata(&issuer_key).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&issuer_key, permissions).unwrap();
+    }
     GovernedDocketAdapterRootV1 {
         schema: GOVERNED_DOCKET_ADAPTER_ROOT_SCHEMA_V1.to_owned(),
         adapter_label: "qualification-fixture-not-human-authority".to_owned(),
@@ -193,7 +203,7 @@ fn docket_root(directory: &Path, trust_config: &Path) -> GovernedDocketAdapterRo
         checkpoint_verifier: None,
         issuer_principal: "qualification-fixture-not-human-authority".to_owned(),
         issuer_key_id: "qualification-fixture-not-human-authority".to_owned(),
-        issuer_key: pinned(trust_config),
+        issuer_key: pinned(&issuer_key),
     }
 }
 
@@ -610,6 +620,83 @@ fn docket_adapter_root_is_genesis_pinned_and_substitution_refuses() {
 }
 
 #[test]
+fn docket_runtime_correspondence_controls_pre_spend_transition_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let trust = directory.path().join("docket-trust.json");
+    let exact_trust = b"{\"trust\":\"fixture\"}\n";
+    std::fs::write(&trust, exact_trust).unwrap();
+    let mut create = creation(None, directory.path());
+    create.governed_docket_adapter_root = Some(docket_root(directory.path(), &trust));
+    let mut service = GovernedCampaignServiceV1::create(&database, create).unwrap();
+    let initial = service.state().unwrap().current;
+    let proposal = ExactWorkProposalV1::new(
+        initial.key.campaign.clone(),
+        digest("subject"),
+        product_scope(),
+        "test.product/v1".to_owned(),
+        digest("work"),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
+        None,
+    )
+    .unwrap();
+    let proposed = service
+        .record_proposal(
+            initial.state_digest(),
+            ObservationRefV1::from_digest(digest("observation")),
+            proposal,
+            ProposalClassV1::Initial,
+        )
+        .unwrap();
+    let standing = service.require_standing(proposed.state_digest()).unwrap();
+    let admissible = service.decide(standing.state_digest()).unwrap();
+    assert!(
+        service
+            .state()
+            .unwrap()
+            .allowed_transitions
+            .contains(&GovernedOperationV1::Authorize)
+    );
+
+    std::fs::write(&trust, b"{\"trust\":\"substituted\"}\n").unwrap();
+    let unavailable = service.state().unwrap();
+    assert_eq!(unavailable.current.state_digest, admissible.state_digest);
+    assert!(
+        !unavailable
+            .allowed_transitions
+            .contains(&GovernedOperationV1::Authorize)
+    );
+    let error = service.authorize(admissible.state_digest()).unwrap_err();
+    assert_eq!(error.stable_code(), "operation_not_allowed");
+    assert_eq!(
+        CampaignStoreV1::open(&database)
+            .unwrap()
+            .replay()
+            .unwrap()
+            .ag_spends,
+        0,
+        "an availability observation creates neither spend nor signing authority"
+    );
+
+    std::fs::write(&trust, exact_trust).unwrap();
+    assert!(
+        service
+            .state()
+            .unwrap()
+            .allowed_transitions
+            .contains(&GovernedOperationV1::Authorize)
+    );
+    let authorized = service.authorize(admissible.state_digest()).unwrap();
+    assert_eq!(
+        authorized.program_counter,
+        ProgramCounterV1::AuthorizationConsumed
+    );
+}
+
+#[test]
 fn pre_spend_generic_halt_does_not_advertise_or_accept_a_governed_request() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("campaign.sqlite");
@@ -837,6 +924,51 @@ fn verifier_root_and_request_are_pinned_and_open_request_view_is_current() {
         nonce: HumanNonceRefV1::from_digest(digest("nonce")),
         expires_at_unix_ms: NOW + 40,
     };
+
+    let verifier_path = directory
+        .path()
+        .join("qualification-fixture-not-human-authority.py");
+    let exact_verifier = std::fs::read(&verifier_path).unwrap();
+    std::fs::write(
+        &verifier_path,
+        b"#!/bin/sh\nprintf '%s\\n' '{\"substituted\":true}'\n",
+    )
+    .unwrap();
+    assert!(
+        !service
+            .state()
+            .unwrap()
+            .allowed_transitions
+            .contains(&GovernedOperationV1::SubmitDisposition)
+    );
+    let before = service.state().unwrap().current;
+    let unavailable = service
+        .submit_governed_disposition(SubmitGovernedDispositionV1 {
+            expected_state_digest: halted.state_digest().clone(),
+            request: request_ref.clone(),
+            artifact: disposition.clone(),
+        })
+        .unwrap_err();
+    assert_eq!(unavailable.stable_code(), "operation_not_allowed");
+    assert_eq!(service.state().unwrap().current, before);
+    assert_eq!(
+        CampaignStoreV1::open(&database)
+            .unwrap()
+            .replay()
+            .unwrap()
+            .governed_repair_dispositions,
+        0,
+        "deployment availability cannot consume a request or mint a successor"
+    );
+
+    std::fs::write(&verifier_path, exact_verifier).unwrap();
+    assert!(
+        service
+            .state()
+            .unwrap()
+            .allowed_transitions
+            .contains(&GovernedOperationV1::SubmitDisposition)
+    );
     let submitted = service
         .submit_governed_disposition(SubmitGovernedDispositionV1 {
             expected_state_digest: halted.state_digest().clone(),

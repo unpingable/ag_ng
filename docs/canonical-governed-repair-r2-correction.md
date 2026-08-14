@@ -69,8 +69,13 @@ state/legality, cursor-stable lists/events, closed artifact inventory and
 retrieval, decision request, verified disposition, and successor progression.
 Allowed operations are a closed enum derived from the same state, expiry,
 budget, Docket-availability, and verifier-availability predicates enforced by
-the mutation methods.  Historical lifecycle links survive terminal-state
-replacement, including completion evidence and historical dispositions.
+the mutation methods.  Docket-backed operations are advertised only after a
+fresh non-authorizing measurement of every pinned adapter coordinate;
+disposition submission additionally requires fresh verifier-executable
+correspondence.  The consequence boundary rechecks the same correspondence,
+so projection never becomes inherited authority.  Historical lifecycle links
+survive terminal-state replacement, including completion evidence and
+historical dispositions.
 No Maude, Phosphor, Docket-client, NQ, or Gen4 implementation is changed by R2.
 
 ## Nonclaims
