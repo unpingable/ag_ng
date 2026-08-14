@@ -46,10 +46,11 @@ obligation book or an issuance.
 | Which parts are inherited migration structure? | None. This is formal-correspondence structure (the four-family crossing crosswalked to the calculus), not AG-classic residue. |
 | Which classic doctrine was dropped? | AG classic had three *live* residual mechanisms — non-discharge claims bound into receipt identity, policy obligations with enforcement records, and tolerability horizons. None survived the hard cut, deliberately and without replacement. |
 
-## Why the issuance reports `unrepresented`
+## Why the historical V1 issuance reported `unrepresented`
 
-Because it is true. `ag.docket-issuance:v1` carries a residual **status**, and this
-office emits `unrepresented` — *"this producer cannot express residual obligations"* —
+Because it was true. The now-retired `ag.docket-issuance:v1` carried a residual
+**status**, and its former producer emitted `unrepresented` — *"this producer cannot
+express residual obligations"* —
 rather than `none_recorded`, which would assert that the decision produced none. The
 consumer stores that status verbatim and the downstream testimony consumer renders it as
 a coverage limitation ("their absence is a producer limitation, not evidence"). The
@@ -57,7 +58,7 @@ seam is therefore **honest but not lossless** on residuals, and says so at every
 
 ## Ceremony versus useful substrate
 
-**Useful substrate, keep:** the type-level separation of the four families
+**Useful historical substrate, keep as evidence:** the type-level separation of the four families
 (non-interchangeable refs, per-family refusal types, lossless accumulation); the
 `ResidualStatusV1` three-way status on the wire; the `UpstreamResidualV1` shape already
 carried end to end (source system, obligation id, subject, kind, statement), which is

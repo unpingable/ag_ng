@@ -6,7 +6,6 @@ pub mod config;
 mod custody;
 pub mod derived;
 pub mod descriptor_path;
-pub mod docket_issuance;
 pub mod doctor;
 pub mod effect_executor_adapter;
 pub mod effectd;

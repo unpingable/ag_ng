@@ -24,6 +24,10 @@ const POST_SPEND: &[u8] =
 const ARCHITECTURE: &[u8] =
     include_bytes!("../../ag-campaign/tests/fixtures/nq-c1/architectural-readjudication.v1.json");
 
+fn current_state_digest(engine: &CampaignEngineV1) -> Digest {
+    engine.current().unwrap().state_digest().clone()
+}
+
 fn digest(label: &str) -> Digest {
     Digest::hash_domain(
         "ag-app.nq-c1-governed-repair-lifecycle-test/v1",
@@ -346,6 +350,7 @@ fn pre_spend_discovery_records_only_the_revised_exact_proposal() {
     let revised = proposal(revised_scope.clone(), "pre-spend-revised-proposal");
     let recorded = engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("pre-spend-observation")),
             revised,
             ProposalClassV1::Initial,
@@ -413,6 +418,7 @@ fn post_spend_checkpoint_approval_opens_exact_successor_and_rejection_opens_none
     let mut standing = CurrentStanding;
     engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("post-spend-observation")),
             proposed,
             ProposalClassV1::Initial,
@@ -420,9 +426,12 @@ fn post_spend_checkpoint_approval_opens_exact_successor_and_rejection_opens_none
             NOW + 1,
         )
         .unwrap();
-    engine.require_standing(NOW + 2).unwrap();
+    engine
+        .require_standing(&current_state_digest(&engine), NOW + 2)
+        .unwrap();
     engine
         .decide(
+            &current_state_digest(&engine),
             &mut observation,
             &mut standing,
             &work_catalog,
@@ -432,6 +441,7 @@ fn post_spend_checkpoint_approval_opens_exact_successor_and_rejection_opens_none
         .unwrap();
     engine
         .authorize(
+            &current_state_digest(&engine),
             &mut observation,
             &mut standing,
             &work_catalog,
@@ -441,6 +451,7 @@ fn post_spend_checkpoint_approval_opens_exact_successor_and_rejection_opens_none
         .unwrap();
     let halted = engine
         .dispatch(
+            &current_state_digest(&engine),
             &mut PostSpendFixtureDocket {
                 missing_path: next_missing_path.clone(),
             },
@@ -679,6 +690,7 @@ fn architectural_census_yields_readjudication_without_repair_authority() {
     let read_only_proposal = proposal(adjudication_scope.clone(), "read-only-scope-audit");
     engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("readjudication-observation")),
             read_only_proposal,
             ProposalClassV1::Initial,
@@ -688,6 +700,7 @@ fn architectural_census_yields_readjudication_without_repair_authority() {
         .unwrap();
     let halted = engine
         .halt(
+            &current_state_digest(&engine),
             HaltReasonRefV1::from_digest(digest("architectural-classification-required")),
             NOW + 2,
         )

@@ -1400,12 +1400,18 @@ pub struct SubmitGovernedDispositionResultV1 {
     pub replayed: bool,
 }
 
+#[cfg(test)]
+type AfterProjectionBeforeMutationHookV1 =
+    Box<dyn FnOnce(&Path, &Digest, GovernedOperationV1) + Send>;
+
 /// Reusable service around the one canonical engine/store state machine.
 pub struct GovernedCampaignServiceV1 {
     engine: CampaignEngineV1,
     policy_root: GovernedAgPolicyRootV1,
     verifier_root: Option<GovernedRepairVerifierRootV1>,
     docket_root: Option<GovernedDocketAdapterRootV1>,
+    #[cfg(test)]
+    after_projection_before_mutation: std::sync::Mutex<Option<AfterProjectionBeforeMutationHookV1>>,
 }
 
 impl GovernedCampaignServiceV1 {
@@ -1477,6 +1483,8 @@ impl GovernedCampaignServiceV1 {
             policy_root,
             verifier_root: root,
             docket_root,
+            #[cfg(test)]
+            after_projection_before_mutation: std::sync::Mutex::new(None),
         })
     }
 
@@ -1541,6 +1549,8 @@ impl GovernedCampaignServiceV1 {
             policy_root,
             verifier_root,
             docket_root,
+            #[cfg(test)]
+            after_projection_before_mutation: std::sync::Mutex::new(None),
         })
     }
 
@@ -1962,14 +1972,20 @@ impl GovernedCampaignServiceV1 {
         );
         match result {
             Ok(_) => self.committed_disposition_result(disposition, request_ref, false),
-            Err(CampaignEngineErrorV1::Store(CampaignStoreErrorV1::GovernedRepairReplay)) => {
+            Err(error)
+                if matches!(
+                    &error,
+                    CampaignEngineErrorV1::Store(
+                        CampaignStoreErrorV1::GovernedRepairReplay
+                            | CampaignStoreErrorV1::StalePredecessor { .. }
+                    )
+                ) =>
+            {
                 let store = CampaignStoreV1::open(self.engine.store_path())?;
                 if store.governed_repair_disposition(&disposition)? == Some(exact_artifact) {
                     self.committed_disposition_result(disposition, request_ref, true)
                 } else {
-                    Err(CampaignEngineErrorV1::Store(
-                        CampaignStoreErrorV1::GovernedRepairReplay,
-                    ))
+                    Err(error)
                 }
             }
             Err(error) => Err(error),
@@ -2016,6 +2032,7 @@ impl GovernedCampaignServiceV1 {
         let now_unix_ms = self.consequence_now()?;
         let mut resolver = self.policy_root.observation()?;
         let current = self.engine.record_proposal(
+            expected_state_digest,
             observation,
             proposal,
             class,
@@ -2037,7 +2054,9 @@ impl GovernedCampaignServiceV1 {
         self.require_allowed(expected_state_digest, GovernedOperationV1::ReconcileDocket)?;
         let now_unix_ms = self.consequence_now()?;
         let mut docket = self.docket_port(None)?;
-        let _ = self.engine.poll_docket(&mut docket, now_unix_ms)?;
+        let _ = self
+            .engine
+            .poll_docket(expected_state_digest, &mut docket, now_unix_ms)?;
         self.state()
     }
 
@@ -2054,7 +2073,11 @@ impl GovernedCampaignServiceV1 {
     ) -> Result<OccurrenceViewV1, CampaignEngineErrorV1> {
         self.require_allowed(expected_state_digest, GovernedOperationV1::OpenContinuation)?;
         let now_unix_ms = self.consequence_now()?;
-        OccurrenceViewV1::try_from(&self.engine.open_continuation(occurrence, now_unix_ms)?)
+        OccurrenceViewV1::try_from(&self.engine.open_continuation(
+            expected_state_digest,
+            occurrence,
+            now_unix_ms,
+        )?)
     }
 
     /// Halts from one exact authority-safe state under caller CAS.
@@ -2069,7 +2092,11 @@ impl GovernedCampaignServiceV1 {
     ) -> Result<OccurrenceViewV1, CampaignEngineErrorV1> {
         self.require_allowed(expected_state_digest, GovernedOperationV1::Halt)?;
         let now_unix_ms = self.consequence_now()?;
-        OccurrenceViewV1::try_from(&self.engine.halt(reason, now_unix_ms)?)
+        OccurrenceViewV1::try_from(
+            &self
+                .engine
+                .halt(expected_state_digest, reason, now_unix_ms)?,
+        )
     }
 
     /// Enters standing-required through the canonical engine under CAS.
@@ -2083,7 +2110,7 @@ impl GovernedCampaignServiceV1 {
     ) -> Result<OccurrenceViewV1, CampaignEngineErrorV1> {
         self.require_allowed(expected, GovernedOperationV1::RequireStanding)?;
         let now_unix_ms = self.consequence_now()?;
-        OccurrenceViewV1::try_from(&self.engine.require_standing(now_unix_ms)?)
+        OccurrenceViewV1::try_from(&self.engine.require_standing(expected, now_unix_ms)?)
     }
 
     /// Records one exact admissibility decision through the canonical engine.
@@ -2100,6 +2127,7 @@ impl GovernedCampaignServiceV1 {
         let catalog = self.policy_root.catalog()?;
         let controlling_review = self.policy_root.review()?;
         OccurrenceViewV1::try_from(&self.engine.decide(
+            expected,
             &mut observation,
             &mut standing,
             &catalog,
@@ -2125,6 +2153,7 @@ impl GovernedCampaignServiceV1 {
         let catalog = self.policy_root.catalog()?;
         let controlling_review = self.policy_root.review()?;
         OccurrenceViewV1::try_from(&self.engine.authorize(
+            expected,
             &mut observation,
             &mut standing,
             &catalog,
@@ -2145,17 +2174,21 @@ impl GovernedCampaignServiceV1 {
         self.require_allowed(expected, GovernedOperationV1::Dispatch)?;
         let now_unix_ms = self.consequence_now()?;
         let mut store = CampaignStoreV1::open(self.engine.store_path())?;
-        match store.issuance_signing_permit() {
+        match store.issuance_signing_permit(expected) {
             Ok(permit) => {
                 let mut docket = self.docket_port(Some(permit))?;
-                OccurrenceViewV1::try_from(&self.engine.dispatch(&mut docket, now_unix_ms)?)
+                OccurrenceViewV1::try_from(&self.engine.dispatch(
+                    expected,
+                    &mut docket,
+                    now_unix_ms,
+                )?)
             }
             Err(CampaignStoreErrorV1::IssuanceSigningAlreadyReserved) => {
                 // A prior process already crossed the one-use authentication
                 // boundary. Never mint or sign again: reconcile the exact
                 // issuance through Docket's replay-safe read boundary.
                 let mut docket = self.docket_port(None)?;
-                let _ = self.engine.recover(&mut docket, now_unix_ms)?;
+                let _ = self.engine.recover(expected, &mut docket, now_unix_ms)?;
                 OccurrenceViewV1::try_from(&self.engine.current()?)
             }
             Err(error) => Err(error.into()),
@@ -2174,7 +2207,7 @@ impl GovernedCampaignServiceV1 {
         self.require_allowed(expected, GovernedOperationV1::Recover)?;
         let now_unix_ms = self.consequence_now()?;
         let mut docket = self.docket_port(None)?;
-        let _ = self.engine.recover(&mut docket, now_unix_ms)?;
+        let _ = self.engine.recover(expected, &mut docket, now_unix_ms)?;
         self.state()
     }
 
@@ -2223,7 +2256,30 @@ impl GovernedCampaignServiceV1 {
                 operation.as_str()
             )));
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .after_projection_before_mutation
+            .lock()
+            .expect("test interleaving hook mutex must remain usable")
+            .take()
+        {
+            hook(self.engine.store_path(), expected, operation);
+        }
         Ok(())
+    }
+
+    /// Installs one test-only deterministic interleaving at the precise seam
+    /// after advisory product projection but before the lower-layer mutation.
+    /// The hook is consumed once and is absent from production builds.
+    #[cfg(test)]
+    pub(crate) fn set_after_projection_before_mutation_hook(
+        &self,
+        hook: impl FnOnce(&Path, &Digest, GovernedOperationV1) + Send + 'static,
+    ) {
+        *self
+            .after_projection_before_mutation
+            .lock()
+            .expect("test interleaving hook mutex must remain usable") = Some(Box::new(hook));
     }
 
     /// Records one read-only probe fact under CAS.
@@ -2237,7 +2293,7 @@ impl GovernedCampaignServiceV1 {
     ) -> Result<OccurrenceViewV1, CampaignEngineErrorV1> {
         self.require_allowed(expected, GovernedOperationV1::NoteProbe)?;
         let now_unix_ms = self.consequence_now()?;
-        OccurrenceViewV1::try_from(&self.engine.note_probe(now_unix_ms)?)
+        OccurrenceViewV1::try_from(&self.engine.note_probe(expected, now_unix_ms)?)
     }
 
     /// Records one escalation halt under CAS.
@@ -2252,7 +2308,7 @@ impl GovernedCampaignServiceV1 {
     ) -> Result<OccurrenceViewV1, CampaignEngineErrorV1> {
         self.require_allowed(expected, GovernedOperationV1::Escalate)?;
         let now_unix_ms = self.consequence_now()?;
-        OccurrenceViewV1::try_from(&self.engine.escalate(reason, now_unix_ms)?)
+        OccurrenceViewV1::try_from(&self.engine.escalate(expected, reason, now_unix_ms)?)
     }
 
     /// Completes one exact authority-empty occurrence under CAS.
@@ -2271,6 +2327,7 @@ impl GovernedCampaignServiceV1 {
         let now_unix_ms = self.consequence_now()?;
         let mut observation = self.policy_root.observation()?;
         OccurrenceViewV1::try_from(&self.engine.complete(
+            expected,
             observation_ref,
             subject,
             terminal_witness,
@@ -2292,7 +2349,8 @@ impl GovernedCampaignServiceV1 {
     ) -> Result<Digest, CampaignEngineErrorV1> {
         self.require_allowed(expected, GovernedOperationV1::RecordRefusal)?;
         let now_unix_ms = self.consequence_now()?;
-        self.engine.record_refusal(code, evidence, now_unix_ms)
+        self.engine
+            .record_refusal(expected, code, evidence, now_unix_ms)
     }
 }
 

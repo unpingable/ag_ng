@@ -13,6 +13,7 @@ use ring::signature::Ed25519KeyPair;
 use rusqlite::Connection;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use uuid::Uuid;
 
@@ -340,6 +341,7 @@ fn scope_decision_fixture(directory: &Path) -> ScopeDecisionFixture {
         GovernedLoopKernelV1::accept_docket_custody(&authorized_snapshot, custody.clone()).unwrap();
     store
         .commit(
+            authorized_snapshot.state_digest(),
             &authorized_snapshot,
             &dispatched,
             CampaignTransitionKindV1::DocketCustodyAccepted,
@@ -395,7 +397,13 @@ fn scope_decision_fixture(directory: &Path) -> ScopeDecisionFixture {
     )
     .unwrap();
     store
-        .commit_docket_governed_repair_halt(&dispatched, &halted_snapshot, &result, NOW)
+        .commit_docket_governed_repair_halt(
+            dispatched.state_digest(),
+            &dispatched,
+            &halted_snapshot,
+            &result,
+            NOW,
+        )
         .unwrap();
     drop(store);
     let mut service = GovernedCampaignServiceV1::open(&database).unwrap();
@@ -575,6 +583,275 @@ fn create_is_exact_idempotent_and_product_pages_are_bounded() {
 }
 
 #[test]
+fn product_caller_cas_survives_intervening_legal_commit_after_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut service =
+        GovernedCampaignServiceV1::create(&database, creation(Some(root()), directory.path()))
+            .unwrap();
+    let initial = service.state().unwrap().current;
+    let expected = initial.state_digest().clone();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let observed_hook_calls = Arc::clone(&hook_calls);
+    service.set_after_projection_before_mutation_hook(move |database, hook_expected, operation| {
+        assert_eq!(operation, GovernedOperationV1::RecordProposal);
+        assert_eq!(hook_expected, &expected);
+        observed_hook_calls.fetch_add(1, Ordering::SeqCst);
+        let mut competing = GovernedCampaignServiceV1::open(database).unwrap();
+        let advanced = competing.note_probe(hook_expected).unwrap();
+        assert_ne!(advanced.state_digest(), hook_expected);
+    });
+
+    let proposal = ExactWorkProposalV1::new(
+        initial.key().campaign.clone(),
+        digest("subject"),
+        product_scope(),
+        "test.product/v1".to_owned(),
+        digest("stale-work"),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
+        None,
+    )
+    .unwrap();
+    let error = service
+        .record_proposal(
+            initial.state_digest(),
+            ObservationRefV1::from_digest(digest("stale-observation")),
+            proposal,
+            ProposalClassV1::Initial,
+        )
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "stale_state");
+    assert_eq!(error.cas_expected_state(), Some(initial.state_digest()));
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+
+    let store = CampaignStoreV1::open(&database).unwrap();
+    let current = store.current().unwrap();
+    assert_eq!(
+        current.program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+    assert_eq!(current.state().meta().budget().probes_used, 1);
+    assert!(current.proposal().is_none());
+    assert_eq!(store.replay().unwrap().transitions, 2);
+}
+
+#[test]
+fn product_halt_caller_cas_survives_intervening_legal_commit_after_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut service =
+        GovernedCampaignServiceV1::create(&database, creation(Some(root()), directory.path()))
+            .unwrap();
+    let initial = service.state().unwrap().current;
+    let expected = initial.state_digest().clone();
+    service.set_after_projection_before_mutation_hook(move |database, hook_expected, operation| {
+        assert_eq!(operation, GovernedOperationV1::Halt);
+        assert_eq!(hook_expected, &expected);
+        let mut competing = GovernedCampaignServiceV1::open(database).unwrap();
+        competing.note_probe(hook_expected).unwrap();
+    });
+
+    let error = service
+        .halt(
+            initial.state_digest(),
+            HaltReasonRefV1::from_digest(digest("stale-halt")),
+        )
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "stale_state");
+    assert_eq!(error.cas_expected_state(), Some(initial.state_digest()));
+
+    let store = CampaignStoreV1::open(&database).unwrap();
+    let current = store.current().unwrap();
+    assert_eq!(
+        current.program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+    assert_eq!(current.state().meta().budget().probes_used, 1);
+    assert!(current.halted().is_none());
+    assert_eq!(store.replay().unwrap().transitions, 2);
+}
+
+#[test]
+fn product_refusal_caller_cas_survives_intervening_legal_commit_without_sidecar() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut service =
+        GovernedCampaignServiceV1::create(&database, creation(Some(root()), directory.path()))
+            .unwrap();
+    let initial = service.state().unwrap().current;
+    let expected = initial.state_digest().clone();
+    service.set_after_projection_before_mutation_hook(move |database, hook_expected, operation| {
+        assert_eq!(operation, GovernedOperationV1::RecordRefusal);
+        assert_eq!(hook_expected, &expected);
+        let mut competing = GovernedCampaignServiceV1::open(database).unwrap();
+        competing.note_probe(hook_expected).unwrap();
+    });
+
+    let error = service
+        .record_refusal(
+            initial.state_digest(),
+            RefusalCodeV1::RecoveryRequired,
+            Some(digest("stale-refusal-evidence")),
+        )
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "stale_state");
+    assert_eq!(error.cas_expected_state(), Some(initial.state_digest()));
+
+    let store = CampaignStoreV1::open(&database).unwrap();
+    let current = store.current().unwrap();
+    assert_eq!(current.state().meta().budget().probes_used, 1);
+    assert_eq!(store.replay().unwrap().transitions, 2);
+    let connection = Connection::open(&database).unwrap();
+    let refusals: u64 = connection
+        .query_row("SELECT COUNT(*) FROM refusals", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(refusals, 0, "stale no-state refusal writes no sidecar");
+}
+
+#[test]
+fn product_disposition_caller_cas_has_one_deterministic_successor_winner() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = scope_decision_fixture(directory.path());
+    let winning = approval(&fixture);
+    let winning_ref = winning.reference();
+    let losing = rejection(&fixture);
+    let losing_ref = losing.reference();
+    let expected = fixture.halted.state_digest().clone();
+    let request = fixture.request.reference();
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    service.set_after_projection_before_mutation_hook(move |database, hook_expected, operation| {
+        assert_eq!(operation, GovernedOperationV1::SubmitDisposition);
+        assert_eq!(hook_expected, &expected);
+        let mut competing = GovernedCampaignServiceV1::open(database).unwrap();
+        let result = competing
+            .submit_governed_disposition(SubmitGovernedDispositionV1 {
+                expected_state_digest: hook_expected.clone(),
+                request,
+                artifact: winning,
+            })
+            .unwrap();
+        assert!(!result.replayed);
+    });
+
+    let error = service
+        .submit_governed_disposition(SubmitGovernedDispositionV1 {
+            expected_state_digest: fixture.halted.state_digest().clone(),
+            request: fixture.request.reference(),
+            artifact: losing,
+        })
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "stale_state");
+    assert_eq!(
+        error.cas_expected_state(),
+        Some(fixture.halted.state_digest())
+    );
+
+    let store = CampaignStoreV1::open(&fixture.database).unwrap();
+    assert!(
+        store
+            .governed_repair_disposition(&winning_ref)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store.governed_repair_disposition(&losing_ref).unwrap(),
+        None
+    );
+    assert_eq!(store.list_occurrences(None, 10).unwrap().len(), 2);
+    let connection = Connection::open(&fixture.database).unwrap();
+    let dispositions: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM governed_repair_dispositions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let consumed_requests: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM human_decision_requests
+             WHERE consumed_by_decision_id IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dispositions, 1);
+    assert_eq!(consumed_requests, 1);
+}
+
+#[test]
+fn verified_disposition_cut_rechecks_caller_before_any_sidecar_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = scope_decision_fixture(directory.path());
+    let losing = rejection(&fixture);
+    let losing_ref = losing.reference();
+    let store = CampaignStoreV1::open(&fixture.database).unwrap();
+    let stale_verified = store
+        .verify_governed_repair_disposition(
+            fixture.halted.state_digest(),
+            &fixture.request.reference(),
+            losing,
+            NOW,
+        )
+        .unwrap();
+    drop(store);
+
+    let winning = approval(&fixture);
+    let winning_ref = winning.reference();
+    let mut competing = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    competing
+        .submit_governed_disposition(SubmitGovernedDispositionV1 {
+            expected_state_digest: fixture.halted.state_digest().clone(),
+            request: fixture.request.reference(),
+            artifact: winning,
+        })
+        .unwrap();
+    drop(competing);
+
+    let mut store = CampaignStoreV1::open(&fixture.database).unwrap();
+    let error = store
+        .commit_verified_governed_repair_disposition(stale_verified)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::governed_store::CampaignStoreErrorV1::StalePredecessor { .. }
+    ));
+    assert!(
+        store
+            .governed_repair_disposition(&winning_ref)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        store.governed_repair_disposition(&losing_ref).unwrap(),
+        None
+    );
+    assert_eq!(store.list_occurrences(None, 10).unwrap().len(), 2);
+    let connection = Connection::open(&fixture.database).unwrap();
+    let dispositions: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM governed_repair_dispositions",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let verification_identities: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM governed_repair_verification_identities",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dispositions, 1, "stale disposition creates no sidecar");
+    assert_eq!(
+        verification_identities, 2,
+        "only the winner's receipt and complete verification identity exist"
+    );
+}
+
+#[test]
 fn reusable_product_fixture_returns_real_successor_issuance_with_optional_diff() {
     for diff in [None, Some(digest("checkpoint-diff"))] {
         let directory = tempfile::tempdir().unwrap();
@@ -719,7 +996,13 @@ fn pre_spend_generic_halt_does_not_advertise_or_accept_a_governed_request() {
     )
     .unwrap();
     store
-        .commit(&current, &halted, CampaignTransitionKindV1::Halted, NOW)
+        .commit(
+            current.state_digest(),
+            &current,
+            &halted,
+            CampaignTransitionKindV1::Halted,
+            NOW,
+        )
         .unwrap();
     drop(store);
 

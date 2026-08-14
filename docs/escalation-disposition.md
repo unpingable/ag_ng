@@ -84,9 +84,9 @@ Escalation should only be built when all of these can be satisfied:
 4. **No weakening of the admitted path.** An escalation must not become a route by
    which a proposal is later admitted without the full decision path, the catalog, and
    the authority burn.
-5. **Wire consequences stated first.** `ag.docket-issuance:v1` carries admitted
-   decisions only. An escalation must not be squeezed into it; it needs its own record
-   or no wire form at all.
+5. **Wire consequences stated first.** The retired `ag.docket-issuance:v1` carried
+   admitted decisions only. Its historical shape grants no present route for an
+   escalation or any other consequence.
 
 ## Verdict
 

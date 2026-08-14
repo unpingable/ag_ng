@@ -8,6 +8,35 @@ use ag_campaign::governed::*;
 use ag_primitives::{Digest, JcsDocument};
 
 const NOW: u64 = 20_000;
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const FIRST_UNSAFE_INTEGER: u64 = 9_007_199_254_740_992;
+
+fn demote_safe_integer_schema_to_v4(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "DROP TRIGGER campaigns_safe_integer_insert_v1;
+             DROP TRIGGER campaigns_safe_integer_update_v1;
+             DROP TRIGGER occurrences_safe_integer_insert_v1;
+             DROP TRIGGER occurrences_safe_integer_update_v1;
+             DROP TRIGGER transitions_safe_integer_insert_v1;
+             DROP TRIGGER transitions_safe_integer_update_v1;
+             DROP TRIGGER human_dispositions_safe_integer_insert_v1;
+             DROP TRIGGER human_dispositions_safe_integer_update_v1;
+             DROP TRIGGER human_decision_requests_safe_integer_insert_v1;
+             DROP TRIGGER human_decision_requests_safe_integer_update_v1;
+             DROP TRIGGER governed_repair_dispositions_safe_integer_insert_v1;
+             DROP TRIGGER governed_repair_dispositions_safe_integer_update_v1;
+             DROP TRIGGER refusals_safe_integer_insert_v1;
+             DROP TRIGGER refusals_safe_integer_update_v1;
+             UPDATE store_identity
+                SET schema_name='ag-governed-loop-campaign-store/v4',
+                    schema_version=4,
+                    schema_digest='sha256:2a4aea8855baf0caa6e3c9ccd8b8f57159ec84f45d9a7b3379057c534b49869e'
+              WHERE singleton=1;
+             PRAGMA user_version=4;",
+        )
+        .unwrap();
+}
 
 fn digest(label: &str) -> Digest {
     Digest::hash_domain("ag-governed-store-test/v1", label.as_bytes())
@@ -537,7 +566,13 @@ fn halt_with_sealed_scope_result(
     )
     .unwrap();
     store
-        .commit_docket_governed_repair_halt(dispatched, &halted, result, NOW + 3)
+        .commit_docket_governed_repair_halt(
+            dispatched.state_digest(),
+            dispatched,
+            &halted,
+            result,
+            NOW + 3,
+        )
         .unwrap();
     halted
 }
@@ -575,6 +610,7 @@ fn commit_to_spent(
     .unwrap();
     store
         .commit(
+            start.state_digest(),
             start,
             &proposed,
             CampaignTransitionKindV1::ProposalRecorded,
@@ -584,6 +620,7 @@ fn commit_to_spent(
     let required = GovernedLoopKernelV1::require_standing(&proposed).unwrap();
     store
         .commit(
+            proposed.state_digest(),
             &proposed,
             &required,
             CampaignTransitionKindV1::StandingRequired,
@@ -601,6 +638,7 @@ fn commit_to_spent(
     .unwrap();
     store
         .commit(
+            required.state_digest(),
             &required,
             &admissible,
             CampaignTransitionKindV1::Admissible,
@@ -618,6 +656,7 @@ fn commit_to_spent(
     .unwrap();
     store
         .commit(
+            admissible.state_digest(),
             &admissible,
             &spent,
             CampaignTransitionKindV1::AuthorizationConsumed,
@@ -635,6 +674,7 @@ fn commit_to_dispatched(
     let dispatched = GovernedLoopKernelV1::accept_docket_custody(&spent, custody(&spent)).unwrap();
     store
         .commit(
+            spent.state_digest(),
             &spent,
             &dispatched,
             CampaignTransitionKindV1::DocketCustodyAccepted,
@@ -653,6 +693,7 @@ fn commit_normal_path(
         GovernedLoopKernelV1::record_settlement(&dispatched, settlement(&dispatched)).unwrap();
     store
         .commit(
+            dispatched.state_digest(),
             &dispatched,
             &settled,
             CampaignTransitionKindV1::SettlementRecorded,
@@ -730,6 +771,7 @@ fn rejected_r1_settlement_bytes_remain_historically_replayable() {
     let settled = GovernedLoopKernelV1::record_settlement(&dispatched, legacy.clone()).unwrap();
     store
         .commit(
+            dispatched.state_digest(),
             &dispatched,
             &settled,
             CampaignTransitionKindV1::SettlementRecorded,
@@ -753,36 +795,174 @@ fn signing_permit_is_store_minted_one_use_and_only_at_the_spent_cut() {
     let database = directory.path().join("campaign.sqlite");
     let start = initial();
     let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
-    assert!(store.issuance_signing_permit().is_err());
+    assert!(store.issuance_signing_permit(start.state_digest()).is_err());
 
     let spent = commit_to_spent(&mut store, &start);
     let expected = spent.issuance().unwrap().clone();
-    let permit = store.issuance_signing_permit().unwrap();
+    let permit = store.issuance_signing_permit(spent.state_digest()).unwrap();
     assert_eq!(permit.into_issuance(), expected);
     assert!(matches!(
-        store.issuance_signing_permit(),
+        store.issuance_signing_permit(spent.state_digest()),
         Err(CampaignStoreErrorV1::IssuanceSigningAlreadyReserved)
     ));
     drop(store);
     let mut store = CampaignStoreV1::open(&database).unwrap();
     assert!(matches!(
-        store.issuance_signing_permit(),
+        store.issuance_signing_permit(spent.state_digest()),
         Err(CampaignStoreErrorV1::IssuanceSigningAlreadyReserved)
     ));
 
     let dispatched = GovernedLoopKernelV1::accept_docket_custody(&spent, custody(&spent)).unwrap();
     store
         .commit(
+            spent.state_digest(),
             &spent,
             &dispatched,
             CampaignTransitionKindV1::DocketCustodyAccepted,
             NOW + 1,
         )
         .unwrap();
-    assert!(store.issuance_signing_permit().is_err());
+    assert!(
+        store
+            .issuance_signing_permit(dispatched.state_digest())
+            .is_err()
+    );
     drop(store);
     let mut reopened = CampaignStoreV1::open(&database).unwrap();
-    assert!(reopened.issuance_signing_permit().is_err());
+    assert!(
+        reopened
+            .issuance_signing_permit(dispatched.state_digest())
+            .is_err()
+    );
+}
+
+#[test]
+fn transition_transaction_refuses_stale_caller_even_with_authoritative_predecessor() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let probed = GovernedLoopKernelV1::note_probe(&start).unwrap();
+    store
+        .commit(
+            start.state_digest(),
+            &start,
+            &probed,
+            CampaignTransitionKindV1::ProbeNoted,
+            NOW + 1,
+        )
+        .unwrap();
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &probed,
+        ObservationRefV1::from_digest(digest("caller-cas-observation")),
+        proposal("caller-cas-work"),
+        ProposalClassV1::Initial,
+        &mut Observation::new("caller-cas-preconditions"),
+        NOW + 2,
+    )
+    .unwrap();
+
+    let error = store
+        .commit(
+            start.state_digest(),
+            &probed,
+            &proposed,
+            CampaignTransitionKindV1::ProposalRecorded,
+            NOW + 2,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CampaignStoreErrorV1::StalePredecessor {
+            expected,
+            authoritative,
+        } if expected == *start.state_digest() && authoritative == *probed.state_digest()
+    ));
+    assert_eq!(store.current().unwrap(), probed);
+    assert_eq!(store.replay().unwrap().transitions, 2);
+}
+
+#[test]
+fn signing_permit_transaction_refuses_stale_caller_without_reservation() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut stale_store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let spent = commit_to_spent(&mut stale_store, &start);
+    let mut competing_store = CampaignStoreV1::open(&database).unwrap();
+    let dispatched = GovernedLoopKernelV1::accept_docket_custody(&spent, custody(&spent)).unwrap();
+    competing_store
+        .commit(
+            spent.state_digest(),
+            &spent,
+            &dispatched,
+            CampaignTransitionKindV1::DocketCustodyAccepted,
+            NOW + 1,
+        )
+        .unwrap();
+
+    let Err(error) = stale_store.issuance_signing_permit(spent.state_digest()) else {
+        panic!("stale caller must not mint a signing permit")
+    };
+    assert!(matches!(
+        error,
+        CampaignStoreErrorV1::StalePredecessor {
+            expected,
+            authoritative,
+        } if expected == *spent.state_digest() && authoritative == *dispatched.state_digest()
+    ));
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let reservations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM issuance_signing_reservations",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reservations, 0);
+    assert_eq!(stale_store.current().unwrap(), dispatched);
+}
+
+#[test]
+fn refusal_transaction_refuses_stale_caller_without_sidecar_write() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut stale_store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let mut competing_store = CampaignStoreV1::open(&database).unwrap();
+    let probed = GovernedLoopKernelV1::note_probe(&start).unwrap();
+    competing_store
+        .commit(
+            start.state_digest(),
+            &start,
+            &probed,
+            CampaignTransitionKindV1::ProbeNoted,
+            NOW + 1,
+        )
+        .unwrap();
+    let refusal = RefusalOutcomeV1 {
+        key: probed.key().clone(),
+        at_state_digest: probed.state_digest().clone(),
+        code: RefusalCodeV1::RecoveryRequired,
+        evidence: Some(digest("stale-refusal-evidence")),
+    };
+
+    let error = stale_store
+        .record_refusal(start.state_digest(), &refusal, NOW + 2)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CampaignStoreErrorV1::StalePredecessor {
+            expected,
+            authoritative,
+        } if expected == *start.state_digest() && authoritative == *probed.state_digest()
+    ));
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let refusals: i64 = connection
+        .query_row("SELECT COUNT(*) FROM refusals", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(refusals, 0);
+    assert_eq!(stale_store.current().unwrap(), probed);
 }
 
 #[cfg(unix)]
@@ -817,7 +997,9 @@ fn every_direct_table_artifact_refuses_canonical_row_byte_substitution() {
         code: RefusalCodeV1::RecoveryRequired,
         evidence: Some(digest("refusal-evidence")),
     };
-    let refusal_identity = store.record_refusal(&refusal, NOW + 3).unwrap();
+    let refusal_identity = store
+        .record_refusal(settled.state_digest(), &refusal, NOW + 3)
+        .unwrap();
 
     for case in [
         DirectRowSubstitution {
@@ -919,7 +1101,13 @@ fn complete_proposal_and_docket_result_artifacts_survive_exact_restart_lookup() 
     .unwrap();
     assert!(
         store
-            .commit_docket_governed_repair_halt(&dispatched, &exact_halt, &altered_result, NOW + 3,)
+            .commit_docket_governed_repair_halt(
+                dispatched.state_digest(),
+                &dispatched,
+                &exact_halt,
+                &altered_result,
+                NOW + 3,
+            )
             .is_err(),
         "a nested requested-delta substitution must fail before durable halt"
     );
@@ -986,6 +1174,7 @@ fn docket_issuance_refusal_is_durable_exact_replayable_and_residual_bearing() {
     assert!(
         store
             .commit_docket_issuance_refusal(
+                spent.state_digest(),
                 &spent,
                 &halted,
                 &refusal,
@@ -999,14 +1188,20 @@ fn docket_issuance_refusal_is_durable_exact_replayable_and_residual_bearing() {
     substituted.evidence = digest("substituted-standing-evidence");
     assert!(
         store
-            .commit_docket_issuance_refusal(&spent, &halted, &substituted, NOW + 1)
+            .commit_docket_issuance_refusal(
+                spent.state_digest(),
+                &spent,
+                &halted,
+                &substituted,
+                NOW + 1,
+            )
             .is_err()
     );
     assert_eq!(store.current().unwrap(), spent);
     assert_eq!(store.replay().unwrap().ag_spends, 1);
 
     store
-        .commit_docket_issuance_refusal(&spent, &halted, &refusal, NOW + 1)
+        .commit_docket_issuance_refusal(spent.state_digest(), &spent, &halted, &refusal, NOW + 1)
         .unwrap();
     assert_eq!(store.current().unwrap(), halted);
     assert_eq!(
@@ -1379,6 +1574,7 @@ fn stale_writer_and_duplicate_successor_refuse_without_partial_accounting() {
             let mut store = CampaignStoreV1::open(&database).unwrap();
             barrier.wait();
             store.commit(
+                expected.state_digest(),
                 &expected,
                 &successor,
                 CampaignTransitionKindV1::ProposalRecorded,
@@ -1399,6 +1595,7 @@ fn stale_writer_and_duplicate_successor_refuse_without_partial_accounting() {
     assert!(authoritative == first || authoritative.state_digest() != start.state_digest());
     assert!(matches!(
         store.commit(
+            start.state_digest(),
             &start,
             &first,
             CampaignTransitionKindV1::ProposalRecorded,
@@ -1508,6 +1705,7 @@ fn unrelated_sidecar_loss_cannot_revive_a_spent_occurrence() {
     assert!(
         reopened
             .commit(
+                start.state_digest(),
                 &start,
                 &settled,
                 CampaignTransitionKindV1::SettlementRecorded,
@@ -1563,6 +1761,337 @@ fn restart_refuses_tampered_spend_attempt_and_settlement_accounting() {
             CampaignStoreV1::open(&database).is_err(),
             "{label} accounting tamper must fail closed on restart"
         );
+    }
+}
+
+#[test]
+fn safe_integer_boundary_is_inclusive_and_unsafe_api_values_are_fallible() {
+    for (label, unsafe_time) in [
+        ("first-unsafe", FIRST_UNSAFE_INTEGER),
+        ("u64-max", u64::MAX),
+    ] {
+        let unsafe_directory = tempfile::tempdir().unwrap();
+        let unsafe_database = unsafe_directory
+            .path()
+            .join(format!("{label}-genesis.sqlite"));
+        let unsafe_start = initial();
+        let unsafe_create = std::panic::catch_unwind(|| {
+            CampaignStoreV1::create(&unsafe_database, &unsafe_start, unsafe_time)
+        });
+        assert!(
+            matches!(unsafe_create, Ok(Err(_))),
+            "{label} event time must return an error rather than panic while hashing"
+        );
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("safe-boundary.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, MAX_SAFE_INTEGER - 1).unwrap();
+    let probed = GovernedLoopKernelV1::note_probe(&start).unwrap();
+    store
+        .commit(
+            start.state_digest(),
+            &start,
+            &probed,
+            CampaignTransitionKindV1::ProbeNoted,
+            MAX_SAFE_INTEGER,
+        )
+        .unwrap();
+    assert!(store.list_events(MAX_SAFE_INTEGER, 1).unwrap().is_empty());
+    assert!(store.list_events(FIRST_UNSAFE_INTEGER, 1).is_err());
+
+    let refusal = RefusalOutcomeV1 {
+        key: probed.key().clone(),
+        at_state_digest: probed.state_digest().clone(),
+        code: RefusalCodeV1::RecoveryRequired,
+        evidence: None,
+    };
+    assert!(
+        store
+            .record_refusal(probed.state_digest(), &refusal, FIRST_UNSAFE_INTEGER)
+            .is_err()
+    );
+    store
+        .record_refusal(probed.state_digest(), &refusal, MAX_SAFE_INTEGER)
+        .unwrap();
+    assert_eq!(store.last_recorded_at_unix_ms().unwrap(), MAX_SAFE_INTEGER);
+    assert_eq!(
+        store
+            .campaign_state_read(MAX_SAFE_INTEGER)
+            .unwrap()
+            .last_recorded_at_unix_ms,
+        MAX_SAFE_INTEGER
+    );
+
+    let transition_directory = tempfile::tempdir().unwrap();
+    let transition_database = transition_directory.path().join("unsafe-transition.sqlite");
+    let transition_start = initial();
+    let mut transition_store =
+        CampaignStoreV1::create(&transition_database, &transition_start, NOW).unwrap();
+    let transition_successor = GovernedLoopKernelV1::note_probe(&transition_start).unwrap();
+    let unsafe_commit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        transition_store.commit(
+            transition_start.state_digest(),
+            &transition_start,
+            &transition_successor,
+            CampaignTransitionKindV1::ProbeNoted,
+            FIRST_UNSAFE_INTEGER,
+        )
+    }));
+    assert!(matches!(unsafe_commit, Ok(Err(_))));
+    assert_eq!(transition_store.current().unwrap(), transition_start);
+}
+
+#[test]
+fn v4_safe_integer_migration_rolls_back_then_cleanly_retries_exact_sequence_counterexample() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    drop(CampaignStoreV1::create(&database, &start, NOW).unwrap());
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    demote_safe_integer_schema_to_v4(&connection);
+    connection
+        .execute("UPDATE transitions SET sequence=9007199254740992", [])
+        .unwrap();
+    drop(connection);
+
+    assert!(
+        CampaignStoreV1::open(&database).is_err(),
+        "the exact first unsafe SQL sequence must refuse V5 migration"
+    );
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let identity: (String, u32) = connection
+        .query_row(
+            "SELECT schema_name,schema_version FROM store_identity WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(version, 4, "failed migration must roll back user_version");
+    assert_eq!(
+        identity,
+        ("ag-governed-loop-campaign-store/v4".to_owned(), 4),
+        "failed migration must retain the exact V4 identity"
+    );
+    connection
+        .execute("UPDATE transitions SET sequence=1", [])
+        .unwrap();
+    drop(connection);
+
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(reopened.replay().unwrap().transitions, 1);
+    drop(reopened);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    assert!(
+        connection
+            .execute("UPDATE transitions SET sequence=9007199254740992", [],)
+            .is_err(),
+        "the migrated additive trigger must reject the same counterexample"
+    );
+}
+
+#[test]
+fn replay_refuses_safe_but_discontinuous_transition_sequence() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    drop(CampaignStoreV1::create(&database, &start, NOW).unwrap());
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE transitions SET sequence=2;
+             UPDATE sqlite_sequence SET seq=2 WHERE name='transitions';",
+        )
+        .unwrap();
+    drop(connection);
+    assert!(CampaignStoreV1::open(&database).is_err());
+}
+
+#[test]
+fn replay_strictly_refuses_unsafe_timestamp_inside_canonical_snapshot_blob() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    commit_to_spent(&mut store, &start);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let original: Vec<u8> = connection
+        .query_row(
+            "SELECT successor_snapshot_jcs FROM transitions
+             WHERE transition_kind='proposal_recorded'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let original = String::from_utf8(original).unwrap();
+    let changed = original.replacen(
+        &format!("\"expires_at_unix_ms\":{}", NOW + 1_000),
+        "\"expires_at_unix_ms\":9007199254740992",
+        1,
+    );
+    assert_ne!(
+        changed, original,
+        "fixture must contain the proposal expiry"
+    );
+    connection
+        .execute(
+            "UPDATE transitions SET successor_snapshot_jcs=?1
+             WHERE transition_kind='proposal_recorded'",
+            rusqlite::params![changed.as_bytes()],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(CampaignStoreV1::open(&database).is_err());
+}
+
+#[test]
+fn v4_migration_and_replay_validate_refusal_timestamp_column() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let refusal = RefusalOutcomeV1 {
+        key: start.key().clone(),
+        at_state_digest: start.state_digest().clone(),
+        code: RefusalCodeV1::RecoveryRequired,
+        evidence: None,
+    };
+    store
+        .record_refusal(start.state_digest(), &refusal, NOW + 1)
+        .unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    demote_safe_integer_schema_to_v4(&connection);
+    connection
+        .execute(
+            "UPDATE refusals SET recorded_at_unix_ms=9007199254740992",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(CampaignStoreV1::open(&database).is_err());
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE refusals SET recorded_at_unix_ms=?1",
+            rusqlite::params![i64::try_from(NOW + 1).unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(CampaignStoreV1::open(&database).is_ok());
+}
+
+#[test]
+fn v4_migration_refuses_unsafe_transition_event_timestamp_and_rolls_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    drop(CampaignStoreV1::create(&database, &start, NOW).unwrap());
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    demote_safe_integer_schema_to_v4(&connection);
+    connection
+        .execute(
+            "UPDATE transitions SET recorded_at_unix_ms=9007199254740992",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(CampaignStoreV1::open(&database).is_err());
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 4, "unsafe event time rolls migration back");
+}
+
+#[test]
+fn v4_migration_refuses_every_historical_sidecar_timestamp_column() {
+    for table in [
+        "human_dispositions",
+        "human_decision_requests",
+        "governed_repair_dispositions",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join(format!("{table}.sqlite"));
+        let start = initial();
+        drop(CampaignStoreV1::create(&database, &start, NOW).unwrap());
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        demote_safe_integer_schema_to_v4(&connection);
+        let campaign = start.key().campaign.as_str();
+        let occurrence = start.key().occurrence.to_string();
+        match table {
+            "human_dispositions" => {
+                connection
+                    .execute(
+                        "INSERT INTO human_dispositions
+                         (decision_id,nonce,campaign_id,occurrence_id,
+                          halted_state_digest,verification_ref,artifact_jcs,
+                          consumed_at_unix_ms)
+                         VALUES ('sha256:decision','sha256:nonce',?1,?2,?3,
+                                 'sha256:verification',x'7b7d',9007199254740992)",
+                        rusqlite::params![campaign, occurrence, start.state_digest().as_str()],
+                    )
+                    .unwrap();
+            }
+            "human_decision_requests" => {
+                connection
+                    .execute(
+                        "INSERT INTO human_decision_requests
+                         (request_id,idempotency_key,campaign_id,occurrence_id,
+                          halted_state_digest,request_jcs,created_at_unix_ms)
+                         VALUES ('sha256:request','sha256:idempotency',?1,?2,?3,
+                                 x'7b7d',9007199254740992)",
+                        rusqlite::params![campaign, occurrence, start.state_digest().as_str()],
+                    )
+                    .unwrap();
+            }
+            "governed_repair_dispositions" => {
+                connection
+                    .execute(
+                        "INSERT INTO human_decision_requests
+                         (request_id,idempotency_key,campaign_id,occurrence_id,
+                          halted_state_digest,request_jcs,created_at_unix_ms)
+                         VALUES ('sha256:request','sha256:idempotency',?1,?2,?3,x'7b7d',1)",
+                        rusqlite::params![campaign, occurrence, start.state_digest().as_str()],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO governed_repair_dispositions
+                         (decision_id,nonce,request_id,campaign_id,occurrence_id,
+                          halted_state_digest,disposition_id,verification_receipt_ref,
+                          verification_record_id,verification_jcs,artifact_jcs,
+                          consumed_at_unix_ms)
+                         VALUES ('sha256:decision','sha256:nonce','sha256:request',?1,?2,?3,
+                                 'sha256:disposition','sha256:receipt','sha256:record',
+                                 x'7b7d',x'7b7d',9007199254740992)",
+                        rusqlite::params![campaign, occurrence, start.state_digest().as_str()],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(connection);
+
+        assert!(
+            CampaignStoreV1::open(&database).is_err(),
+            "unsafe historical timestamp in {table} must refuse migration"
+        );
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4, "{table} refusal must roll migration back");
     }
 }
 

@@ -7,6 +7,26 @@ protocol, store, session, and effect components under construction, plus a
 reviewable service/package skeleton. A release tag, package, successful unit
 start, or passing crate test does not override the gates below.
 
+## Canonical governed-repair contract gate
+
+AG owns the versioned governed-repair producer contract and Docket consumes
+it. Every governed-repair development release or conformance run must execute
+the offline cross-repository gate against the exact Docket checkout under
+review:
+
+```sh
+python3 scripts/run_governed_repair_r3_contract_gate.py \
+  --docket-root /path/to/docket/runtime
+```
+
+The gate first verifies the pinned corpus identity and byte correspondence,
+then runs the actual AG producer and Docket consumer serializer/validator
+tests. It also checks a closed test census so deleting or renaming the
+behavioral checks cannot turn an empty Cargo test filter into a false pass. A
+copied-corpus match alone is not a pass. Any step exits nonzero on drift.
+`--ag-target-dir` and `--docket-target-dir` may name external build roots;
+they do not alter the contract or its qualification status.
+
 ## Closed Promotion Loop v1 qualification
 
 The fixed qualification baseline is commit `10b7aa9`. The current environment

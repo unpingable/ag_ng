@@ -334,6 +334,7 @@ pub fn authorized_successor_issuance_with_docket(
             GovernedLoopKernelV1::accept_docket_custody(&current, custody.clone()).unwrap();
         store
             .commit(
+                current.state_digest(),
                 &current,
                 &dispatched,
                 CampaignTransitionKindV1::DocketCustodyAccepted,
@@ -387,7 +388,13 @@ pub fn authorized_successor_issuance_with_docket(
         )
         .unwrap();
         store
-            .commit_docket_governed_repair_halt(&dispatched, &halted, &result, NOW)
+            .commit_docket_governed_repair_halt(
+                dispatched.state_digest(),
+                &dispatched,
+                &halted,
+                &result,
+                NOW,
+            )
             .unwrap();
         (OccurrenceViewV1::try_from(&halted).unwrap(), checkpoint)
     };

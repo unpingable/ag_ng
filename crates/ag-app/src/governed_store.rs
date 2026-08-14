@@ -61,11 +61,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current governed-loop campaign-store schema version.
-pub const CAMPAIGN_STORE_SCHEMA_VERSION: u32 = 4;
+pub const CAMPAIGN_STORE_SCHEMA_VERSION: u32 = 5;
 /// `SQLite` application identifier for this exact store family (`AGC1`).
 pub const CAMPAIGN_STORE_APPLICATION_ID: u32 = 0x4147_4331;
 /// Human-readable exact store schema identity.
-pub const CAMPAIGN_STORE_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v4";
+pub const CAMPAIGN_STORE_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v5";
 
 const EVENT_DOMAIN_V1: &str = "ag.governed-loop.store-event/v1";
 const EVENT_GENESIS_DOMAIN_V1: &str = "ag.governed-loop.store-event-genesis/v1";
@@ -79,6 +79,11 @@ const CAMPAIGN_STORE_V2_SCHEMA_DIGEST: &str =
 const CAMPAIGN_STORE_V3_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v3";
 const CAMPAIGN_STORE_V3_SCHEMA_DIGEST: &str =
     "sha256:20a0fa1300ffbf0531a892509f0ed22169253ffab277259740cae899fe5948dd";
+const CAMPAIGN_STORE_V4_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v4";
+const CAMPAIGN_STORE_V4_SCHEMA_DIGEST: &str =
+    "sha256:2a4aea8855baf0caa6e3c9ccd8b8f57159ec84f45d9a7b3379057c534b49869e";
+const MAX_DURABLE_SAFE_INTEGER_V1: u64 = ag_primitives::MAX_JCS_SAFE_INTEGER;
+const MAX_DURABLE_SAFE_INTEGER_SQL_V1: i64 = 9_007_199_254_740_991;
 const GOVERNED_REPAIR_VERIFIER_ROOT_SCHEMA_V1: &str =
     "ag.governed-loop.governed-repair-verifier-root/v1";
 const GOVERNED_REPAIR_VERIFIER_CATALOG_SCHEMA_V1: &str =
@@ -312,6 +317,108 @@ CREATE TABLE refusals (
     FOREIGN KEY (campaign_id, occurrence_id)
         REFERENCES occurrences(campaign_id, occurrence_id)
 ) STRICT;
+";
+
+// SQLite cannot add CHECK constraints to existing tables without rebuilding
+// them.  These triggers are therefore the additive V5 enforcement layer for
+// every durable counter or timestamp that is projected into strict JCS.  Read
+// and replay paths independently validate the same bound so a pre-V5 hostile
+// row cannot acquire the V5 identity merely by reopening the Store.
+const V5_SAFE_INTEGER_SCHEMA_SQL: &str = r"
+CREATE TRIGGER IF NOT EXISTS campaigns_safe_integer_insert_v1
+BEFORE INSERT ON campaigns
+WHEN NEW.revision NOT BETWEEN 1 AND 9007199254740991
+  OR NEW.event_count NOT BETWEEN 1 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'campaign counter outside JCS safe-integer range');
+END;
+CREATE TRIGGER IF NOT EXISTS campaigns_safe_integer_update_v1
+BEFORE UPDATE OF revision, event_count ON campaigns
+WHEN NEW.revision NOT BETWEEN 1 AND 9007199254740991
+  OR NEW.event_count NOT BETWEEN 1 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'campaign counter outside JCS safe-integer range');
+END;
+
+CREATE TRIGGER IF NOT EXISTS occurrences_safe_integer_insert_v1
+BEFORE INSERT ON occurrences
+WHEN NEW.revision NOT BETWEEN 1 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'occurrence revision outside JCS safe-integer range');
+END;
+CREATE TRIGGER IF NOT EXISTS occurrences_safe_integer_update_v1
+BEFORE UPDATE OF revision ON occurrences
+WHEN NEW.revision NOT BETWEEN 1 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'occurrence revision outside JCS safe-integer range');
+END;
+
+CREATE TRIGGER IF NOT EXISTS transitions_safe_integer_insert_v1
+AFTER INSERT ON transitions
+WHEN NEW.sequence NOT BETWEEN 1 AND 9007199254740991
+  OR NEW.recorded_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'transition integer outside JCS safe-integer range');
+END;
+CREATE TRIGGER IF NOT EXISTS transitions_safe_integer_update_v1
+BEFORE UPDATE OF sequence, recorded_at_unix_ms ON transitions
+WHEN NEW.sequence NOT BETWEEN 1 AND 9007199254740991
+  OR NEW.recorded_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'transition integer outside JCS safe-integer range');
+END;
+
+CREATE TRIGGER IF NOT EXISTS human_dispositions_safe_integer_insert_v1
+BEFORE INSERT ON human_dispositions
+WHEN NEW.consumed_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'human disposition time outside JCS safe-integer range');
+END;
+CREATE TRIGGER IF NOT EXISTS human_dispositions_safe_integer_update_v1
+BEFORE UPDATE OF consumed_at_unix_ms ON human_dispositions
+WHEN NEW.consumed_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'human disposition time outside JCS safe-integer range');
+END;
+
+CREATE TRIGGER IF NOT EXISTS human_decision_requests_safe_integer_insert_v1
+BEFORE INSERT ON human_decision_requests
+WHEN NEW.created_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'human decision request time outside JCS safe-integer range');
+END;
+CREATE TRIGGER IF NOT EXISTS human_decision_requests_safe_integer_update_v1
+BEFORE UPDATE OF created_at_unix_ms ON human_decision_requests
+WHEN NEW.created_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'human decision request time outside JCS safe-integer range');
+END;
+
+CREATE TRIGGER IF NOT EXISTS governed_repair_dispositions_safe_integer_insert_v1
+BEFORE INSERT ON governed_repair_dispositions
+WHEN NEW.consumed_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'governed disposition time outside JCS safe-integer range');
+END;
+CREATE TRIGGER IF NOT EXISTS governed_repair_dispositions_safe_integer_update_v1
+BEFORE UPDATE OF consumed_at_unix_ms ON governed_repair_dispositions
+WHEN NEW.consumed_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'governed disposition time outside JCS safe-integer range');
+END;
+
+CREATE TRIGGER IF NOT EXISTS refusals_safe_integer_insert_v1
+BEFORE INSERT ON refusals
+WHEN NEW.recorded_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'refusal time outside JCS safe-integer range');
+END;
+CREATE TRIGGER IF NOT EXISTS refusals_safe_integer_update_v1
+BEFORE UPDATE OF recorded_at_unix_ms ON refusals
+WHEN NEW.recorded_at_unix_ms NOT BETWEEN 0 AND 9007199254740991
+BEGIN
+    SELECT RAISE(ABORT, 'refusal time outside JCS safe-integer range');
+END;
 ";
 
 /// Exact semantic transition kind stored in the authoritative journal.
@@ -801,8 +908,8 @@ impl CampaignStoreV1 {
         configure_connection(&connection)?;
         let transaction = connection.unchecked_transaction()?;
         transaction.execute_batch(SCHEMA_SQL)?;
-        let schema_digest =
-            Digest::hash_domain("ag.governed-loop.store-schema/v1", SCHEMA_SQL.as_bytes());
+        transaction.execute_batch(V5_SAFE_INTEGER_SCHEMA_SQL)?;
+        let schema_digest = current_schema_digest();
         transaction.execute(
             "INSERT INTO store_identity
              (singleton, application_id, schema_name, schema_version, schema_digest)
@@ -838,7 +945,7 @@ impl CampaignStoreV1 {
             &evidence_digest,
             &previous_event_digest,
             recorded_at_unix_ms,
-        );
+        )?;
         transaction.execute(
             "INSERT INTO campaigns
              (campaign_id, current_occurrence_id, current_state_digest, revision,
@@ -873,6 +980,11 @@ impl CampaignStoreV1 {
                 to_i64(recorded_at_unix_ms)?,
             ],
         )?;
+        if to_u64(transaction.last_insert_rowid())? != 1 {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "genesis transition sequence is not one".to_owned(),
+            ));
+        }
         if let Some((idempotency, identity, bytes)) = product_creation {
             transaction.execute(
                 "INSERT INTO product_creation_request
@@ -915,6 +1027,7 @@ impl CampaignStoreV1 {
         migrate_v1_to_v2_if_safe(&mut connection)?;
         migrate_v2_to_v3_if_safe(&mut connection)?;
         migrate_v3_to_v4_if_safe(&mut connection)?;
+        migrate_v4_to_v5_if_safe(&mut connection)?;
         let store = Self {
             path: path.to_owned(),
             connection,
@@ -964,7 +1077,11 @@ impl CampaignStoreV1 {
         let row: (i64, i64, String, String, Vec<u8>, i64) = transaction.query_row(
             "SELECT c.revision,c.event_count,c.current_state_digest,
                     c.event_head_digest,o.snapshot_jcs,
-                    (SELECT MAX(recorded_at_unix_ms) FROM transitions)
+                    (SELECT MAX(recorded_at_unix_ms) FROM (
+                         SELECT recorded_at_unix_ms FROM transitions
+                         UNION ALL
+                         SELECT recorded_at_unix_ms FROM refusals
+                     ))
              FROM campaigns c JOIN occurrences o
                ON o.campaign_id=c.campaign_id
               AND o.occurrence_id=c.current_occurrence_id",
@@ -1016,7 +1133,11 @@ impl CampaignStoreV1 {
     /// process restart.
     pub fn last_recorded_at_unix_ms(&self) -> Result<u64, CampaignStoreErrorV1> {
         let value: i64 = self.connection.query_row(
-            "SELECT MAX(recorded_at_unix_ms) FROM transitions",
+            "SELECT MAX(recorded_at_unix_ms) FROM (
+                 SELECT recorded_at_unix_ms FROM transitions
+                 UNION ALL
+                 SELECT recorded_at_unix_ms FROM refusals
+             )",
             [],
             |row| row.get(0),
         )?;
@@ -2057,9 +2178,18 @@ impl CampaignStoreV1 {
     /// issuance bytes, and later states cannot be signed as fresh issuances.
     pub fn issuance_signing_permit(
         &mut self,
+        caller_expected: &Digest,
     ) -> Result<StoreIssuanceSigningPermitV1, CampaignStoreErrorV1> {
         self.replay()?;
-        let current = self.current()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let head = campaign_head(&transaction)?;
+        require_caller_expected(&head, caller_expected)?;
+        let current = current_snapshot_on(&transaction)?;
+        if current.state_digest() != caller_expected {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
         if current.program_counter() != ProgramCounterV1::AuthorizationConsumed {
             return Err(CampaignStoreErrorV1::BindingMismatch);
         }
@@ -2072,8 +2202,7 @@ impl CampaignStoreV1 {
         if spend.spend != issuance.spend || spend.key != issuance.key {
             return Err(CampaignStoreErrorV1::BindingMismatch);
         }
-        let stored: Option<(Vec<u8>, Vec<u8>)> = self
-            .connection
+        let stored: Option<(Vec<u8>, Vec<u8>)> = transaction
             .query_row(
                 "SELECT spend_jcs,issuance_jcs FROM ag_authorization_spends
                  WHERE spend_id=?1 AND issuance_id=?2",
@@ -2094,9 +2223,6 @@ impl CampaignStoreV1 {
             "ag.governed-loop.issuance-signing-reservation/v1",
             &issuance_jcs,
         );
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<(String, String, Vec<u8>)> = transaction
             .query_row(
                 "SELECT spend_id,transition_state_digest,issuance_jcs
@@ -2139,6 +2265,7 @@ impl CampaignStoreV1 {
     /// Commits one non-human kernel successor with exact CAS semantics.
     pub fn commit(
         &mut self,
+        caller_expected: &Digest,
         expected: &OccurrenceSnapshotV1,
         successor: &OccurrenceSnapshotV1,
         kind: CampaignTransitionKindV1,
@@ -2159,6 +2286,7 @@ impl CampaignStoreV1 {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let receipt = write_transition(
             &transaction,
+            caller_expected,
             expected,
             successor,
             kind,
@@ -2174,6 +2302,7 @@ impl CampaignStoreV1 {
     /// replayable transition evidence.
     pub fn commit_docket_issuance_refusal(
         &mut self,
+        caller_expected: &Digest,
         expected: &OccurrenceSnapshotV1,
         successor: &OccurrenceSnapshotV1,
         refusal: &DocketIssuanceRefusalV1,
@@ -2204,6 +2333,7 @@ impl CampaignStoreV1 {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let receipt = write_transition(
             &transaction,
+            caller_expected,
             expected,
             successor,
             CampaignTransitionKindV1::DocketIssuanceRefused,
@@ -2222,6 +2352,7 @@ impl CampaignStoreV1 {
     /// custody/attempt.
     pub fn commit_docket_governed_repair_halt(
         &mut self,
+        caller_expected: &Digest,
         expected: &OccurrenceSnapshotV1,
         successor: &OccurrenceSnapshotV1,
         result: &DocketSealedGovernedRepairResultV1,
@@ -2249,6 +2380,7 @@ impl CampaignStoreV1 {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let receipt = write_transition(
             &transaction,
+            caller_expected,
             expected,
             successor,
             CampaignTransitionKindV1::DocketGovernedRepairHalted,
@@ -2310,6 +2442,14 @@ impl CampaignStoreV1 {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Verification is deliberately outside the write transaction, so a
+        // competing legal consequence may advance the campaign while the
+        // external verifier runs.  Recheck the exact caller-observed cut
+        // before consuming the request or inserting any verification or
+        // disposition sidecar.  `write_transition` repeats this check at the
+        // transition boundary, but it is intentionally not the first write.
+        let head = campaign_head(&transaction)?;
+        require_caller_expected(&head, expected.state_digest())?;
         let request_ref = request.reference();
         let found: Option<(Vec<u8>, Option<String>)> = transaction
             .query_row(
@@ -2381,6 +2521,7 @@ impl CampaignStoreV1 {
         };
         let mut receipts = vec![write_transition(
             &transaction,
+            expected.state_digest(),
             &expected,
             first,
             CampaignTransitionKindV1::HumanDisposition,
@@ -2390,6 +2531,7 @@ impl CampaignStoreV1 {
         if let Some(second) = second {
             receipts.push(write_transition(
                 &transaction,
+                first.state_digest(),
                 first,
                 second,
                 CampaignTransitionKindV1::HumanDisposition,
@@ -2404,18 +2546,23 @@ impl CampaignStoreV1 {
     /// Records a durable non-authorizing refusal without changing the PC.
     pub fn record_refusal(
         &mut self,
+        caller_expected: &Digest,
         refusal: &RefusalOutcomeV1,
         recorded_at_unix_ms: u64,
     ) -> Result<Digest, CampaignStoreErrorV1> {
-        let current = self.current()?;
-        if refusal.key != *current.key() || refusal.at_state_digest != *current.state_digest() {
-            return Err(CampaignStoreErrorV1::BindingMismatch);
-        }
         let bytes = encode(refusal)?;
         let refusal_id = Digest::hash_domain(REFUSAL_DOMAIN_V1, &bytes);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let head = campaign_head(&transaction)?;
+        require_caller_expected(&head, caller_expected)?;
+        if refusal.key.campaign.as_str() != head.campaign
+            || refusal.key.occurrence.to_string() != head.occurrence
+            || refusal.at_state_digest != *caller_expected
+        {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
         transaction.execute(
             "INSERT INTO refusals
              (refusal_id, campaign_id, occurrence_id, state_digest,
@@ -2490,8 +2637,7 @@ impl CampaignStoreV1 {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        let expected_digest =
-            Digest::hash_domain("ag.governed-loop.store-schema/v1", SCHEMA_SQL.as_bytes());
+        let expected_digest = current_schema_digest();
         if application_id != CAMPAIGN_STORE_APPLICATION_ID
             || user_version != CAMPAIGN_STORE_SCHEMA_VERSION
             || identity.0 != CAMPAIGN_STORE_APPLICATION_ID
@@ -2501,8 +2647,124 @@ impl CampaignStoreV1 {
         {
             return Err(CampaignStoreErrorV1::StoreIdentity);
         }
+        verify_safe_integer_schema(&self.connection)?;
+        verify_safe_integer_materialization(&self.connection)?;
         Ok(())
     }
+}
+
+fn current_schema_digest() -> Digest {
+    let mut schema = Vec::with_capacity(SCHEMA_SQL.len() + V5_SAFE_INTEGER_SCHEMA_SQL.len());
+    schema.extend_from_slice(SCHEMA_SQL.as_bytes());
+    schema.extend_from_slice(V5_SAFE_INTEGER_SCHEMA_SQL.as_bytes());
+    Digest::hash_domain("ag.governed-loop.store-schema/v1", &schema)
+}
+
+fn verify_safe_integer_schema(connection: &Connection) -> Result<(), CampaignStoreErrorV1> {
+    let trigger_count: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='trigger' AND name IN (
+             'campaigns_safe_integer_insert_v1',
+             'campaigns_safe_integer_update_v1',
+             'occurrences_safe_integer_insert_v1',
+             'occurrences_safe_integer_update_v1',
+             'transitions_safe_integer_insert_v1',
+             'transitions_safe_integer_update_v1',
+             'human_dispositions_safe_integer_insert_v1',
+             'human_dispositions_safe_integer_update_v1',
+             'human_decision_requests_safe_integer_insert_v1',
+             'human_decision_requests_safe_integer_update_v1',
+             'governed_repair_dispositions_safe_integer_insert_v1',
+             'governed_repair_dispositions_safe_integer_update_v1',
+             'refusals_safe_integer_insert_v1',
+             'refusals_safe_integer_update_v1'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if trigger_count != 14 {
+        return Err(CampaignStoreErrorV1::StoreIdentity);
+    }
+    Ok(())
+}
+
+fn verify_safe_integer_materialization(
+    connection: &Connection,
+) -> Result<(), CampaignStoreErrorV1> {
+    for (label, query) in [
+        (
+            "campaign counter",
+            "SELECT EXISTS(SELECT 1 FROM campaigns
+             WHERE revision NOT BETWEEN 1 AND ?1 OR event_count NOT BETWEEN 1 AND ?1)",
+        ),
+        (
+            "occurrence revision",
+            "SELECT EXISTS(SELECT 1 FROM occurrences
+             WHERE revision NOT BETWEEN 1 AND ?1)",
+        ),
+        (
+            "transition sequence/time",
+            "SELECT EXISTS(SELECT 1 FROM transitions
+             WHERE sequence NOT BETWEEN 1 AND ?1
+                OR recorded_at_unix_ms NOT BETWEEN 0 AND ?1)",
+        ),
+        (
+            "human disposition time",
+            "SELECT EXISTS(SELECT 1 FROM human_dispositions
+             WHERE consumed_at_unix_ms NOT BETWEEN 0 AND ?1)",
+        ),
+        (
+            "human decision request time",
+            "SELECT EXISTS(SELECT 1 FROM human_decision_requests
+             WHERE created_at_unix_ms NOT BETWEEN 0 AND ?1)",
+        ),
+        (
+            "governed disposition time",
+            "SELECT EXISTS(SELECT 1 FROM governed_repair_dispositions
+             WHERE consumed_at_unix_ms NOT BETWEEN 0 AND ?1)",
+        ),
+        (
+            "refusal time",
+            "SELECT EXISTS(SELECT 1 FROM refusals
+             WHERE recorded_at_unix_ms NOT BETWEEN 0 AND ?1)",
+        ),
+    ] {
+        let invalid: i64 =
+            connection.query_row(query, params![MAX_DURABLE_SAFE_INTEGER_SQL_V1], |row| {
+                row.get(0)
+            })?;
+        if invalid != 0 {
+            return Err(CampaignStoreErrorV1::Corrupt(format!(
+                "{label} outside JCS safe-integer range"
+            )));
+        }
+    }
+
+    let (transition_count, maximum_sequence): (i64, i64) = connection.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(sequence), 0) FROM transitions",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let transition_count = to_u64(transition_count)?;
+    let maximum_sequence = to_u64(maximum_sequence)?;
+    if transition_count == 0 || transition_count != maximum_sequence {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "transition sequence is not continuous from one".to_owned(),
+        ));
+    }
+    let allocator: Option<i64> = connection
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name='transitions'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if allocator.map(to_u64).transpose()? != Some(maximum_sequence) {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "transition sequence allocator differs from journal head".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn configure_connection(connection: &Connection) -> Result<(), CampaignStoreErrorV1> {
@@ -2718,8 +2980,46 @@ fn migrate_v3_to_v4_if_safe(connection: &mut Connection) -> Result<(), CampaignS
             params![receipt, record, bytes],
         )?;
     }
-    let schema_digest =
-        Digest::hash_domain("ag.governed-loop.store-schema/v1", SCHEMA_SQL.as_bytes());
+    transaction.execute(
+        "UPDATE store_identity SET schema_name=?1, schema_version=?2,
+         schema_digest=?3 WHERE singleton=1",
+        params![
+            CAMPAIGN_STORE_V4_SCHEMA_NAME,
+            4_i64,
+            CAMPAIGN_STORE_V4_SCHEMA_DIGEST,
+        ],
+    )?;
+    transaction.pragma_update(None, "user_version", 4_u32)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v4_to_v5_if_safe(connection: &mut Connection) -> Result<(), CampaignStoreErrorV1> {
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 4 {
+        return Ok(());
+    }
+    let identity: (u32, String, u32, String) = connection.query_row(
+        "SELECT application_id, schema_name, schema_version, schema_digest
+         FROM store_identity WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if identity.0 != CAMPAIGN_STORE_APPLICATION_ID
+        || identity.1 != CAMPAIGN_STORE_V4_SCHEMA_NAME
+        || identity.2 != 4
+        || identity.3 != CAMPAIGN_STORE_V4_SCHEMA_DIGEST
+    {
+        return Err(CampaignStoreErrorV1::StoreIdentity);
+    }
+
+    // The validation and identity change share one immediate transaction.
+    // Consequently an unsafe pre-V5 value leaves both the schema identity and
+    // trigger set untouched, rather than blessing a partially migrated Store.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    verify_safe_integer_materialization(&transaction)?;
+    transaction.execute_batch(V5_SAFE_INTEGER_SCHEMA_SQL)?;
+    let schema_digest = current_schema_digest();
     transaction.execute(
         "UPDATE store_identity SET schema_name=?1, schema_version=?2,
          schema_digest=?3 WHERE singleton=1",
@@ -2747,13 +3047,25 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, CampaignSto
 }
 
 fn to_i64(value: u64) -> Result<i64, CampaignStoreErrorV1> {
-    i64::try_from(value)
-        .map_err(|_| CampaignStoreErrorV1::Corrupt("integer exceeds SQLite range".to_owned()))
+    if value > MAX_DURABLE_SAFE_INTEGER_V1 {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "durable integer exceeds JCS safe-integer range".to_owned(),
+        ));
+    }
+    i64::try_from(value).map_err(|_| {
+        CampaignStoreErrorV1::Corrupt("durable integer exceeds SQLite range".to_owned())
+    })
 }
 
 fn to_u64(value: i64) -> Result<u64, CampaignStoreErrorV1> {
-    u64::try_from(value)
-        .map_err(|_| CampaignStoreErrorV1::Corrupt("negative durable counter".to_owned()))
+    let value = u64::try_from(value)
+        .map_err(|_| CampaignStoreErrorV1::Corrupt("negative durable integer".to_owned()))?;
+    if value > MAX_DURABLE_SAFE_INTEGER_V1 {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "durable integer exceeds JCS safe-integer range".to_owned(),
+        ));
+    }
+    Ok(value)
 }
 
 fn pc_tag(value: ProgramCounterV1) -> &'static str {
@@ -2807,7 +3119,7 @@ fn store_event_digest(
     evidence: &Digest,
     previous: &Digest,
     recorded_at_unix_ms: u64,
-) -> Digest {
+) -> Result<Digest, CampaignStoreErrorV1> {
     let input = StoreEventDigestInputV1 {
         campaign,
         source_occurrence,
@@ -2819,9 +3131,9 @@ fn store_event_digest(
         previous_event_digest: previous,
         recorded_at_unix_ms,
     };
-    let bytes =
-        JcsDocument::canonicalize(&input).expect("store event input is strict JCS-compatible");
-    Digest::hash_domain(EVENT_DOMAIN_V1, bytes.as_bytes())
+    let bytes = JcsDocument::canonicalize(&input)
+        .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
+    Ok(Digest::hash_domain(EVENT_DOMAIN_V1, bytes.as_bytes()))
 }
 
 #[derive(Debug)]
@@ -2861,8 +3173,45 @@ fn campaign_head(transaction: &Transaction<'_>) -> Result<CampaignHeadRow, Campa
     })
 }
 
+fn current_snapshot_on(
+    transaction: &Transaction<'_>,
+) -> Result<OccurrenceSnapshotV1, CampaignStoreErrorV1> {
+    let bytes: Vec<u8> = transaction.query_row(
+        "SELECT o.snapshot_jcs
+         FROM campaigns c JOIN occurrences o
+           ON o.campaign_id=c.campaign_id
+          AND o.occurrence_id=c.current_occurrence_id",
+        [],
+        |row| row.get(0),
+    )?;
+    let snapshot: OccurrenceSnapshotV1 = decode(&bytes)?;
+    snapshot.validate_integrity()?;
+    if encode(&snapshot)? != bytes {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "current occurrence bytes do not round-trip exactly".to_owned(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn require_caller_expected(
+    head: &CampaignHeadRow,
+    caller_expected: &Digest,
+) -> Result<(), CampaignStoreErrorV1> {
+    let authoritative = Digest::parse(&head.state_digest)
+        .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+    if &authoritative != caller_expected {
+        return Err(CampaignStoreErrorV1::StalePredecessor {
+            expected: caller_expected.clone(),
+            authoritative,
+        });
+    }
+    Ok(())
+}
+
 fn write_transition(
     transaction: &Transaction<'_>,
+    caller_expected: &Digest,
     expected: &OccurrenceSnapshotV1,
     successor: &OccurrenceSnapshotV1,
     kind: CampaignTransitionKindV1,
@@ -2883,18 +3232,26 @@ fn write_transition(
         return Err(CampaignStoreErrorV1::BindingMismatch);
     }
     let head = campaign_head(transaction)?;
+    require_caller_expected(&head, caller_expected)?;
+    if expected.state_digest() != caller_expected {
+        return Err(CampaignStoreErrorV1::BindingMismatch);
+    }
+    let next_revision = head
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| CampaignStoreErrorV1::Corrupt("campaign revision overflow".to_owned()))?;
+    let next_event_count = head
+        .event_count
+        .checked_add(1)
+        .ok_or_else(|| CampaignStoreErrorV1::Corrupt("campaign event count overflow".to_owned()))?;
+    // Validate the next persisted counters before constructing any canonical
+    // event bytes or mutating a materialized row.
+    let next_revision_sql = to_i64(next_revision)?;
+    let next_event_count_sql = to_i64(next_event_count)?;
     if head.campaign != expected.key().campaign.as_str()
         || head.occurrence != expected.key().occurrence.to_string()
     {
         return Err(CampaignStoreErrorV1::BindingMismatch);
-    }
-    let authoritative = Digest::parse(&head.state_digest)
-        .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
-    if &authoritative != expected.state_digest() {
-        return Err(CampaignStoreErrorV1::StalePredecessor {
-            expected: expected.state_digest().clone(),
-            authoritative,
-        });
     }
     validate_transition_kind(expected, successor, kind)?;
 
@@ -2915,7 +3272,7 @@ fn write_transition(
         &evidence_digest,
         &previous_event_digest,
         recorded_at_unix_ms,
-    );
+    )?;
 
     if expected.key() == successor.key() {
         let changed = transaction.execute(
@@ -2968,8 +3325,12 @@ fn write_transition(
             to_i64(recorded_at_unix_ms)?,
         ],
     )?;
-    let next_revision = head.revision.saturating_add(1);
-    let next_event_count = head.event_count.saturating_add(1);
+    let inserted_sequence = to_u64(transaction.last_insert_rowid())?;
+    if inserted_sequence != next_event_count {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "transition sequence is not the next campaign event".to_owned(),
+        ));
+    }
     let changed = transaction.execute(
         "UPDATE campaigns
          SET current_occurrence_id=?1, current_state_digest=?2,
@@ -2978,8 +3339,8 @@ fn write_transition(
         params![
             successor.key().occurrence.to_string(),
             successor.state_digest().as_str(),
-            to_i64(next_revision)?,
-            to_i64(next_event_count)?,
+            next_revision_sql,
+            next_event_count_sql,
             event_digest.as_str(),
             successor.key().campaign.as_str(),
             to_i64(head.revision)?,
@@ -3242,6 +3603,7 @@ fn validate_residual_disposition(
 
 #[derive(Debug)]
 struct StoredTransitionRow {
+    sequence: u64,
     source_occurrence: Option<String>,
     successor_occurrence: String,
     kind: CampaignTransitionKindV1,
@@ -3353,7 +3715,7 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
         .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
 
     let mut statement = connection.prepare(
-        "SELECT source_occurrence_id, successor_occurrence_id, transition_kind,
+        "SELECT sequence, source_occurrence_id, successor_occurrence_id, transition_kind,
                 predecessor_state_digest, successor_state_digest,
                 successor_snapshot_jcs, evidence_jcs, evidence_digest,
                 previous_event_digest, event_digest, recorded_at_unix_ms
@@ -3361,38 +3723,40 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
     )?;
     let rows = statement.query_map(params![campaign.as_str()], |row| {
         Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, String>(1)?,
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
-            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, String>(5)?,
             row.get::<_, Vec<u8>>(6)?,
-            row.get::<_, String>(7)?,
+            row.get::<_, Vec<u8>>(7)?,
             row.get::<_, String>(8)?,
             row.get::<_, String>(9)?,
-            row.get::<_, i64>(10)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, i64>(11)?,
         ))
     })?;
     let mut transitions = Vec::new();
     for row in rows {
         let raw = row?;
-        let snapshot: OccurrenceSnapshotV1 = decode(&raw.5)?;
-        let evidence: CampaignTransitionEvidenceV1 = decode(&raw.6)?;
+        let snapshot: OccurrenceSnapshotV1 = decode(&raw.6)?;
+        let evidence: CampaignTransitionEvidenceV1 = decode(&raw.7)?;
         transitions.push(StoredTransitionRow {
-            source_occurrence: raw.0,
-            successor_occurrence: raw.1,
-            kind: CampaignTransitionKindV1::parse(&raw.2)?,
-            predecessor: parse_digest(&raw.3)?,
-            successor: parse_digest(&raw.4)?,
+            sequence: to_u64(raw.0)?,
+            source_occurrence: raw.1,
+            successor_occurrence: raw.2,
+            kind: CampaignTransitionKindV1::parse(&raw.3)?,
+            predecessor: parse_digest(&raw.4)?,
+            successor: parse_digest(&raw.5)?,
             snapshot,
-            snapshot_jcs: raw.5,
+            snapshot_jcs: raw.6,
             evidence,
-            evidence_jcs: raw.6,
-            evidence_digest: parse_digest(&raw.7)?,
-            previous_event: parse_digest(&raw.8)?,
-            event: parse_digest(&raw.9)?,
-            recorded_at_unix_ms: to_u64(raw.10)?,
+            evidence_jcs: raw.7,
+            evidence_digest: parse_digest(&raw.8)?,
+            previous_event: parse_digest(&raw.9)?,
+            event: parse_digest(&raw.10)?,
+            recorded_at_unix_ms: to_u64(raw.11)?,
         });
     }
     if transitions.is_empty() {
@@ -3405,6 +3769,7 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
     let mut previous_event =
         Digest::hash_domain(EVENT_GENESIS_DOMAIN_V1, campaign.as_str().as_bytes());
     let mut latest_occurrences: BTreeMap<String, OccurrenceSnapshotV1> = BTreeMap::new();
+    let mut occurrence_revisions: BTreeMap<String, u64> = BTreeMap::new();
     let mut spends = BTreeMap::new();
     let mut attempts = BTreeMap::new();
     let mut settlements = BTreeMap::new();
@@ -3413,6 +3778,18 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
     let mut governed_repair_artifacts = BTreeMap::new();
 
     for (index, row) in transitions.iter().enumerate() {
+        let expected_sequence = u64::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| {
+                CampaignStoreErrorV1::Corrupt("transition sequence overflow".to_owned())
+            })?;
+        if row.sequence != expected_sequence {
+            return Err(CampaignStoreErrorV1::Corrupt(format!(
+                "transition sequence {} is not continuous",
+                row.sequence
+            )));
+        }
         row.snapshot.validate_integrity()?;
         if encode(&row.snapshot)? != row.snapshot_jcs || encode(&row.evidence)? != row.evidence_jcs
         {
@@ -3448,7 +3825,7 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
             &row.evidence_digest,
             &row.previous_event,
             row.recorded_at_unix_ms,
-        );
+        )?;
         if row.event != expected_event {
             return Err(CampaignStoreErrorV1::Corrupt(format!(
                 "transition {} event digest failed",
@@ -3631,6 +4008,13 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
                 "Docket issuance refusal evidence changed across replay".to_owned(),
             ));
         }
+        let revision = occurrence_revisions
+            .entry(row.successor_occurrence.clone())
+            .or_default();
+        *revision = revision.checked_add(1).ok_or_else(|| {
+            CampaignStoreErrorV1::Corrupt("occurrence revision overflow".to_owned())
+        })?;
+        to_i64(*revision)?;
         latest_occurrences.insert(row.successor_occurrence.clone(), row.snapshot.clone());
         previous_event = row.event.clone();
         previous_snapshot = Some(row.snapshot.clone());
@@ -3652,7 +4036,12 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
         ));
     }
 
-    verify_occurrence_materialization(connection, &campaign, &latest_occurrences)?;
+    verify_occurrence_materialization(
+        connection,
+        &campaign,
+        &latest_occurrences,
+        &occurrence_revisions,
+    )?;
     verify_spend_accounting(connection, &spends)?;
     verify_attempt_accounting(connection, &attempts)?;
     verify_settlement_accounting(connection, &settlements)?;
@@ -3727,6 +4116,8 @@ fn verify_product_records(
             .query_row(&query, [], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
         if let Some((identity, bytes)) = record {
+            JcsDocument::from_canonical_bytes(&bytes)
+                .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))?;
             let identity = Digest::parse(&identity)
                 .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
             if identity != Digest::hash_domain(domain, &bytes) {
@@ -3886,10 +4277,11 @@ fn verify_occurrence_materialization(
     connection: &Connection,
     campaign: &CampaignId,
     expected: &BTreeMap<String, OccurrenceSnapshotV1>,
+    expected_revisions: &BTreeMap<String, u64>,
 ) -> Result<(), CampaignStoreErrorV1> {
     let mut statement = connection.prepare(
         "SELECT occurrence_id, program_basis, program_counter,
-                prior_state_digest, state_digest, snapshot_jcs
+                prior_state_digest, state_digest, revision, snapshot_jcs
          FROM occurrences WHERE campaign_id=?1 ORDER BY occurrence_id",
     )?;
     let rows = statement.query_map(params![campaign.as_str()], |row| {
@@ -3899,12 +4291,13 @@ fn verify_occurrence_materialization(
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
-            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Vec<u8>>(6)?,
         ))
     })?;
     let mut seen = BTreeSet::new();
     for row in rows {
-        let (occurrence, program, pc, prior_digest, digest, bytes) = row?;
+        let (occurrence, program, pc, prior_digest, digest, revision, bytes) = row?;
         let snapshot: OccurrenceSnapshotV1 = decode(&bytes)?;
         let expected_snapshot = expected
             .get(&occurrence)
@@ -3914,6 +4307,7 @@ fn verify_occurrence_materialization(
             || pc != pc_tag(snapshot.program_counter())
             || prior_digest != snapshot.prior_state_digest().as_str()
             || digest != snapshot.state_digest().as_str()
+            || Some(to_u64(revision)?) != expected_revisions.get(&occurrence).copied()
         {
             return Err(CampaignStoreErrorV1::Corrupt(
                 "occurrence materialization differs from replay".to_owned(),
@@ -4301,12 +4695,18 @@ fn verify_refusals(
     campaign: &CampaignId,
     transitions: &[StoredTransitionRow],
 ) -> Result<(), CampaignStoreErrorV1> {
-    let valid_states: BTreeSet<_> = transitions
+    let valid_states: BTreeMap<_, _> = transitions
         .iter()
-        .map(|transition| transition.successor.as_str().to_owned())
+        .map(|transition| {
+            (
+                transition.successor.as_str().to_owned(),
+                transition.recorded_at_unix_ms,
+            )
+        })
         .collect();
     let mut statement = connection.prepare(
-        "SELECT refusal_id, campaign_id, occurrence_id, state_digest, refusal_jcs
+        "SELECT refusal_id, campaign_id, occurrence_id, state_digest, refusal_jcs,
+                recorded_at_unix_ms
          FROM refusals ORDER BY refusal_id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -4316,18 +4716,22 @@ fn verify_refusals(
             row.get::<_, String>(2)?,
             row.get::<_, String>(3)?,
             row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, i64>(5)?,
         ))
     })?;
     for row in rows {
-        let (id, campaign_id, occurrence, state_digest, bytes) = row?;
+        let (id, campaign_id, occurrence, state_digest, bytes, recorded_at) = row?;
         let refusal: RefusalOutcomeV1 = decode(&bytes)?;
         let expected_id = Digest::hash_domain(REFUSAL_DOMAIN_V1, &bytes);
+        let recorded_at = to_u64(recorded_at)?;
         if id != expected_id.as_str()
             || campaign_id != campaign.as_str()
             || campaign_id != refusal.key.campaign.as_str()
             || occurrence != refusal.key.occurrence.to_string()
             || state_digest != refusal.at_state_digest.as_str()
-            || !valid_states.contains(&state_digest)
+            || valid_states
+                .get(&state_digest)
+                .is_none_or(|state_time| recorded_at < *state_time)
         {
             return Err(CampaignStoreErrorV1::Corrupt(
                 "refusal materialization mismatch".to_owned(),

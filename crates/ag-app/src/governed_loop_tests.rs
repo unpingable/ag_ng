@@ -3,12 +3,14 @@
 
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
 use crate::governed_loop::{
     CampaignEngineErrorV1, CampaignEngineV1, CampaignRecoveryV1, DocketProgressV1,
     EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1, ExactWorkCatalogV1,
 };
+use crate::governed_store::CampaignStoreErrorV1;
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::Digest;
@@ -16,6 +18,10 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const NOW: u64 = 30_000;
+
+fn current_state_digest(engine: &CampaignEngineV1) -> Digest {
+    engine.current().unwrap().state_digest().clone()
+}
 
 fn digest(label: &str) -> Digest {
     Digest::hash_domain("ag-governed-engine-test/v1", label.as_bytes())
@@ -489,6 +495,7 @@ fn advance_to_spent(
 ) -> OccurrenceSnapshotV1 {
     engine
         .record_proposal(
+            &current_state_digest(engine),
             ObservationRefV1::from_digest(digest("observation-1")),
             proposal("work-1"),
             ProposalClassV1::Initial,
@@ -496,12 +503,28 @@ fn advance_to_spent(
             NOW + 1,
         )
         .unwrap();
-    engine.require_standing(NOW + 2).unwrap();
     engine
-        .decide(observation, standing, &catalog(), None, NOW + 3)
+        .require_standing(&current_state_digest(engine), NOW + 2)
         .unwrap();
     engine
-        .authorize(observation, standing, &catalog(), None, NOW + 4)
+        .decide(
+            &current_state_digest(engine),
+            observation,
+            standing,
+            &catalog(),
+            None,
+            NOW + 3,
+        )
+        .unwrap();
+    engine
+        .authorize(
+            &current_state_digest(engine),
+            observation,
+            standing,
+            &catalog(),
+            None,
+            NOW + 4,
+        )
         .unwrap()
 }
 
@@ -521,15 +544,23 @@ fn production_path_spends_once_settles_and_requires_a_new_occurrence() {
     assert_eq!(standing.calls, 2);
 
     let mut docket = FakeDocket::default();
-    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let dispatched = engine
+        .dispatch(&current_state_digest(&engine), &mut docket, NOW + 5)
+        .unwrap();
     assert_eq!(dispatched.program_counter(), ProgramCounterV1::Dispatched);
     assert_eq!(docket.accept_calls(), 1);
-    assert!(engine.dispatch(&mut docket, NOW + 6).is_err());
+    assert!(
+        engine
+            .dispatch(&current_state_digest(&engine), &mut docket, NOW + 6)
+            .is_err()
+    );
     assert_eq!(docket.accept_calls(), 1);
 
     let issuance = dispatched.issuance().unwrap().issuance.clone();
     docket.settle(&issuance, KnownOutcomeV1::Success);
-    let DocketProgressV1::Settled(settled) = engine.poll_docket(&mut docket, NOW + 7).unwrap()
+    let DocketProgressV1::Settled(settled) = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 7)
+        .unwrap()
     else {
         panic!("known outcome must settle")
     };
@@ -539,11 +570,20 @@ fn production_path_spends_once_settles_and_requires_a_new_occurrence() {
     );
     assert!(
         engine
-            .authorize(&mut observation, &mut standing, &catalog(), None, NOW + 8)
+            .authorize(
+                &current_state_digest(&engine),
+                &mut observation,
+                &mut standing,
+                &catalog(),
+                None,
+                NOW + 8,
+            )
             .is_err()
     );
 
-    let next = engine.open_continuation(occurrence(2), NOW + 9).unwrap();
+    let next = engine
+        .open_continuation(&current_state_digest(&engine), occurrence(2), NOW + 9)
+        .unwrap();
     assert_eq!(
         next.program_counter(),
         ProgramCounterV1::ObservationRequired
@@ -562,6 +602,7 @@ fn consequence_time_stale_observation_and_revoked_standing_do_not_spend() {
     let mut standing = StandingBoundary::current();
     engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("observation-1")),
             proposal("work-1"),
             ProposalClassV1::Initial,
@@ -569,16 +610,32 @@ fn consequence_time_stale_observation_and_revoked_standing_do_not_spend() {
             NOW + 1,
         )
         .unwrap();
-    engine.require_standing(NOW + 2).unwrap();
     engine
-        .decide(&mut observation, &mut standing, &catalog(), None, NOW + 3)
+        .require_standing(&current_state_digest(&engine), NOW + 2)
+        .unwrap();
+    engine
+        .decide(
+            &current_state_digest(&engine),
+            &mut observation,
+            &mut standing,
+            &catalog(),
+            None,
+            NOW + 3,
+        )
         .unwrap();
     let before = engine.current().unwrap();
 
     observation.status = ObservationStatusV1::Stale;
     assert!(
         engine
-            .authorize(&mut observation, &mut standing, &catalog(), None, NOW + 4)
+            .authorize(
+                &current_state_digest(&engine),
+                &mut observation,
+                &mut standing,
+                &catalog(),
+                None,
+                NOW + 4,
+            )
             .is_err()
     );
     assert_eq!(engine.current().unwrap(), before);
@@ -588,7 +645,14 @@ fn consequence_time_stale_observation_and_revoked_standing_do_not_spend() {
     standing.status = StandingStatusV1::Revoked;
     assert!(
         engine
-            .authorize(&mut observation, &mut standing, &catalog(), None, NOW + 5)
+            .authorize(
+                &current_state_digest(&engine),
+                &mut observation,
+                &mut standing,
+                &catalog(),
+                None,
+                NOW + 5,
+            )
             .is_err()
     );
     assert_eq!(engine.current().unwrap(), before);
@@ -654,7 +718,9 @@ fn docket_pre_custody_refusal_terminalizes_spent_occurrence_and_replays() {
     let spend_identity = spent.ag_spend().unwrap().spend.clone();
     let mut docket = RefusingDocket::default();
 
-    let halted = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let halted = engine
+        .dispatch(&current_state_digest(&engine), &mut docket, NOW + 5)
+        .unwrap();
     assert_eq!(halted.program_counter(), ProgramCounterV1::Halted);
     let refusal = halted
         .halted()
@@ -696,7 +762,8 @@ fn custody_crash_recovers_to_reconciliation_without_respend_or_repeat() {
     docket.set_panic_after_accept();
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            let _ = engine.dispatch(&mut docket, NOW + 5);
+            let expected = current_state_digest(&engine);
+            let _ = engine.dispatch(&expected, &mut docket, NOW + 5);
         }))
         .is_err()
     );
@@ -707,8 +774,9 @@ fn custody_crash_recovers_to_reconciliation_without_respend_or_repeat() {
         recovered.current().unwrap().program_counter(),
         ProgramCounterV1::AuthorizationConsumed
     );
-    let CampaignRecoveryV1::Advanced(reconciling) =
-        recovered.recover(&mut docket, NOW + 6).unwrap()
+    let CampaignRecoveryV1::Advanced(reconciling) = recovered
+        .recover(&current_state_digest(&recovered), &mut docket, NOW + 6)
+        .unwrap()
     else {
         panic!("known custody must advance recovery")
     };
@@ -721,7 +789,9 @@ fn custody_crash_recovers_to_reconciliation_without_respend_or_repeat() {
     assert_eq!(recovered.replay().unwrap().docket_attempts, 1);
 
     docket.settle(&issuance, KnownOutcomeV1::Failure);
-    let CampaignRecoveryV1::Advanced(settled) = recovered.recover(&mut docket, NOW + 7).unwrap()
+    let CampaignRecoveryV1::Advanced(settled) = recovered
+        .recover(&current_state_digest(&recovered), &mut docket, NOW + 7)
+        .unwrap()
     else {
         panic!("exact reconciliation must settle")
     };
@@ -733,6 +803,10 @@ fn custody_crash_recovers_to_reconciliation_without_respend_or_repeat() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the restart specimen keeps every durable consequence cut visibly ordered"
+)]
 fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authority() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("campaign.sqlite");
@@ -747,6 +821,7 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
     let mut observation = ObservationBoundary::current("preconditions");
     engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("observation-1")),
             proposal("work-1"),
             ProposalClassV1::Initial,
@@ -761,7 +836,9 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
         engine.current().unwrap().program_counter(),
         ProgramCounterV1::ProposalRecorded
     );
-    engine.require_standing(NOW + 2).unwrap();
+    engine
+        .require_standing(&current_state_digest(&engine), NOW + 2)
+        .unwrap();
     drop(engine);
 
     engine = CampaignEngineV1::open(&database).unwrap();
@@ -771,7 +848,14 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
     );
     let mut standing = StandingBoundary::current();
     engine
-        .decide(&mut observation, &mut standing, &catalog(), None, NOW + 3)
+        .decide(
+            &current_state_digest(&engine),
+            &mut observation,
+            &mut standing,
+            &catalog(),
+            None,
+            NOW + 3,
+        )
         .unwrap();
     drop(engine);
 
@@ -781,7 +865,14 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
         ProgramCounterV1::AdmissiblePendingAuthorization
     );
     engine
-        .authorize(&mut observation, &mut standing, &catalog(), None, NOW + 4)
+        .authorize(
+            &current_state_digest(&engine),
+            &mut observation,
+            &mut standing,
+            &catalog(),
+            None,
+            NOW + 4,
+        )
         .unwrap();
     drop(engine);
 
@@ -789,11 +880,15 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
     engine = CampaignEngineV1::open(&database).unwrap();
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
     assert!(matches!(
-        engine.recover(&mut docket, NOW + 5).unwrap(),
+        engine
+            .recover(&current_state_digest(&engine), &mut docket, NOW + 5)
+            .unwrap(),
         CampaignRecoveryV1::IssuanceNotAccepted(_)
     ));
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
-    let dispatched = engine.dispatch(&mut docket, NOW + 6).unwrap();
+    let dispatched = engine
+        .dispatch(&current_state_digest(&engine), &mut docket, NOW + 6)
+        .unwrap();
     let issuance = dispatched.issuance().unwrap().issuance.clone();
     drop(engine);
 
@@ -802,7 +897,9 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
         engine.current().unwrap().program_counter(),
         ProgramCounterV1::Dispatched
     );
-    let CampaignRecoveryV1::Advanced(reconciling) = engine.recover(&mut docket, NOW + 7).unwrap()
+    let CampaignRecoveryV1::Advanced(reconciling) = engine
+        .recover(&current_state_digest(&engine), &mut docket, NOW + 7)
+        .unwrap()
     else {
         panic!("accepted attempt must recover into explicit reconciliation")
     };
@@ -815,7 +912,9 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
 
     docket.settle(&issuance, KnownOutcomeV1::Success);
     engine = CampaignEngineV1::open(&database).unwrap();
-    let CampaignRecoveryV1::Advanced(settled) = engine.recover(&mut docket, NOW + 8).unwrap()
+    let CampaignRecoveryV1::Advanced(settled) = engine
+        .recover(&current_state_digest(&engine), &mut docket, NOW + 8)
+        .unwrap()
     else {
         panic!("exact Docket settlement must close reconciliation")
     };
@@ -829,7 +928,9 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
     drop(engine);
 
     engine = CampaignEngineV1::open(&database).unwrap();
-    let next = engine.open_continuation(occurrence(2), NOW + 9).unwrap();
+    let next = engine
+        .open_continuation(&current_state_digest(&engine), occurrence(2), NOW + 9)
+        .unwrap();
     assert_eq!(
         next.program_counter(),
         ProgramCounterV1::ObservationRequired
@@ -847,17 +948,24 @@ fn changed_preconditions_cannot_be_laundered_as_retry() {
     let mut standing = StandingBoundary::current();
     let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
     let mut docket = FakeDocket::default();
-    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let dispatched = engine
+        .dispatch(&current_state_digest(&engine), &mut docket, NOW + 5)
+        .unwrap();
     docket.settle(
         &dispatched.issuance().unwrap().issuance,
         KnownOutcomeV1::Failure,
     );
-    let _ = engine.poll_docket(&mut docket, NOW + 6).unwrap();
-    engine.open_continuation(occurrence(2), NOW + 7).unwrap();
+    let _ = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 6)
+        .unwrap();
+    engine
+        .open_continuation(&current_state_digest(&engine), occurrence(2), NOW + 7)
+        .unwrap();
 
     observation.preconditions = PreconditionBasisRefV1::from_digest(digest("changed"));
     let error = engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("observation-2")),
             proposal("work-1"),
             ProposalClassV1::Retry,
@@ -876,6 +984,7 @@ fn changed_preconditions_cannot_be_laundered_as_retry() {
 
     let successor = engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("observation-2")),
             proposal("work-2"),
             ProposalClassV1::Successor,
@@ -898,11 +1007,14 @@ fn indeterminate_attempt_blocks_repeat_until_exact_settlement() {
     let mut standing = StandingBoundary::current();
     let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
     let mut docket = FakeDocket::default();
-    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let dispatched = engine
+        .dispatch(&current_state_digest(&engine), &mut docket, NOW + 5)
+        .unwrap();
     let issuance = dispatched.issuance().unwrap().issuance.clone();
     docket.make_indeterminate(&issuance);
-    let DocketProgressV1::ReconciliationRequired(reconciling) =
-        engine.poll_docket(&mut docket, NOW + 6).unwrap()
+    let DocketProgressV1::ReconciliationRequired(reconciling) = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 6)
+        .unwrap()
     else {
         panic!("unknown outcome must reconcile")
     };
@@ -910,12 +1022,22 @@ fn indeterminate_attempt_blocks_repeat_until_exact_settlement() {
         reconciling.program_counter(),
         ProgramCounterV1::ReconciliationRequired
     );
-    assert!(engine.dispatch(&mut docket, NOW + 7).is_err());
-    assert!(engine.open_continuation(occurrence(2), NOW + 8).is_err());
+    assert!(
+        engine
+            .dispatch(&current_state_digest(&engine), &mut docket, NOW + 7)
+            .is_err()
+    );
+    assert!(
+        engine
+            .open_continuation(&current_state_digest(&engine), occurrence(2), NOW + 8)
+            .is_err()
+    );
     assert_eq!(docket.accept_calls(), 1);
 
     docket.settle(&issuance, KnownOutcomeV1::Success);
-    let DocketProgressV1::Settled(settled) = engine.poll_docket(&mut docket, NOW + 9).unwrap()
+    let DocketProgressV1::Settled(settled) = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 9)
+        .unwrap()
     else {
         panic!("reconciliation settlement must be consumed")
     };
@@ -934,12 +1056,15 @@ fn reconciled_governed_repair_halt_is_durable_and_replayable() {
     let mut standing = StandingBoundary::current();
     let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
     let mut docket = FakeDocket::default();
-    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let dispatched = engine
+        .dispatch(&current_state_digest(&engine), &mut docket, NOW + 5)
+        .unwrap();
     let issuance = dispatched.issuance().unwrap().issuance.clone();
 
     docket.make_indeterminate(&issuance);
-    let DocketProgressV1::ReconciliationRequired(reconciling) =
-        engine.poll_docket(&mut docket, NOW + 6).unwrap()
+    let DocketProgressV1::ReconciliationRequired(reconciling) = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 6)
+        .unwrap()
     else {
         panic!("unknown result must enter reconciliation")
     };
@@ -953,7 +1078,9 @@ fn reconciled_governed_repair_halt_is_durable_and_replayable() {
     let DocketProgressV1::GovernedRepairRequired {
         halted,
         requirement,
-    } = engine.poll_docket(&mut docket, NOW + 7).unwrap()
+    } = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 7)
+        .unwrap()
     else {
         panic!("sealed reconciled requirement must durably halt")
     };
@@ -992,7 +1119,9 @@ fn logical_crash_after_docket_seal_before_ag_ingestion_reconciles_to_one_halt() 
     let mut standing = StandingBoundary::current();
     let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
     let mut docket = FakeDocket::default();
-    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let dispatched = engine
+        .dispatch(&current_state_digest(&engine), &mut docket, NOW + 5)
+        .unwrap();
     let issuance = dispatched.issuance().unwrap().issuance.clone();
 
     // Docket's sealed result is durable in its own custody boundary while AG
@@ -1006,7 +1135,9 @@ fn logical_crash_after_docket_seal_before_ag_ingestion_reconciles_to_one_halt() 
     drop(engine);
 
     let mut reopened = CampaignEngineV1::open(&database).unwrap();
-    let CampaignRecoveryV1::Advanced(halted) = reopened.recover(&mut docket, NOW + 6).unwrap()
+    let CampaignRecoveryV1::Advanced(halted) = reopened
+        .recover(&current_state_digest(&reopened), &mut docket, NOW + 6)
+        .unwrap()
     else {
         panic!("sealed Docket result must reconcile to one durable AG halt")
     };
@@ -1032,7 +1163,9 @@ fn durable_budget_fact_is_nonauthorizing_and_exhaustion_halts() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("campaign.sqlite");
     let mut engine = create_engine(&directory, ResidualSetV1::default());
-    let observed = engine.note_probe(NOW + 1).unwrap();
+    let observed = engine
+        .note_probe(&current_state_digest(&engine), NOW + 1)
+        .unwrap();
     assert_eq!(
         observed.program_counter(),
         ProgramCounterV1::ObservationRequired
@@ -1040,7 +1173,9 @@ fn durable_budget_fact_is_nonauthorizing_and_exhaustion_halts() {
     assert_eq!(observed.state().meta().budget().probes_used, 1);
     assert!(observed.ag_spend().is_none());
 
-    let halted = engine.note_probe(NOW + 2).unwrap();
+    let halted = engine
+        .note_probe(&current_state_digest(&engine), NOW + 2)
+        .unwrap();
     assert_eq!(halted.program_counter(), ProgramCounterV1::Halted);
     assert_eq!(halted.state().meta().budget().probes_used, 1);
     assert!(halted.ag_spend().is_none());
@@ -1055,6 +1190,69 @@ fn durable_budget_fact_is_nonauthorizing_and_exhaustion_halts() {
 }
 
 #[test]
+fn stale_engine_caller_cannot_redirect_proposal_after_intervening_commit() {
+    struct InterleavingObservation {
+        database: std::path::PathBuf,
+        expected: Digest,
+        calls: Arc<AtomicUsize>,
+        inner: ObservationBoundary,
+    }
+
+    impl ObservationResolverV1 for InterleavingObservation {
+        fn resolve_observation(
+            &mut self,
+            request: &ObservationResolutionRequestV1<'_>,
+        ) -> Result<ObservationResolutionV1, ExternalBoundaryErrorV1> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut competing_engine = CampaignEngineV1::open(&self.database).unwrap();
+            competing_engine
+                .note_probe(&self.expected, NOW + 1)
+                .unwrap();
+            self.inner.resolve_observation(request)
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut stale_engine = create_engine(&directory, ResidualSetV1::default());
+    let expected = current_state_digest(&stale_engine);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut observation = InterleavingObservation {
+        database,
+        expected: expected.clone(),
+        calls: Arc::clone(&calls),
+        inner: ObservationBoundary::current("resolved-before-store-cas"),
+    };
+    let error = stale_engine
+        .record_proposal(
+            &expected,
+            ObservationRefV1::from_digest(digest("stale-observation")),
+            proposal("stale-work"),
+            ProposalClassV1::Initial,
+            &mut observation,
+            NOW + 2,
+        )
+        .unwrap_err();
+    let advanced = stale_engine.current().unwrap();
+    assert!(matches!(
+        error,
+        CampaignEngineErrorV1::Store(CampaignStoreErrorV1::StalePredecessor {
+            expected: stale_expected,
+            authoritative,
+        }) if stale_expected == expected && authoritative == *advanced.state_digest()
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(observation.inner.calls, 1);
+    assert_eq!(
+        advanced.program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+    assert_eq!(advanced.state().meta().budget().probes_used, 1);
+    assert!(advanced.proposal().is_none());
+    assert_eq!(stale_engine.replay().unwrap().transitions, 2);
+}
+
+#[test]
 fn exact_reconciliation_and_settlement_replay_are_idempotent_but_substitution_refuses() {
     let directory = tempfile::tempdir().unwrap();
     let mut engine = create_engine(&directory, ResidualSetV1::default());
@@ -1062,16 +1260,21 @@ fn exact_reconciliation_and_settlement_replay_are_idempotent_but_substitution_re
     let mut standing = StandingBoundary::current();
     let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
     let mut docket = FakeDocket::default();
-    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let dispatched = engine
+        .dispatch(&current_state_digest(&engine), &mut docket, NOW + 5)
+        .unwrap();
     let issuance = dispatched.issuance().unwrap().issuance.clone();
     docket.make_indeterminate(&issuance);
-    let DocketProgressV1::ReconciliationRequired(reconciling) =
-        engine.poll_docket(&mut docket, NOW + 6).unwrap()
+    let DocketProgressV1::ReconciliationRequired(reconciling) = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 6)
+        .unwrap()
     else {
         panic!("indeterminate outcome must enter reconciliation")
     };
     let transition_count = engine.replay().unwrap().transitions;
-    let replay = engine.poll_docket(&mut docket, NOW + 7).unwrap();
+    let replay = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 7)
+        .unwrap();
     assert_eq!(
         replay,
         DocketProgressV1::ReconciliationRequired(reconciling.clone())
@@ -1093,17 +1296,25 @@ fn exact_reconciliation_and_settlement_replay_are_idempotent_but_substitution_re
             FakeAttemptState::Indeterminate(custody, evidence),
         );
     }
-    assert!(engine.poll_docket(&mut docket, NOW + 8).is_err());
+    assert!(
+        engine
+            .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 8)
+            .is_err()
+    );
     assert_eq!(engine.current().unwrap(), reconciling);
 
     docket.settle(&issuance, KnownOutcomeV1::Success);
-    let DocketProgressV1::Settled(settled) = engine.poll_docket(&mut docket, NOW + 9).unwrap()
+    let DocketProgressV1::Settled(settled) = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 9)
+        .unwrap()
     else {
         panic!("known reconciliation must settle")
     };
     let settled_transition_count = engine.replay().unwrap().transitions;
     assert_eq!(
-        engine.poll_docket(&mut docket, NOW + 10).unwrap(),
+        engine
+            .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 10)
+            .unwrap(),
         DocketProgressV1::Settled(settled.clone())
     );
     assert_eq!(
@@ -1124,7 +1335,11 @@ fn exact_reconciliation_and_settlement_replay_are_idempotent_but_substitution_re
             FakeAttemptState::Settled(custody, settlement),
         );
     }
-    assert!(engine.poll_docket(&mut docket, NOW + 11).is_err());
+    assert!(
+        engine
+            .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 11)
+            .is_err()
+    );
     assert_eq!(engine.current().unwrap(), settled);
 }
 
@@ -1168,7 +1383,9 @@ fn concurrent_settlement_ingestion_has_one_legal_successor() {
     let mut standing = StandingBoundary::current();
     let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
     let mut docket = FakeDocket::default();
-    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let dispatched = engine
+        .dispatch(&current_state_digest(&engine), &mut docket, NOW + 5)
+        .unwrap();
     let issuance = dispatched.issuance().unwrap().issuance.clone();
     docket.settle(&issuance, KnownOutcomeV1::Success);
     let response = {
@@ -1185,8 +1402,9 @@ fn concurrent_settlement_ingestion_has_one_legal_successor() {
         let response = response.clone();
         handles.push(std::thread::spawn(move || {
             let mut engine = CampaignEngineV1::open(&database).unwrap();
+            let expected = current_state_digest(&engine);
             engine
-                .poll_docket(&mut BarrierDocket { response, barrier }, NOW + 6)
+                .poll_docket(&expected, &mut BarrierDocket { response, barrier }, NOW + 6)
                 .is_ok()
         }));
     }
@@ -1227,6 +1445,7 @@ fn concurrent_authorization_consumes_exactly_one_ag_spend() {
     let mut standing = StandingBoundary::current();
     engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("observation-1")),
             proposal("work-1"),
             ProposalClassV1::Initial,
@@ -1234,9 +1453,18 @@ fn concurrent_authorization_consumes_exactly_one_ag_spend() {
             NOW + 1,
         )
         .unwrap();
-    engine.require_standing(NOW + 2).unwrap();
     engine
-        .decide(&mut observation, &mut standing, &catalog(), None, NOW + 3)
+        .require_standing(&current_state_digest(&engine), NOW + 2)
+        .unwrap();
+    engine
+        .decide(
+            &current_state_digest(&engine),
+            &mut observation,
+            &mut standing,
+            &catalog(),
+            None,
+            NOW + 3,
+        )
         .unwrap();
     drop(engine);
 
@@ -1247,8 +1475,10 @@ fn concurrent_authorization_consumes_exactly_one_ag_spend() {
         let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
             let mut engine = CampaignEngineV1::open(&database).unwrap();
+            let expected = current_state_digest(&engine);
             engine
                 .authorize(
+                    &expected,
                     &mut BarrierObservation {
                         inner: ObservationBoundary::current("preconditions"),
                         barrier,
@@ -1287,6 +1517,7 @@ fn governed_scope_expansion_is_durable_exact_one_use_and_opens_only_new_occurren
     let original_scope = proposed.effect_scope().clone();
     engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("observation-repair")),
             proposed,
             ProposalClassV1::Initial,
@@ -1296,6 +1527,7 @@ fn governed_scope_expansion_is_durable_exact_one_use_and_opens_only_new_occurren
         .unwrap();
     let halted = engine
         .halt(
+            &current_state_digest(&engine),
             HaltReasonRefV1::from_digest(digest("scope-insufficient")),
             NOW + 2,
         )
@@ -1475,6 +1707,7 @@ fn governed_request_collision_expiry_profile_and_readjudication_mutation_fail_cl
     let proposed = proposal("work-2");
     engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("observation-readjudication")),
             proposed,
             ProposalClassV1::Initial,
@@ -1484,6 +1717,7 @@ fn governed_request_collision_expiry_profile_and_readjudication_mutation_fail_cl
         .unwrap();
     let halted = engine
         .halt(
+            &current_state_digest(&engine),
             HaltReasonRefV1::from_digest(digest("normative-gap")),
             NOW + 2,
         )
@@ -1656,6 +1890,7 @@ fn governed_repair_rejection_is_terminal_halted_with_exact_residual() {
     let original_scope = proposed.effect_scope().clone();
     engine
         .record_proposal(
+            &current_state_digest(&engine),
             ObservationRefV1::from_digest(digest("observation-reject")),
             proposed,
             ProposalClassV1::Initial,
@@ -1664,7 +1899,11 @@ fn governed_repair_rejection_is_terminal_halted_with_exact_residual() {
         )
         .unwrap();
     let halted = engine
-        .halt(HaltReasonRefV1::from_digest(digest("reject-halt")), NOW + 2)
+        .halt(
+            &current_state_digest(&engine),
+            HaltReasonRefV1::from_digest(digest("reject-halt")),
+            NOW + 2,
+        )
         .unwrap();
     let delta = CanonicalEffectScopeV1::new(
         original_scope.effect_class().to_owned(),

@@ -286,6 +286,25 @@ impl CampaignEngineV1 {
         Ok(self.store.current()?)
     }
 
+    /// Loads the authoritative current occurrence only when it still matches
+    /// the exact caller-observed product state. Product legality projection is
+    /// advisory until this lower-layer check binds the caller CAS to the
+    /// engine operation that may cross an external or durable boundary.
+    fn current_at(
+        &self,
+        expected_state_digest: &Digest,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+        let current = self.store.current()?;
+        if current.state_digest() != expected_state_digest {
+            return Err(CampaignStoreErrorV1::StalePredecessor {
+                expected: expected_state_digest.clone(),
+                authoritative: current.state_digest().clone(),
+            }
+            .into());
+        }
+        Ok(current)
+    }
+
     /// Runs deterministic store replay and accounting verification.
     pub fn replay(&self) -> Result<CampaignReplayReportV1, CampaignEngineErrorV1> {
         Ok(self.store.replay()?)
@@ -295,13 +314,14 @@ impl CampaignEngineV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn record_proposal<O: ObservationResolverV1>(
         &mut self,
+        expected_state_digest: &Digest,
         observation: ObservationRefV1,
         proposal: ExactWorkProposalV1,
         class: ProposalClassV1,
         resolver: &mut O,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let successor = match GovernedLoopKernelV1::record_proposal(
             &current,
             observation,
@@ -312,11 +332,17 @@ impl CampaignEngineV1 {
         ) {
             Ok(successor) => successor,
             Err(KernelErrorV1::BudgetExhausted("retry")) => {
-                return self.halt_for_exhausted_budget(&current, "retry", now_unix_ms);
+                return self.halt_for_exhausted_budget(
+                    expected_state_digest,
+                    &current,
+                    "retry",
+                    now_unix_ms,
+                );
             }
             Err(error) => return Err(error.into()),
         };
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::ProposalRecorded,
@@ -328,11 +354,13 @@ impl CampaignEngineV1 {
     /// Enters the explicit standing-required state.
     pub fn require_standing(
         &mut self,
+        expected_state_digest: &Digest,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let successor = GovernedLoopKernelV1::require_standing(&current)?;
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::StandingRequired,
@@ -345,6 +373,7 @@ impl CampaignEngineV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn decide<O, S>(
         &mut self,
+        expected_state_digest: &Digest,
         observation: &mut O,
         standing: &mut S,
         catalog: &ExactWorkCatalogV1,
@@ -355,7 +384,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let mut decider = CatalogAdmissibilityDeciderV1::new(catalog)?;
         let successor = GovernedLoopKernelV1::record_admissible(
             &current,
@@ -366,6 +395,7 @@ impl CampaignEngineV1 {
             now_unix_ms,
         )?;
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::Admissible,
@@ -378,6 +408,7 @@ impl CampaignEngineV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn authorize<O, S>(
         &mut self,
+        expected_state_digest: &Digest,
         observation: &mut O,
         standing: &mut S,
         catalog: &ExactWorkCatalogV1,
@@ -388,7 +419,7 @@ impl CampaignEngineV1 {
         O: ObservationResolverV1,
         S: StandingResolverV1,
     {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let mut decider = CatalogAdmissibilityDeciderV1::new(catalog)?;
         let successor = GovernedLoopKernelV1::consume_authorization(
             &current,
@@ -399,6 +430,7 @@ impl CampaignEngineV1 {
             now_unix_ms,
         )?;
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::AuthorizationConsumed,
@@ -410,10 +442,11 @@ impl CampaignEngineV1 {
     /// Delegates the exact durable issuance to Docket and records its custody.
     pub fn dispatch<D: DocketCustodyPortV1>(
         &mut self,
+        expected_state_digest: &Digest,
         docket: &mut D,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         if current.program_counter() != ProgramCounterV1::AuthorizationConsumed {
             return Err(KernelErrorV1::IllegalTransition {
                 from: current.program_counter(),
@@ -431,6 +464,7 @@ impl CampaignEngineV1 {
                     let halted =
                         GovernedLoopKernelV1::halt_expired_issuance(&current, now_unix_ms)?;
                     self.store.commit(
+                        expected_state_digest,
                         &current,
                         &halted,
                         CampaignTransitionKindV1::Halted,
@@ -438,16 +472,30 @@ impl CampaignEngineV1 {
                     )?;
                     Ok(halted)
                 }
-                DocketIssuanceReconciliationV1::Refused(refusal) => {
-                    self.apply_docket_issuance_refusal(&current, refusal, now_unix_ms)
-                }
-                response => self.apply_recovered_issuance(&current, response, now_unix_ms),
+                DocketIssuanceReconciliationV1::Refused(refusal) => self
+                    .apply_docket_issuance_refusal(
+                        expected_state_digest,
+                        &current,
+                        refusal,
+                        now_unix_ms,
+                    ),
+                response => self.apply_recovered_issuance(
+                    expected_state_digest,
+                    &current,
+                    response,
+                    now_unix_ms,
+                ),
             };
         }
         let acceptance = docket.accept_issuance(&issuance)?;
         let (custody, governed_result) = match acceptance {
             DocketIssuanceAcceptanceV1::Refused(refusal) => {
-                return self.apply_docket_issuance_refusal(&current, refusal, now_unix_ms);
+                return self.apply_docket_issuance_refusal(
+                    expected_state_digest,
+                    &current,
+                    refusal,
+                    now_unix_ms,
+                );
             }
             DocketIssuanceAcceptanceV1::Custody(custody) => (custody, None),
             DocketIssuanceAcceptanceV1::GovernedRepairRequired { custody, result } => {
@@ -456,14 +504,20 @@ impl CampaignEngineV1 {
         };
         let successor = GovernedLoopKernelV1::accept_docket_custody(&current, custody)?;
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::DocketCustodyAccepted,
             now_unix_ms,
         )?;
         if let Some(result) = governed_result {
-            let DocketProgressV1::GovernedRepairRequired { halted, .. } =
-                self.apply_sealed_governed_repair(&successor, result, now_unix_ms)?
+            let DocketProgressV1::GovernedRepairRequired { halted, .. } = self
+                .apply_sealed_governed_repair(
+                    successor.state_digest(),
+                    &successor,
+                    result,
+                    now_unix_ms,
+                )?
             else {
                 return Err(CampaignEngineErrorV1::DocketResponse);
             };
@@ -476,10 +530,11 @@ impl CampaignEngineV1 {
     /// Polls Docket read-only and consumes only exact custody/settlement evidence.
     pub fn poll_docket<D: DocketCustodyPortV1>(
         &mut self,
+        expected_state_digest: &Digest,
         docket: &mut D,
         now_unix_ms: u64,
     ) -> Result<DocketProgressV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let custody = current
             .docket_custody()
             .cloned()
@@ -489,18 +544,20 @@ impl CampaignEngineV1 {
             .cloned()
             .ok_or(CampaignEngineErrorV1::DocketResponse)?;
         let response = docket.reconcile_attempt(&issuance, &custody)?;
-        self.apply_docket_progress(&current, response, now_unix_ms)
+        self.apply_docket_progress(expected_state_digest, &current, response, now_unix_ms)
     }
 
     /// Opens a distinct authority-empty continuation after settlement.
     pub fn open_continuation(
         &mut self,
+        expected_state_digest: &Digest,
         occurrence: OccurrenceId,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let successor = GovernedLoopKernelV1::open_continuation(&current, occurrence)?;
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::ContinuationOpened,
@@ -512,17 +569,24 @@ impl CampaignEngineV1 {
     /// Records one read-only probe budget fact; probe mechanics stay external.
     pub fn note_probe(
         &mut self,
+        expected_state_digest: &Digest,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let successor = match GovernedLoopKernelV1::note_probe(&current) {
             Ok(successor) => successor,
             Err(KernelErrorV1::BudgetExhausted("probe")) => {
-                return self.halt_for_exhausted_budget(&current, "probe", now_unix_ms);
+                return self.halt_for_exhausted_budget(
+                    expected_state_digest,
+                    &current,
+                    "probe",
+                    now_unix_ms,
+                );
             }
             Err(error) => return Err(error.into()),
         };
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::ProbeNoted,
@@ -534,12 +598,14 @@ impl CampaignEngineV1 {
     /// Safely halts from a non-effecting boundary.
     pub fn halt(
         &mut self,
+        expected_state_digest: &Digest,
         reason: HaltReasonRefV1,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let successor = GovernedLoopKernelV1::halt(&current, reason)?;
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::Halted,
@@ -551,18 +617,25 @@ impl CampaignEngineV1 {
     /// Records one bounded escalation and halts.
     pub fn escalate(
         &mut self,
+        expected_state_digest: &Digest,
         reason: HaltReasonRefV1,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let successor = match GovernedLoopKernelV1::escalate(&current, reason) {
             Ok(successor) => successor,
             Err(KernelErrorV1::BudgetExhausted("escalation")) => {
-                return self.halt_for_exhausted_budget(&current, "escalation", now_unix_ms);
+                return self.halt_for_exhausted_budget(
+                    expected_state_digest,
+                    &current,
+                    "escalation",
+                    now_unix_ms,
+                );
             }
             Err(error) => return Err(error.into()),
         };
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::Escalated,
@@ -648,13 +721,14 @@ impl CampaignEngineV1 {
     #[allow(clippy::too_many_arguments)]
     pub fn complete<O: ObservationResolverV1>(
         &mut self,
+        expected_state_digest: &Digest,
         observation_ref: ObservationRefV1,
         subject: &Digest,
         terminal_witness: TerminalWitnessRefV1,
         observation: &mut O,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         let successor = GovernedLoopKernelV1::complete_from_observation(
             &current,
             observation_ref,
@@ -664,6 +738,7 @@ impl CampaignEngineV1 {
             now_unix_ms,
         )?;
         self.store.commit(
+            expected_state_digest,
             &current,
             &successor,
             CampaignTransitionKindV1::Completed,
@@ -675,12 +750,14 @@ impl CampaignEngineV1 {
     /// Records one typed refusal without changing the current state.
     pub fn record_refusal(
         &mut self,
+        expected_state_digest: &Digest,
         code: RefusalCodeV1,
         evidence: Option<Digest>,
         now_unix_ms: u64,
     ) -> Result<Digest, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         Ok(self.store.record_refusal(
+            expected_state_digest,
             &RefusalOutcomeV1 {
                 key: current.key().clone(),
                 at_state_digest: current.state_digest().clone(),
@@ -694,10 +771,11 @@ impl CampaignEngineV1 {
     /// Applies the exact restart law without recreating freshness or authority.
     pub fn recover<D: DocketCustodyPortV1>(
         &mut self,
+        expected_state_digest: &Digest,
         docket: &mut D,
         now_unix_ms: u64,
     ) -> Result<CampaignRecoveryV1, CampaignEngineErrorV1> {
-        let current = self.store.current()?;
+        let current = self.current_at(expected_state_digest)?;
         match current.program_counter() {
             ProgramCounterV1::AuthorizationConsumed => {
                 let issuance = current
@@ -710,6 +788,7 @@ impl CampaignEngineV1 {
                             let halted =
                                 GovernedLoopKernelV1::halt_expired_issuance(&current, now_unix_ms)?;
                             self.store.commit(
+                                expected_state_digest,
                                 &current,
                                 &halted,
                                 CampaignTransitionKindV1::Halted,
@@ -721,8 +800,12 @@ impl CampaignEngineV1 {
                         }
                     }
                     response => {
-                        let advanced =
-                            self.apply_recovered_issuance(&current, response, now_unix_ms)?;
+                        let advanced = self.apply_recovered_issuance(
+                            expected_state_digest,
+                            &current,
+                            response,
+                            now_unix_ms,
+                        )?;
                         Ok(CampaignRecoveryV1::Advanced(advanced))
                     }
                 }
@@ -730,6 +813,7 @@ impl CampaignEngineV1 {
             ProgramCounterV1::Dispatched => {
                 let reconciling = GovernedLoopKernelV1::recover_dispatched(&current)?;
                 self.store.commit(
+                    expected_state_digest,
                     &current,
                     &reconciling,
                     CampaignTransitionKindV1::RecoveryReconciliation,
@@ -744,17 +828,15 @@ impl CampaignEngineV1 {
                     .cloned()
                     .ok_or(CampaignEngineErrorV1::DocketResponse)?;
                 let response = docket.reconcile_attempt(&issuance, &custody)?;
-                match self.apply_docket_progress(&reconciling, response, now_unix_ms)? {
-                    DocketProgressV1::Pending | DocketProgressV1::ReconciliationRequired(_) => {
-                        Ok(CampaignRecoveryV1::Advanced(self.store.current()?))
-                    }
-                    DocketProgressV1::Settled(snapshot) => {
-                        Ok(CampaignRecoveryV1::Advanced(snapshot))
-                    }
-                    DocketProgressV1::GovernedRepairRequired { halted, .. } => {
-                        Ok(CampaignRecoveryV1::Advanced(halted))
-                    }
-                }
+                Self::recovery_from_progress(
+                    self.apply_docket_progress(
+                        reconciling.state_digest(),
+                        &reconciling,
+                        response,
+                        now_unix_ms,
+                    )?,
+                    &self.store,
+                )
             }
             ProgramCounterV1::ReconciliationRequired => {
                 let custody = current
@@ -766,17 +848,15 @@ impl CampaignEngineV1 {
                     .cloned()
                     .ok_or(CampaignEngineErrorV1::DocketResponse)?;
                 let response = docket.reconcile_attempt(&issuance, &custody)?;
-                match self.apply_docket_progress(&current, response, now_unix_ms)? {
-                    DocketProgressV1::Pending | DocketProgressV1::ReconciliationRequired(_) => {
-                        Ok(CampaignRecoveryV1::Advanced(self.store.current()?))
-                    }
-                    DocketProgressV1::Settled(snapshot) => {
-                        Ok(CampaignRecoveryV1::Advanced(snapshot))
-                    }
-                    DocketProgressV1::GovernedRepairRequired { halted, .. } => {
-                        Ok(CampaignRecoveryV1::Advanced(halted))
-                    }
-                }
+                Self::recovery_from_progress(
+                    self.apply_docket_progress(
+                        expected_state_digest,
+                        &current,
+                        response,
+                        now_unix_ms,
+                    )?,
+                    &self.store,
+                )
             }
             _ => Ok(CampaignRecoveryV1::ExternalRevalidation(
                 GovernedLoopKernelV1::recovery_requirement(&current),
@@ -784,8 +864,24 @@ impl CampaignEngineV1 {
         }
     }
 
+    fn recovery_from_progress(
+        progress: DocketProgressV1,
+        store: &CampaignStoreV1,
+    ) -> Result<CampaignRecoveryV1, CampaignEngineErrorV1> {
+        match progress {
+            DocketProgressV1::Pending | DocketProgressV1::ReconciliationRequired(_) => {
+                Ok(CampaignRecoveryV1::Advanced(store.current()?))
+            }
+            DocketProgressV1::Settled(snapshot) => Ok(CampaignRecoveryV1::Advanced(snapshot)),
+            DocketProgressV1::GovernedRepairRequired { halted, .. } => {
+                Ok(CampaignRecoveryV1::Advanced(halted))
+            }
+        }
+    }
+
     fn apply_recovered_issuance(
         &mut self,
+        caller_expected: &Digest,
         current: &OccurrenceSnapshotV1,
         response: DocketIssuanceReconciliationV1,
         now_unix_ms: u64,
@@ -794,13 +890,19 @@ impl CampaignEngineV1 {
         {
             let dispatched = GovernedLoopKernelV1::accept_docket_custody(current, custody)?;
             self.store.commit(
+                caller_expected,
                 current,
                 &dispatched,
                 CampaignTransitionKindV1::DocketCustodyAccepted,
                 now_unix_ms,
             )?;
-            let DocketProgressV1::GovernedRepairRequired { halted, .. } =
-                self.apply_sealed_governed_repair(&dispatched, result, now_unix_ms)?
+            let DocketProgressV1::GovernedRepairRequired { halted, .. } = self
+                .apply_sealed_governed_repair(
+                    dispatched.state_digest(),
+                    &dispatched,
+                    result,
+                    now_unix_ms,
+                )?
             else {
                 return Err(CampaignEngineErrorV1::DocketResponse);
             };
@@ -820,7 +922,12 @@ impl CampaignEngineV1 {
                 return Err(CampaignEngineErrorV1::DocketResponse);
             }
             DocketIssuanceReconciliationV1::Refused(refusal) => {
-                return self.apply_docket_issuance_refusal(current, refusal, now_unix_ms);
+                return self.apply_docket_issuance_refusal(
+                    caller_expected,
+                    current,
+                    refusal,
+                    now_unix_ms,
+                );
             }
             DocketIssuanceReconciliationV1::GovernedRepairRequired { .. } => unreachable!(
                 "governed repair recovery response handled before ordinary reconciliation"
@@ -828,6 +935,7 @@ impl CampaignEngineV1 {
         };
         let dispatched = GovernedLoopKernelV1::accept_docket_custody(current, custody)?;
         self.store.commit(
+            caller_expected,
             current,
             &dispatched,
             CampaignTransitionKindV1::DocketCustodyAccepted,
@@ -840,6 +948,7 @@ impl CampaignEngineV1 {
                 // explicit reconciliation rather than ordinary dispatch.
                 let reconciling = GovernedLoopKernelV1::recover_dispatched(&dispatched)?;
                 self.store.commit(
+                    dispatched.state_digest(),
                     &dispatched,
                     &reconciling,
                     CampaignTransitionKindV1::RecoveryReconciliation,
@@ -850,6 +959,7 @@ impl CampaignEngineV1 {
             Some(Ok(settlement)) => {
                 let settled = GovernedLoopKernelV1::record_settlement(&dispatched, settlement)?;
                 self.store.commit(
+                    dispatched.state_digest(),
                     &dispatched,
                     &settled,
                     CampaignTransitionKindV1::SettlementRecorded,
@@ -861,6 +971,7 @@ impl CampaignEngineV1 {
                 let reconciling =
                     GovernedLoopKernelV1::require_reconciliation(&dispatched, indeterminate)?;
                 self.store.commit(
+                    dispatched.state_digest(),
                     &dispatched,
                     &reconciling,
                     CampaignTransitionKindV1::ReconciliationRequired,
@@ -873,18 +984,25 @@ impl CampaignEngineV1 {
 
     fn apply_docket_issuance_refusal(
         &mut self,
+        caller_expected: &Digest,
         current: &OccurrenceSnapshotV1,
         refusal: ag_campaign::governed::DocketIssuanceRefusalV1,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
         let halted = GovernedLoopKernelV1::halt_docket_issuance_refusal(current, refusal.clone())?;
-        self.store
-            .commit_docket_issuance_refusal(current, &halted, &refusal, now_unix_ms)?;
+        self.store.commit_docket_issuance_refusal(
+            caller_expected,
+            current,
+            &halted,
+            &refusal,
+            now_unix_ms,
+        )?;
         Ok(halted)
     }
 
     fn apply_docket_progress(
         &mut self,
+        caller_expected: &Digest,
         current: &OccurrenceSnapshotV1,
         response: DocketIssuanceReconciliationV1,
         now_unix_ms: u64,
@@ -933,6 +1051,7 @@ impl CampaignEngineV1 {
                         GovernedLoopKernelV1::record_settlement(current, settlement)?
                     };
                 self.store.commit(
+                    caller_expected,
                     current,
                     &successor,
                     if current.program_counter() == ProgramCounterV1::ReconciliationRequired {
@@ -961,6 +1080,7 @@ impl CampaignEngineV1 {
                 let successor =
                     GovernedLoopKernelV1::require_reconciliation(current, indeterminate)?;
                 self.store.commit(
+                    caller_expected,
                     current,
                     &successor,
                     CampaignTransitionKindV1::ReconciliationRequired,
@@ -972,13 +1092,14 @@ impl CampaignEngineV1 {
                 if current.docket_custody() != Some(&custody) {
                     return Err(CampaignEngineErrorV1::DocketResponse);
                 }
-                self.apply_sealed_governed_repair(current, result, now_unix_ms)
+                self.apply_sealed_governed_repair(caller_expected, current, result, now_unix_ms)
             }
         }
     }
 
     fn apply_sealed_governed_repair(
         &mut self,
+        caller_expected: &Digest,
         current: &OccurrenceSnapshotV1,
         result: DocketSealedGovernedRepairResultV1,
         now_unix_ms: u64,
@@ -1013,6 +1134,7 @@ impl CampaignEngineV1 {
             reason,
         )?;
         self.store.commit_docket_governed_repair_halt(
+            caller_expected,
             current,
             &halted,
             &exact_result,
@@ -1026,6 +1148,7 @@ impl CampaignEngineV1 {
 
     fn halt_for_exhausted_budget(
         &mut self,
+        caller_expected: &Digest,
         current: &OccurrenceSnapshotV1,
         budget: &'static str,
         now_unix_ms: u64,
@@ -1043,6 +1166,7 @@ impl CampaignEngineV1 {
         ));
         let successor = GovernedLoopKernelV1::halt(current, reason)?;
         self.store.commit(
+            caller_expected,
             current,
             &successor,
             CampaignTransitionKindV1::Halted,
