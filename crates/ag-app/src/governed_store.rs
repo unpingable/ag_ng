@@ -51,7 +51,8 @@ use ag_campaign::governed::{
     GovernedRepairVerificationV1, GovernedRepairVerifierProfileV1, HumanDecisionRequestRefV1,
     HumanDecisionRequestV1, HumanDecisionRequirementV1, HumanDispositionKindV1,
     HumanDispositionRefV1, HumanDispositionV1, HumanPrincipalRefV1, HumanVerificationRefV1,
-    MandateRefV1, OccurrenceKeyV1, OccurrenceSnapshotV1, ProgramCounterV1, RefusalOutcomeV1,
+    MandateRefV1, OccurrenceKeyV1, OccurrenceSnapshotV1, PreSpendScopeDiscoveryParametersV1,
+    PreSpendScopeDiscoveryV1, PreSpendScopeInsufficiencyV1, ProgramCounterV1, RefusalOutcomeV1,
 };
 use ag_primitives::{Digest, JcsDocument};
 use rusqlite::{
@@ -449,6 +450,10 @@ pub enum CampaignTransitionKindV1 {
     ProbeNoted,
     /// Safe halt recorded.
     Halted,
+    /// Exact typed pre-spend scope-insufficiency halt recorded.
+    PreSpendScopeInsufficiencyHalted,
+    /// Exact non-authorizing discovery opened one revised occurrence.
+    PreSpendScopeDiscovery,
     /// Exact Docket-sealed governed-repair outcome pinned into a halt.
     DocketGovernedRepairHalted,
     /// Exact Docket pre-custody refusal terminalized a consumed issuance.
@@ -480,6 +485,8 @@ impl CampaignTransitionKindV1 {
             Self::ContinuationOpened => "continuation_opened",
             Self::ProbeNoted => "probe_noted",
             Self::Halted => "halted",
+            Self::PreSpendScopeInsufficiencyHalted => "pre_spend_scope_insufficiency_halted",
+            Self::PreSpendScopeDiscovery => "pre_spend_scope_discovery",
             Self::DocketGovernedRepairHalted => "docket_governed_repair_halted",
             Self::DocketIssuanceRefused => "docket_issuance_refused",
             Self::Escalated => "escalated",
@@ -503,6 +510,8 @@ impl CampaignTransitionKindV1 {
             "continuation_opened" => Ok(Self::ContinuationOpened),
             "probe_noted" => Ok(Self::ProbeNoted),
             "halted" => Ok(Self::Halted),
+            "pre_spend_scope_insufficiency_halted" => Ok(Self::PreSpendScopeInsufficiencyHalted),
+            "pre_spend_scope_discovery" => Ok(Self::PreSpendScopeDiscovery),
             "docket_governed_repair_halted" => Ok(Self::DocketGovernedRepairHalted),
             "docket_issuance_refused" => Ok(Self::DocketIssuanceRefused),
             "escalated" => Ok(Self::Escalated),
@@ -590,6 +599,12 @@ enum CampaignTransitionEvidenceV1 {
     DocketIssuanceRefusal {
         refusal: DocketIssuanceRefusalV1,
     },
+    PreSpendScopeInsufficiency {
+        marker: PreSpendScopeInsufficiencyV1,
+    },
+    PreSpendScopeDiscovery {
+        artifact: PreSpendScopeDiscoveryV1,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -628,6 +643,7 @@ pub(crate) enum StoreLifecycleArtifactKindV1 {
     TerminalWitness,
     HistoricalHumanDisposition,
     DocketIssuanceRefusal,
+    PreSpendScopeDiscovery,
     Refusal,
 }
 
@@ -794,6 +810,20 @@ pub struct CampaignReplayReportV1 {
     pub current_state_digest: Digest,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredPreSpendScopeInsufficiencyV1 {
+    pub source: OccurrenceSnapshotV1,
+    pub halted: OccurrenceSnapshotV1,
+    pub marker: PreSpendScopeInsufficiencyV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredPreSpendScopeDiscoveryV1 {
+    pub predecessor: OccurrenceSnapshotV1,
+    pub successor: OccurrenceSnapshotV1,
+    pub artifact: PreSpendScopeDiscoveryV1,
+}
+
 /// Transactional campaign-store failures.
 #[derive(Debug, Error)]
 pub enum CampaignStoreErrorV1 {
@@ -839,6 +869,14 @@ pub enum CampaignStoreErrorV1 {
     /// substituted.
     #[error("governed repair request/disposition replay or substitution")]
     GovernedRepairReplay,
+    /// A typed pre-spend halt idempotency identity was reused with different
+    /// complete inputs.
+    #[error("pre-spend scope-insufficiency replay/substitution")]
+    PreSpendScopeInsufficiencyCollision,
+    /// A pre-spend discovery idempotency identity was reused with different
+    /// complete artifact bytes.
+    #[error("pre-spend scope-discovery replay/substitution")]
+    PreSpendScopeDiscoveryCollision,
     /// This exact issuance already crossed the one-use authentication seam.
     /// Callers must reconcile Docket custody instead of signing again.
     #[error("issuance signing already reserved; reconcile exact issuance")]
@@ -1386,6 +1424,111 @@ impl CampaignStoreV1 {
             .transpose()
     }
 
+    /// Retrieves one exact typed pre-spend halt by its one-use idempotency
+    /// identity.  This is read-only replay evidence and grants no transition.
+    pub(crate) fn pre_spend_scope_insufficiency_by_idempotency(
+        &self,
+        idempotency: &Digest,
+    ) -> Result<Option<StoredPreSpendScopeInsufficiencyV1>, CampaignStoreErrorV1> {
+        self.replay()?;
+        let mut found = None;
+        let mut statement = self.connection.prepare(
+            "SELECT predecessor_state_digest,successor_snapshot_jcs,evidence_jcs
+             FROM transitions WHERE transition_kind=?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map(
+            params![CampaignTransitionKindV1::PreSpendScopeInsufficiencyHalted.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (source_digest, halted_bytes, evidence_bytes) = row?;
+            let evidence: CampaignTransitionEvidenceV1 = decode(&evidence_bytes)?;
+            let CampaignTransitionEvidenceV1::PreSpendScopeInsufficiency { marker } = evidence
+            else {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "typed pre-spend halt lacks exact evidence".to_owned(),
+                ));
+            };
+            if marker.idempotency_key != *idempotency {
+                continue;
+            }
+            marker.validate()?;
+            let source_digest = parse_digest(&source_digest)?;
+            let source = snapshot_by_state_digest(&self.connection, &source_digest)?;
+            let halted: OccurrenceSnapshotV1 = decode(&halted_bytes)?;
+            halted.validate_integrity()?;
+            let record = StoredPreSpendScopeInsufficiencyV1 {
+                source,
+                halted,
+                marker,
+            };
+            if found.replace(record).is_some() {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "duplicate pre-spend halt idempotency identity".to_owned(),
+                ));
+            }
+        }
+        Ok(found)
+    }
+
+    /// Retrieves one exact pre-spend discovery by its one-use idempotency
+    /// identity.  This is read-only replay evidence and grants no transition.
+    pub(crate) fn pre_spend_scope_discovery_by_idempotency(
+        &self,
+        idempotency: &Digest,
+    ) -> Result<Option<StoredPreSpendScopeDiscoveryV1>, CampaignStoreErrorV1> {
+        self.replay()?;
+        let mut found = None;
+        let mut statement = self.connection.prepare(
+            "SELECT predecessor_state_digest,successor_snapshot_jcs,evidence_jcs
+             FROM transitions WHERE transition_kind=?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map(
+            params![CampaignTransitionKindV1::PreSpendScopeDiscovery.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (source_digest, successor_bytes, evidence_bytes) = row?;
+            let evidence: CampaignTransitionEvidenceV1 = decode(&evidence_bytes)?;
+            let CampaignTransitionEvidenceV1::PreSpendScopeDiscovery { artifact } = evidence else {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "pre-spend discovery lacks exact evidence".to_owned(),
+                ));
+            };
+            if artifact.idempotency_key != *idempotency {
+                continue;
+            }
+            artifact.validate()?;
+            let source_digest = parse_digest(&source_digest)?;
+            let predecessor = snapshot_by_state_digest(&self.connection, &source_digest)?;
+            let successor: OccurrenceSnapshotV1 = decode(&successor_bytes)?;
+            successor.validate_integrity()?;
+            let record = StoredPreSpendScopeDiscoveryV1 {
+                predecessor,
+                successor,
+                artifact,
+            };
+            if found.replace(record).is_some() {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "duplicate pre-spend discovery idempotency identity".to_owned(),
+                ));
+            }
+        }
+        Ok(found)
+    }
+
     /// Lists occurrences in stable UUID order after an optional exclusive
     /// cursor.  The bounded limit must be in `1..=1000`.
     pub fn list_occurrences(
@@ -1706,6 +1849,24 @@ impl CampaignStoreV1 {
             {
                 merge_exact_artifact_bytes(&mut found, encode(&refusal)?)?;
             }
+            if let CampaignTransitionEvidenceV1::PreSpendScopeInsufficiency { ref marker } =
+                evidence
+                && marker.reference().as_digest() == identity
+            {
+                merge_exact_artifact_bytes(&mut found, encode(marker)?)?;
+            }
+            if let CampaignTransitionEvidenceV1::PreSpendScopeDiscovery { ref artifact } = evidence
+            {
+                if artifact.reference().as_digest() == identity {
+                    merge_exact_artifact_bytes(&mut found, encode(artifact)?)?;
+                }
+                if artifact.revised_proposal.as_digest() == identity {
+                    merge_exact_artifact_bytes(
+                        &mut found,
+                        encode(&artifact.exact_revised_proposal)?,
+                    )?;
+                }
+            }
         }
 
         // External receipt and complete-record identities are each unique and
@@ -1745,7 +1906,9 @@ impl CampaignStoreV1 {
         let mut links = Vec::new();
         let mut statement = self.connection.prepare(
             "SELECT successor_snapshot_jcs,evidence_jcs FROM transitions
-             WHERE campaign_id=?1 AND successor_occurrence_id=?2 ORDER BY sequence",
+             WHERE campaign_id=?1
+               AND (source_occurrence_id=?2 OR successor_occurrence_id=?2)
+             ORDER BY sequence",
         )?;
         let rows = statement.query_map(
             params![key.campaign.as_str(), key.occurrence.to_string()],
@@ -1912,7 +2075,14 @@ impl CampaignStoreV1 {
                         identity: refusal.refusal,
                     });
                 }
-                CampaignTransitionEvidenceV1::None
+                CampaignTransitionEvidenceV1::PreSpendScopeDiscovery { artifact } => {
+                    links.push(StoreLifecycleArtifactLinkV1 {
+                        kind: StoreLifecycleArtifactKindV1::PreSpendScopeDiscovery,
+                        identity: artifact.reference().as_digest().clone(),
+                    });
+                }
+                CampaignTransitionEvidenceV1::PreSpendScopeInsufficiency { .. }
+                | CampaignTransitionEvidenceV1::None
                 | CampaignTransitionEvidenceV1::ProductGenesis { .. } => {}
             }
         }
@@ -2263,6 +2433,121 @@ impl CampaignStoreV1 {
     }
 
     /// Commits one non-human kernel successor with exact CAS semantics.
+    pub(crate) fn commit_pre_spend_scope_insufficiency(
+        &mut self,
+        caller_expected: &Digest,
+        expected: &OccurrenceSnapshotV1,
+        diagnostic_basis: Digest,
+        idempotency_key: Digest,
+        recorded_at_unix_ms: u64,
+    ) -> Result<(OccurrenceSnapshotV1, bool), CampaignStoreErrorV1> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) = pre_spend_scope_insufficiency_on(&transaction, &idempotency_key)? {
+            if caller_expected != stored.source.state_digest() {
+                return Err(CampaignStoreErrorV1::PreSpendScopeInsufficiencyCollision);
+            }
+            let reconstructed = GovernedLoopKernelV1::halt_pre_spend_scope_insufficiency(
+                &stored.source,
+                diagnostic_basis,
+                idempotency_key,
+                stored.marker.recorded_at_unix_ms,
+            )
+            .map_err(|_| CampaignStoreErrorV1::PreSpendScopeInsufficiencyCollision)?;
+            if reconstructed != stored.halted {
+                return Err(CampaignStoreErrorV1::PreSpendScopeInsufficiencyCollision);
+            }
+            transaction.commit()?;
+            return Ok((stored.halted, true));
+        }
+        let head = campaign_head(&transaction)?;
+        require_caller_expected(&head, caller_expected)?;
+        let authoritative = current_snapshot_on(&transaction)?;
+        if &authoritative != expected || expected.state_digest() != caller_expected {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        ensure_pre_spend_occurrence_has_no_consequences(&transaction, expected.key())?;
+        let halted = GovernedLoopKernelV1::halt_pre_spend_scope_insufficiency(
+            expected,
+            diagnostic_basis,
+            idempotency_key,
+            recorded_at_unix_ms,
+        )?;
+        let marker = halted
+            .halted()
+            .and_then(|value| value.pre_spend_scope_insufficiency())
+            .cloned()
+            .ok_or(CampaignStoreErrorV1::BindingMismatch)?;
+        write_transition(
+            &transaction,
+            caller_expected,
+            expected,
+            &halted,
+            CampaignTransitionKindV1::PreSpendScopeInsufficiencyHalted,
+            &CampaignTransitionEvidenceV1::PreSpendScopeInsufficiency { marker },
+            recorded_at_unix_ms,
+        )?;
+        transaction.commit()?;
+        Ok((halted, false))
+    }
+
+    /// Atomically records one exact pre-spend discovery and creates its one
+    /// distinct authority-empty revised occurrence.
+    pub(crate) fn commit_pre_spend_scope_discovery(
+        &mut self,
+        caller_expected: &Digest,
+        expected: &OccurrenceSnapshotV1,
+        parameters: PreSpendScopeDiscoveryParametersV1,
+    ) -> Result<(PreSpendScopeDiscoveryV1, OccurrenceSnapshotV1, bool), CampaignStoreErrorV1> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(stored) =
+            pre_spend_scope_discovery_on(&transaction, &parameters.idempotency_key)?
+        {
+            if caller_expected != stored.predecessor.state_digest() {
+                return Err(CampaignStoreErrorV1::PreSpendScopeDiscoveryCollision);
+            }
+            let mut replay_parameters = parameters;
+            replay_parameters.recorded_at_unix_ms = stored.artifact.recorded_at_unix_ms;
+            let (artifact, successor) = GovernedLoopKernelV1::create_pre_spend_scope_discovery(
+                &stored.predecessor,
+                replay_parameters,
+            )
+            .map_err(|_| CampaignStoreErrorV1::PreSpendScopeDiscoveryCollision)?;
+            if artifact != stored.artifact || successor != stored.successor {
+                return Err(CampaignStoreErrorV1::PreSpendScopeDiscoveryCollision);
+            }
+            transaction.commit()?;
+            return Ok((stored.artifact, stored.successor, true));
+        }
+        let head = campaign_head(&transaction)?;
+        require_caller_expected(&head, caller_expected)?;
+        let authoritative = current_snapshot_on(&transaction)?;
+        if &authoritative != expected || expected.state_digest() != caller_expected {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        ensure_pre_spend_occurrence_has_no_consequences(&transaction, expected.key())?;
+        let recorded_at_unix_ms = parameters.recorded_at_unix_ms;
+        let (artifact, successor) =
+            GovernedLoopKernelV1::create_pre_spend_scope_discovery(expected, parameters)?;
+        write_transition(
+            &transaction,
+            caller_expected,
+            expected,
+            &successor,
+            CampaignTransitionKindV1::PreSpendScopeDiscovery,
+            &CampaignTransitionEvidenceV1::PreSpendScopeDiscovery {
+                artifact: artifact.clone(),
+            },
+            recorded_at_unix_ms,
+        )?;
+        transaction.commit()?;
+        Ok((artifact, successor, false))
+    }
+
+    /// Commits one non-human kernel successor with exact CAS semantics.
     pub fn commit(
         &mut self,
         caller_expected: &Digest,
@@ -2274,6 +2559,8 @@ impl CampaignStoreV1 {
         if kind == CampaignTransitionKindV1::HumanDisposition
             || kind == CampaignTransitionKindV1::DocketGovernedRepairHalted
             || kind == CampaignTransitionKindV1::DocketIssuanceRefused
+            || kind == CampaignTransitionKindV1::PreSpendScopeInsufficiencyHalted
+            || kind == CampaignTransitionKindV1::PreSpendScopeDiscovery
             || kind == CampaignTransitionKindV1::CampaignCreated
         {
             return Err(CampaignStoreErrorV1::Corrupt(
@@ -3194,6 +3481,148 @@ fn current_snapshot_on(
     Ok(snapshot)
 }
 
+fn snapshot_by_state_digest(
+    connection: &Connection,
+    state_digest: &Digest,
+) -> Result<OccurrenceSnapshotV1, CampaignStoreErrorV1> {
+    let bytes: Vec<u8> = connection.query_row(
+        "SELECT successor_snapshot_jcs FROM transitions
+         WHERE successor_state_digest=?1",
+        params![state_digest.as_str()],
+        |row| row.get(0),
+    )?;
+    let snapshot: OccurrenceSnapshotV1 = decode(&bytes)?;
+    snapshot.validate_integrity()?;
+    if snapshot.state_digest() != state_digest || encode(&snapshot)? != bytes {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "transition snapshot lookup differs from exact state identity".to_owned(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn pre_spend_scope_insufficiency_on(
+    connection: &Connection,
+    idempotency: &Digest,
+) -> Result<Option<StoredPreSpendScopeInsufficiencyV1>, CampaignStoreErrorV1> {
+    let mut found = None;
+    let mut statement = connection.prepare(
+        "SELECT predecessor_state_digest,successor_snapshot_jcs,evidence_jcs
+         FROM transitions WHERE transition_kind=?1 ORDER BY sequence",
+    )?;
+    let rows = statement.query_map(
+        params![CampaignTransitionKindV1::PreSpendScopeInsufficiencyHalted.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        },
+    )?;
+    for row in rows {
+        let (source_digest, halted_bytes, evidence_bytes) = row?;
+        let evidence: CampaignTransitionEvidenceV1 = decode(&evidence_bytes)?;
+        let CampaignTransitionEvidenceV1::PreSpendScopeInsufficiency { marker } = evidence else {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "typed pre-spend halt lacks exact evidence".to_owned(),
+            ));
+        };
+        if marker.idempotency_key != *idempotency {
+            continue;
+        }
+        marker.validate()?;
+        let source = snapshot_by_state_digest(connection, &parse_digest(&source_digest)?)?;
+        let halted: OccurrenceSnapshotV1 = decode(&halted_bytes)?;
+        halted.validate_integrity()?;
+        let record = StoredPreSpendScopeInsufficiencyV1 {
+            source,
+            halted,
+            marker,
+        };
+        if found.replace(record).is_some() {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "duplicate pre-spend halt idempotency identity".to_owned(),
+            ));
+        }
+    }
+    Ok(found)
+}
+
+fn pre_spend_scope_discovery_on(
+    connection: &Connection,
+    idempotency: &Digest,
+) -> Result<Option<StoredPreSpendScopeDiscoveryV1>, CampaignStoreErrorV1> {
+    let mut found = None;
+    let mut statement = connection.prepare(
+        "SELECT predecessor_state_digest,successor_snapshot_jcs,evidence_jcs
+         FROM transitions WHERE transition_kind=?1 ORDER BY sequence",
+    )?;
+    let rows = statement.query_map(
+        params![CampaignTransitionKindV1::PreSpendScopeDiscovery.as_str()],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        },
+    )?;
+    for row in rows {
+        let (source_digest, successor_bytes, evidence_bytes) = row?;
+        let evidence: CampaignTransitionEvidenceV1 = decode(&evidence_bytes)?;
+        let CampaignTransitionEvidenceV1::PreSpendScopeDiscovery { artifact } = evidence else {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "pre-spend discovery lacks exact evidence".to_owned(),
+            ));
+        };
+        if artifact.idempotency_key != *idempotency {
+            continue;
+        }
+        artifact.validate()?;
+        let predecessor = snapshot_by_state_digest(connection, &parse_digest(&source_digest)?)?;
+        let successor: OccurrenceSnapshotV1 = decode(&successor_bytes)?;
+        successor.validate_integrity()?;
+        let record = StoredPreSpendScopeDiscoveryV1 {
+            predecessor,
+            successor,
+            artifact,
+        };
+        if found.replace(record).is_some() {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "duplicate pre-spend discovery idempotency identity".to_owned(),
+            ));
+        }
+    }
+    Ok(found)
+}
+
+fn ensure_pre_spend_occurrence_has_no_consequences(
+    transaction: &Transaction<'_>,
+    key: &OccurrenceKeyV1,
+) -> Result<(), CampaignStoreErrorV1> {
+    for table in [
+        "human_decision_requests",
+        "human_dispositions",
+        "governed_repair_dispositions",
+        "ag_authorization_spends",
+        "docket_attempts",
+        "docket_settlements",
+    ] {
+        let query =
+            format!("SELECT COUNT(*) FROM {table} WHERE campaign_id=?1 AND occurrence_id=?2");
+        let count: i64 = transaction.query_row(
+            &query,
+            params![key.campaign.as_str(), key.occurrence.to_string()],
+            |row| row.get(0),
+        )?;
+        if count != 0 {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+    }
+    Ok(())
+}
+
 fn require_caller_expected(
     head: &CampaignHeadRow,
     caller_expected: &Digest,
@@ -3466,7 +3895,24 @@ fn validate_transition_kind(
                 && target.halted().is_some_and(|halted| {
                     halted.governed_repair_requirement().is_none()
                         && halted.docket_issuance_refusal().is_none()
+                        && halted.pre_spend_scope_insufficiency().is_none()
                 })
+        }
+        K::PreSpendScopeInsufficiencyHalted => {
+            pair == (P::ProposalRecorded, P::Halted)
+                && target.halted().is_some_and(|halted| {
+                    halted.pre_spend_scope_insufficiency().is_some()
+                        && halted.governed_repair_requirement().is_none()
+                        && halted.docket_issuance_refusal().is_none()
+                })
+        }
+        K::PreSpendScopeDiscovery => {
+            pair == (P::Halted, P::ObservationRequired)
+                && source.key() != target.key()
+                && source
+                    .halted()
+                    .is_some_and(|halted| halted.pre_spend_scope_insufficiency().is_some())
+                && target.pre_spend_revision_constraint().is_some()
         }
         K::DocketGovernedRepairHalted => {
             matches!(pair, (P::Dispatched | P::ReconciliationRequired, P::Halted))
@@ -3482,6 +3928,9 @@ fn validate_transition_kind(
         }
         K::HumanDisposition => {
             source.program_counter() == P::Halted
+                && source
+                    .halted()
+                    .is_some_and(|halted| halted.pre_spend_scope_insufficiency().is_none())
                 && matches!(
                     target.program_counter(),
                     P::Halted | P::ObservationRequired | P::Completed
@@ -3776,6 +4225,8 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
     let mut human_decisions = BTreeSet::new();
     let mut human_artifacts = BTreeMap::new();
     let mut governed_repair_artifacts = BTreeMap::new();
+    let mut pre_spend_insufficiency_idempotency = BTreeSet::new();
+    let mut pre_spend_discovery_idempotency = BTreeSet::new();
 
     for (index, row) in transitions.iter().enumerate() {
         let expected_sequence = u64::try_from(index)
@@ -3875,6 +4326,29 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
                 &row.evidence,
                 row.recorded_at_unix_ms,
             )?;
+            match &row.evidence {
+                CampaignTransitionEvidenceV1::PreSpendScopeInsufficiency { marker } => {
+                    if !pre_spend_insufficiency_idempotency
+                        .insert(marker.idempotency_key.as_str().to_owned())
+                    {
+                        return Err(CampaignStoreErrorV1::Corrupt(
+                            "pre-spend insufficiency idempotency identity appears twice in replay"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                CampaignTransitionEvidenceV1::PreSpendScopeDiscovery { artifact } => {
+                    if !pre_spend_discovery_idempotency
+                        .insert(artifact.idempotency_key.as_str().to_owned())
+                    {
+                        return Err(CampaignStoreErrorV1::Corrupt(
+                            "pre-spend discovery idempotency identity appears twice in replay"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                _ => {}
+            }
             for decision in row
                 .snapshot
                 .state()
@@ -4142,6 +4616,66 @@ fn validate_replayed_evidence(
 ) -> Result<(), CampaignStoreErrorV1> {
     match (kind, evidence) {
         (
+            CampaignTransitionKindV1::PreSpendScopeInsufficiencyHalted,
+            CampaignTransitionEvidenceV1::PreSpendScopeInsufficiency { marker },
+        ) => {
+            marker.validate()?;
+            if marker.recorded_at_unix_ms != recorded_at_unix_ms {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "pre-spend insufficiency transition time mismatch".to_owned(),
+                ));
+            }
+            let reconstructed = GovernedLoopKernelV1::halt_pre_spend_scope_insufficiency(
+                source,
+                marker.diagnostic_basis.clone(),
+                marker.idempotency_key.clone(),
+                marker.recorded_at_unix_ms,
+            )?;
+            if reconstructed != *target
+                || target
+                    .halted()
+                    .and_then(|halted| halted.pre_spend_scope_insufficiency())
+                    != Some(marker)
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "pre-spend insufficiency transition reconstruction mismatch".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        (
+            CampaignTransitionKindV1::PreSpendScopeDiscovery,
+            CampaignTransitionEvidenceV1::PreSpendScopeDiscovery { artifact },
+        ) => {
+            artifact.validate()?;
+            if artifact.recorded_at_unix_ms != recorded_at_unix_ms {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "pre-spend discovery transition time mismatch".to_owned(),
+                ));
+            }
+            let parameters = PreSpendScopeDiscoveryParametersV1 {
+                predecessor: artifact.predecessor.clone(),
+                original_proposal: artifact.original_proposal.clone(),
+                original_scope_identity: artifact.original_scope_identity.clone(),
+                diagnostic_basis: artifact.diagnostic_basis.clone(),
+                requested_delta: artifact.requested_delta.clone(),
+                claimed_revised_scope: artifact.revised_scope.clone(),
+                claimed_revised_proposal: artifact.revised_proposal.clone(),
+                exact_revised_proposal: artifact.exact_revised_proposal.clone(),
+                revised_occurrence: artifact.revised_occurrence,
+                idempotency_key: artifact.idempotency_key.clone(),
+                recorded_at_unix_ms: artifact.recorded_at_unix_ms,
+            };
+            let (reconstructed_artifact, reconstructed_target) =
+                GovernedLoopKernelV1::create_pre_spend_scope_discovery(source, parameters)?;
+            if reconstructed_artifact != *artifact || reconstructed_target != *target {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "pre-spend discovery transition reconstruction mismatch".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        (
             CampaignTransitionKindV1::DocketGovernedRepairHalted,
             CampaignTransitionEvidenceV1::DocketGovernedRepairHalt { result },
         ) => {
@@ -4261,6 +4795,14 @@ fn validate_replayed_evidence(
         (CampaignTransitionKindV1::DocketIssuanceRefused, _) => Err(CampaignStoreErrorV1::Corrupt(
             "Docket issuance refusal lacks exact evidence".to_owned(),
         )),
+        (CampaignTransitionKindV1::PreSpendScopeInsufficiencyHalted, _) => {
+            Err(CampaignStoreErrorV1::Corrupt(
+                "pre-spend insufficiency halt lacks exact evidence".to_owned(),
+            ))
+        }
+        (CampaignTransitionKindV1::PreSpendScopeDiscovery, _) => Err(
+            CampaignStoreErrorV1::Corrupt("pre-spend discovery lacks exact evidence".to_owned()),
+        ),
         (_, CampaignTransitionEvidenceV1::None) => Ok(()),
         (_, CampaignTransitionEvidenceV1::ProductGenesis { .. }) => {
             Err(CampaignStoreErrorV1::Corrupt(

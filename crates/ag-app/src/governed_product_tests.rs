@@ -180,6 +180,103 @@ fn product_scope() -> CanonicalEffectScopeV1 {
     .unwrap()
 }
 
+fn pre_spend_delta(path: &str) -> CanonicalEffectScopeV1 {
+    CanonicalEffectScopeV1::new(
+        "repair".to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: path.to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap()
+}
+
+#[derive(Clone)]
+struct PreSpendHaltedFixture {
+    database: PathBuf,
+    original_proposal: ExactWorkProposalV1,
+    proposed: OccurrenceViewV1,
+    halt_request: HaltPreSpendScopeInsufficiencyV1,
+    halted: HaltPreSpendScopeInsufficiencyResultV1,
+}
+
+impl PreSpendHaltedFixture {
+    fn discovery_request(
+        &self,
+        path: &str,
+        revised_occurrence: u128,
+        idempotency_label: &str,
+    ) -> RecordPreSpendScopeDiscoveryV1 {
+        let requested_delta = pre_spend_delta(path);
+        let revised_scope = self
+            .original_proposal
+            .effect_scope()
+            .exact_additive_union(&requested_delta)
+            .unwrap();
+        let exact_revised_proposal = self
+            .original_proposal
+            .derive_pre_spend_revision(revised_scope.clone())
+            .unwrap();
+        RecordPreSpendScopeDiscoveryV1 {
+            expected_state_digest: self.halted.halted.state_digest().clone(),
+            predecessor: self.halted.halted.key().clone(),
+            original_proposal: self.original_proposal.reference(),
+            original_scope_identity: self.original_proposal.scope().clone(),
+            diagnostic_basis: self.halt_request.diagnostic_basis.clone(),
+            requested_delta,
+            revised_scope,
+            revised_proposal: exact_revised_proposal.reference(),
+            exact_revised_proposal,
+            revised_occurrence: OccurrenceId::from_uuid(Uuid::from_u128(revised_occurrence)),
+            idempotency_key: digest(idempotency_label),
+        }
+    }
+}
+
+fn pre_spend_halted_fixture(directory: &Path) -> PreSpendHaltedFixture {
+    let database = directory.join("campaign.sqlite");
+    let mut service =
+        GovernedCampaignServiceV1::create(&database, creation(None, directory)).unwrap();
+    let initial = service.state().unwrap().current;
+    let original_proposal = ExactWorkProposalV1::new(
+        initial.key().campaign.clone(),
+        digest("subject"),
+        product_scope(),
+        "test.product/v1".to_owned(),
+        digest("pre-spend-work"),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
+        None,
+    )
+    .unwrap();
+    let proposed = service
+        .record_proposal(
+            initial.state_digest(),
+            ObservationRefV1::from_digest(digest("pre-spend-observation")),
+            original_proposal.clone(),
+            ProposalClassV1::Initial,
+        )
+        .unwrap();
+    let halt_request = HaltPreSpendScopeInsufficiencyV1 {
+        expected_state_digest: proposed.state_digest().clone(),
+        diagnostic_basis: digest("pre-spend-diagnostic-basis"),
+        idempotency_key: digest("pre-spend-halt-idempotency"),
+    };
+    let halted = service
+        .halt_pre_spend_scope_insufficiency(halt_request.clone())
+        .unwrap();
+    PreSpendHaltedFixture {
+        database,
+        original_proposal,
+        proposed,
+        halt_request,
+        halted,
+    }
+}
+
 fn docket_root(directory: &Path, trust_config: &Path) -> GovernedDocketAdapterRootV1 {
     let state_directory = directory.join("docket-state");
     std::fs::create_dir_all(&state_directory).unwrap();
@@ -582,6 +679,280 @@ fn create_is_exact_idempotent_and_product_pages_are_bounded() {
     assert_eq!(events.next, None, "terminal event page has no cursor");
 }
 
+fn assert_typed_pre_spend_halt(
+    fixture: &PreSpendHaltedFixture,
+    service: &mut GovernedCampaignServiceV1,
+) {
+    let marker = fixture
+        .halted
+        .halted
+        .halted()
+        .unwrap()
+        .pre_spend_scope_insufficiency
+        .as_ref()
+        .unwrap();
+    assert_eq!(marker.proposal, fixture.original_proposal.reference());
+    assert_eq!(marker.original_scope_identity, product_scope().digest());
+    assert_eq!(
+        marker.diagnostic_basis,
+        fixture.halt_request.diagnostic_basis
+    );
+    let replayed_halt = service
+        .halt_pre_spend_scope_insufficiency(fixture.halt_request.clone())
+        .unwrap();
+    assert!(replayed_halt.replayed);
+    assert_eq!(replayed_halt.halted, fixture.halted.halted);
+    let allowed = service.allowed_transitions().unwrap().allowed_transitions;
+    assert!(allowed.contains(&GovernedOperationV1::RecordPreSpendScopeDiscovery));
+    assert!(!allowed.contains(&GovernedOperationV1::CreateDecisionRequest));
+    assert!(!allowed.contains(&GovernedOperationV1::SubmitDisposition));
+    assert!(!allowed.contains(&GovernedOperationV1::Authorize));
+}
+
+fn assert_pre_spend_occurrence_views(
+    fixture: &PreSpendHaltedFixture,
+    service: &GovernedCampaignServiceV1,
+    result: &PreSpendScopeDiscoveryResultV1,
+    expected_revised_proposal: &ExactWorkProposalV1,
+) -> (OccurrenceViewV1, OccurrenceViewV1) {
+    let predecessor = service.occurrence(&result.predecessor).unwrap().unwrap();
+    assert_eq!(predecessor.key, fixture.halted.halted.key);
+    assert_eq!(predecessor.program, fixture.halted.halted.program);
+    assert_eq!(
+        predecessor.program_counter,
+        fixture.halted.halted.program_counter
+    );
+    assert_eq!(
+        predecessor.prior_state_digest,
+        fixture.halted.halted.prior_state_digest
+    );
+    assert_eq!(predecessor.state_digest, fixture.halted.halted.state_digest);
+    assert_eq!(predecessor.halted, fixture.halted.halted.halted);
+    assert!(predecessor.artifacts.iter().any(|link| {
+        link.kind == GovernedArtifactKindV1::PreSpendScopeDiscovery
+            && link.identity == *result.discovery.as_digest()
+    }));
+    assert_eq!(
+        predecessor.proposal_contract,
+        fixture.proposed.proposal_contract
+    );
+    let revised = service
+        .occurrence(&result.revised_occurrence)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        revised.program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+    assert_eq!(revised.state_digest(), &result.revised_initial_state_digest);
+    assert!(revised.proposal_contract.is_none());
+    assert!(revised.halted.is_none());
+    assert!(revised.completed.is_none());
+    assert!(revised.used_human_decisions.is_empty());
+    assert_eq!(revised.authority_history, AuthorityHistoryV1::default());
+    let constraint = revised.pre_spend_revision.as_ref().unwrap();
+    assert_eq!(constraint.predecessor, result.predecessor);
+    assert_eq!(constraint.discovery, result.discovery);
+    assert_eq!(constraint.revised_proposal, result.revised_proposal);
+    assert_eq!(
+        &constraint.exact_revised_proposal,
+        expected_revised_proposal
+    );
+    let artifact = service
+        .artifact(result.discovery.as_digest())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        artifact.kind,
+        GovernedArtifactKindV1::PreSpendScopeDiscovery
+    );
+    assert!(artifact.occurrences.contains(&result.predecessor));
+    assert!(artifact.occurrences.contains(&result.revised_occurrence));
+    let exact: PreSpendScopeDiscoveryV1 = serde_json::from_slice(&artifact.bytes).unwrap();
+    exact.validate().unwrap();
+    assert_eq!(exact.reference(), &result.discovery);
+    assert_eq!(
+        exact.exact_revised_proposal(),
+        &constraint.exact_revised_proposal
+    );
+    (predecessor, revised)
+}
+
+fn assert_reopened_revision_requires_fresh_governance(
+    database: &Path,
+    result: &PreSpendScopeDiscoveryResultV1,
+    predecessor: &OccurrenceViewV1,
+    revised: &OccurrenceViewV1,
+    expected_revised_proposal: ExactWorkProposalV1,
+) {
+    let mut reopened = GovernedCampaignServiceV1::open(database).unwrap();
+    assert_eq!(
+        reopened.occurrence(&result.predecessor).unwrap().unwrap(),
+        *predecessor
+    );
+    assert_eq!(
+        reopened
+            .occurrence(&result.revised_occurrence)
+            .unwrap()
+            .unwrap(),
+        *revised
+    );
+    let next = reopened.allowed_transitions().unwrap().allowed_transitions;
+    assert!(next.contains(&GovernedOperationV1::RecordProposal));
+    assert!(!next.contains(&GovernedOperationV1::RequireStanding));
+    assert!(!next.contains(&GovernedOperationV1::Authorize));
+    assert!(
+        reopened.require_standing(revised.state_digest()).is_err(),
+        "the discovery constraint is evidence, not standing"
+    );
+    let freshly_observed = reopened
+        .record_proposal(
+            revised.state_digest(),
+            ObservationRefV1::from_digest(digest("fresh-revised-observation")),
+            expected_revised_proposal,
+            ProposalClassV1::Successor,
+        )
+        .unwrap();
+    assert_eq!(
+        freshly_observed.program_counter(),
+        ProgramCounterV1::ProposalRecorded
+    );
+    assert_eq!(
+        freshly_observed.proposal_contract.unwrap().proposal,
+        result.revised_proposal
+    );
+}
+
+#[test]
+fn product_pre_spend_discovery_preserves_predecessor_and_opens_authority_empty_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = pre_spend_halted_fixture(directory.path());
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    assert_typed_pre_spend_halt(&fixture, &mut service);
+    let request = fixture.discovery_request("bounded/discovered", 2, "pre-spend-discovery");
+    let expected_revised_proposal = request.exact_revised_proposal.clone();
+    let result = service.record_pre_spend_scope_discovery(request).unwrap();
+    assert!(!result.replayed);
+    assert_eq!(result.predecessor, fixture.halted.halted.key);
+    assert_eq!(
+        result.revised_proposal,
+        expected_revised_proposal.reference()
+    );
+    assert_ne!(result.revised_occurrence, result.predecessor);
+    let (predecessor, revised) =
+        assert_pre_spend_occurrence_views(&fixture, &service, &result, &expected_revised_proposal);
+    drop(service);
+    assert_reopened_revision_requires_fresh_governance(
+        &fixture.database,
+        &result,
+        &predecessor,
+        &revised,
+        expected_revised_proposal,
+    );
+}
+
+#[test]
+fn product_pre_spend_discovery_replay_collision_and_stale_calls_write_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = pre_spend_halted_fixture(directory.path());
+    let request = fixture.discovery_request("bounded/discovered", 2, "pre-spend-discovery");
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    let committed = service
+        .record_pre_spend_scope_discovery(request.clone())
+        .unwrap();
+    let exact_replay = service
+        .record_pre_spend_scope_discovery(request.clone())
+        .unwrap();
+    assert!(exact_replay.replayed);
+    assert_eq!(exact_replay.discovery, committed.discovery);
+    assert_eq!(
+        exact_replay.revised_occurrence,
+        committed.revised_occurrence
+    );
+
+    let before_collision = service.replay().unwrap();
+    let mut changed =
+        fixture.discovery_request("bounded/different-discovery", 3, "pre-spend-discovery");
+    changed.expected_state_digest = request.expected_state_digest.clone();
+    assert!(
+        service
+            .record_pre_spend_scope_discovery(changed.clone())
+            .is_err()
+    );
+    assert_eq!(service.replay().unwrap(), before_collision);
+    assert!(
+        service
+            .occurrence(&OccurrenceKeyV1 {
+                campaign: committed.predecessor.campaign.clone(),
+                occurrence: changed.revised_occurrence,
+            })
+            .unwrap()
+            .is_none()
+    );
+
+    let stale_directory = tempfile::tempdir().unwrap();
+    let stale_fixture = pre_spend_halted_fixture(stale_directory.path());
+    let mut stale_request =
+        stale_fixture.discovery_request("bounded/discovered", 2, "stale-discovery");
+    stale_request.expected_state_digest = digest("stale-pre-spend-head");
+    let mut stale_service = GovernedCampaignServiceV1::open(&stale_fixture.database).unwrap();
+    let before_stale = stale_service.replay().unwrap();
+    let error = stale_service
+        .record_pre_spend_scope_discovery(stale_request)
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "stale_state");
+    assert_eq!(stale_service.replay().unwrap(), before_stale);
+    assert_eq!(
+        stale_service.state().unwrap().current,
+        stale_fixture.halted.halted
+    );
+}
+
+#[test]
+fn product_pre_spend_discovery_has_one_concurrent_winner() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = pre_spend_halted_fixture(directory.path());
+    let request = fixture.discovery_request("bounded/discovered", 2, "pre-spend-discovery");
+    let competing_request = request.clone();
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    service.set_after_projection_before_mutation_hook(move |database, expected, operation| {
+        assert_eq!(operation, GovernedOperationV1::RecordPreSpendScopeDiscovery);
+        assert_eq!(expected, &competing_request.expected_state_digest);
+        let mut competing = GovernedCampaignServiceV1::open(database).unwrap();
+        let winner = competing
+            .record_pre_spend_scope_discovery(competing_request)
+            .unwrap();
+        assert!(!winner.replayed);
+    });
+    let replay = service.record_pre_spend_scope_discovery(request).unwrap();
+    assert!(replay.replayed);
+
+    let conflict_directory = tempfile::tempdir().unwrap();
+    let conflict_fixture = pre_spend_halted_fixture(conflict_directory.path());
+    let losing = conflict_fixture.discovery_request("bounded/losing", 2, "losing-discovery");
+    let winning = conflict_fixture.discovery_request("bounded/winning", 3, "winning-discovery");
+    let winning_key = OccurrenceKeyV1 {
+        campaign: winning.predecessor.campaign.clone(),
+        occurrence: winning.revised_occurrence,
+    };
+    let losing_key = OccurrenceKeyV1 {
+        campaign: losing.predecessor.campaign.clone(),
+        occurrence: losing.revised_occurrence,
+    };
+    let mut conflicting = GovernedCampaignServiceV1::open(&conflict_fixture.database).unwrap();
+    conflicting.set_after_projection_before_mutation_hook(move |database, _, operation| {
+        assert_eq!(operation, GovernedOperationV1::RecordPreSpendScopeDiscovery);
+        let mut competing = GovernedCampaignServiceV1::open(database).unwrap();
+        competing.record_pre_spend_scope_discovery(winning).unwrap();
+    });
+    let error = conflicting
+        .record_pre_spend_scope_discovery(losing)
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "stale_state");
+    assert!(conflicting.occurrence(&winning_key).unwrap().is_some());
+    assert!(conflicting.occurrence(&losing_key).unwrap().is_none());
+}
+
 #[test]
 fn product_caller_cas_survives_intervening_legal_commit_after_projection() {
     let directory = tempfile::tempdir().unwrap();
@@ -973,61 +1344,23 @@ fn docket_runtime_correspondence_controls_pre_spend_transition_projection() {
     );
 }
 
-#[test]
-fn pre_spend_generic_halt_does_not_advertise_or_accept_a_governed_request() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("campaign.sqlite");
-    let verifier = verifier_fixture(directory.path());
-    let service = GovernedCampaignServiceV1::create(
-        &database,
-        creation(Some(root_with_executable(&verifier)), directory.path()),
-    )
-    .unwrap();
-    drop(service);
-
-    // This direct Store/kernel setup is intentionally test-only. It proves
-    // that a generic pre-spend halt cannot enter the governed post-custody
-    // request path merely because a caller can describe a plausible delta.
-    let mut store = CampaignStoreV1::open(&database).unwrap();
-    let current = store.current().unwrap();
-    let halted = GovernedLoopKernelV1::halt(
-        &current,
-        HaltReasonRefV1::from_digest(digest("pre-spend-assessment-halt")),
-    )
-    .unwrap();
-    store
-        .commit(
-            current.state_digest(),
-            &current,
-            &halted,
-            CampaignTransitionKindV1::Halted,
-            NOW,
-        )
-        .unwrap();
-    drop(store);
-
-    let mut service = GovernedCampaignServiceV1::open(&database).unwrap();
+fn assert_generic_halt_rejects_governed_request(
+    service: &mut GovernedCampaignServiceV1,
+    halted: &OccurrenceSnapshotV1,
+    delta: &CanonicalEffectScopeV1,
+) {
     let allowed = service.allowed_transitions().unwrap();
     assert!(
         !allowed
             .allowed_transitions
             .contains(&GovernedOperationV1::CreateDecisionRequest)
     );
-    let delta = CanonicalEffectScopeV1::new(
-        "repair".to_owned(),
-        vec![CanonicalEffectResourceV1 {
-            resource: "repository".to_owned(),
-            path: "bounded/missing".to_owned(),
-            operations: vec![CanonicalEffectOperationV1::Modify],
-        }],
-    )
-    .unwrap();
     let requirement = HumanDecisionRequirementV1::ScopeExpansion(ScopeExpansionRequiredV1 {
         schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
         original_scope: product_scope(),
         original_scope_digest: product_scope().digest(),
         requested_delta_digest: delta.digest(),
-        requested_delta: delta,
+        requested_delta: delta.clone(),
         blocked_operation: BlockedEffectOperationV1 {
             resource: "repository".to_owned(),
             path: "bounded/missing".to_owned(),
@@ -1052,6 +1385,331 @@ fn pre_spend_generic_halt_does_not_advertise_or_accept_a_governed_request() {
             })
             .is_err()
     );
+}
+
+fn assert_generic_halt_rejects_pre_spend_revision(
+    service: &mut GovernedCampaignServiceV1,
+    halted: &OccurrenceSnapshotV1,
+    delta: CanonicalEffectScopeV1,
+) {
+    assert!(
+        service
+            .halt_pre_spend_scope_insufficiency(HaltPreSpendScopeInsufficiencyV1 {
+                expected_state_digest: halted.state_digest().clone(),
+                diagnostic_basis: digest("generic-halt-diagnostic"),
+                idempotency_key: digest("generic-halt-idempotency"),
+            })
+            .is_err(),
+        "a generic halt cannot be relabeled as typed pre-spend insufficiency"
+    );
+    let arbitrary = ExactWorkProposalV1::new(
+        halted.key().campaign.clone(),
+        digest("subject"),
+        product_scope(),
+        "test.product/v1".to_owned(),
+        digest("generic-halt-work"),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
+        None,
+    )
+    .unwrap();
+    let revised_scope = arbitrary
+        .effect_scope()
+        .exact_additive_union(&delta)
+        .unwrap();
+    let revised = arbitrary
+        .derive_pre_spend_revision(revised_scope.clone())
+        .unwrap();
+    assert!(
+        service
+            .record_pre_spend_scope_discovery(RecordPreSpendScopeDiscoveryV1 {
+                expected_state_digest: halted.state_digest().clone(),
+                predecessor: halted.key().clone(),
+                original_proposal: arbitrary.reference(),
+                original_scope_identity: arbitrary.scope().clone(),
+                diagnostic_basis: digest("generic-halt-diagnostic"),
+                requested_delta: delta,
+                revised_scope,
+                revised_proposal: revised.reference(),
+                exact_revised_proposal: revised,
+                revised_occurrence: OccurrenceId::from_uuid(Uuid::from_u128(2)),
+                idempotency_key: digest("generic-discovery-idempotency"),
+            })
+            .is_err(),
+        "a generic halt cannot create a pre-spend revised occurrence"
+    );
+}
+
+#[test]
+fn pre_spend_generic_halt_does_not_advertise_or_accept_a_governed_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let verifier = verifier_fixture(directory.path());
+    let service = GovernedCampaignServiceV1::create(
+        &database,
+        creation(Some(root_with_executable(&verifier)), directory.path()),
+    )
+    .unwrap();
+    drop(service);
+
+    // This direct Store/kernel setup is intentionally test-only. It proves
+    // that a generic pre-spend halt cannot enter either governed repair route.
+    let mut store = CampaignStoreV1::open(&database).unwrap();
+    let current = store.current().unwrap();
+    let halted = GovernedLoopKernelV1::halt(
+        &current,
+        HaltReasonRefV1::from_digest(digest("pre-spend-assessment-halt")),
+    )
+    .unwrap();
+    store
+        .commit(
+            current.state_digest(),
+            &current,
+            &halted,
+            CampaignTransitionKindV1::Halted,
+            NOW,
+        )
+        .unwrap();
+    drop(store);
+
+    let delta = pre_spend_delta("bounded/missing");
+    let mut service = GovernedCampaignServiceV1::open(&database).unwrap();
+    assert_generic_halt_rejects_governed_request(&mut service, &halted, &delta);
+    assert_generic_halt_rejects_pre_spend_revision(&mut service, &halted, delta);
+}
+
+#[test]
+fn post_spend_halt_cannot_enter_the_pre_spend_revision_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = scope_decision_fixture(directory.path());
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    assert!(
+        service
+            .halt_pre_spend_scope_insufficiency(HaltPreSpendScopeInsufficiencyV1 {
+                expected_state_digest: fixture.halted.state_digest().clone(),
+                diagnostic_basis: digest("post-spend-diagnostic"),
+                idempotency_key: digest("post-spend-halt-idempotency"),
+            })
+            .is_err()
+    );
+    let exact_original = fixture
+        .halted
+        .proposal_contract
+        .as_ref()
+        .unwrap()
+        .exact_record
+        .clone();
+    let revised_scope = exact_original
+        .effect_scope()
+        .exact_additive_union(&fixture.delta)
+        .unwrap();
+    let revised = exact_original
+        .derive_pre_spend_revision(revised_scope.clone())
+        .unwrap();
+    assert!(
+        service
+            .record_pre_spend_scope_discovery(RecordPreSpendScopeDiscoveryV1 {
+                expected_state_digest: fixture.halted.state_digest().clone(),
+                predecessor: fixture.halted.key().clone(),
+                original_proposal: exact_original.reference(),
+                original_scope_identity: exact_original.scope().clone(),
+                diagnostic_basis: digest("post-spend-diagnostic"),
+                requested_delta: fixture.delta,
+                revised_scope,
+                revised_proposal: revised.reference(),
+                exact_revised_proposal: revised,
+                revised_occurrence: OccurrenceId::from_uuid(Uuid::from_u128(9)),
+                idempotency_key: digest("post-spend-discovery-idempotency"),
+            })
+            .is_err(),
+        "post-spend scope expansion remains exclusive to Docket result and human disposition"
+    );
+    let after = service.state().unwrap().current;
+    assert_eq!(after.key, fixture.halted.key);
+    assert_eq!(after.program_counter, fixture.halted.program_counter);
+    assert_eq!(after.state_digest, fixture.halted.state_digest);
+    assert_eq!(after.proposal_contract, fixture.halted.proposal_contract);
+    assert_eq!(
+        after.halted.as_ref().unwrap().pre_spend_scope_insufficiency,
+        None
+    );
+}
+
+#[test]
+fn checkpoint_bound_successor_proposal_never_advertises_or_enters_pre_spend_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = scope_decision_fixture(directory.path());
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    let approved = service
+        .submit_governed_disposition(SubmitGovernedDispositionV1 {
+            expected_state_digest: fixture.halted.state_digest().clone(),
+            request: fixture.request.reference(),
+            artifact: approval(&fixture),
+        })
+        .unwrap();
+    let successor_scope = fixture.original_scope.exact_union(&fixture.delta).unwrap();
+    let proposal = ExactWorkProposalV1::new(
+        approved.current.key.campaign.clone(),
+        digest("subject"),
+        successor_scope,
+        "test.product/v1".to_owned(),
+        digest("checkpoint-bound-work"),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1_000,
+        },
+        None,
+    )
+    .unwrap()
+    .with_governed_repair_checkpoint(repair_checkpoint())
+    .unwrap();
+    let proposed = service
+        .record_proposal(
+            approved.current.state_digest(),
+            ObservationRefV1::from_digest(digest("checkpoint-bound-observation")),
+            proposal,
+            ProposalClassV1::Successor,
+        )
+        .unwrap();
+    let before = service.state().unwrap();
+    assert!(
+        !before
+            .allowed_transitions
+            .contains(&GovernedOperationV1::HaltPreSpendScopeInsufficiency)
+    );
+    let error = service
+        .halt_pre_spend_scope_insufficiency(HaltPreSpendScopeInsufficiencyV1 {
+            expected_state_digest: proposed.state_digest().clone(),
+            diagnostic_basis: digest("checkpoint-bound-diagnostic"),
+            idempotency_key: digest("checkpoint-bound-halt"),
+        })
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "operation_not_allowed");
+    let after = service.state().unwrap();
+    assert_eq!(after.current, before.current);
+    assert_eq!(after.event_sequence, before.event_sequence);
+}
+
+#[test]
+fn expired_typed_halt_never_advertises_or_creates_a_pre_spend_revision() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = pre_spend_halted_fixture(directory.path());
+    std::fs::write(
+        directory.path().join("governed-clock-value"),
+        format!("{}\n", NOW + 1_000),
+    )
+    .unwrap();
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    let halted_state = service.state().unwrap();
+    assert!(
+        !halted_state
+            .allowed_transitions
+            .contains(&GovernedOperationV1::RecordPreSpendScopeDiscovery)
+    );
+    let request =
+        fixture.discovery_request("bounded/expired-delta", 77, "expired-discovery-idempotency");
+    let error = service
+        .record_pre_spend_scope_discovery(request)
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "operation_not_allowed");
+    let after = service.state().unwrap();
+    assert_eq!(after.current, halted_state.current);
+    assert_eq!(after.event_sequence, halted_state.event_sequence);
+}
+
+#[test]
+fn expired_recorded_proposal_never_enters_the_typed_pre_spend_halt() {
+    let second = tempfile::tempdir().unwrap();
+    let database = second.path().join("campaign.sqlite");
+    let mut service =
+        GovernedCampaignServiceV1::create(&database, creation(None, second.path())).unwrap();
+    let initial = service.state().unwrap().current;
+    let proposal = ExactWorkProposalV1::new(
+        initial.key.campaign.clone(),
+        digest("subject"),
+        product_scope(),
+        "test.product/v1".to_owned(),
+        digest("expiring-pre-spend-work"),
+        ProposalGovernanceTermsV1 {
+            nonclaims: vec![digest("proposal-nonclaim")],
+            expires_at_unix_ms: NOW + 1,
+        },
+        None,
+    )
+    .unwrap();
+    let proposed = service
+        .record_proposal(
+            initial.state_digest(),
+            ObservationRefV1::from_digest(digest("expiring-pre-spend-observation")),
+            proposal,
+            ProposalClassV1::Initial,
+        )
+        .unwrap();
+    std::fs::write(
+        second.path().join("governed-clock-value"),
+        format!("{}\n", NOW + 1),
+    )
+    .unwrap();
+    let before = service.state().unwrap();
+    assert!(
+        !before
+            .allowed_transitions
+            .contains(&GovernedOperationV1::HaltPreSpendScopeInsufficiency)
+    );
+    let error = service
+        .halt_pre_spend_scope_insufficiency(HaltPreSpendScopeInsufficiencyV1 {
+            expected_state_digest: proposed.state_digest().clone(),
+            diagnostic_basis: digest("expired-halt-diagnostic"),
+            idempotency_key: digest("expired-halt-idempotency"),
+        })
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "operation_not_allowed");
+    let after = service.state().unwrap();
+    assert_eq!(after.current, before.current);
+    assert_eq!(after.event_sequence, before.event_sequence);
+}
+
+#[test]
+fn expired_revised_occurrence_does_not_advertise_fresh_proposal_recording() {
+    let third = tempfile::tempdir().unwrap();
+    let fixture = pre_spend_halted_fixture(third.path());
+    let request = fixture.discovery_request(
+        "bounded/revised-then-expired",
+        78,
+        "revised-then-expired-idempotency",
+    );
+    let exact_revised_proposal = request.exact_revised_proposal.clone();
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    let revised = service
+        .record_pre_spend_scope_discovery(request)
+        .unwrap()
+        .revised_occurrence;
+    std::fs::write(
+        third.path().join("governed-clock-value"),
+        format!("{}\n", NOW + 1_000),
+    )
+    .unwrap();
+    let expired_revision = service.state().unwrap();
+    assert_eq!(expired_revision.current.key, revised);
+    assert!(
+        !expired_revision
+            .allowed_transitions
+            .contains(&GovernedOperationV1::RecordProposal)
+    );
+    let error = service
+        .record_proposal(
+            expired_revision.current.state_digest(),
+            ObservationRefV1::from_digest(digest("expired-revised-observation")),
+            exact_revised_proposal,
+            ProposalClassV1::Successor,
+        )
+        .unwrap_err();
+    assert_eq!(error.stable_code(), "operation_not_allowed");
+    let after = service.state().unwrap();
+    assert_eq!(after.current, expired_revision.current);
+    assert_eq!(after.event_sequence, expired_revision.event_sequence);
 }
 
 #[test]

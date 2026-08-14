@@ -18,18 +18,19 @@ use serde::{Deserialize, Serialize};
 
 use ag_campaign::governed::{
     AG_ISSUANCE_SCHEMA_V2, AdmissionDecisionV1, AuthorityHistoryV1, AuthorizedSuccessorBasisV1,
-    C1RejectedReviewBasisV1, CurrentStandingResolutionV1, DOCKET_CUSTODY_SCHEMA_V1,
-    DOCKET_SETTLEMENT_SCHEMA_V1, DocketAttemptRefV1, DocketCheckpointRefV1,
-    DocketIssuanceRefusalV1, DocketSealedResultRefV1, EXACT_WORK_PROPOSAL_SCHEMA_V1,
-    ExactWorkProposalV1, GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1,
+    C1RejectedReviewBasisV1, CanonicalEffectScopeV1, CurrentStandingResolutionV1,
+    DOCKET_CUSTODY_SCHEMA_V1, DOCKET_SETTLEMENT_SCHEMA_V1, DocketAttemptRefV1,
+    DocketCheckpointRefV1, DocketIssuanceRefusalV1, DocketSealedResultRefV1,
+    EXACT_WORK_PROPOSAL_SCHEMA_V1, ExactWorkProposalV1, GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1,
     GOVERNED_REPAIR_VERIFICATION_SCHEMA_V1, GovernedRepairCheckpointV1, GovernedRepairClosedV1,
     GovernedRepairDispositionV1, GovernedRepairVerifierProfileV1, HUMAN_DECISION_REQUEST_SCHEMA_V1,
     HUMAN_DISPOSITION_SCHEMA_V1, HaltReasonRefV1, HumanDecisionIdV1, HumanDecisionRequestRefV1,
     HumanDecisionRequestV1, HumanDecisionRequirementV1, HumanDispositionRefV1, HumanPrincipalRefV1,
     HumanVerificationRefV1, IndeterminateOutcomeV1, LoopBudgetV1, MandateRefV1, ObservationRefV1,
     ObservationResolutionV1, OccurrenceId, OccurrenceKeyV1, OccurrenceSnapshotV1,
-    ProgramBasisRefV1, ProgramCounterV1, ProposalClassV1, ProposalRefV1, RefusalCodeV1,
-    ResidualSetV1, TerminalWitnessRefV1,
+    PRE_SPEND_SCOPE_DISCOVERY_SCHEMA_V1, PreSpendScopeDiscoveryParametersV1,
+    PreSpendScopeDiscoveryRefV1, PreSpendScopeInsufficiencyV1, ProgramBasisRefV1, ProgramCounterV1,
+    ProposalClassV1, ProposalRefV1, RefusalCodeV1, ResidualSetV1, TerminalWitnessRefV1,
 };
 
 use crate::governed_loop::{CampaignEngineErrorV1, CampaignEngineV1};
@@ -63,6 +64,12 @@ impl CampaignEngineErrorV1 {
                 }
                 CampaignStoreErrorV1::GovernedRepairReplay => {
                     "governed_repair_replay_or_substitution"
+                }
+                CampaignStoreErrorV1::PreSpendScopeInsufficiencyCollision => {
+                    "pre_spend_scope_insufficiency_replay_or_substitution"
+                }
+                CampaignStoreErrorV1::PreSpendScopeDiscoveryCollision => {
+                    "pre_spend_scope_discovery_replay_or_substitution"
                 }
                 CampaignStoreErrorV1::IssuanceSigningAlreadyReserved => {
                     "issuance_reconciliation_required"
@@ -668,6 +675,10 @@ pub enum GovernedOperationV1 {
     NoteProbe,
     /// Halt from an authority-safe boundary.
     Halt,
+    /// Record a typed nonauthorizing pre-spend scope-insufficiency halt.
+    HaltPreSpendScopeInsufficiency,
+    /// Record one exact discovery and open its authority-empty revised occurrence.
+    RecordPreSpendScopeDiscovery,
     /// Consume one escalation budget fact and halt.
     Escalate,
     /// Complete an authority-empty occurrence.
@@ -695,6 +706,8 @@ impl GovernedOperationV1 {
             Self::OpenContinuation => "open_continuation",
             Self::NoteProbe => "note_probe",
             Self::Halt => "halt",
+            Self::HaltPreSpendScopeInsufficiency => "halt_pre_spend_scope_insufficiency",
+            Self::RecordPreSpendScopeDiscovery => "record_pre_spend_scope_discovery",
             Self::Escalate => "escalate",
             Self::Complete => "complete",
             Self::CreateDecisionRequest => "create_decision_request",
@@ -717,6 +730,8 @@ impl GovernedOperationV1 {
             Self::OpenContinuation => "open-continuation",
             Self::NoteProbe => "note-probe",
             Self::Halt => "halt",
+            Self::HaltPreSpendScopeInsufficiency => "halt-pre-spend-scope-insufficiency",
+            Self::RecordPreSpendScopeDiscovery => "record-pre-spend-scope-discovery",
             Self::Escalate => "escalate",
             Self::Complete => "complete",
             Self::CreateDecisionRequest => "create-decision-request",
@@ -770,6 +785,8 @@ pub enum GovernedArtifactKindV1 {
     GovernedRepairVerification,
     /// Exact authority-empty predecessor/successor constraint.
     SuccessorBinding,
+    /// Exact nonauthorizing pre-spend scope discovery and revision binding.
+    PreSpendScopeDiscovery,
     /// Exact residual state at one occurrence cut.
     ResidualState,
     /// Exact fresh observation that completed an occurrence.
@@ -1029,6 +1046,10 @@ pub struct OccurrenceViewV1 {
     /// Exact immutable proposal contract once proposal recording occurred.
     /// Authority-empty observation shells expose `None`.
     pub proposal_contract: Option<ProposalContractViewV1>,
+    /// Exact nonauthorizing pre-spend revision constraint on an
+    /// observation-required successor.  This records its pending proposal but
+    /// carries no observation, standing, admission, spend, or issuance.
+    pub pre_spend_revision: Option<PreSpendRevisionConstraintViewV1>,
     /// Halt-specific facts, absent at every other program counter.
     pub halted: Option<HaltedOccurrenceViewV1>,
     /// Completion-specific evidence, absent at every other program counter.
@@ -1049,6 +1070,22 @@ pub struct ProposalContractViewV1 {
     pub nonclaims: Vec<Digest>,
     /// Exclusive absolute deadline for fresh consequence-bearing progress.
     pub expires_at_unix_ms: u64,
+}
+
+/// Stable product projection of an exact pending pre-spend revision.  The
+/// constraint is lineage/evidence only and cannot substitute for recording a
+/// fresh observation against the exact revised proposal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreSpendRevisionConstraintViewV1 {
+    /// Exact immutable predecessor occurrence.
+    pub predecessor: OccurrenceKeyV1,
+    /// Exact discovery artifact that opened the revised occurrence.
+    pub discovery: PreSpendScopeDiscoveryRefV1,
+    /// Exact pending revised proposal identity.
+    pub revised_proposal: ProposalRefV1,
+    /// Complete pending revised proposal contract.
+    pub exact_revised_proposal: ExactWorkProposalV1,
 }
 
 impl OccurrenceViewV1 {
@@ -1111,6 +1148,9 @@ pub struct HaltedOccurrenceViewV1 {
     pub governed_repair_closed: Option<GovernedRepairClosedV1>,
     /// Exact Docket pre-custody refusal, when that terminalized the consumed issuance.
     pub docket_issuance_refusal: Option<DocketIssuanceRefusalV1>,
+    /// Exact typed pre-spend insufficiency basis, when this is the sole
+    /// nonauthorizing discovery/revision eligibility class.
+    pub pre_spend_scope_insufficiency: Option<PreSpendScopeInsufficiencyV1>,
     /// Exact current unconsumed and unexpired human-decision request. This is
     /// populated by the product service, not reconstructed from the snapshot.
     pub open_human_decision_request: Option<HumanDecisionRequestRefV1>,
@@ -1143,6 +1183,7 @@ impl TryFrom<&OccurrenceSnapshotV1> for OccurrenceViewV1 {
             governed_repair_requirement: halted.governed_repair_requirement().cloned(),
             governed_repair_closed: halted.governed_repair_closed().cloned(),
             docket_issuance_refusal: halted.docket_issuance_refusal().cloned(),
+            pre_spend_scope_insufficiency: halted.pre_spend_scope_insufficiency().cloned(),
             open_human_decision_request: None,
         });
         let completed =
@@ -1177,6 +1218,14 @@ impl TryFrom<&OccurrenceSnapshotV1> for OccurrenceViewV1 {
             authority_history: snapshot.state().authority_history(),
             artifacts: occurrence_artifact_links(snapshot)?,
             proposal_contract,
+            pre_spend_revision: snapshot.pre_spend_revision_constraint().map(|constraint| {
+                PreSpendRevisionConstraintViewV1 {
+                    predecessor: constraint.predecessor().clone(),
+                    discovery: constraint.discovery().clone(),
+                    revised_proposal: constraint.revised_proposal().clone(),
+                    exact_revised_proposal: constraint.exact_revised_proposal().clone(),
+                }
+            }),
             halted,
             completed,
         })
@@ -1348,6 +1397,81 @@ pub struct CreateCampaignV1 {
     pub governed_repair_verifier_root: Option<GovernedRepairVerifierRootV1>,
     /// Optional deployment-owned Docket adapter root, pinned once at creation.
     pub governed_docket_adapter_root: Option<GovernedDocketAdapterRootV1>,
+}
+
+/// Stable request for a typed, nonauthorizing pre-spend scope-insufficiency
+/// halt.  The Store derives and binds the current occurrence, proposal, and
+/// scope; the caller supplies only the exact diagnostic basis and CAS cut.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaltPreSpendScopeInsufficiencyV1 {
+    /// Exact expected current state.
+    pub expected_state_digest: Digest,
+    /// Exact diagnostic/evidence basis that identified insufficient scope.
+    pub diagnostic_basis: Digest,
+    /// Stable exact-request idempotency identity.
+    pub idempotency_key: Digest,
+}
+
+/// Stable idempotent result of one typed pre-spend insufficiency halt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HaltPreSpendScopeInsufficiencyResultV1 {
+    /// Exact typed halted occurrence.
+    pub halted: OccurrenceViewV1,
+    /// Whether this call observed an already committed exact replay.
+    pub replayed: bool,
+}
+
+/// Stable request to preserve one exact pre-spend discovery and open its
+/// distinct authority-empty revised occurrence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordPreSpendScopeDiscoveryV1 {
+    /// Exact typed-halt state observed by the caller.
+    pub expected_state_digest: Digest,
+    /// Exact immutable predecessor occurrence.
+    pub predecessor: OccurrenceKeyV1,
+    /// Exact immutable predecessor proposal.
+    pub original_proposal: ProposalRefV1,
+    /// Exact immutable predecessor scope identity.
+    pub original_scope_identity: Digest,
+    /// Exact diagnostic basis already pinned by the typed halt.
+    pub diagnostic_basis: Digest,
+    /// Exact additive scope delta; this is evidence, not authority.
+    pub requested_delta: CanonicalEffectScopeV1,
+    /// Claimed mechanically derived revised scope, checked by AG.
+    pub revised_scope: CanonicalEffectScopeV1,
+    /// Exact mechanically derived revised proposal identity.
+    pub revised_proposal: ProposalRefV1,
+    /// Complete mechanically derived revised proposal contract.
+    pub exact_revised_proposal: ExactWorkProposalV1,
+    /// Fresh distinct occurrence that will hold the pending exact proposal.
+    pub revised_occurrence: OccurrenceId,
+    /// Stable exact-request idempotency identity.
+    pub idempotency_key: Digest,
+}
+
+/// Stable result of one atomic pre-spend discovery/revision operation.
+/// Identities describe the original committed cut even after the revised
+/// occurrence later advances through fresh governance.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreSpendScopeDiscoveryResultV1 {
+    /// Exact durable discovery artifact.
+    pub discovery: PreSpendScopeDiscoveryRefV1,
+    /// Immutable halted predecessor occurrence.
+    pub predecessor: OccurrenceKeyV1,
+    /// Exact predecessor halt state bound by the discovery.
+    pub predecessor_state_digest: Digest,
+    /// Fresh distinct revised occurrence.
+    pub revised_occurrence: OccurrenceKeyV1,
+    /// Exact initial authority-empty state of the revised occurrence.
+    pub revised_initial_state_digest: Digest,
+    /// Exact pending revised proposal bound into that occurrence.
+    pub revised_proposal: ProposalRefV1,
+    /// Whether this call observed an already committed exact replay.
+    pub replayed: bool,
 }
 
 /// Stable request-creation operation with explicit CAS and idempotency.
@@ -1603,6 +1727,13 @@ impl GovernedCampaignServiceV1 {
                     governed: governed_state,
                     proposal: if current
                         .proposal_contract()
+                        .or_else(|| {
+                            current
+                                .pre_spend_revision_constraint()
+                                .map(
+                                    ag_campaign::governed::PreSpendRevisionConstraintV1::exact_revised_proposal,
+                                )
+                        })
                         .is_some_and(|proposal| now_unix_ms >= proposal.expires_at_unix_ms())
                     {
                         ProposalTimeStateV1::Expired
@@ -1611,6 +1742,9 @@ impl GovernedCampaignServiceV1 {
                     },
                     budget: current_view.budget,
                     residuals_empty: current_view.residuals.is_empty(),
+                    pre_spend_revision_eligible: current
+                        .proposal_contract()
+                        .is_some_and(|proposal| proposal.governed_repair_checkpoint().is_none()),
                     docket,
                     verifier,
                 },
@@ -2099,6 +2233,91 @@ impl GovernedCampaignServiceV1 {
         )
     }
 
+    /// Records one exact typed pre-spend scope-insufficiency halt.  The marker
+    /// is nonauthorizing and can only make the exact discovery/revision
+    /// transition eligible; it cannot enter the post-spend human-disposition
+    /// path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale state, an ineligible source, identity
+    /// collision, or Store failure.
+    pub fn halt_pre_spend_scope_insufficiency(
+        &mut self,
+        request: HaltPreSpendScopeInsufficiencyV1,
+    ) -> Result<HaltPreSpendScopeInsufficiencyResultV1, CampaignEngineErrorV1> {
+        if self.engine.current()?.state_digest() == &request.expected_state_digest {
+            self.require_allowed(
+                &request.expected_state_digest,
+                GovernedOperationV1::HaltPreSpendScopeInsufficiency,
+            )?;
+        }
+        let now_unix_ms = self.consequence_now()?;
+        let commit = self.engine.halt_pre_spend_scope_insufficiency(
+            &request.expected_state_digest,
+            request.diagnostic_basis,
+            request.idempotency_key,
+            now_unix_ms,
+        )?;
+        let store = CampaignStoreV1::open(self.engine.store_path())?;
+        Ok(HaltPreSpendScopeInsufficiencyResultV1 {
+            halted: project_occurrence(&store, &commit.halted, now_unix_ms)?,
+            replayed: commit.replayed,
+        })
+    }
+
+    /// Atomically records one exact pre-spend scope discovery and creates one
+    /// distinct authority-empty revised occurrence.  Every caller-supplied
+    /// predecessor coordinate is rechecked by the Store in the committing
+    /// transaction; the revised proposal is pending exact fresh observation,
+    /// not admitted or authorized work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale state, generic-halt laundering, an altered
+    /// predecessor/delta/proposal, replay collision, or Store failure.
+    pub fn record_pre_spend_scope_discovery(
+        &mut self,
+        request: RecordPreSpendScopeDiscoveryV1,
+    ) -> Result<PreSpendScopeDiscoveryResultV1, CampaignEngineErrorV1> {
+        // Apply the strict recursive JCS/safe-integer gate before any caller
+        // value participates in identity derivation or durable lookup.
+        JcsDocument::canonicalize(&request)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        if self.engine.current()?.state_digest() == &request.expected_state_digest {
+            self.require_allowed(
+                &request.expected_state_digest,
+                GovernedOperationV1::RecordPreSpendScopeDiscovery,
+            )?;
+        }
+        let now_unix_ms = self.consequence_now()?;
+        let commit = self.engine.record_pre_spend_scope_discovery(
+            &request.expected_state_digest,
+            PreSpendScopeDiscoveryParametersV1 {
+                predecessor: request.predecessor,
+                original_proposal: request.original_proposal,
+                original_scope_identity: request.original_scope_identity,
+                diagnostic_basis: request.diagnostic_basis,
+                requested_delta: request.requested_delta,
+                claimed_revised_scope: request.revised_scope,
+                claimed_revised_proposal: request.revised_proposal,
+                exact_revised_proposal: request.exact_revised_proposal,
+                revised_occurrence: request.revised_occurrence,
+                idempotency_key: request.idempotency_key,
+                recorded_at_unix_ms: now_unix_ms,
+            },
+        )?;
+        Ok(PreSpendScopeDiscoveryResultV1 {
+            discovery: commit.discovery.reference().clone(),
+            predecessor: commit.predecessor.key().clone(),
+            predecessor_state_digest: commit.predecessor.state_digest().clone(),
+            revised_occurrence: commit.successor.key().clone(),
+            revised_initial_state_digest: commit.successor.state_digest().clone(),
+            revised_proposal: commit.discovery.revised_proposal().clone(),
+            replayed: commit.replayed,
+        })
+    }
+
     /// Enters standing-required through the canonical engine under CAS.
     ///
     /// # Errors
@@ -2439,6 +2658,9 @@ fn project_occurrence(
             StoreLifecycleArtifactKindV1::SuccessorBinding => {
                 GovernedArtifactKindV1::SuccessorBinding
             }
+            StoreLifecycleArtifactKindV1::PreSpendScopeDiscovery => {
+                GovernedArtifactKindV1::PreSpendScopeDiscovery
+            }
             StoreLifecycleArtifactKindV1::ResidualState => GovernedArtifactKindV1::ResidualState,
             StoreLifecycleArtifactKindV1::CompletionObservation => {
                 GovernedArtifactKindV1::CompletionObservation
@@ -2663,6 +2885,7 @@ fn artifact_schema(kind: GovernedArtifactKindV1) -> &'static str {
             GOVERNED_REPAIR_VERIFICATION_SCHEMA_V1
         }
         GovernedArtifactKindV1::SuccessorBinding => SUCCESSOR_BINDING_ARTIFACT_SCHEMA_V1,
+        GovernedArtifactKindV1::PreSpendScopeDiscovery => PRE_SPEND_SCOPE_DISCOVERY_SCHEMA_V1,
         GovernedArtifactKindV1::ResidualState => RESIDUAL_STATE_ARTIFACT_SCHEMA_V1,
         GovernedArtifactKindV1::CompletionObservation => COMPLETION_OBSERVATION_ARTIFACT_SCHEMA_V1,
         GovernedArtifactKindV1::TerminalWitness => TERMINAL_WITNESS_ARTIFACT_SCHEMA_V1,
@@ -2734,6 +2957,9 @@ fn artifact_occurrences(
                             }
                             StoreLifecycleArtifactKindV1::SuccessorBinding => {
                                 GovernedArtifactKindV1::SuccessorBinding
+                            }
+                            StoreLifecycleArtifactKindV1::PreSpendScopeDiscovery => {
+                                GovernedArtifactKindV1::PreSpendScopeDiscovery
                             }
                             StoreLifecycleArtifactKindV1::ResidualState => {
                                 GovernedArtifactKindV1::ResidualState
@@ -2813,6 +3039,7 @@ fn classify_artifact(bytes: &[u8]) -> Result<GovernedArtifactKindV1, CampaignEng
             GovernedArtifactKindV1::EffectJournalReference
         }
         Some(SUCCESSOR_BINDING_ARTIFACT_SCHEMA_V1) => GovernedArtifactKindV1::SuccessorBinding,
+        Some(PRE_SPEND_SCOPE_DISCOVERY_SCHEMA_V1) => GovernedArtifactKindV1::PreSpendScopeDiscovery,
         Some(RESIDUAL_STATE_ARTIFACT_SCHEMA_V1) => GovernedArtifactKindV1::ResidualState,
         Some(COMPLETION_OBSERVATION_ARTIFACT_SCHEMA_V1) => {
             GovernedArtifactKindV1::CompletionObservation
@@ -2852,6 +3079,7 @@ fn classify_artifact(bytes: &[u8]) -> Result<GovernedArtifactKindV1, CampaignEng
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GovernedDecisionStateV1 {
     NotGoverned,
+    PreSpendScopeInsufficiency,
     AwaitingRequest,
     RequestOpen,
     Closed,
@@ -2882,6 +3110,7 @@ struct AllowedTransitionStateV1 {
     proposal: ProposalTimeStateV1,
     budget: LoopBudgetV1,
     residuals_empty: bool,
+    pre_spend_revision_eligible: bool,
     docket: DocketDeploymentStateV1,
     verifier: VerifierDeploymentStateV1,
 }
@@ -2896,7 +3125,9 @@ fn governed_decision_state(
     let halted = current.halted().ok_or_else(|| {
         CampaignEngineErrorV1::Canonical("halted program counter lacks halted state".to_owned())
     })?;
-    Ok(if halted.governed_repair_closed().is_some() {
+    Ok(if halted.pre_spend_scope_insufficiency().is_some() {
+        GovernedDecisionStateV1::PreSpendScopeInsufficiency
+    } else if halted.governed_repair_closed().is_some() {
         GovernedDecisionStateV1::Closed
     } else if has_open_request {
         GovernedDecisionStateV1::RequestOpen
@@ -2905,6 +3136,30 @@ fn governed_decision_state(
     } else {
         GovernedDecisionStateV1::NotGoverned
     })
+}
+
+fn allow_halted_transition(names: &mut Vec<GovernedOperationV1>, state: AllowedTransitionStateV1) {
+    match state.governed {
+        GovernedDecisionStateV1::PreSpendScopeInsufficiency => {
+            if state.proposal == ProposalTimeStateV1::Current {
+                names.push(GovernedOperationV1::RecordPreSpendScopeDiscovery);
+            }
+        }
+        GovernedDecisionStateV1::AwaitingRequest
+            if state.verifier != VerifierDeploymentStateV1::Absent =>
+        {
+            names.push(GovernedOperationV1::CreateDecisionRequest);
+        }
+        GovernedDecisionStateV1::RequestOpen
+            if state.verifier == VerifierDeploymentStateV1::RuntimeCurrent =>
+        {
+            names.push(GovernedOperationV1::SubmitDisposition);
+        }
+        GovernedDecisionStateV1::NotGoverned
+        | GovernedDecisionStateV1::AwaitingRequest
+        | GovernedDecisionStateV1::RequestOpen
+        | GovernedDecisionStateV1::Closed => {}
+    }
 }
 
 fn allowed_transitions(
@@ -2920,7 +3175,10 @@ fn allowed_transitions(
     let docket_current = state.docket == DocketDeploymentStateV1::RuntimeCurrent;
     match pc {
         ProgramCounterV1::ObservationRequired => {
-            allow(true, GovernedOperationV1::RecordProposal);
+            allow(
+                state.proposal == ProposalTimeStateV1::Current,
+                GovernedOperationV1::RecordProposal,
+            );
             allow(state.residuals_empty, GovernedOperationV1::Complete);
             allow(
                 state.budget.probe_available(),
@@ -2935,6 +3193,10 @@ fn allowed_transitions(
         ProgramCounterV1::ProposalRecorded => {
             allow(true, GovernedOperationV1::RequireStanding);
             allow(true, GovernedOperationV1::Halt);
+            allow(
+                state.pre_spend_revision_eligible && state.proposal == ProposalTimeStateV1::Current,
+                GovernedOperationV1::HaltPreSpendScopeInsufficiency,
+            );
             allow(
                 state.budget.escalation_available(),
                 GovernedOperationV1::Escalate,
@@ -2999,17 +3261,7 @@ fn allowed_transitions(
                 GovernedOperationV1::Escalate,
             );
         }
-        ProgramCounterV1::Halted => match state.governed {
-            GovernedDecisionStateV1::AwaitingRequest => allow(
-                state.verifier != VerifierDeploymentStateV1::Absent,
-                GovernedOperationV1::CreateDecisionRequest,
-            ),
-            GovernedDecisionStateV1::RequestOpen => allow(
-                state.verifier == VerifierDeploymentStateV1::RuntimeCurrent,
-                GovernedOperationV1::SubmitDisposition,
-            ),
-            GovernedDecisionStateV1::NotGoverned | GovernedDecisionStateV1::Closed => {}
-        },
+        ProgramCounterV1::Halted => allow_halted_transition(&mut names, state),
         ProgramCounterV1::Completed => {}
     }
     // Recording a refusal is the sole legal no-state-change consequence at
@@ -3040,6 +3292,7 @@ mod tests {
                 escalations_used: 0,
             },
             residuals_empty: true,
+            pre_spend_revision_eligible: true,
             docket: DocketDeploymentStateV1::RuntimeCurrent,
             verifier: VerifierDeploymentStateV1::RuntimeCurrent,
         };
@@ -3062,6 +3315,7 @@ mod tests {
                 &[
                     GovernedOperationV1::RequireStanding,
                     GovernedOperationV1::Halt,
+                    GovernedOperationV1::HaltPreSpendScopeInsufficiency,
                     GovernedOperationV1::Escalate,
                     GovernedOperationV1::RecordRefusal,
                 ],
@@ -3131,6 +3385,17 @@ mod tests {
                 ProgramCounterV1::Halted,
                 ordinary,
                 &[GovernedOperationV1::RecordRefusal],
+            ),
+            (
+                ProgramCounterV1::Halted,
+                AllowedTransitionStateV1 {
+                    governed: GovernedDecisionStateV1::PreSpendScopeInsufficiency,
+                    ..ordinary
+                },
+                &[
+                    GovernedOperationV1::RecordPreSpendScopeDiscovery,
+                    GovernedOperationV1::RecordRefusal,
+                ],
             ),
             (
                 ProgramCounterV1::Halted,

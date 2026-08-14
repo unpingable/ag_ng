@@ -22,10 +22,17 @@ fn write_downstream_fixture(root: &std::path::Path) {
     .unwrap();
     fs::write(
         root.join("src/bin/product.rs"),
-        r"use ag_app::governed_product::{GovernedCampaignServiceV1, OccurrencePageRequestV1};
+        r"use ag_app::governed_product::{
+    GovernedCampaignServiceV1,
+    HaltPreSpendScopeInsufficiencyV1,
+    OccurrencePageRequestV1,
+    RecordPreSpendScopeDiscoveryV1,
+};
 fn main() {
     let _ = core::mem::size_of::<GovernedCampaignServiceV1>();
+    let _ = core::mem::size_of::<HaltPreSpendScopeInsufficiencyV1>();
     let _ = core::mem::size_of::<OccurrencePageRequestV1>();
+    let _ = core::mem::size_of::<RecordPreSpendScopeDiscoveryV1>();
 }
 ",
     )
@@ -196,6 +203,7 @@ fn assert_workspace_targets_and_features(metadata: &serde_json::Value) {
             "ag-app:bin:agd",
             "ag-app:lib:ag_app",
             "ag-app:test:governed_docket_process",
+            "ag-app:test:governed_pre_spend_discovery",
             "ag-app:test:governed_product_cli",
             "ag-app:test:managed_pointer_promotion",
             "ag-app:test:public_api_exclusivity",
@@ -357,6 +365,7 @@ fn assert_closed_product_api(source: &str) {
             "dispatch",
             "escalate",
             "halt",
+            "halt_pre_spend_scope_insufficiency",
             "list_events",
             "list_occurrences",
             "note_probe",
@@ -364,6 +373,7 @@ fn assert_closed_product_api(source: &str) {
             "open",
             "open_continuation",
             "reconcile_docket",
+            "record_pre_spend_scope_discovery",
             "record_proposal",
             "record_refusal",
             "recover",
@@ -407,6 +417,8 @@ fn assert_product_public_types(source: &str) {
             "GovernedRepairVerifierProfileRecordV1",
             "GovernedRepairVerifierRootV1",
             "GovernedReplayReportV1",
+            "HaltPreSpendScopeInsufficiencyResultV1",
+            "HaltPreSpendScopeInsufficiencyV1",
             "HaltedOccurrenceViewV1",
             "ObservationResolutionArtifactV1",
             "OccurrencePageRequestV1",
@@ -414,7 +426,10 @@ fn assert_product_public_types(source: &str) {
             "OccurrenceViewV1",
             "PageRequestV1",
             "PinnedDeploymentFileV1",
+            "PreSpendRevisionConstraintViewV1",
+            "PreSpendScopeDiscoveryResultV1",
             "ProposalContractViewV1",
+            "RecordPreSpendScopeDiscoveryV1",
             "ResidualStateArtifactV1",
             "StandingResolutionArtifactV1",
             "SubmitGovernedDispositionResultV1",
@@ -431,13 +446,15 @@ fn assert_product_public_types(source: &str) {
 fn assert_product_consequence_edges(source: &str) {
     for (needle, expected) in [
         ("CampaignEngineV1::open(", 1),
-        ("CampaignStoreV1::open(", 13),
+        ("CampaignStoreV1::open(", 14),
         ("AgIssuanceSignerV2::from_pkcs8(", 2),
         ("self.engine.replay(", 1),
         ("self.engine.governed_repair_request(", 1),
         ("self.engine.create_governed_repair_request(", 1),
         ("self.engine.apply_governed_repair_disposition(", 1),
-        ("self.engine.current(", 2),
+        ("self.engine.current(", 4),
+        ("self.engine.halt_pre_spend_scope_insufficiency(", 1),
+        ("self.engine.record_pre_spend_scope_discovery(", 1),
         ("self.engine.record_proposal(", 1),
         ("self.engine.open_continuation(", 1),
         ("self.engine.require_standing(", 1),

@@ -191,6 +191,28 @@ pub enum CampaignRecoveryV1 {
     Advanced(OccurrenceSnapshotV1),
 }
 
+/// Result of one exact typed pre-spend insufficiency halt commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreSpendScopeInsufficiencyCommitV1 {
+    /// Exact durable halted snapshot.
+    pub halted: OccurrenceSnapshotV1,
+    /// Whether this was an exact replay of the already committed request.
+    pub replayed: bool,
+}
+
+/// Result of one exact pre-spend discovery/revision commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreSpendScopeDiscoveryCommitV1 {
+    /// Exact durable discovery artifact.
+    pub discovery: PreSpendScopeDiscoveryV1,
+    /// Immutable typed halted predecessor.
+    pub predecessor: OccurrenceSnapshotV1,
+    /// Distinct authority-empty revised occurrence.
+    pub successor: OccurrenceSnapshotV1,
+    /// Whether this was an exact replay of the already committed request.
+    pub replayed: bool,
+}
+
 /// Production governed-loop orchestration errors.
 #[derive(Debug, Error)]
 pub enum CampaignEngineErrorV1 {
@@ -593,6 +615,66 @@ impl CampaignEngineV1 {
             now_unix_ms,
         )?;
         Ok(successor)
+    }
+
+    /// Safely halts from a non-effecting boundary.
+    pub fn halt_pre_spend_scope_insufficiency(
+        &mut self,
+        expected_state_digest: &Digest,
+        diagnostic_basis: Digest,
+        idempotency_key: Digest,
+        now_unix_ms: u64,
+    ) -> Result<PreSpendScopeInsufficiencyCommitV1, CampaignEngineErrorV1> {
+        // The Store, not this advisory read, performs the authoritative
+        // caller-cut comparison in the committing transaction.  Reading the
+        // current snapshot here also permits exact idempotent replay after the
+        // campaign head has advanced.
+        let current = if let Some(stored) = self
+            .store
+            .pre_spend_scope_insufficiency_by_idempotency(&idempotency_key)?
+        {
+            stored.source
+        } else {
+            self.store.current()?
+        };
+        let (halted, replayed) = self.store.commit_pre_spend_scope_insufficiency(
+            expected_state_digest,
+            &current,
+            diagnostic_basis,
+            idempotency_key,
+            now_unix_ms,
+        )?;
+        Ok(PreSpendScopeInsufficiencyCommitV1 { halted, replayed })
+    }
+
+    /// Records one exact non-authorizing discovery and creates one distinct
+    /// authority-empty revised occurrence.  Exact replay returns the original
+    /// artifact/successor; changed bytes under one idempotency identity refuse.
+    pub fn record_pre_spend_scope_discovery(
+        &mut self,
+        expected_state_digest: &Digest,
+        parameters: PreSpendScopeDiscoveryParametersV1,
+    ) -> Result<PreSpendScopeDiscoveryCommitV1, CampaignEngineErrorV1> {
+        let current = self.store.current()?;
+        let predecessor = if let Some(stored) = self
+            .store
+            .pre_spend_scope_discovery_by_idempotency(&parameters.idempotency_key)?
+        {
+            stored.predecessor
+        } else {
+            current.clone()
+        };
+        let (discovery, successor, replayed) = self.store.commit_pre_spend_scope_discovery(
+            expected_state_digest,
+            &current,
+            parameters,
+        )?;
+        Ok(PreSpendScopeDiscoveryCommitV1 {
+            discovery,
+            predecessor,
+            successor,
+            replayed,
+        })
     }
 
     /// Safely halts from a non-effecting boundary.

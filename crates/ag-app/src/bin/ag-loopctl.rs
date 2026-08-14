@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 use ag_app::governed_product::{
     CreateCampaignV1, CreateDecisionRequestV1, GovernedAgPolicyRootV1, GovernedCampaignServiceV1,
     GovernedDocketAdapterRootV1, GovernedProductErrorV1, GovernedRepairVerifierRootV1,
-    OccurrencePageRequestV1, PageRequestV1, SubmitGovernedDispositionV1,
+    HaltPreSpendScopeInsufficiencyV1, OccurrencePageRequestV1, PageRequestV1,
+    RecordPreSpendScopeDiscoveryV1, SubmitGovernedDispositionV1,
 };
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
@@ -203,6 +204,24 @@ enum Command {
     },
     /// Halt from an authority-safe boundary.
     Halt {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
+    },
+    /// Halt one exact recorded proposal for a typed pre-spend scope insufficiency.
+    HaltPreSpendScopeInsufficiency {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[command(flatten)]
+        cas: CasArguments,
+    },
+    /// Record one exact pre-spend discovery and open its authority-empty revision.
+    RecordPreSpendScopeDiscovery {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
@@ -586,6 +605,38 @@ fn run() -> anyhow::Result<()> {
             let mut service = GovernedCampaignServiceV1::open(&database)?;
             let expected = parse_expected_state(&cas)?;
             write_exact(&service.halt(&expected, input.reason)?)
+        }
+        Command::HaltPreSpendScopeInsufficiency {
+            database,
+            input,
+            cas,
+        } => {
+            let request: HaltPreSpendScopeInsufficiencyV1 = read_exact_record(&input)?;
+            let expected = parse_expected_state(&cas)?;
+            if request.expected_state_digest != expected {
+                return Err(stable_failure(
+                    "cas_input_mismatch",
+                    "input and --expected-state differ",
+                ));
+            }
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            write_exact(&service.halt_pre_spend_scope_insufficiency(request)?)
+        }
+        Command::RecordPreSpendScopeDiscovery {
+            database,
+            input,
+            cas,
+        } => {
+            let request: RecordPreSpendScopeDiscoveryV1 = read_exact_record(&input)?;
+            let expected = parse_expected_state(&cas)?;
+            if request.expected_state_digest != expected {
+                return Err(stable_failure(
+                    "cas_input_mismatch",
+                    "input and --expected-state differ",
+                ));
+            }
+            let mut service = GovernedCampaignServiceV1::open(&database)?;
+            write_exact(&service.record_pre_spend_scope_discovery(request)?)
         }
         Command::Escalate {
             database,

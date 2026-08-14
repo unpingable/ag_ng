@@ -930,6 +930,44 @@ fn restart_mapping_erases_authority_and_ambiguous_dispatch_reconciles() {
 }
 
 #[test]
+fn typed_pre_spend_halt_reopens_only_for_nonauthorizing_scope_discovery() {
+    let start = initial();
+    let exact_proposal = proposal(&campaign(), "pre-spend-work");
+    let mut observation = ObservationBoundary::current("pre-spend-preconditions");
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &start,
+        ObservationRefV1::from_digest(digest("pre-spend-observation")),
+        exact_proposal,
+        ProposalClassV1::Initial,
+        &mut observation,
+        NOW,
+    )
+    .unwrap();
+    let halted = GovernedLoopKernelV1::halt_pre_spend_scope_insufficiency(
+        &proposed,
+        digest("pre-spend-diagnostic"),
+        digest("pre-spend-idempotency"),
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        GovernedLoopKernelV1::recovery_requirement(&halted),
+        RecoveryRequirementV1::PreSpendScopeDiscovery
+    );
+    let bytes = JcsDocument::canonicalize(&halted).unwrap();
+    let reopened: OccurrenceSnapshotV1 = JcsDocument::from_canonical_bytes(bytes.as_bytes())
+        .unwrap()
+        .decode()
+        .unwrap();
+    reopened.validate_integrity().unwrap();
+    assert_eq!(reopened, halted);
+    assert_eq!(
+        GovernedLoopKernelV1::recovery_requirement(&reopened),
+        RecoveryRequirementV1::PreSpendScopeDiscovery
+    );
+}
+
+#[test]
 fn completed_is_terminal_and_halted_is_effect_free() {
     let start = initial();
     let mut terminal = ObservationBoundary::current("terminal-preconditions");

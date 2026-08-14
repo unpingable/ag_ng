@@ -180,6 +180,32 @@ creation replay reopens the same campaign; changed canonical request bytes or a
 changed idempotency identity refuse. Consequence time is sampled only from the
 pinned clock and cannot regress behind the Store's last durable event.
 
+### Pre-spend scope discovery
+
+Scope insufficiency discovered before authorization spend is not a human
+disposition and does not use Docket custody. The product service first records
+a typed, nonauthorizing pre-spend-insufficiency halt from the exact
+proposal-recorded state. A generic halt is ineligible. A second exact operation
+atomically records `PreSpendScopeDiscoveryV1` and opens one distinct
+observation-required occurrence whose pending proposal is the mechanical
+original-scope-plus-delta revision.
+
+The predecessor proposal and scope remain immutable. The discovery binds the
+exact predecessor occurrence, proposal, scope, diagnostic basis, additive
+delta, derived scope, derived proposal, halted state, and revised occurrence.
+It grants no observation, Standing, admission, spend, issuance, Docket
+custody, checkpoint, effect journal, decision request, or execution authority.
+The revised occurrence must record the exact pending proposal through a fresh
+observation and then pass through ordinary Standing, admission, spend,
+issuance, and custody law. Exact request replay is idempotent; changed bytes
+under a reused idempotency identity, a stale head, or a conflicting concurrent
+delta fail before any artifact or successor write.
+
+This pre-spend path is disjoint from post-spend
+`ScopeExpansionRequiredV1`: once spend or Docket consequence exists, only the
+sealed Docket-result and externally verified disposition flow may create a
+successor. Neither discovery artifacts nor checkpoints are authority.
+
 ## Stable AG producer surface
 
 `GovernedCampaignServiceV1` is the application boundary for future clients.
@@ -195,6 +221,8 @@ provides versioned DTOs and operations to:
 - record an exact proposal and advance the ordinary observation, standing,
   decision, spend, dispatch, reconciliation, continuation, halt, and completion
   transitions under expected-state comparison;
+- record a typed pre-spend scope insufficiency and atomically open the exact
+  authority-empty revised occurrence without using Docket or human disposition;
 - retrieve one occurrence, list occurrences with an exclusive stable cursor
   plus closed program-counter/governed-repair-pending filters, and list the
   ordered event stream by monotone sequence;

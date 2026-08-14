@@ -76,6 +76,12 @@ pub const HUMAN_DECISION_REQUEST_SCHEMA_V1: &str = "ag.governed-loop.human-decis
 pub const SCOPE_EXPANSION_REQUIRED_SCHEMA_V1: &str = "ag.governed-loop.scope-expansion-required/v1";
 /// Wire schema for exact readjudication requirements.
 pub const READJUDICATION_REQUIRED_SCHEMA_V1: &str = "ag.governed-loop.readjudication-required/v1";
+/// Wire schema for a typed pre-spend scope-insufficiency halt marker.
+pub const PRE_SPEND_SCOPE_INSUFFICIENCY_SCHEMA_V1: &str =
+    "ag.governed-loop.pre-spend-scope-insufficiency/v1";
+/// Wire schema for the durable, non-authorizing pre-spend discovery artifact.
+pub const PRE_SPEND_SCOPE_DISCOVERY_SCHEMA_V1: &str =
+    "ag.governed-loop.pre-spend-scope-discovery/v1";
 
 const STATE_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.state/v1";
 const GENESIS_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.genesis/v1";
@@ -271,6 +277,14 @@ exact_digest_ref!(
 exact_digest_ref!(
     /// Exact Docket sealed-result identity for a post-spend repair outcome.
     DocketSealedResultRefV1
+);
+exact_digest_ref!(
+    /// Exact typed pre-spend scope-insufficiency halt marker.
+    PreSpendScopeInsufficiencyRefV1
+);
+exact_digest_ref!(
+    /// Exact durable, non-authorizing pre-spend discovery artifact.
+    PreSpendScopeDiscoveryRefV1
 );
 
 /// Independently allocated identity of one governed occurrence.
@@ -697,6 +711,48 @@ impl CanonicalEffectScopeV1 {
             }
         }
         Self::new(self.effect_class.clone(), rows)
+    }
+
+    /// Computes a strict additive union for a newly discovered pre-spend
+    /// requirement.  The delta may add operations to an existing exact path,
+    /// but it may not repeat an operation already present in the immutable
+    /// predecessor scope.
+    pub fn exact_additive_union(&self, delta: &Self) -> Result<Self, KernelErrorV1> {
+        self.validate()?;
+        delta.validate()?;
+        if self.effect_class != delta.effect_class {
+            return Err(KernelErrorV1::EffectScope("effect class changed"));
+        }
+        let mut rows = self.resources.clone();
+        for incoming in &delta.resources {
+            if let Some(existing) = rows
+                .iter_mut()
+                .find(|row| row.resource == incoming.resource && row.path == incoming.path)
+            {
+                if incoming
+                    .operations
+                    .iter()
+                    .any(|operation| existing.operations.contains(operation))
+                {
+                    return Err(KernelErrorV1::EffectScope(
+                        "delta repeats an already authorized effect",
+                    ));
+                }
+                existing
+                    .operations
+                    .extend(incoming.operations.iter().copied());
+                existing.operations.sort();
+            } else {
+                rows.push(incoming.clone());
+            }
+        }
+        let revised = Self::new(self.effect_class.clone(), rows)?;
+        if &revised == self {
+            return Err(KernelErrorV1::EffectScope(
+                "delta does not add an exact effect",
+            ));
+        }
+        Ok(revised)
     }
 }
 
@@ -1474,6 +1530,27 @@ impl ExactWorkProposalV1 {
         self.governed_repair_checkpoint.as_ref()
     }
 
+    /// Derives the one exact pre-spend revised proposal by replacing only the
+    /// immutable effect scope.  A post-spend checkpoint cannot be laundered
+    /// through this authority-empty path.
+    pub fn derive_pre_spend_revision(
+        &self,
+        revised_scope: CanonicalEffectScopeV1,
+    ) -> Result<Self, KernelErrorV1> {
+        self.validate()?;
+        if self.governed_repair_checkpoint.is_some() {
+            return Err(KernelErrorV1::Proposal(
+                "pre-spend revision cannot inherit a governed-repair checkpoint",
+            ));
+        }
+        revised_scope.validate()?;
+        let mut revised = self.clone();
+        revised.effect_scope_digest = revised_scope.digest();
+        revised.effect_scope = revised_scope;
+        revised.validate()?;
+        Ok(revised)
+    }
+
     /// Returns the typed work schema.
     #[must_use]
     pub fn work_schema(&self) -> &str {
@@ -1722,6 +1799,317 @@ pub enum ContinuationClassV1 {
     Successor,
 }
 
+/// Exact typed reason for halting an unspent proposal before governance.  It
+/// records discovery eligibility only and grants no observation, standing,
+/// spend, issuance, or execution authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreSpendScopeInsufficiencyV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Deterministic identity of every other field.
+    pub insufficiency: PreSpendScopeInsufficiencyRefV1,
+    /// Exact campaign and predecessor occurrence.
+    pub key: OccurrenceKeyV1,
+    /// Exact recorded predecessor proposal.
+    pub proposal: ProposalRefV1,
+    /// Exact immutable predecessor scope identity.
+    pub original_scope_identity: Digest,
+    /// Exact external diagnostic/evidence basis.
+    pub diagnostic_basis: Digest,
+    /// Exact proposal-recorded state from which the halt was created.
+    pub source_state_digest: Digest,
+    /// Caller-chosen idempotency identity for this one typed halt.
+    pub idempotency_key: Digest,
+    /// Consequence time, bounded to the canonical JSON integer range.
+    pub recorded_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct PreSpendScopeInsufficiencyIdentityBodyV1<'a> {
+    schema: &'a str,
+    key: &'a OccurrenceKeyV1,
+    proposal: &'a ProposalRefV1,
+    original_scope_identity: &'a Digest,
+    diagnostic_basis: &'a Digest,
+    source_state_digest: &'a Digest,
+    idempotency_key: &'a Digest,
+    recorded_at_unix_ms: u64,
+}
+
+impl PreSpendScopeInsufficiencyV1 {
+    fn derived_reference(&self) -> PreSpendScopeInsufficiencyRefV1 {
+        PreSpendScopeInsufficiencyRefV1::from_digest(digest_value(
+            PRE_SPEND_SCOPE_INSUFFICIENCY_SCHEMA_V1,
+            &PreSpendScopeInsufficiencyIdentityBodyV1 {
+                schema: &self.schema,
+                key: &self.key,
+                proposal: &self.proposal,
+                original_scope_identity: &self.original_scope_identity,
+                diagnostic_basis: &self.diagnostic_basis,
+                source_state_digest: &self.source_state_digest,
+                idempotency_key: &self.idempotency_key,
+                recorded_at_unix_ms: self.recorded_at_unix_ms,
+            },
+        ))
+    }
+
+    /// Revalidates the strict decoded marker without granting authority.
+    pub fn validate(&self) -> Result<(), KernelErrorV1> {
+        if self.schema != PRE_SPEND_SCOPE_INSUFFICIENCY_SCHEMA_V1 {
+            return Err(KernelErrorV1::ForeignSchema(
+                "pre-spend scope insufficiency",
+            ));
+        }
+        validate_canonical_timestamp(
+            self.recorded_at_unix_ms,
+            "pre-spend halt time is not canonically representable",
+        )?;
+        if self.insufficiency != self.derived_reference() {
+            return Err(KernelErrorV1::BindingMismatch(
+                "pre-spend scope insufficiency identity",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the exact marker identity.
+    #[must_use]
+    pub const fn reference(&self) -> &PreSpendScopeInsufficiencyRefV1 {
+        &self.insufficiency
+    }
+}
+
+/// Exact caller claims required to create one pre-spend discovery and revised
+/// authority-empty occurrence.  Every predecessor claim is checked again by
+/// the Store inside the committing transaction.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreSpendScopeDiscoveryParametersV1 {
+    /// Claimed exact predecessor occurrence.
+    pub predecessor: OccurrenceKeyV1,
+    /// Claimed exact predecessor proposal.
+    pub original_proposal: ProposalRefV1,
+    /// Claimed exact immutable predecessor scope identity.
+    pub original_scope_identity: Digest,
+    /// Claimed exact diagnostic basis pinned by the typed halt.
+    pub diagnostic_basis: Digest,
+    /// Exact newly discovered additive effects.
+    pub requested_delta: CanonicalEffectScopeV1,
+    /// Claimed exact original-plus-delta derivation.
+    pub claimed_revised_scope: CanonicalEffectScopeV1,
+    /// Claimed exact revised proposal identity.
+    pub claimed_revised_proposal: ProposalRefV1,
+    /// Complete claimed revised proposal record.
+    pub exact_revised_proposal: ExactWorkProposalV1,
+    /// Distinct revised occurrence identity.
+    pub revised_occurrence: OccurrenceId,
+    /// One exact idempotency identity.
+    pub idempotency_key: Digest,
+    /// Consequence time.
+    pub recorded_at_unix_ms: u64,
+}
+
+/// Durable, non-authorizing record of one exact pre-spend scope discovery and
+/// the mechanically derived revised proposal.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreSpendScopeDiscoveryV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Deterministic identity of every other field.
+    pub discovery: PreSpendScopeDiscoveryRefV1,
+    /// Caller idempotency identity.
+    pub idempotency_key: Digest,
+    /// Exact campaign and immutable predecessor occurrence.
+    pub predecessor: OccurrenceKeyV1,
+    /// Exact typed halt marker consumed by this discovery.
+    pub insufficiency: PreSpendScopeInsufficiencyRefV1,
+    /// Exact halted-state head.
+    pub halted_state_digest: Digest,
+    /// Exact pre-halt proposal-recorded head.
+    pub source_state_digest: Digest,
+    /// Exact immutable predecessor proposal identity and record.
+    pub original_proposal: ProposalRefV1,
+    /// Complete immutable predecessor proposal.
+    pub exact_original_proposal: ExactWorkProposalV1,
+    /// Exact immutable predecessor scope and identity.
+    pub original_scope: CanonicalEffectScopeV1,
+    /// Exact immutable predecessor scope identity.
+    pub original_scope_identity: Digest,
+    /// Exact newly discovered additive effects and identity.
+    pub requested_delta: CanonicalEffectScopeV1,
+    /// Exact requested-delta identity.
+    pub requested_delta_identity: Digest,
+    /// Exact mechanically derived revised scope and identity.
+    pub revised_scope: CanonicalEffectScopeV1,
+    /// Exact revised-scope identity.
+    pub revised_scope_identity: Digest,
+    /// Exact mechanically derived revised proposal identity and record.
+    pub revised_proposal: ProposalRefV1,
+    /// Complete exact revised proposal.
+    pub exact_revised_proposal: ExactWorkProposalV1,
+    /// Exact external diagnostic/evidence basis.
+    pub diagnostic_basis: Digest,
+    /// Distinct revised occurrence.
+    pub revised_occurrence: OccurrenceId,
+    /// Consequence time.
+    pub recorded_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct PreSpendScopeDiscoveryIdentityBodyV1<'a> {
+    schema: &'a str,
+    idempotency_key: &'a Digest,
+    predecessor: &'a OccurrenceKeyV1,
+    insufficiency: &'a PreSpendScopeInsufficiencyRefV1,
+    halted_state_digest: &'a Digest,
+    source_state_digest: &'a Digest,
+    original_proposal: &'a ProposalRefV1,
+    exact_original_proposal: &'a ExactWorkProposalV1,
+    original_scope: &'a CanonicalEffectScopeV1,
+    original_scope_identity: &'a Digest,
+    requested_delta: &'a CanonicalEffectScopeV1,
+    requested_delta_identity: &'a Digest,
+    revised_scope: &'a CanonicalEffectScopeV1,
+    revised_scope_identity: &'a Digest,
+    revised_proposal: &'a ProposalRefV1,
+    exact_revised_proposal: &'a ExactWorkProposalV1,
+    diagnostic_basis: &'a Digest,
+    revised_occurrence: OccurrenceId,
+    recorded_at_unix_ms: u64,
+}
+
+impl PreSpendScopeDiscoveryV1 {
+    fn derived_reference(&self) -> PreSpendScopeDiscoveryRefV1 {
+        PreSpendScopeDiscoveryRefV1::from_digest(digest_value(
+            PRE_SPEND_SCOPE_DISCOVERY_SCHEMA_V1,
+            &PreSpendScopeDiscoveryIdentityBodyV1 {
+                schema: &self.schema,
+                idempotency_key: &self.idempotency_key,
+                predecessor: &self.predecessor,
+                insufficiency: &self.insufficiency,
+                halted_state_digest: &self.halted_state_digest,
+                source_state_digest: &self.source_state_digest,
+                original_proposal: &self.original_proposal,
+                exact_original_proposal: &self.exact_original_proposal,
+                original_scope: &self.original_scope,
+                original_scope_identity: &self.original_scope_identity,
+                requested_delta: &self.requested_delta,
+                requested_delta_identity: &self.requested_delta_identity,
+                revised_scope: &self.revised_scope,
+                revised_scope_identity: &self.revised_scope_identity,
+                revised_proposal: &self.revised_proposal,
+                exact_revised_proposal: &self.exact_revised_proposal,
+                diagnostic_basis: &self.diagnostic_basis,
+                revised_occurrence: self.revised_occurrence,
+                recorded_at_unix_ms: self.recorded_at_unix_ms,
+            },
+        ))
+    }
+
+    /// Revalidates every exact identity and mechanical derivation.
+    pub fn validate(&self) -> Result<(), KernelErrorV1> {
+        if self.schema != PRE_SPEND_SCOPE_DISCOVERY_SCHEMA_V1 {
+            return Err(KernelErrorV1::ForeignSchema("pre-spend scope discovery"));
+        }
+        validate_canonical_timestamp(
+            self.recorded_at_unix_ms,
+            "pre-spend discovery time is not canonically representable",
+        )?;
+        self.exact_original_proposal.validate()?;
+        if self.recorded_at_unix_ms >= self.exact_original_proposal.expires_at_unix_ms() {
+            return Err(KernelErrorV1::Proposal(
+                "expired proposal cannot create pre-spend revision",
+            ));
+        }
+        self.exact_revised_proposal.validate()?;
+        self.original_scope.validate()?;
+        self.requested_delta.validate()?;
+        self.revised_scope.validate()?;
+        let derived_scope = self
+            .original_scope
+            .exact_additive_union(&self.requested_delta)?;
+        let derived_proposal = self
+            .exact_original_proposal
+            .derive_pre_spend_revision(derived_scope.clone())?;
+        if self.predecessor.campaign != *self.exact_original_proposal.campaign()
+            || self.original_proposal != self.exact_original_proposal.reference()
+            || self.original_scope != *self.exact_original_proposal.effect_scope()
+            || self.original_scope_identity != self.original_scope.digest()
+            || self.requested_delta_identity != self.requested_delta.digest()
+            || self.revised_scope != derived_scope
+            || self.revised_scope_identity != self.revised_scope.digest()
+            || self.exact_revised_proposal != derived_proposal
+            || self.revised_proposal != self.exact_revised_proposal.reference()
+            || self.discovery != self.derived_reference()
+            || self.revised_occurrence == self.predecessor.occurrence
+        {
+            return Err(KernelErrorV1::BindingMismatch(
+                "pre-spend scope discovery derivation",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the exact discovery identity.
+    #[must_use]
+    pub const fn reference(&self) -> &PreSpendScopeDiscoveryRefV1 {
+        &self.discovery
+    }
+
+    /// Returns the exact revised proposal reference.
+    #[must_use]
+    pub const fn revised_proposal(&self) -> &ProposalRefV1 {
+        &self.revised_proposal
+    }
+
+    /// Returns the complete exact revised proposal.
+    #[must_use]
+    pub const fn exact_revised_proposal(&self) -> &ExactWorkProposalV1 {
+        &self.exact_revised_proposal
+    }
+}
+
+/// Nonauthorizing lineage constraint carried by the fresh revised occurrence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreSpendRevisionConstraintV1 {
+    /// Immutable predecessor occurrence.
+    predecessor: OccurrenceKeyV1,
+    /// Exact discovery artifact.
+    discovery: PreSpendScopeDiscoveryRefV1,
+    /// Exact proposal that ordinary fresh governance must later record.
+    revised_proposal: ProposalRefV1,
+    /// Complete exact proposal pinned for hostile revalidation.
+    exact_revised_proposal: ExactWorkProposalV1,
+}
+
+impl PreSpendRevisionConstraintV1 {
+    /// Returns the immutable predecessor key.
+    #[must_use]
+    pub const fn predecessor(&self) -> &OccurrenceKeyV1 {
+        &self.predecessor
+    }
+
+    /// Returns the exact discovery artifact reference.
+    #[must_use]
+    pub const fn discovery(&self) -> &PreSpendScopeDiscoveryRefV1 {
+        &self.discovery
+    }
+
+    /// Returns the exact revised proposal reference.
+    #[must_use]
+    pub const fn revised_proposal(&self) -> &ProposalRefV1 {
+        &self.revised_proposal
+    }
+
+    /// Returns the complete exact revised proposal.
+    #[must_use]
+    pub const fn exact_revised_proposal(&self) -> &ExactWorkProposalV1 {
+        &self.exact_revised_proposal
+    }
+}
+
 /// Closed externally approved basis for one distinct successor occurrence.
 /// It constrains the next proposal but carries no standing or reusable effect
 /// authority.
@@ -1785,6 +2173,15 @@ pub struct PriorOccurrenceBasisV1 {
     /// Optional exact human-governed successor constraint.  This is lineage
     /// evidence only; fresh observation, standing, and admission remain due.
     pub authorized_successor: Option<AuthorizedSuccessorBasisV1>,
+    /// Optional exact pre-spend revision constraint.  This is immutable
+    /// lineage and proposal evidence only; it is disjoint from externally
+    /// authorized post-spend successor bases.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub pre_spend_revision: Option<PreSpendRevisionConstraintV1>,
 }
 
 /// Occurrence linkage; authority never travels through this record.
@@ -2145,6 +2542,14 @@ pub struct HaltedV1 {
     /// Exact Docket-owned refusal that terminalized a consumed issuance before
     /// custody, when this is that halt class.
     docket_issuance_refusal: Option<DocketIssuanceRefusalV1>,
+    /// Exact typed pre-spend scope-insufficiency marker.  Generic and
+    /// post-spend halts omit this field, preserving the R3 wire form.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pre_spend_scope_insufficiency: Option<PreSpendScopeInsufficiencyV1>,
 }
 
 /// Durable terminal/refused result for one rejected governed-repair request.
@@ -2483,6 +2888,9 @@ pub enum RecoveryRequirementV1 {
     ReconcileAttempt,
     /// Only an externally verified disposition may proceed.
     ExternalDisposition,
+    /// Exact typed pre-spend discovery may create one authority-empty revised
+    /// occurrence; this is disjoint from external disposition.
+    PreSpendScopeDiscovery,
     /// No legal continuation exists.
     None,
 }
@@ -3136,7 +3544,7 @@ impl GovernedLoopKernelV1 {
 
     /// Derives the exact recovery action without reconstructing live authority.
     #[must_use]
-    pub const fn recovery_requirement(snapshot: &OccurrenceSnapshotV1) -> RecoveryRequirementV1 {
+    pub fn recovery_requirement(snapshot: &OccurrenceSnapshotV1) -> RecoveryRequirementV1 {
         match snapshot.program_counter() {
             ProgramCounterV1::ObservationRequired
             | ProgramCounterV1::SettledObservationRequired => {
@@ -3152,7 +3560,17 @@ impl GovernedLoopKernelV1 {
             ProgramCounterV1::Dispatched | ProgramCounterV1::ReconciliationRequired => {
                 RecoveryRequirementV1::ReconcileAttempt
             }
-            ProgramCounterV1::Halted => RecoveryRequirementV1::ExternalDisposition,
+            ProgramCounterV1::Halted => {
+                if snapshot
+                    .halted()
+                    .and_then(HaltedV1::pre_spend_scope_insufficiency)
+                    .is_some()
+                {
+                    RecoveryRequirementV1::PreSpendScopeDiscovery
+                } else {
+                    RecoveryRequirementV1::ExternalDisposition
+                }
+            }
             ProgramCounterV1::Completed => RecoveryRequirementV1::None,
         }
     }
@@ -3178,6 +3596,11 @@ impl GovernedLoopKernelV1 {
         let OccurrenceStateV1::Halted(halted) = current.state() else {
             return Err(illegal(current, "create_human_decision_request"));
         };
+        if halted.pre_spend_scope_insufficiency.is_some() {
+            return Err(KernelErrorV1::HumanDecisionRequest(
+                "pre-spend scope discovery is not a human-disposition route",
+            ));
+        }
         if halted.governed_repair_closed.is_some() {
             return Err(KernelErrorV1::HumanDecisionRequest(
                 "governed repair occurrence is terminally rejected",
@@ -3247,6 +3670,11 @@ impl GovernedLoopKernelV1 {
         let OccurrenceStateV1::Halted(halted) = current.state() else {
             return Err(illegal(current, "apply_governed_repair_disposition"));
         };
+        if halted.pre_spend_scope_insufficiency.is_some() {
+            return Err(KernelErrorV1::HumanDisposition(
+                "pre-spend scope discovery is not a human-disposition route",
+            ));
+        }
         validate_decision_request(current, halted, request, now_unix_ms)?;
         validate_governed_repair_artifact(
             current,
@@ -3495,7 +3923,7 @@ impl GovernedLoopKernelV1 {
                                     ))
                         })) =>
             {
-                validate_halt_successor(source.state(), to)
+                validate_halt_successor(source, to)
             }
             (
                 OccurrenceStateV1::Dispatched(from),
@@ -3540,13 +3968,32 @@ impl GovernedLoopKernelV1 {
                             && to.source == ProgramCounterV1::Dispatched
                             && to.unresolved_attempt.is_none())) =>
             {
-                validate_halt_successor(from, to)
+                validate_halt_successor(source, to)
             }
             (OccurrenceStateV1::Halted(from), OccurrenceStateV1::Halted(to)) if same_key => {
                 validate_human_halt_update(from, to)
             }
             (OccurrenceStateV1::Halted(from), OccurrenceStateV1::ObservationRequired(to))
-                if !same_key && from.unresolved_attempt.is_none() =>
+                if !same_key
+                    && from.unresolved_attempt.is_none()
+                    && from.pre_spend_scope_insufficiency.is_some()
+                    && to
+                        .prior
+                        .as_ref()
+                        .and_then(|prior| prior.pre_spend_revision.as_ref())
+                        .is_some() =>
+            {
+                validate_pre_spend_revision_successor(source, from, to)
+            }
+            (OccurrenceStateV1::Halted(from), OccurrenceStateV1::ObservationRequired(to))
+                if !same_key
+                    && from.unresolved_attempt.is_none()
+                    && from.pre_spend_scope_insufficiency.is_none()
+                    && to
+                        .prior
+                        .as_ref()
+                        .and_then(|prior| prior.pre_spend_revision.as_ref())
+                        .is_none() =>
             {
                 validate_continuation(
                     source,
@@ -3616,7 +4063,7 @@ impl GovernedLoopKernelV1 {
                 ));
             }
             (Some(prior), ProposalClassV1::Retry) => {
-                if prior.authorized_successor.is_some() {
+                if prior.authorized_successor.is_some() || prior.pre_spend_revision.is_some() {
                     return Err(KernelErrorV1::HumanDecisionRequest(
                         "governed successor cannot be classified as retry",
                     ));
@@ -3668,6 +4115,14 @@ impl GovernedLoopKernelV1 {
                             ));
                         }
                     }
+                }
+                if let Some(constraint) = &prior.pre_spend_revision
+                    && (proposal.reference() != constraint.revised_proposal
+                        || proposal != constraint.exact_revised_proposal)
+                {
+                    return Err(KernelErrorV1::Proposal(
+                        "proposal does not equal exact pre-spend revision constraint",
+                    ));
                 }
                 (
                     OccurrenceLinkV1::SuccessorOf(prior.key.clone()),
@@ -3963,6 +4418,7 @@ impl GovernedLoopKernelV1 {
             docket_attempt: Some(settled.dispatch.custody.attempt.clone()),
             state_digest: current.state_digest.clone(),
             authorized_successor: None,
+            pre_spend_revision: None,
         };
         let state = OccurrenceStateV1::ObservationRequired(ObservationRequiredV1 {
             meta: OccurrenceMetaV1 {
@@ -4004,6 +4460,223 @@ impl GovernedLoopKernelV1 {
     }
 
     /// Halts from an authority-safe boundary; dispatched first requires reconciliation.
+    pub fn halt_pre_spend_scope_insufficiency(
+        current: &OccurrenceSnapshotV1,
+        diagnostic_basis: Digest,
+        idempotency_key: Digest,
+        recorded_at_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, KernelErrorV1> {
+        current.validate_integrity()?;
+        let OccurrenceStateV1::ProposalRecorded(recorded) = current.state() else {
+            return Err(illegal(current, "halt_pre_spend_scope_insufficiency"));
+        };
+        if recorded.0.proposal.governed_repair_checkpoint().is_some() {
+            return Err(KernelErrorV1::Proposal(
+                "checkpoint-bound successor cannot enter pre-spend revision",
+            ));
+        }
+        validate_canonical_timestamp(
+            recorded_at_unix_ms,
+            "pre-spend halt time is not canonically representable",
+        )?;
+        if recorded_at_unix_ms >= recorded.0.proposal.expires_at_unix_ms() {
+            return Err(KernelErrorV1::Proposal(
+                "expired proposal cannot enter pre-spend revision",
+            ));
+        }
+        let schema = PRE_SPEND_SCOPE_INSUFFICIENCY_SCHEMA_V1.to_owned();
+        let key = recorded.0.meta.key.clone();
+        let proposal = recorded.0.proposal_ref.clone();
+        let original_scope_identity = recorded.0.proposal.scope().clone();
+        let body = PreSpendScopeInsufficiencyIdentityBodyV1 {
+            schema: &schema,
+            key: &key,
+            proposal: &proposal,
+            original_scope_identity: &original_scope_identity,
+            diagnostic_basis: &diagnostic_basis,
+            source_state_digest: current.state_digest(),
+            idempotency_key: &idempotency_key,
+            recorded_at_unix_ms,
+        };
+        let insufficiency = PreSpendScopeInsufficiencyRefV1::from_digest(digest_value(
+            PRE_SPEND_SCOPE_INSUFFICIENCY_SCHEMA_V1,
+            &body,
+        ));
+        let marker = PreSpendScopeInsufficiencyV1 {
+            schema,
+            insufficiency: insufficiency.clone(),
+            key,
+            proposal,
+            original_scope_identity,
+            diagnostic_basis,
+            source_state_digest: current.state_digest().clone(),
+            idempotency_key,
+            recorded_at_unix_ms,
+        };
+        marker.validate()?;
+        let state = OccurrenceStateV1::Halted(HaltedV1 {
+            meta: recorded.0.meta.clone(),
+            source: ProgramCounterV1::ProposalRecorded,
+            reason: HaltReasonRefV1::from_digest(digest_value(
+                PRE_SPEND_SCOPE_INSUFFICIENCY_SCHEMA_V1,
+                &insufficiency,
+            )),
+            prior: current_prior_basis(current),
+            unresolved_attempt: None,
+            history: AuthorityHistoryV1::default(),
+            governed_repair_requirement: None,
+            governed_repair_closed: None,
+            docket_issuance_refusal: None,
+            pre_spend_scope_insufficiency: Some(marker),
+        });
+        let next = successor_snapshot(current, state);
+        next.validate_integrity()?;
+        Ok(next)
+    }
+
+    /// Creates one exact non-authorizing pre-spend discovery and a distinct
+    /// observation-required revised occurrence.  Every claim is derived again
+    /// from the typed halted predecessor.
+    pub fn create_pre_spend_scope_discovery(
+        current: &OccurrenceSnapshotV1,
+        parameters: PreSpendScopeDiscoveryParametersV1,
+    ) -> Result<(PreSpendScopeDiscoveryV1, OccurrenceSnapshotV1), KernelErrorV1> {
+        current.validate_integrity()?;
+        let OccurrenceStateV1::Halted(halted) = current.state() else {
+            return Err(illegal(current, "create_pre_spend_scope_discovery"));
+        };
+        let Some(marker) = halted.pre_spend_scope_insufficiency.as_ref() else {
+            return Err(KernelErrorV1::BindingMismatch(
+                "halt is not typed pre-spend scope insufficiency",
+            ));
+        };
+        marker.validate()?;
+        validate_canonical_timestamp(
+            parameters.recorded_at_unix_ms,
+            "pre-spend discovery time is not canonically representable",
+        )?;
+        if halted.source != ProgramCounterV1::ProposalRecorded
+            || halted.unresolved_attempt.is_some()
+            || halted.governed_repair_requirement.is_some()
+            || halted.governed_repair_closed.is_some()
+            || halted.docket_issuance_refusal.is_some()
+            || halted.history != AuthorityHistoryV1::default()
+            || halted.prior.issuance.is_some()
+            || halted.prior.docket_custody.is_some()
+            || halted.prior.docket_attempt.is_some()
+            || halted.prior.authorized_successor.is_some()
+            || halted.prior.pre_spend_revision.is_some()
+        {
+            return Err(KernelErrorV1::BindingMismatch(
+                "pre-spend discovery predecessor has consequence authority",
+            ));
+        }
+        let original =
+            halted
+                .prior
+                .proposal_contract
+                .as_ref()
+                .ok_or(KernelErrorV1::BindingMismatch(
+                    "pre-spend discovery missing original proposal",
+                ))?;
+        let original_ref = original.reference();
+        let original_scope = original.effect_scope().clone();
+        if parameters.recorded_at_unix_ms >= original.expires_at_unix_ms() {
+            return Err(KernelErrorV1::Proposal(
+                "expired proposal cannot create pre-spend revision",
+            ));
+        }
+        let revised_scope = original_scope.exact_additive_union(&parameters.requested_delta)?;
+        let revised_proposal = original.derive_pre_spend_revision(revised_scope.clone())?;
+        let revised_proposal_ref = revised_proposal.reference();
+        if parameters.predecessor != halted.meta.key
+            || parameters.original_proposal != original_ref
+            || parameters.original_scope_identity != original_scope.digest()
+            || parameters.diagnostic_basis != marker.diagnostic_basis
+            || parameters.claimed_revised_scope != revised_scope
+            || parameters.claimed_revised_proposal != revised_proposal_ref
+            || parameters.exact_revised_proposal != revised_proposal
+            || parameters.revised_occurrence == halted.meta.key.occurrence
+        {
+            return Err(KernelErrorV1::BindingMismatch(
+                "pre-spend discovery caller claims",
+            ));
+        }
+        let placeholder = PreSpendScopeDiscoveryRefV1::from_digest(Digest::hash_domain(
+            "ag.governed-loop.pre-spend-scope-discovery-placeholder/v1",
+            b"identity is replaced before validation",
+        ));
+        let mut discovery = PreSpendScopeDiscoveryV1 {
+            schema: PRE_SPEND_SCOPE_DISCOVERY_SCHEMA_V1.to_owned(),
+            discovery: placeholder,
+            idempotency_key: parameters.idempotency_key,
+            predecessor: halted.meta.key.clone(),
+            insufficiency: marker.insufficiency.clone(),
+            halted_state_digest: current.state_digest.clone(),
+            source_state_digest: marker.source_state_digest.clone(),
+            original_proposal: original_ref,
+            exact_original_proposal: original.clone(),
+            original_scope,
+            original_scope_identity: parameters.original_scope_identity,
+            requested_delta: parameters.requested_delta,
+            requested_delta_identity: Digest::hash_domain(
+                "ag.governed-loop.pre-spend-delta-placeholder/v1",
+                b"identity is replaced before validation",
+            ),
+            revised_scope,
+            revised_scope_identity: Digest::hash_domain(
+                "ag.governed-loop.pre-spend-revised-scope-placeholder/v1",
+                b"identity is replaced before validation",
+            ),
+            revised_proposal: revised_proposal_ref,
+            exact_revised_proposal: revised_proposal,
+            diagnostic_basis: parameters.diagnostic_basis,
+            revised_occurrence: parameters.revised_occurrence,
+            recorded_at_unix_ms: parameters.recorded_at_unix_ms,
+        };
+        discovery.requested_delta_identity = discovery.requested_delta.digest();
+        discovery.revised_scope_identity = discovery.revised_scope.digest();
+        discovery.discovery = discovery.derived_reference();
+        discovery.validate()?;
+
+        let prior = PriorOccurrenceBasisV1 {
+            key: halted.meta.key.clone(),
+            proposal: Some(discovery.original_proposal.clone()),
+            proposal_contract: Some(discovery.exact_original_proposal.clone()),
+            normalized_preconditions: None,
+            effect_scope: Some(discovery.original_scope.clone()),
+            issuance: None,
+            docket_custody: None,
+            docket_attempt: None,
+            state_digest: current.state_digest.clone(),
+            authorized_successor: None,
+            pre_spend_revision: Some(PreSpendRevisionConstraintV1 {
+                predecessor: halted.meta.key.clone(),
+                discovery: discovery.discovery.clone(),
+                revised_proposal: discovery.revised_proposal.clone(),
+                exact_revised_proposal: discovery.exact_revised_proposal.clone(),
+            }),
+        };
+        let successor_state = OccurrenceStateV1::ObservationRequired(ObservationRequiredV1 {
+            meta: OccurrenceMetaV1 {
+                key: OccurrenceKeyV1 {
+                    campaign: halted.meta.key.campaign.clone(),
+                    occurrence: discovery.revised_occurrence,
+                },
+                program: halted.meta.program.clone(),
+                residuals: halted.meta.residuals.clone(),
+                budget: halted.meta.budget,
+                used_human_decisions: halted.meta.used_human_decisions.clone(),
+            },
+            prior: Some(prior),
+        });
+        let successor = successor_snapshot(current, successor_state);
+        successor.validate_integrity()?;
+        Self::validate_successor(current, &successor)?;
+        Ok((discovery, successor))
+    }
+
+    /// Halts from an authority-safe boundary; dispatched first requires reconciliation.
     pub fn halt(
         current: &OccurrenceSnapshotV1,
         reason: HaltReasonRefV1,
@@ -4038,6 +4711,7 @@ impl GovernedLoopKernelV1 {
             governed_repair_requirement: None,
             governed_repair_closed: None,
             docket_issuance_refusal: None,
+            pre_spend_scope_insufficiency: None,
         });
         let next = successor_snapshot(current, state);
         next.validate_integrity()?;
@@ -4067,6 +4741,7 @@ impl GovernedLoopKernelV1 {
             governed_repair_requirement: None,
             governed_repair_closed: None,
             docket_issuance_refusal: None,
+            pre_spend_scope_insufficiency: None,
         });
         let next = successor_snapshot(current, state);
         next.validate_integrity()?;
@@ -4103,6 +4778,7 @@ impl GovernedLoopKernelV1 {
             governed_repair_requirement: None,
             governed_repair_closed: None,
             docket_issuance_refusal: Some(refusal),
+            pre_spend_scope_insufficiency: None,
         });
         let next = successor_snapshot(current, state);
         next.validate_integrity()?;
@@ -4150,6 +4826,7 @@ impl GovernedLoopKernelV1 {
             governed_repair_requirement: Some(requirement.clone()),
             governed_repair_closed: None,
             docket_issuance_refusal: None,
+            pre_spend_scope_insufficiency: None,
         });
         let next = successor_snapshot(current, state);
         next.validate_integrity()?;
@@ -4195,6 +4872,7 @@ impl GovernedLoopKernelV1 {
             governed_repair_requirement: None,
             governed_repair_closed: None,
             docket_issuance_refusal: None,
+            pre_spend_scope_insufficiency: None,
         });
         let next = successor_snapshot(current, state);
         next.validate_integrity()?;
@@ -4366,6 +5044,14 @@ impl OccurrenceSnapshotV1 {
         }
     }
 
+    /// Returns the exact pre-spend revision constraint carried by an
+    /// authority-empty revised occurrence.
+    #[must_use]
+    pub fn pre_spend_revision_constraint(&self) -> Option<&PreSpendRevisionConstraintV1> {
+        self.prior_occurrence()
+            .and_then(|prior| prior.pre_spend_revision.as_ref())
+    }
+
     /// Returns halted details, when halted.
     #[must_use]
     pub fn halted(&self) -> Option<&HaltedV1> {
@@ -4405,6 +5091,13 @@ impl HaltedV1 {
     #[must_use]
     pub const fn governed_repair_closed(&self) -> Option<&GovernedRepairClosedV1> {
         self.governed_repair_closed.as_ref()
+    }
+
+    /// Returns the typed pre-spend insufficiency marker, when this is the
+    /// exact pre-spend discovery halt class.
+    #[must_use]
+    pub const fn pre_spend_scope_insufficiency(&self) -> Option<&PreSpendScopeInsufficiencyV1> {
+        self.pre_spend_scope_insufficiency.as_ref()
     }
 
     /// Returns the exact Docket refusal when this halt terminalized a consumed
@@ -4788,6 +5481,7 @@ fn current_prior_basis(current: &OccurrenceSnapshotV1) -> PriorOccurrenceBasisV1
         docket_attempt: current.docket_custody().map(|value| value.attempt.clone()),
         state_digest: current.state_digest.clone(),
         authorized_successor: None,
+        pre_spend_revision: None,
     }
 }
 
@@ -5086,6 +5780,7 @@ fn open_governed_repair_successor(
         docket_attempt: halted.prior.docket_attempt.clone(),
         state_digest: halted_snapshot.state_digest.clone(),
         authorized_successor: Some(authorized_successor),
+        pre_spend_revision: None,
     };
     let state = OccurrenceStateV1::ObservationRequired(ObservationRequiredV1 {
         meta: OccurrenceMetaV1 {
@@ -5123,6 +5818,7 @@ fn validate_recorded_proposal(
         (Some(prior), OccurrenceLinkV1::RetryOf(linked))
             if linked == &prior.key
                 && prior.authorized_successor.is_none()
+                && prior.pre_spend_revision.is_none()
                 && prior.key != from.meta.key
                 && prior.proposal.as_ref() == Some(&to.proposal_ref)
                 && prior.normalized_preconditions.as_ref()
@@ -5160,6 +5856,13 @@ fn validate_recorded_proposal(
                         &to.meta.program == successor_program
                             && to.proposal.effect_scope() == adjudication_scope
                             && to.proposal.governed_repair_checkpoint() == Some(checkpoint)
+                    }
+                }
+                && match &prior.pre_spend_revision {
+                    None => true,
+                    Some(constraint) => {
+                        to.proposal_ref == constraint.revised_proposal
+                            && to.proposal == constraint.exact_revised_proposal
                     }
                 }
                 && from.meta.budget == to.meta.budget =>
@@ -5213,6 +5916,73 @@ fn validate_continuation(
     Ok(())
 }
 
+fn validate_pre_spend_revision_successor(
+    source: &OccurrenceSnapshotV1,
+    halted: &HaltedV1,
+    target: &ObservationRequiredV1,
+) -> Result<(), KernelErrorV1> {
+    let marker =
+        halted
+            .pre_spend_scope_insufficiency
+            .as_ref()
+            .ok_or(KernelErrorV1::StateInvariant(
+                "missing pre-spend insufficiency marker",
+            ))?;
+    marker.validate()?;
+    let prior = target
+        .prior
+        .as_ref()
+        .ok_or(KernelErrorV1::StateInvariant("missing pre-spend prior"))?;
+    let constraint = prior
+        .pre_spend_revision
+        .as_ref()
+        .ok_or(KernelErrorV1::StateInvariant(
+            "missing pre-spend revision constraint",
+        ))?;
+    constraint.exact_revised_proposal.validate()?;
+    let original = halted
+        .prior
+        .proposal_contract
+        .as_ref()
+        .ok_or(KernelErrorV1::StateInvariant(
+            "pre-spend revision lacks original proposal",
+        ))?;
+    let mechanically_revised = original
+        .derive_pre_spend_revision(constraint.exact_revised_proposal.effect_scope().clone())?;
+    if halted.source != ProgramCounterV1::ProposalRecorded
+        || halted.history != AuthorityHistoryV1::default()
+        || halted.governed_repair_requirement.is_some()
+        || halted.governed_repair_closed.is_some()
+        || halted.docket_issuance_refusal.is_some()
+        || prior.key != halted.meta.key
+        || prior.state_digest != source.state_digest
+        || prior.proposal != halted.prior.proposal
+        || prior.proposal_contract != halted.prior.proposal_contract
+        || prior.normalized_preconditions.is_some()
+        || prior.effect_scope != halted.prior.effect_scope
+        || prior.issuance.is_some()
+        || prior.docket_custody.is_some()
+        || prior.docket_attempt.is_some()
+        || prior.authorized_successor.is_some()
+        || constraint.predecessor != halted.meta.key
+        || constraint.revised_proposal != constraint.exact_revised_proposal.reference()
+        || constraint.exact_revised_proposal == *original
+        || constraint.exact_revised_proposal != mechanically_revised
+        || constraint.exact_revised_proposal.campaign() != &halted.meta.key.campaign
+        || target.meta.key.campaign != halted.meta.key.campaign
+        || target.meta.key.occurrence == halted.meta.key.occurrence
+        || target.meta.program != halted.meta.program
+        || target.meta.residuals != halted.meta.residuals
+        || target.meta.budget != halted.meta.budget
+        || target.meta.used_human_decisions != halted.meta.used_human_decisions
+    {
+        return Err(KernelErrorV1::StateInvariant(
+            "pre-spend revision successor linkage",
+        ));
+    }
+    Ok(())
+}
+
 const fn is_safe_halt_source(source: ProgramCounterV1) -> bool {
     matches!(
         source,
@@ -5235,7 +6005,11 @@ fn budget_same_or_one_escalation(left: LoopBudgetV1, right: LoopBudgetV1) -> boo
             || left.escalations_used.saturating_add(1) == right.escalations_used)
 }
 
-fn validate_halt_successor(from: &OccurrenceStateV1, to: &HaltedV1) -> Result<(), KernelErrorV1> {
+fn validate_halt_successor(
+    source: &OccurrenceSnapshotV1,
+    to: &HaltedV1,
+) -> Result<(), KernelErrorV1> {
+    let from = source.state();
     let from_meta = from.meta();
     let expected_unresolved = match from {
         OccurrenceStateV1::ReconciliationRequired(value) => {
@@ -5261,6 +6035,30 @@ fn validate_halt_successor(from: &OccurrenceStateV1, to: &HaltedV1) -> Result<()
     } else {
         to.meta.residuals == from_meta.residuals
     };
+    let pre_spend_marker_valid = if let Some(marker) = &to.pre_spend_scope_insufficiency {
+        marker.validate()?;
+        let Some(proposal) = from.proposal_basis() else {
+            return Err(KernelErrorV1::StateInvariant(
+                "pre-spend halt without proposal basis",
+            ));
+        };
+        from.program_counter() == ProgramCounterV1::ProposalRecorded
+            && marker.key == from_meta.key
+            && marker.proposal == proposal.proposal_ref
+            && marker.original_scope_identity == *proposal.proposal.scope()
+            && marker.source_state_digest == source.state_digest
+            && to.reason
+                == HaltReasonRefV1::from_digest(digest_value(
+                    PRE_SPEND_SCOPE_INSUFFICIENCY_SCHEMA_V1,
+                    &marker.insufficiency,
+                ))
+            && to.history == AuthorityHistoryV1::default()
+            && to.governed_repair_requirement.is_none()
+            && to.governed_repair_closed.is_none()
+            && to.docket_issuance_refusal.is_none()
+    } else {
+        true
+    };
     if to.source != from.program_counter()
         || to.meta.key != from_meta.key
         || to.meta.program != from_meta.program
@@ -5268,6 +6066,7 @@ fn validate_halt_successor(from: &OccurrenceStateV1, to: &HaltedV1) -> Result<()
         || to.meta.used_human_decisions != from_meta.used_human_decisions
         || !budget_same_or_one_escalation(from_meta.budget, to.meta.budget)
         || to.prior.key != from_meta.key
+        || to.prior.state_digest != source.state_digest
         || to.prior.effect_scope
             != from
                 .proposal_basis()
@@ -5276,11 +6075,13 @@ fn validate_halt_successor(from: &OccurrenceStateV1, to: &HaltedV1) -> Result<()
         || to.prior.docket_custody != from.docket_custody().map(DocketCustodyV1::reference)
         || to.prior.docket_attempt != from.docket_custody().map(|value| value.attempt.clone())
         || to.prior.authorized_successor.is_some()
+        || to.prior.pre_spend_revision.is_some()
         || to.unresolved_attempt != expected_unresolved
         || to.history != from.authority_history()
         || (from.program_counter() == ProgramCounterV1::Dispatched
             && to.governed_repair_requirement.is_none())
         || (!governed_source && to.governed_repair_requirement.is_some())
+        || !pre_spend_marker_valid
     {
         return Err(KernelErrorV1::StateInvariant("halt transition"));
     }
@@ -5304,6 +6105,11 @@ fn exactly_one_appended<T: Eq>(before: &[T], after: &[T]) -> bool {
 }
 
 fn validate_human_halt_update(from: &HaltedV1, to: &HaltedV1) -> Result<(), KernelErrorV1> {
+    if from.pre_spend_scope_insufficiency.is_some() || to.pre_spend_scope_insufficiency.is_some() {
+        return Err(KernelErrorV1::StateInvariant(
+            "typed pre-spend halt cannot be updated by human disposition",
+        ));
+    }
     let residual_update_valid = match (&from.governed_repair_closed, &to.governed_repair_closed) {
         (None, Some(closed)) => {
             to.meta.residuals.len() == from.meta.residuals.len().saturating_add(1)
@@ -5486,6 +6292,34 @@ fn validate_state(state: &OccurrenceStateV1) -> Result<(), KernelErrorV1> {
                     ));
                 }
             }
+            if let Some(marker) = &value.pre_spend_scope_insufficiency {
+                marker.validate()?;
+                if value.source != ProgramCounterV1::ProposalRecorded
+                    || value.meta.key != marker.key
+                    || value.prior.proposal.as_ref() != Some(&marker.proposal)
+                    || value
+                        .prior
+                        .effect_scope
+                        .as_ref()
+                        .map(CanonicalEffectScopeV1::digest)
+                        != Some(marker.original_scope_identity.clone())
+                    || value.prior.state_digest != marker.source_state_digest
+                    || value.reason
+                        != HaltReasonRefV1::from_digest(digest_value(
+                            PRE_SPEND_SCOPE_INSUFFICIENCY_SCHEMA_V1,
+                            &marker.insufficiency,
+                        ))
+                    || value.history != AuthorityHistoryV1::default()
+                    || value.governed_repair_requirement.is_some()
+                    || value.governed_repair_closed.is_some()
+                    || value.docket_issuance_refusal.is_some()
+                    || value.unresolved_attempt.is_some()
+                {
+                    return Err(KernelErrorV1::StateInvariant(
+                        "halted pre-spend scope insufficiency binding",
+                    ));
+                }
+            }
         }
         OccurrenceStateV1::Completed(value) => {
             if let Some(proposal) = &value.proposal_contract {
@@ -5507,6 +6341,11 @@ fn validate_state(state: &OccurrenceStateV1) -> Result<(), KernelErrorV1> {
 }
 
 fn validate_prior_basis(prior: &PriorOccurrenceBasisV1) -> Result<(), KernelErrorV1> {
+    if prior.authorized_successor.is_some() && prior.pre_spend_revision.is_some() {
+        return Err(KernelErrorV1::StateInvariant(
+            "pre-spend and post-spend successor constraints overlap",
+        ));
+    }
     match (
         prior.proposal.as_ref(),
         prior.proposal_contract.as_ref(),
@@ -5534,6 +6373,22 @@ fn validate_prior_basis(prior: &PriorOccurrenceBasisV1) -> Result<(), KernelErro
         return Err(KernelErrorV1::StateInvariant(
             "prior issuance without proposal contract",
         ));
+    }
+    if let Some(constraint) = &prior.pre_spend_revision {
+        constraint.exact_revised_proposal.validate()?;
+        if constraint.predecessor != prior.key
+            || constraint.revised_proposal != constraint.exact_revised_proposal.reference()
+            || constraint.exact_revised_proposal.campaign() != &prior.key.campaign
+            || prior.proposal.is_none()
+            || prior.issuance.is_some()
+            || prior.docket_custody.is_some()
+            || prior.docket_attempt.is_some()
+            || prior.normalized_preconditions.is_some()
+        {
+            return Err(KernelErrorV1::StateInvariant(
+                "pre-spend revision constraint",
+            ));
+        }
     }
     Ok(())
 }
