@@ -29,13 +29,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::governed_store::{
+    CampaignReplayReportV1, CampaignStoreErrorV1, CampaignStoreV1, CampaignTransitionKindV1,
+};
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::{Digest, JcsDocument};
-use ag_store::campaign::{
-    CampaignCommitReceiptV1, CampaignReplayReportV1, CampaignStoreErrorV1, CampaignStoreV1,
-    CampaignTransitionKindV1,
-};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -210,6 +209,10 @@ pub enum CampaignEngineErrorV1 {
     /// Canonical encoding failed.
     #[error("canonical encoding failed: {0}")]
     Canonical(String),
+    /// The stable product legality projection refused an operation at the
+    /// exact reported state before any consequence boundary was crossed.
+    #[error("product operation is not allowed: {0}")]
+    OperationNotAllowed(String),
     /// Docket returned a state that is impossible at this boundary.
     #[error("Docket custody/reconciliation response is not applicable")]
     DocketResponse,
@@ -229,6 +232,7 @@ impl CampaignEngineV1 {
 
     /// Creates one campaign with one authority-empty occurrence.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub fn create(
         database: &Path,
         campaign: CampaignId,
@@ -565,36 +569,6 @@ impl CampaignEngineV1 {
             now_unix_ms,
         )?;
         Ok(successor)
-    }
-
-    /// Applies one externally verified human disposition transactionally.
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_human_disposition<O, H>(
-        &mut self,
-        artifact: HumanDispositionV1,
-        expected_scope: &HumanAuthorityScopeV1,
-        new_occurrence: Option<OccurrenceId>,
-        observation: &mut O,
-        verifier: &mut H,
-        now_unix_ms: u64,
-    ) -> Result<HumanDispositionEffectV1, CampaignEngineErrorV1>
-    where
-        O: ObservationResolverV1,
-        H: HumanDispositionVerifierV1,
-    {
-        let current = self.store.current()?;
-        let effect = GovernedLoopKernelV1::apply_human_disposition(
-            &current,
-            artifact.clone(),
-            expected_scope,
-            new_occurrence,
-            observation,
-            verifier,
-            now_unix_ms,
-        )?;
-        self.store
-            .commit_human_disposition(&current, &effect, &artifact, now_unix_ms)?;
-        Ok(effect)
     }
 
     /// Creates and durably records one exact non-authorizing governed-repair
@@ -1077,6 +1051,3 @@ impl CampaignEngineV1 {
         Ok(successor)
     }
 }
-
-/// Convenience type for batches of commit receipts returned by future callers.
-pub type CampaignCommitBatchV1 = Vec<CampaignCommitReceiptV1>;

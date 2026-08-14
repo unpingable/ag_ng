@@ -5,12 +5,18 @@ Status: **development candidate; operational qualification is
 
 This is the current AG contract for consequence-bearing repair governance. It
 replaces the retired fixed-stage campaign repair office as a production path.
-The implementation is the governed-loop kernel in
-`crates/ag-campaign/src/governed.rs`, the append-only store in
-`crates/ag-store/src/campaign.rs`, the application engine and boundary adapters
+The implementation is the authority-neutral governed-loop kernel in
+`crates/ag-campaign/src/governed.rs`; its private append-only application Store
+in `crates/ag-app/src/governed_store.rs`; the application engine and boundary adapters
 in `crates/ag-app/src/governed_loop.rs` and
 `crates/ag-app/src/governed_ports.rs`, and the reusable product surface in
 `crates/ag-app/src/governed_product.rs`.
+
+The persistence module is deliberately private to `ag-app`: external crates
+cannot combine the public semantic kernel with a mutable Store, mint an
+issuance-signing permit, or reach a second consequence-bearing application
+root. `GovernedCampaignServiceV1` is the sole production repair-governance
+surface.
 
 ## Bootstrap fact and nonclaim
 
@@ -36,9 +42,11 @@ dispositions; successor creation; terminal refusal, residuals, and escalation.
 
 Docket owns execution custody, attempts, the exact executor/checkpoint/result
 binding, effect journals, sealed outcomes, replay, and unknown-result
-reconciliation. Docket reports an exact requirement and whether the newly
-requested unauthorized effect was not performed. It does not decide whether an
-NQ diagnosis is correct or whether a scope expansion is permissible.
+reconciliation. Docket reports an exact requirement, validates that every
+executor-reported effect is in scope, and reports that the executor journal
+contains no newly requested unauthorized effect. This is not proof about an
+unreported physical effect. Docket does not decide whether an NQ diagnosis is
+correct or whether a scope expansion is permissible.
 
 The AG-side Docket outcome reference retains the sealed occurrence's exact
 creation/expiry and idempotency identities, whether authorized effects were
@@ -124,7 +132,7 @@ The load-bearing public schemas are:
 | `CanonicalEffectScopeV1` | `ag.governed-loop.canonical-effect-scope/v1`; exact closed resources and operations |
 | `AgIssuanceV2` | `ag.governed-loop.issuance/v2`; exact structured scope and optional immutable checkpoint |
 | `DocketIssuanceRefusalV1` | `docket.governed-loop.issuance-refusal/v1`; sealed pre-custody semantic refusal that retains the consumed AG spend and creates no Docket attempt |
-| `ScopeExpansionRequiredV1` | `ag.governed-loop.scope-expansion-required/v1`; additive delta plus Docket evidence and no-unauthorized-effect assertion |
+| `ScopeExpansionRequiredV1` | `ag.governed-loop.scope-expansion-required/v1`; additive delta plus Docket evidence and the bounded `no_unauthorized_effect_reported` observation |
 | `ReadjudicationRequiredV1` | `ag.governed-loop.readjudication-required/v1`; bounded read-only normative question |
 | `HumanDecisionRequestV1` | `ag.governed-loop.human-decision-request/v1`; immutable, expiring, non-authorizing request |
 | `GovernedRepairDispositionV1` | `ag.governed-loop.governed-repair-disposition/v1`; exact externally verified decision |
@@ -215,7 +223,9 @@ The implementation and development tests defend these laws:
 
 1. An occurrence's original scope never changes.
 2. Every journaled executor effect belongs to the attempt's issuance scope.
-3. An out-of-scope effect is not performed before approval.
+3. No out-of-scope effect appears in the complete journal reported by the
+   executor before approval; executor completeness and physical containment
+   remain operational premises.
 4. A post-spend halt never refunds or revives the spend.
 5. Checkpoint possession grants no authority.
 6. Continuation after a governed repair halt occurs only through a distinct

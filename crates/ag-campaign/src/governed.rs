@@ -32,12 +32,19 @@ use core::fmt;
 use std::collections::BTreeSet;
 
 use ag_primitives::{Digest, JcsDocument};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::identity::{CampaignId, CampaignLabelError};
-use crate::transcript::validate_label;
+use crate::transcript::{is_canonical_wire_label, validate_label};
+
+/// Tests one value against the shared AG/Docket lowercase wire-label grammar.
+/// The stable corpus additionally fixes the 128-byte protocol bound.
+#[must_use]
+pub fn governed_wire_label_is_canonical_v1(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && is_canonical_wire_label(value)
+}
 
 /// Wire schema for exact-work proposals.
 pub const EXACT_WORK_PROPOSAL_SCHEMA_V1: &str = "ag.governed-loop.exact-work-proposal/v1";
@@ -53,6 +60,8 @@ pub const AG_ISSUANCE_SCHEMA_V2: &str = "ag.governed-loop.issuance/v2";
 pub const DOCKET_CUSTODY_SCHEMA_V1: &str = "ag.governed-loop.docket-custody/v1";
 /// Wire schema for Docket settlements.
 pub const DOCKET_SETTLEMENT_SCHEMA_V1: &str = "ag.governed-loop.docket-settlement/v1";
+/// Identity domain for the complete exact Docket settlement body.
+pub const DOCKET_SETTLEMENT_IDENTITY_DOMAIN_V1: &str = "docket.governed-loop.settlement/v1";
 /// Wire schema for external human dispositions.
 pub const HUMAN_DISPOSITION_SCHEMA_V1: &str = "ag.governed-loop.human-disposition/v1";
 /// Wire schema for exact governed-repair human dispositions.
@@ -81,6 +90,23 @@ fn digest_value<T: Serialize + ?Sized>(domain: &str, value: &T) -> Digest {
     let document = JcsDocument::canonicalize(value)
         .expect("governed-loop values contain only strict JCS-compatible fields");
     Digest::hash_domain(domain, document.as_bytes())
+}
+
+fn validate_canonical_timestamp(value: u64, field: &'static str) -> Result<(), KernelErrorV1> {
+    if value > MAX_CANONICAL_JSON_INTEGER_V1 {
+        return Err(KernelErrorV1::HumanDecisionRequest(field));
+    }
+    Ok(())
+}
+
+// Canonical cross-office records omit absent optional fields.  When a field is
+// present it must contain T; explicit JSON null must not collapse to omission.
+fn deserialize_present_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 macro_rules! exact_digest_ref {
@@ -225,6 +251,10 @@ exact_digest_ref!(
 exact_digest_ref!(
     /// Exact external verification record for a human disposition.
     HumanVerificationRefV1
+);
+exact_digest_ref!(
+    /// Exact complete Store-validated governed-repair verification receipt.
+    GovernedRepairVerificationRefV1
 );
 exact_digest_ref!(
     /// Exact non-authorizing human-decision request identity.
@@ -413,10 +443,6 @@ impl ResidualSetV1 {
     pub fn len(&self) -> usize {
         self.0.len()
     }
-
-    fn ids(&self) -> BTreeSet<ResidualIdV1> {
-        self.0.iter().map(|item| item.residual.clone()).collect()
-    }
 }
 
 impl TryFrom<Vec<ResidualObligationV1>> for ResidualSetV1 {
@@ -514,7 +540,7 @@ pub type C1RepairCitationV1 = C1RejectedReviewBasisV1;
 
 /// Closed operation vocabulary for one exact effect-scope row.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CanonicalEffectOperationV1 {
     /// Read exact existing content.
     Read,
@@ -630,7 +656,22 @@ impl CanonicalEffectScopeV1 {
     /// Returns the canonical semantic identity of the complete scope.
     #[must_use]
     pub fn digest(&self) -> Digest {
-        digest_value("ag.governed-loop.canonical-effect-scope/v1", self)
+        Digest::hash_domain(
+            CANONICAL_EFFECT_SCOPE_SCHEMA_V1,
+            self.canonical_document().as_bytes(),
+        )
+    }
+
+    /// Returns the exact canonical scope bytes shared by AG and Docket.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if this already validated, closed Rust value can no longer
+    /// be represented by the repository's canonical JSON implementation.
+    #[must_use]
+    pub fn canonical_document(&self) -> JcsDocument {
+        JcsDocument::canonicalize(self)
+            .expect("validated canonical effect scopes contain only exact JCS values")
     }
 
     /// Computes the exact closed union used by an approved scope expansion.
@@ -710,10 +751,15 @@ pub struct DocketGovernedRepairOutcomeRefV1 {
     pub executor_receipt: ReceiptRefV1,
     /// Exact immutable work checkpoint sealed by Docket, when the attempted
     /// work began from one. This is evidence, never authority.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub immutable_work_checkpoint: Option<GovernedRepairCheckpointV1>,
     /// Whether exact authorized effects were already journaled before the
     /// requirement was discovered.
-    pub authorized_effects_occurred: bool,
+    pub reported_authorized_effects_occurred: bool,
     /// Docket's exact requirement creation time.
     pub created_at_unix_ms: u64,
     /// Exclusive Docket requirement expiry.
@@ -724,7 +770,7 @@ pub struct DocketGovernedRepairOutcomeRefV1 {
 
 /// Closed class of Docket-owned terminal refusal before execution custody.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DocketIssuanceRefusalClassV1 {
     /// The authenticated issuance failed Docket's closed semantic validation.
     IssuanceInvalid,
@@ -856,6 +902,14 @@ impl DocketIssuanceRefusalV1 {
 
 impl DocketGovernedRepairOutcomeRefV1 {
     fn validate(&self) -> Result<(), KernelErrorV1> {
+        validate_canonical_timestamp(
+            self.created_at_unix_ms,
+            "Docket outcome creation time is not canonically representable",
+        )?;
+        validate_canonical_timestamp(
+            self.expires_at_unix_ms,
+            "Docket outcome expiry is not canonically representable",
+        )?;
         if self.created_at_unix_ms >= self.expires_at_unix_ms {
             return Err(KernelErrorV1::HumanDecisionRequest(
                 "Docket outcome has an empty validity interval",
@@ -885,10 +939,20 @@ pub struct GovernedRepairCheckpointV1 {
     /// Exact full tree object identity.
     pub tree: String,
     /// Optional exact dirty-diff/content overlay identity.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub diff_identity: Option<Digest>,
     /// Exact canonical changed-path/content manifest identity.
     pub content_manifest: Digest,
     /// Exact Docket checkpoint when this is a post-spend result.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub docket_checkpoint: Option<DocketCheckpointRefV1>,
 }
 
@@ -932,9 +996,16 @@ pub struct ScopeExpansionRequiredV1 {
     /// Exact Docket-owned limitations retained without granting authority.
     pub limitations: Vec<Digest>,
     /// Optional Docket-sealed result for a post-spend discovery.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub docket_outcome: Option<DocketGovernedRepairOutcomeRefV1>,
-    /// Must be true: the discovered out-of-scope effect did not occur.
-    pub unauthorized_effect_not_performed: bool,
+    /// Must be true: the executor reported no unauthorized effect and Docket
+    /// found no out-of-scope entry in the reported effect journal. This is not
+    /// a claim of complete physical mediation.
+    pub no_unauthorized_effect_reported: bool,
 }
 
 impl ScopeExpansionRequiredV1 {
@@ -983,9 +1054,9 @@ impl ScopeExpansionRequiredV1 {
                 "dependency evidence must be sorted and unique",
             ));
         }
-        if !self.unauthorized_effect_not_performed {
+        if !self.no_unauthorized_effect_reported {
             return Err(KernelErrorV1::HumanDecisionRequest(
-                "unauthorized effect already occurred",
+                "executor did not report a clean unauthorized-effect boundary",
             ));
         }
         if let Some(outcome) = &self.docket_outcome {
@@ -1033,9 +1104,16 @@ pub struct ReadjudicationRequiredV1 {
     /// fresh decision.  It is not repair or mutation authority.
     pub adjudication_scope: CanonicalEffectScopeV1,
     /// Optional Docket-sealed result for a post-spend discovery.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub docket_outcome: Option<DocketGovernedRepairOutcomeRefV1>,
-    /// Must be true: no unadjudicated effect occurred.
-    pub unauthorized_effect_not_performed: bool,
+    /// Must be true: the executor reported no unadjudicated effect and Docket
+    /// found no such entry in the reported effect journal. This is not a
+    /// completeness claim about effects outside the mediated journal.
+    pub no_unauthorized_effect_reported: bool,
 }
 
 impl ReadjudicationRequiredV1 {
@@ -1069,9 +1147,9 @@ impl ReadjudicationRequiredV1 {
                 ));
             }
         }
-        if !self.unauthorized_effect_not_performed {
+        if !self.no_unauthorized_effect_reported {
             return Err(KernelErrorV1::HumanDecisionRequest(
-                "unauthorized effect already occurred",
+                "executor did not report a clean unadjudicated-effect boundary",
             ));
         }
         if let Some(outcome) = &self.docket_outcome {
@@ -1083,7 +1161,7 @@ impl ReadjudicationRequiredV1 {
 
 /// Closed reason a halted occurrence requires fresh human governance.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanDecisionRequirementV1 {
     /// Exact additive effect-scope expansion.
     ScopeExpansion(ScopeExpansionRequiredV1),
@@ -1093,7 +1171,7 @@ pub enum HumanDecisionRequirementV1 {
 
 /// Closed disposition classes serialized into each human-decision request.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovernedRepairDecisionClassV1 {
     /// Approve exactly the requested additive scope delta.
     ApproveExactExpansion,
@@ -1188,6 +1266,14 @@ impl HumanDecisionRequestV1 {
         if self.schema != HUMAN_DECISION_REQUEST_SCHEMA_V1 {
             return Err(KernelErrorV1::ForeignSchema("human decision request"));
         }
+        validate_canonical_timestamp(
+            self.created_at_unix_ms,
+            "human decision request creation time is not canonically representable",
+        )?;
+        validate_canonical_timestamp(
+            self.expires_at_unix_ms,
+            "human decision request expiry is not canonically representable",
+        )?;
         if self.created_at_unix_ms >= self.expires_at_unix_ms {
             return Err(KernelErrorV1::HumanDecisionRequest(
                 "empty validity interval",
@@ -1257,7 +1343,7 @@ pub struct ProposalGovernanceTermsV1 {
 
 /// Largest integer whose exact value survives the RFC 8785/ECMAScript number
 /// representation used by the cross-repository canonical JSON wire.
-pub const MAX_CANONICAL_JSON_INTEGER_V1: u64 = 9_007_199_254_740_991;
+pub const MAX_CANONICAL_JSON_INTEGER_V1: u64 = ag_primitives::MAX_JCS_SAFE_INTEGER;
 
 /// Generic exact-work proposal; the work payload is an immutable typed digest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1273,6 +1359,11 @@ pub struct ExactWorkProposalV1 {
     nonclaims: Vec<Digest>,
     expires_at_unix_ms: u64,
     repair: Option<C1RepairCitationV1>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     governed_repair_checkpoint: Option<GovernedRepairCheckpointV1>,
 }
 
@@ -1416,7 +1507,7 @@ impl ExactWorkProposalV1 {
 
 /// Observation status returned by the external observation resolver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObservationStatusV1 {
     /// The exact observation remains current and fresh.
     Current,
@@ -1478,7 +1569,7 @@ pub trait ObservationResolverV1 {
 
 /// Standing status returned by the authoritative Standing/Docket resolver.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum StandingStatusV1 {
     /// Exact standing is current.
     Current,
@@ -1550,7 +1641,7 @@ pub trait StandingResolverV1 {
 
 /// Closed result vocabulary for AG's exact-work admission policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdmissionDispositionV1 {
     /// Exact work is admitted for possible one-use spend.
     Admitted,
@@ -1623,7 +1714,7 @@ pub enum ExternalBoundaryErrorV1 {
 
 /// Relationship between a continuation occurrence and its predecessor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContinuationClassV1 {
     /// Same exact proposal may be reused only with unchanged fresh preconditions.
     Retry,
@@ -1635,7 +1726,7 @@ pub enum ContinuationClassV1 {
 /// It constrains the next proposal but carries no standing or reusable effect
 /// authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorizedSuccessorBasisV1 {
     /// Human approval of exactly one additive scope delta and exact union.
     ExactScopeExpansion {
@@ -1698,7 +1789,7 @@ pub struct PriorOccurrenceBasisV1 {
 
 /// Occurrence linkage; authority never travels through this record.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum OccurrenceLinkV1 {
     /// First occurrence in the campaign.
     Initial,
@@ -1846,6 +1937,11 @@ pub struct AgIssuanceV2 {
     pub effect_scope_digest: Digest,
     /// Immutable governed-repair checkpoint when this is a constrained
     /// successor issuance.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub governed_repair_checkpoint: Option<GovernedRepairCheckpointV1>,
     /// Exact observation.
     pub observation: ObservationRefV1,
@@ -1913,7 +2009,7 @@ pub struct DispatchedV1(DispatchBasisV1);
 
 /// Known Docket settlement outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum KnownOutcomeV1 {
     /// Exact effect succeeded.
     Success,
@@ -1939,8 +2035,52 @@ pub struct DocketSettlementV1 {
     pub receipt: ReceiptRefV1,
     /// Known outcome.
     pub outcome: KnownOutcomeV1,
+    /// Exact Docket-owned cumulative ordered attempt-journal identity. Absent
+    /// only in explicitly decoded rejected-R1 historical rows; every R2
+    /// production wire and transition requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_effect_journal_identity: Option<Digest>,
     /// Docket settlement time.
     pub settled_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct DocketSettlementIdentityBodyV1<'a> {
+    schema: &'a str,
+    issuance: &'a AgIssuanceRefV1,
+    attempt: &'a DocketAttemptRefV1,
+    executor_marker: &'a ExecutorAttemptMarkerRefV1,
+    receipt: &'a ReceiptRefV1,
+    outcome: KnownOutcomeV1,
+    cumulative_effect_journal_identity: &'a Digest,
+    settled_at_unix_ms: u64,
+}
+
+impl DocketSettlementV1 {
+    /// Reproduces the exact Docket settlement identity from every canonical
+    /// consequence-bearing field except the identity itself.
+    pub fn expected_reference(&self) -> Result<SettlementRefV1, KernelErrorV1> {
+        validate_canonical_timestamp(
+            self.settled_at_unix_ms,
+            "Docket settlement time is not canonically representable",
+        )?;
+        let journal = self.cumulative_effect_journal_identity.as_ref().ok_or(
+            KernelErrorV1::BindingMismatch("R2 cumulative Docket effect journal"),
+        )?;
+        Ok(SettlementRefV1::from_digest(digest_value(
+            DOCKET_SETTLEMENT_IDENTITY_DOMAIN_V1,
+            &DocketSettlementIdentityBodyV1 {
+                schema: &self.schema,
+                issuance: &self.issuance,
+                attempt: &self.attempt,
+                executor_marker: &self.executor_marker,
+                receipt: &self.receipt,
+                outcome: self.outcome,
+                cumulative_effect_journal_identity: journal,
+                settled_at_unix_ms: self.settled_at_unix_ms,
+            },
+        )))
+    }
 }
 
 /// Exact indeterminate-attempt evidence requiring reconciliation.
@@ -2036,7 +2176,7 @@ pub struct CompletedV1 {
 
 /// Closed typed state sum for one occurrence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum OccurrenceStateV1 {
     /// Fresh observation required.
     ObservationRequired(ObservationRequiredV1),
@@ -2167,6 +2307,17 @@ impl OccurrenceStateV1 {
         }
     }
 
+    fn admissible_basis(&self) -> Option<&AdmissibleBasisV1> {
+        match self {
+            Self::AdmissiblePendingAuthorization(value) => Some(&value.0),
+            Self::AuthorizationConsumed(value) => Some(&value.admitted),
+            Self::Dispatched(value) => Some(&value.0.authorized.admitted),
+            Self::ReconciliationRequired(value) => Some(&value.dispatch.authorized.admitted),
+            Self::SettledObservationRequired(value) => Some(&value.dispatch.authorized.admitted),
+            _ => None,
+        }
+    }
+
     fn issuance(&self) -> Option<&AgIssuanceV2> {
         match self {
             Self::AuthorizationConsumed(value) => Some(&value.issuance),
@@ -2278,7 +2429,7 @@ fn successor_snapshot(
 
 /// Durable refusal code. A refusal is never a program-counter state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RefusalCodeV1 {
     /// Observation stale or absent.
     StaleObservation,
@@ -2318,7 +2469,7 @@ pub struct RefusalOutcomeV1 {
 
 /// Canonical recovery requirement derived solely from durable state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RecoveryRequirementV1 {
     /// Fresh observation is required.
     FreshObservation,
@@ -2500,7 +2651,7 @@ pub struct ExecutorDispatchV1 {
 
 /// Closed executor outcome class; this value has no AG transition authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutorOutcomeClassV1 {
     /// Mechanics succeeded.
     Success,
@@ -2553,8 +2704,10 @@ pub enum DocketIssuanceReconciliationV1 {
         /// Exact indeterminate evidence.
         indeterminate: IndeterminateOutcomeV1,
     },
-    /// Docket sealed an exact post-spend scope insufficiency; no unauthorized
-    /// effect occurred and AG must halt before producing a request.
+    /// Docket sealed an exact post-spend scope insufficiency; the executor
+    /// reported no unauthorized effect, Docket found no such journal entry,
+    /// and AG must halt before producing a request. Physical completeness is
+    /// an operational premise rather than a mediated semantic claim.
     GovernedRepairRequired {
         /// Exact custody basis.
         custody: DocketCustodyV1,
@@ -2586,6 +2739,41 @@ pub enum DocketSealedGovernedRepairResultV1 {
         /// Exact non-authorizing requirement.
         requirement: ReadjudicationRequiredV1,
     },
+}
+
+impl DocketSealedGovernedRepairResultV1 {
+    /// Revalidates the complete sealed requirement join. The requested delta
+    /// (or readjudication census) is checked here before AG can halt, and the
+    /// embedded requirement must carry the same exact Docket outcome.
+    pub fn validate(&self) -> Result<(), KernelErrorV1> {
+        match self {
+            Self::ScopeExpansionRequired {
+                outcome,
+                requirement,
+            } => {
+                outcome.validate()?;
+                requirement.validate()?;
+                if requirement.docket_outcome.as_ref() != Some(outcome) {
+                    return Err(KernelErrorV1::BindingMismatch(
+                        "sealed scope requirement/outcome",
+                    ));
+                }
+            }
+            Self::ReadjudicationRequired {
+                outcome,
+                requirement,
+            } => {
+                outcome.validate()?;
+                requirement.validate()?;
+                if requirement.docket_outcome.as_ref() != Some(outcome) {
+                    return Err(KernelErrorV1::BindingMismatch(
+                        "sealed readjudication requirement/outcome",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Exact response to first Docket custody submission.  Docket always returns
@@ -2636,7 +2824,7 @@ pub trait DocketCustodyPortV1 {
 
 /// Closed external human disposition vocabulary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum HumanDispositionKindV1 {
     /// Permit only a new observation-required occurrence.
     ReturnToObservation,
@@ -2694,7 +2882,7 @@ impl HumanDispositionV1 {
 /// request.  Successor identity is part of the signed artifact, never supplied
 /// as an ambient sibling argument.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovernedRepairDispositionKindV1 {
     /// Approve exactly the requested additive delta for one successor.
     ApproveExactExpansion {
@@ -2828,6 +3016,18 @@ pub struct GovernedRepairVerificationV1 {
     pub expires_at_unix_ms: u64,
 }
 
+impl GovernedRepairVerificationV1 {
+    /// Returns the identity of the complete exact verification record, not
+    /// merely the nested cryptographic/currentness evidence reference.
+    #[must_use]
+    pub fn reference(&self) -> GovernedRepairVerificationRefV1 {
+        GovernedRepairVerificationRefV1::from_digest(digest_value(
+            GOVERNED_REPAIR_VERIFICATION_SCHEMA_V1,
+            self,
+        ))
+    }
+}
+
 /// Request to the configured governed-repair verifier.
 #[derive(Debug, Eq, PartialEq)]
 pub struct GovernedRepairVerificationRequestV1<'a> {
@@ -2852,7 +3052,7 @@ pub trait GovernedRepairDispositionVerifierV1 {
 
 /// Result of one exact governed-repair disposition.
 #[derive(Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "effect", rename_all = "snake_case")]
+#[serde(tag = "effect", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovernedRepairDispositionEffectV1 {
     /// Request was rejected; source remains halted with the decision consumed.
     Rejected {
@@ -2872,61 +3072,9 @@ pub enum GovernedRepairDispositionEffectV1 {
     },
 }
 
-/// Root-owned expected human authority scope for one halted boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HumanAuthorityScopeV1 {
-    /// Expected principal/signer.
-    pub principal: HumanPrincipalRefV1,
-    /// Expected mandate.
-    pub mandate: MandateRefV1,
-}
-
-/// Request to the external human-disposition verifier.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HumanDispositionVerificationRequestV1<'a> {
-    /// Exact artifact.
-    pub artifact: &'a HumanDispositionV1,
-    /// Exact non-authorizing AG request for governed-repair dispositions.
-    pub decision_request: Option<&'a HumanDecisionRequestV1>,
-    /// Root-owned expected scope.
-    pub expected_scope: &'a HumanAuthorityScopeV1,
-    /// Consequence-time clock reading.
-    pub now_unix_ms: u64,
-}
-
-/// External signature/mandate/current-authority verifier.
-pub trait HumanDispositionVerifierV1 {
-    /// Verifies the exact artifact now and returns an exact verification record.
-    fn verify_human_disposition(
-        &mut self,
-        request: &HumanDispositionVerificationRequestV1<'_>,
-    ) -> Result<HumanVerificationRefV1, ExternalBoundaryErrorV1>;
-}
-
-/// Result of an applicable human disposition.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HumanDispositionEffectV1 {
-    /// Same occurrence changed while remaining current (residual disposition or completion).
-    Updated {
-        /// Authoritative successor snapshot.
-        snapshot: OccurrenceSnapshotV1,
-        /// Exact external verification record.
-        verification: HumanVerificationRefV1,
-    },
-    /// Halted source records decision consumption and a distinct occurrence opens.
-    OpenedOccurrence {
-        /// Updated halted predecessor with the decision durably consumed.
-        halted: OccurrenceSnapshotV1,
-        /// New authority-empty observation-required occurrence.
-        successor: OccurrenceSnapshotV1,
-        /// Exact external verification record.
-        verification: HumanVerificationRefV1,
-    },
-}
-
 /// Proposal classification at an observation-required boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProposalClassV1 {
     /// Initial campaign proposal.
     Initial,
@@ -4087,134 +4235,6 @@ impl GovernedLoopKernelV1 {
         next.validate_integrity()?;
         Ok(next)
     }
-
-    /// Applies an exactly bound, externally verified, one-use human disposition.
-    #[allow(clippy::too_many_arguments)]
-    pub fn apply_human_disposition<O, H>(
-        current: &OccurrenceSnapshotV1,
-        artifact: HumanDispositionV1,
-        expected_scope: &HumanAuthorityScopeV1,
-        new_occurrence: Option<OccurrenceId>,
-        observation_resolver: &mut O,
-        verifier: &mut H,
-        now_unix_ms: u64,
-    ) -> Result<HumanDispositionEffectV1, KernelErrorV1>
-    where
-        O: ObservationResolverV1,
-        H: HumanDispositionVerifierV1,
-    {
-        current.validate_integrity()?;
-        let OccurrenceStateV1::Halted(halted) = current.state() else {
-            return Err(illegal(current, "apply_human_disposition"));
-        };
-        validate_human_artifact(current, halted, &artifact, expected_scope, now_unix_ms)?;
-        let verification =
-            verifier.verify_human_disposition(&HumanDispositionVerificationRequestV1 {
-                artifact: &artifact,
-                decision_request: None,
-                expected_scope,
-                now_unix_ms,
-            })?;
-
-        match &artifact.disposition {
-            HumanDispositionKindV1::ReturnToObservation => {
-                if halted.unresolved_attempt.is_some() {
-                    return Err(KernelErrorV1::UnresolvedAttempt);
-                }
-                let occurrence = new_occurrence.ok_or(KernelErrorV1::HumanDisposition(
-                    "new occurrence is required",
-                ))?;
-                open_from_halt(
-                    current,
-                    halted,
-                    &artifact,
-                    occurrence,
-                    halted.meta.program.clone(),
-                    verification,
-                )
-            }
-            HumanDispositionKindV1::ReplaceProgram(program) => {
-                if halted.unresolved_attempt.is_some() {
-                    return Err(KernelErrorV1::UnresolvedAttempt);
-                }
-                if program == &halted.meta.program {
-                    return Err(KernelErrorV1::HumanDisposition(
-                        "replacement program must differ",
-                    ));
-                }
-                let occurrence = new_occurrence.ok_or(KernelErrorV1::HumanDisposition(
-                    "new occurrence is required",
-                ))?;
-                open_from_halt(
-                    current,
-                    halted,
-                    &artifact,
-                    occurrence,
-                    program.clone(),
-                    verification,
-                )
-            }
-            HumanDispositionKindV1::ExactResidualDisposition(discharge) => {
-                if new_occurrence.is_some() {
-                    return Err(KernelErrorV1::HumanDisposition(
-                        "residual disposition remains halted",
-                    ));
-                }
-                let after = apply_exact_discharge(halted, discharge, &artifact.decision)?;
-                let mut next_halted = halted.clone();
-                next_halted.meta.residuals = after;
-                next_halted
-                    .meta
-                    .used_human_decisions
-                    .push(artifact.decision.clone());
-                let next = successor_snapshot(current, OccurrenceStateV1::Halted(next_halted));
-                next.validate_integrity()?;
-                Ok(HumanDispositionEffectV1::Updated {
-                    snapshot: next,
-                    verification,
-                })
-            }
-            HumanDispositionKindV1::Terminate {
-                observation,
-                subject,
-                terminal_witness,
-            } => {
-                if new_occurrence.is_some() {
-                    return Err(KernelErrorV1::HumanDisposition(
-                        "termination does not open an occurrence",
-                    ));
-                }
-                if halted.unresolved_attempt.is_some() {
-                    return Err(KernelErrorV1::UnresolvedAttempt);
-                }
-                if !halted.meta.residuals.is_empty() {
-                    return Err(KernelErrorV1::ResidualsOpen);
-                }
-                let terminal = resolve_observation(
-                    observation_resolver,
-                    halted.meta.key(),
-                    observation,
-                    subject,
-                    now_unix_ms,
-                )?;
-                let mut meta = halted.meta.clone();
-                meta.used_human_decisions.push(artifact.decision.clone());
-                let state = OccurrenceStateV1::Completed(CompletedV1 {
-                    meta,
-                    terminal_observation: terminal,
-                    terminal_witness: terminal_witness.clone(),
-                    history: halted.history.clone(),
-                    proposal_contract: halted.prior.proposal_contract.clone(),
-                });
-                let next = successor_snapshot(current, state);
-                next.validate_integrity()?;
-                Ok(HumanDispositionEffectV1::Updated {
-                    snapshot: next,
-                    verification,
-                })
-            }
-        }
-    }
 }
 
 impl OccurrenceSnapshotV1 {
@@ -4239,6 +4259,22 @@ impl OccurrenceSnapshotV1 {
     #[must_use]
     pub fn observation(&self) -> Option<&ObservationResolutionV1> {
         self.state.proposal_basis().map(|basis| &basis.observation)
+    }
+
+    /// Returns the exact current-standing resolution retained by an admitted
+    /// transition snapshot. Later terminal projections expose its identity
+    /// through history; the Store keeps this exact earlier record available
+    /// as product evidence.
+    #[must_use]
+    pub fn standing_resolution(&self) -> Option<&CurrentStandingResolutionV1> {
+        self.state.admissible_basis().map(|basis| &basis.standing)
+    }
+
+    /// Returns the exact AG admission decision retained by an admitted
+    /// transition snapshot.
+    #[must_use]
+    pub fn admission_decision(&self) -> Option<&AdmissionDecisionV1> {
+        self.state.admissible_basis().map(|basis| &basis.decision)
     }
 
     /// Returns the exact AG spend, once consumed.
@@ -4298,6 +4334,25 @@ impl OccurrenceSnapshotV1 {
     pub fn indeterminate(&self) -> Option<&IndeterminateOutcomeV1> {
         match &self.state {
             OccurrenceStateV1::ReconciliationRequired(value) => Some(&value.indeterminate),
+            _ => None,
+        }
+    }
+
+    /// Returns the exact fresh observation that closed this occurrence.
+    #[must_use]
+    pub fn terminal_observation(&self) -> Option<&ObservationResolutionV1> {
+        match &self.state {
+            OccurrenceStateV1::Completed(value) => Some(&value.terminal_observation),
+            _ => None,
+        }
+    }
+
+    /// Returns the exact externally owned witness reference that closed this
+    /// occurrence. The reference is evidence only and carries no live authority.
+    #[must_use]
+    pub fn terminal_witness(&self) -> Option<&TerminalWitnessRefV1> {
+        match &self.state {
+            OccurrenceStateV1::Completed(value) => Some(&value.terminal_witness),
             _ => None,
         }
     }
@@ -4385,6 +4440,10 @@ fn resolve_observation<O: ObservationResolverV1>(
     subject: &Digest,
     now_unix_ms: u64,
 ) -> Result<ObservationResolutionV1, KernelErrorV1> {
+    validate_canonical_timestamp(
+        now_unix_ms,
+        "observation consequence time is not canonically representable",
+    )?;
     let resolved = resolver.resolve_observation(&ObservationResolutionRequestV1 {
         key,
         observation,
@@ -4403,6 +4462,14 @@ fn resolve_observation<O: ObservationResolverV1>(
     if &resolved.subject != subject {
         return Err(KernelErrorV1::BindingMismatch("observation subject"));
     }
+    validate_canonical_timestamp(
+        resolved.resolved_at_unix_ms,
+        "observation resolution time is not canonically representable",
+    )?;
+    validate_canonical_timestamp(
+        resolved.fresh_until_unix_ms,
+        "observation freshness time is not canonically representable",
+    )?;
     if resolved.resolved_at_unix_ms > now_unix_ms || now_unix_ms >= resolved.fresh_until_unix_ms {
         return Err(KernelErrorV1::ObservationNotCurrent);
     }
@@ -4421,6 +4488,10 @@ fn resolve_standing<S: StandingResolverV1>(
     observation: &ObservationResolutionV1,
     now_unix_ms: u64,
 ) -> Result<CurrentStandingResolutionV1, KernelErrorV1> {
+    validate_canonical_timestamp(
+        now_unix_ms,
+        "standing consequence time is not canonically representable",
+    )?;
     let resolved = resolver.resolve_standing(&StandingResolutionRequestV1 {
         key: basis.meta.key(),
         observation: &observation.observation,
@@ -4447,6 +4518,14 @@ fn resolve_standing<S: StandingResolverV1>(
     if resolved.scope != *basis.proposal.scope() {
         return Err(KernelErrorV1::BindingMismatch("standing scope"));
     }
+    validate_canonical_timestamp(
+        resolved.resolved_at_unix_ms,
+        "standing resolution time is not canonically representable",
+    )?;
+    validate_canonical_timestamp(
+        resolved.expires_at_unix_ms,
+        "standing expiry is not canonically representable",
+    )?;
     if resolved.resolved_at_unix_ms > now_unix_ms || now_unix_ms >= resolved.expires_at_unix_ms {
         return Err(KernelErrorV1::StandingNotCurrent);
     }
@@ -4532,6 +4611,7 @@ fn build_issuance(admitted: &AdmissibleBasisV1, spend: &AgSpendRefV1) -> AgIssua
         subject: &'a Digest,
         effect_scope: &'a CanonicalEffectScopeV1,
         effect_scope_digest: &'a Digest,
+        #[serde(skip_serializing_if = "Option::is_none")]
         governed_repair_checkpoint: Option<&'a GovernedRepairCheckpointV1>,
         observation: &'a ObservationRefV1,
         standing_resolution: &'a StandingResolutionRefV1,
@@ -4584,6 +4664,10 @@ fn validate_custody(
     custody: &DocketCustodyV1,
     authorized: &AuthorizationConsumedV1,
 ) -> Result<(), KernelErrorV1> {
+    validate_canonical_timestamp(
+        custody.accepted_at_unix_ms,
+        "Docket custody time is not canonically representable",
+    )?;
     if custody.schema != DOCKET_CUSTODY_SCHEMA_V1 {
         return Err(KernelErrorV1::ForeignSchema("Docket custody"));
     }
@@ -4619,6 +4703,10 @@ fn validate_settlement(
     settlement: &DocketSettlementV1,
     dispatch: &DispatchBasisV1,
 ) -> Result<(), KernelErrorV1> {
+    validate_canonical_timestamp(
+        settlement.settled_at_unix_ms,
+        "Docket settlement time is not canonically representable",
+    )?;
     if settlement.schema != DOCKET_SETTLEMENT_SCHEMA_V1 {
         return Err(KernelErrorV1::ForeignSchema("Docket settlement"));
     }
@@ -4630,6 +4718,35 @@ fn validate_settlement(
     }
     if settlement.executor_marker != dispatch.custody.executor_marker {
         return Err(KernelErrorV1::BindingMismatch("settlement executor marker"));
+    }
+    if settlement.cumulative_effect_journal_identity.is_some() {
+        if settlement.settlement != settlement.expected_reference()? {
+            return Err(KernelErrorV1::BindingMismatch(
+                "complete Docket settlement identity",
+            ));
+        }
+    } else {
+        // Decoder-only rejected-R1 historical law. Production Docket intake
+        // requires the R2 field before this kernel boundary.
+        let outcome = match settlement.outcome {
+            KnownOutcomeV1::Success => "success",
+            KnownOutcomeV1::Failure => "failure",
+        };
+        let legacy = Digest::hash_domain(
+            DOCKET_SETTLEMENT_IDENTITY_DOMAIN_V1,
+            format!(
+                "{}:{}:{}:{outcome}",
+                settlement.issuance.as_str(),
+                settlement.attempt.as_str(),
+                settlement.receipt.as_str()
+            )
+            .as_bytes(),
+        );
+        if settlement.settlement.as_digest() != &legacy {
+            return Err(KernelErrorV1::BindingMismatch(
+                "rejected-R1 historical Docket settlement identity",
+            ));
+        }
     }
     Ok(())
 }
@@ -4685,54 +4802,6 @@ fn expired_issuance_halt_reason(authorized: &AuthorizationConsumedV1) -> HaltRea
     ))
 }
 
-fn validate_human_artifact(
-    current: &OccurrenceSnapshotV1,
-    halted: &HaltedV1,
-    artifact: &HumanDispositionV1,
-    expected_scope: &HumanAuthorityScopeV1,
-    now_unix_ms: u64,
-) -> Result<(), KernelErrorV1> {
-    if halted.governed_repair_requirement.is_some() {
-        return Err(KernelErrorV1::HumanDisposition(
-            "governed repair halt requires the governed disposition path",
-        ));
-    }
-    if halted.governed_repair_closed.is_some() {
-        return Err(KernelErrorV1::HumanDisposition(
-            "governed repair occurrence is terminally rejected",
-        ));
-    }
-    if artifact.schema != HUMAN_DISPOSITION_SCHEMA_V1 {
-        return Err(KernelErrorV1::ForeignSchema("human disposition"));
-    }
-    if artifact.campaign != halted.meta.key.campaign {
-        return Err(KernelErrorV1::HumanDisposition("wrong campaign"));
-    }
-    if artifact.occurrence != halted.meta.key.occurrence {
-        return Err(KernelErrorV1::HumanDisposition("wrong occurrence"));
-    }
-    if artifact.halted_state_digest != current.state_digest {
-        return Err(KernelErrorV1::HumanDisposition("wrong halted-state digest"));
-    }
-    if now_unix_ms >= artifact.expires_at_unix_ms {
-        return Err(KernelErrorV1::HumanDisposition("expired"));
-    }
-    if artifact.principal != expected_scope.principal {
-        return Err(KernelErrorV1::HumanDisposition("wrong principal"));
-    }
-    if artifact.mandate != expected_scope.mandate {
-        return Err(KernelErrorV1::HumanDisposition("wrong mandate"));
-    }
-    if halted
-        .meta
-        .used_human_decisions
-        .contains(&artifact.decision)
-    {
-        return Err(KernelErrorV1::HumanDisposition("replayed decision"));
-    }
-    Ok(())
-}
-
 fn validate_requirement_against_halt(
     halted: &HaltedV1,
     requirement: &HumanDecisionRequirementV1,
@@ -4777,6 +4846,10 @@ fn validate_decision_request(
     request: &HumanDecisionRequestV1,
     now_unix_ms: u64,
 ) -> Result<(), KernelErrorV1> {
+    validate_canonical_timestamp(
+        now_unix_ms,
+        "decision consequence time is not canonically representable",
+    )?;
     request.validate()?;
     if request.key != halted.meta.key
         || request.halted_state_digest != current.state_digest
@@ -4801,6 +4874,14 @@ fn validate_governed_repair_artifact(
     profile: &GovernedRepairVerifierProfileV1,
     now_unix_ms: u64,
 ) -> Result<(), KernelErrorV1> {
+    validate_canonical_timestamp(
+        now_unix_ms,
+        "disposition consequence time is not canonically representable",
+    )?;
+    validate_canonical_timestamp(
+        artifact.expires_at_unix_ms,
+        "governed repair disposition expiry is not canonically representable",
+    )?;
     if artifact.schema != GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1 {
         return Err(KernelErrorV1::ForeignSchema("governed repair disposition"));
     }
@@ -4895,6 +4976,18 @@ fn validate_governed_repair_verification(
     verification: &GovernedRepairVerificationV1,
     now_unix_ms: u64,
 ) -> Result<(), KernelErrorV1> {
+    validate_canonical_timestamp(
+        now_unix_ms,
+        "verification consequence time is not canonically representable",
+    )?;
+    validate_canonical_timestamp(
+        verification.verified_at_unix_ms,
+        "verification time is not canonically representable",
+    )?;
+    validate_canonical_timestamp(
+        verification.expires_at_unix_ms,
+        "verification expiry is not canonically representable",
+    )?;
     if verification.schema != GOVERNED_REPAIR_VERIFICATION_SCHEMA_V1 {
         return Err(KernelErrorV1::ForeignSchema("governed repair verification"));
     }
@@ -5010,99 +5103,6 @@ fn open_governed_repair_successor(
     let successor = successor_snapshot(&halted_snapshot, state);
     successor.validate_integrity()?;
     Ok((halted_snapshot, successor))
-}
-
-fn open_from_halt(
-    current: &OccurrenceSnapshotV1,
-    halted: &HaltedV1,
-    artifact: &HumanDispositionV1,
-    occurrence: OccurrenceId,
-    program: ProgramBasisRefV1,
-    verification: HumanVerificationRefV1,
-) -> Result<HumanDispositionEffectV1, KernelErrorV1> {
-    if occurrence == halted.meta.key.occurrence {
-        return Err(KernelErrorV1::OccurrenceReused);
-    }
-    let mut consumed_halt = halted.clone();
-    consumed_halt
-        .meta
-        .used_human_decisions
-        .push(artifact.decision.clone());
-    let halted_snapshot =
-        successor_snapshot(current, OccurrenceStateV1::Halted(consumed_halt.clone()));
-    halted_snapshot.validate_integrity()?;
-    let prior = PriorOccurrenceBasisV1 {
-        key: consumed_halt.meta.key.clone(),
-        proposal: consumed_halt.prior.proposal.clone(),
-        proposal_contract: consumed_halt.prior.proposal_contract.clone(),
-        normalized_preconditions: consumed_halt.prior.normalized_preconditions.clone(),
-        effect_scope: consumed_halt.prior.effect_scope.clone(),
-        issuance: consumed_halt.prior.issuance.clone(),
-        docket_custody: consumed_halt.prior.docket_custody.clone(),
-        docket_attempt: consumed_halt.prior.docket_attempt.clone(),
-        state_digest: halted_snapshot.state_digest.clone(),
-        authorized_successor: None,
-    };
-    let state = OccurrenceStateV1::ObservationRequired(ObservationRequiredV1 {
-        meta: OccurrenceMetaV1 {
-            key: OccurrenceKeyV1 {
-                campaign: consumed_halt.meta.key.campaign.clone(),
-                occurrence,
-            },
-            program,
-            residuals: consumed_halt.meta.residuals.clone(),
-            budget: consumed_halt.meta.budget,
-            used_human_decisions: consumed_halt.meta.used_human_decisions.clone(),
-        },
-        prior: Some(prior),
-    });
-    let successor = successor_snapshot(&halted_snapshot, state);
-    successor.validate_integrity()?;
-    Ok(HumanDispositionEffectV1::OpenedOccurrence {
-        halted: halted_snapshot,
-        successor,
-        verification,
-    })
-}
-
-fn sorted_unique_ids(values: &[ResidualIdV1]) -> Option<BTreeSet<ResidualIdV1>> {
-    let set: BTreeSet<_> = values.iter().cloned().collect();
-    (set.len() == values.len()).then_some(set)
-}
-
-fn apply_exact_discharge(
-    halted: &HaltedV1,
-    discharge: &ExactResidualDischargeV1,
-    decision: &HumanDecisionIdV1,
-) -> Result<ResidualSetV1, KernelErrorV1> {
-    if discharge.campaign != halted.meta.key.campaign
-        || discharge.occurrence != halted.meta.key.occurrence
-        || discharge.program != halted.meta.program
-        || &discharge.disposition != decision
-    {
-        return Err(KernelErrorV1::ResidualAccounting);
-    }
-    let before = sorted_unique_ids(&discharge.before).ok_or(KernelErrorV1::ResidualAccounting)?;
-    let authorized =
-        sorted_unique_ids(&discharge.authorized).ok_or(KernelErrorV1::ResidualAccounting)?;
-    let closed = sorted_unique_ids(&discharge.closed).ok_or(KernelErrorV1::ResidualAccounting)?;
-    let after = sorted_unique_ids(&discharge.after).ok_or(KernelErrorV1::ResidualAccounting)?;
-    if before != halted.meta.residuals.ids()
-        || authorized != closed
-        || !closed.is_disjoint(&after)
-        || before != closed.union(&after).cloned().collect()
-    {
-        return Err(KernelErrorV1::ResidualAccounting);
-    }
-    let remaining = halted
-        .meta
-        .residuals
-        .as_slice()
-        .iter()
-        .filter(|residual| after.contains(&residual.residual))
-        .cloned()
-        .collect();
-    ResidualSetV1::new(remaining)
 }
 
 fn validate_recorded_proposal(

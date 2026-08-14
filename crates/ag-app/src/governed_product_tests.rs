@@ -1,11 +1,13 @@
 //! Stable product API tests. Fixture verifier records are explicitly not
 //! human authority and never stand in for production verification.
 
-use ag_app::governed_product::*;
+use crate::governed_product_fixture_support;
+
+use crate::governed_product::*;
+use crate::governed_store::{CampaignStoreV1, CampaignTransitionKindV1};
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::Digest;
-use ag_store::campaign::CampaignStoreV1;
 use rusqlite::Connection;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -93,7 +95,16 @@ fn pinned(path: &Path) -> PinnedDeploymentFileV1 {
 
 fn policy_root(directory: &Path) -> GovernedAgPolicyRootV1 {
     let clock = directory.join("governed-clock");
-    std::fs::write(&clock, format!("#!/bin/sh\nprintf '%s\\n' {NOW}\n")).unwrap();
+    let clock_value = directory.join("governed-clock-value");
+    std::fs::write(&clock_value, format!("{NOW}\n")).unwrap();
+    std::fs::write(
+        &clock,
+        format!(
+            "#!/bin/sh\nIFS= read -r now < '{}'\nprintf '%s\\n' \"$now\"\n",
+            clock_value.display()
+        ),
+    )
+    .unwrap();
     let observation = directory.join("governed-observation.py");
     std::fs::write(
         &observation,
@@ -124,10 +135,17 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
         std::fs::set_permissions(path, mode).unwrap();
     }
     let catalog_path = directory.join("exact-work-catalog.json");
-    let catalog = ag_app::governed_loop::ExactWorkCatalogV1 {
-        schema: ag_app::governed_loop::EXACT_WORK_CATALOG_SCHEMA_V1.to_owned(),
+    let catalog = ExactWorkCatalogV1 {
+        schema: EXACT_WORK_CATALOG_SCHEMA_V1.to_owned(),
         policy_basis: digest("unused-catalog-policy"),
-        entries: std::collections::BTreeMap::new(),
+        entries: std::collections::BTreeMap::from([(
+            "test.product/v1".to_owned(),
+            ExactWorkCatalogEntryV1 {
+                work_schema: "test.product/v1".to_owned(),
+                subject: digest("subject"),
+                scope: product_scope().digest(),
+            },
+        )]),
     };
     std::fs::write(
         &catalog_path,
@@ -145,6 +163,18 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
         exact_work_catalog: pinned(&catalog_path),
         controlling_review: None,
     }
+}
+
+fn product_scope() -> CanonicalEffectScopeV1 {
+    CanonicalEffectScopeV1::new(
+        "repair".to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "bounded/original".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap()
 }
 
 fn docket_root(directory: &Path, trust_config: &Path) -> GovernedDocketAdapterRootV1 {
@@ -226,24 +256,20 @@ fn assert_proposal_contract(view: &OccurrenceViewV1, proposal: &ProposalRefV1) {
     assert_eq!(contract.expires_at_unix_ms, NOW + 1_000);
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the fixture intentionally assembles one complete scope-decision lifecycle"
+)]
 fn scope_decision_fixture(directory: &Path) -> ScopeDecisionFixture {
     let database = directory.join("campaign.sqlite");
     let verifier = verifier_fixture(directory);
-    let mut service = GovernedCampaignServiceV1::create(
-        &database,
-        creation(Some(root_with_executable(&verifier)), directory),
-    )
-    .unwrap();
+    let dormant_docket_config = directory.join("dormant-docket-config.json");
+    std::fs::write(&dormant_docket_config, b"{}\n").unwrap();
+    let mut request = creation(Some(root_with_executable(&verifier)), directory);
+    request.governed_docket_adapter_root = Some(docket_root(directory, &dormant_docket_config));
+    let mut service = GovernedCampaignServiceV1::create(&database, request).unwrap();
     let initial = service.state().unwrap().current;
-    let original_scope = CanonicalEffectScopeV1::new(
-        "repair".to_owned(),
-        vec![CanonicalEffectResourceV1 {
-            resource: "repository".to_owned(),
-            path: "bounded/original".to_owned(),
-            operations: vec![CanonicalEffectOperationV1::Modify],
-        }],
-    )
-    .unwrap();
+    let original_scope = product_scope();
     let proposal = ExactWorkProposalV1::new(
         initial.key().campaign.clone(),
         digest("subject"),
@@ -268,13 +294,9 @@ fn scope_decision_fixture(directory: &Path) -> ScopeDecisionFixture {
         )
         .unwrap();
     assert_proposal_contract(&proposed, &proposal_ref);
-    let halted = service
-        .halt(
-            proposed.state_digest(),
-            HaltReasonRefV1::from_digest(digest("scope-insufficient")),
-        )
-        .unwrap();
-    assert_eq!(halted.proposal_contract, proposed.proposal_contract);
+    let standing = service.require_standing(proposed.state_digest()).unwrap();
+    let admissible = service.decide(standing.state_digest()).unwrap();
+    let authorized = service.authorize(admissible.state_digest()).unwrap();
     let delta = CanonicalEffectScopeV1::new(
         "repair".to_owned(),
         vec![CanonicalEffectResourceV1 {
@@ -284,6 +306,53 @@ fn scope_decision_fixture(directory: &Path) -> ScopeDecisionFixture {
         }],
     )
     .unwrap();
+    drop(service);
+    let mut store = CampaignStoreV1::open(&database).unwrap();
+    let authorized_snapshot = store.current().unwrap();
+    assert_eq!(
+        authorized_snapshot.state_digest(),
+        authorized.state_digest()
+    );
+    let issuance = authorized_snapshot.issuance().unwrap().clone();
+    let custody = DocketCustodyV1 {
+        schema: DOCKET_CUSTODY_SCHEMA_V1.to_owned(),
+        issuance: issuance.issuance.clone(),
+        ag_spend: issuance.spend.clone(),
+        execution_standing: DocketExecutionStandingRefV1::from_digest(digest("execution-standing")),
+        standing_currentness: StandingCurrentnessRefV1::from_digest(digest(
+            "execution-currentness",
+        )),
+        attempt: DocketAttemptRefV1::for_issuance(&issuance.issuance),
+        executor_marker: ExecutorAttemptMarkerRefV1::from_digest(digest("executor-marker")),
+        accepted_at_unix_ms: NOW,
+    };
+    let dispatched =
+        GovernedLoopKernelV1::accept_docket_custody(&authorized_snapshot, custody.clone()).unwrap();
+    store
+        .commit(
+            &authorized_snapshot,
+            &dispatched,
+            CampaignTransitionKindV1::DocketCustodyAccepted,
+            NOW,
+        )
+        .unwrap();
+    let outcome = DocketGovernedRepairOutcomeRefV1 {
+        checkpoint: DocketCheckpointRefV1::from_digest(digest("scope-checkpoint")),
+        sealed_result: DocketSealedResultRefV1::from_digest(digest("scope-sealed-result")),
+        outcome: digest("scope-outcome"),
+        issuance: issuance.issuance.clone(),
+        custody: custody.reference(),
+        attempt: custody.attempt.clone(),
+        effect_journal: digest("effect-journal"),
+        executor_binding: digest("executor-binding"),
+        executor_result: digest("executor-result"),
+        executor_receipt: ReceiptRefV1::from_digest(digest("executor-receipt")),
+        immutable_work_checkpoint: Some(repair_checkpoint()),
+        reported_authorized_effects_occurred: false,
+        created_at_unix_ms: NOW,
+        expires_at_unix_ms: NOW + 100,
+        idempotency: digest("scope-result-idempotency"),
+    };
     let requirement = HumanDecisionRequirementV1::ScopeExpansion(ScopeExpansionRequiredV1 {
         schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
         original_scope: original_scope.clone(),
@@ -298,9 +367,30 @@ fn scope_decision_fixture(directory: &Path) -> ScopeDecisionFixture {
         reason: digest("reason"),
         dependency_evidence: sorted(&["dependency"]),
         limitations: sorted(&["limitation"]),
-        docket_outcome: None,
-        unauthorized_effect_not_performed: true,
+        docket_outcome: Some(outcome.clone()),
+        no_unauthorized_effect_reported: true,
     });
+    let result = DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+        outcome: outcome.clone(),
+        requirement: match &requirement {
+            HumanDecisionRequirementV1::ScopeExpansion(value) => value.clone(),
+            HumanDecisionRequirementV1::Readjudication(_) => unreachable!(),
+        },
+    };
+    let halted_snapshot = GovernedLoopKernelV1::halt_from_docket_governed_repair(
+        &dispatched,
+        &outcome,
+        &requirement,
+        HaltReasonRefV1::from_digest(digest("scope-insufficient")),
+    )
+    .unwrap();
+    store
+        .commit_docket_governed_repair_halt(&dispatched, &halted_snapshot, &result, NOW)
+        .unwrap();
+    drop(store);
+    let mut service = GovernedCampaignServiceV1::open(&database).unwrap();
+    let halted = service.state().unwrap().current;
+    assert_eq!(halted.proposal_contract, proposed.proposal_contract);
     let request = service
         .create_decision_request(CreateDecisionRequestV1 {
             expected_state_digest: halted.state_digest().clone(),
@@ -329,7 +419,9 @@ fn repair_checkpoint() -> GovernedRepairCheckpointV1 {
         tree: "2222222222222222222222222222222222222222".to_owned(),
         diff_identity: None,
         content_manifest: digest("checkpoint-content"),
-        docket_checkpoint: None,
+        docket_checkpoint: Some(DocketCheckpointRefV1::from_digest(digest(
+            "scope-checkpoint",
+        ))),
     }
 }
 
@@ -419,6 +511,10 @@ fn create_is_exact_idempotent_and_product_pages_are_bounded() {
         })
         .unwrap();
     assert_eq!(occurrence.items.len(), 1);
+    assert_eq!(
+        occurrence.next, None,
+        "terminal occurrence page has no cursor"
+    );
     assert!(
         service
             .list_occurrences(&OccurrencePageRequestV1 {
@@ -465,6 +561,32 @@ fn create_is_exact_idempotent_and_product_pages_are_bounded() {
         })
         .unwrap();
     assert_eq!(events.items.len(), 1);
+    assert_eq!(events.next, None, "terminal event page has no cursor");
+}
+
+#[test]
+fn reusable_product_fixture_returns_real_successor_issuance_with_optional_diff() {
+    for diff in [None, Some(digest("checkpoint-diff"))] {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture =
+            governed_product_fixture_support::authorized_successor_issuance(directory.path(), diff);
+        assert_eq!(
+            fixture.successor.program_counter(),
+            ProgramCounterV1::AuthorizationConsumed
+        );
+        assert_eq!(
+            fixture.issuance.key.occurrence,
+            fixture.successor.key.occurrence
+        );
+        assert_eq!(
+            fixture
+                .successor_proposal
+                .governed_repair_checkpoint()
+                .expect("successor proposal carries immutable checkpoint")
+                .diff_identity,
+            fixture.checkpoint.diff_identity
+        );
+    }
 }
 
 #[test]
@@ -485,6 +607,148 @@ fn docket_adapter_root_is_genesis_pinned_and_substitution_refuses() {
     substituted.governed_docket_adapter_root = Some(docket_root(directory.path(), &trust_b));
     assert!(GovernedCampaignServiceV1::create(&database, substituted).is_err());
     assert!(GovernedCampaignServiceV1::open(&database).is_ok());
+}
+
+#[test]
+fn pre_spend_generic_halt_does_not_advertise_or_accept_a_governed_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let verifier = verifier_fixture(directory.path());
+    let service = GovernedCampaignServiceV1::create(
+        &database,
+        creation(Some(root_with_executable(&verifier)), directory.path()),
+    )
+    .unwrap();
+    drop(service);
+
+    // This direct Store/kernel setup is intentionally test-only. It proves
+    // that a generic pre-spend halt cannot enter the governed post-custody
+    // request path merely because a caller can describe a plausible delta.
+    let mut store = CampaignStoreV1::open(&database).unwrap();
+    let current = store.current().unwrap();
+    let halted = GovernedLoopKernelV1::halt(
+        &current,
+        HaltReasonRefV1::from_digest(digest("pre-spend-assessment-halt")),
+    )
+    .unwrap();
+    store
+        .commit(&current, &halted, CampaignTransitionKindV1::Halted, NOW)
+        .unwrap();
+    drop(store);
+
+    let mut service = GovernedCampaignServiceV1::open(&database).unwrap();
+    let allowed = service.allowed_transitions().unwrap();
+    assert!(
+        !allowed
+            .allowed_transitions
+            .contains(&GovernedOperationV1::CreateDecisionRequest)
+    );
+    let delta = CanonicalEffectScopeV1::new(
+        "repair".to_owned(),
+        vec![CanonicalEffectResourceV1 {
+            resource: "repository".to_owned(),
+            path: "bounded/missing".to_owned(),
+            operations: vec![CanonicalEffectOperationV1::Modify],
+        }],
+    )
+    .unwrap();
+    let requirement = HumanDecisionRequirementV1::ScopeExpansion(ScopeExpansionRequiredV1 {
+        schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
+        original_scope: product_scope(),
+        original_scope_digest: product_scope().digest(),
+        requested_delta_digest: delta.digest(),
+        requested_delta: delta,
+        blocked_operation: BlockedEffectOperationV1 {
+            resource: "repository".to_owned(),
+            path: "bounded/missing".to_owned(),
+            operation: CanonicalEffectOperationV1::Modify,
+        },
+        reason: digest("pre-spend-reason"),
+        dependency_evidence: sorted(&["pre-spend-evidence"]),
+        limitations: sorted(&["pre-spend-limitation"]),
+        docket_outcome: None,
+        no_unauthorized_effect_reported: true,
+    });
+    assert!(
+        service
+            .create_decision_request(CreateDecisionRequestV1 {
+                expected_state_digest: halted.state_digest().clone(),
+                requirement,
+                required_verifier_profile: digest("profile"),
+                decision_consequences: sorted(&["approve", "reject"]),
+                nonclaims: sorted(&["not-standing"]),
+                idempotency_key: digest("pre-spend-request"),
+                expires_at_unix_ms: NOW + 50,
+            })
+            .is_err()
+    );
+}
+
+#[test]
+fn expired_proposal_is_neither_advertised_nor_executable_for_decide_or_authorize() {
+    fn proposal_for(view: &OccurrenceViewV1) -> ExactWorkProposalV1 {
+        ExactWorkProposalV1::new(
+            view.key.campaign.clone(),
+            digest("subject"),
+            product_scope(),
+            "test.product/v1".to_owned(),
+            digest("work"),
+            ProposalGovernanceTermsV1 {
+                nonclaims: vec![digest("proposal-nonclaim")],
+                expires_at_unix_ms: NOW + 1,
+            },
+            None,
+        )
+        .unwrap()
+    }
+
+    for expire_at in [
+        ProgramCounterV1::StandingRequired,
+        ProgramCounterV1::AdmissiblePendingAuthorization,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("campaign.sqlite");
+        let mut service =
+            GovernedCampaignServiceV1::create(&database, creation(None, directory.path())).unwrap();
+        let initial = service.state().unwrap().current;
+        let proposed = service
+            .record_proposal(
+                initial.state_digest(),
+                ObservationRefV1::from_digest(digest("expiry-observation")),
+                proposal_for(&initial),
+                ProposalClassV1::Initial,
+            )
+            .unwrap();
+        let standing = service.require_standing(proposed.state_digest()).unwrap();
+        let current = if expire_at == ProgramCounterV1::StandingRequired {
+            standing
+        } else {
+            service.decide(standing.state_digest()).unwrap()
+        };
+        std::fs::write(
+            directory.path().join("governed-clock-value"),
+            format!("{}\n", NOW + 1),
+        )
+        .unwrap();
+        let state = service.state().unwrap();
+        let operation = if expire_at == ProgramCounterV1::StandingRequired {
+            GovernedOperationV1::Decide
+        } else {
+            GovernedOperationV1::Authorize
+        };
+        assert_eq!(state.current.state_digest, current.state_digest);
+        assert!(!state.allowed_transitions.contains(&operation));
+        let result = if operation == GovernedOperationV1::Decide {
+            service.decide(current.state_digest())
+        } else {
+            service.authorize(current.state_digest())
+        };
+        assert!(result.is_err());
+        assert_eq!(
+            service.state().unwrap().current.state_digest,
+            current.state_digest
+        );
+    }
 }
 
 #[test]
@@ -511,99 +775,46 @@ fn ag_policy_root_is_genesis_pinned_and_mutated_deployment_input_refuses() {
 )]
 fn verifier_root_and_request_are_pinned_and_open_request_view_is_current() {
     let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("campaign.sqlite");
-    let verifier = verifier_fixture(directory.path());
-    let mut service = GovernedCampaignServiceV1::create(
-        &database,
-        creation(Some(root_with_executable(&verifier)), directory.path()),
-    )
-    .unwrap();
-    let initial = service.state().unwrap().current;
-    let scope = CanonicalEffectScopeV1::new(
-        "repair".to_owned(),
-        vec![CanonicalEffectResourceV1 {
-            resource: "repository".to_owned(),
-            path: "bounded/original".to_owned(),
-            operations: vec![CanonicalEffectOperationV1::Modify],
-        }],
-    )
-    .unwrap();
-    let proposal = ExactWorkProposalV1::new(
-        initial.key().campaign.clone(),
-        digest("subject"),
-        scope.clone(),
-        "test.product/v1".to_owned(),
-        digest("work"),
-        ProposalGovernanceTermsV1 {
-            nonclaims: vec![digest("proposal-nonclaim")],
-            expires_at_unix_ms: NOW + 1_000,
-        },
-        None,
-    )
-    .unwrap();
-    let proposed = service
-        .record_proposal(
-            initial.state_digest(),
-            ObservationRefV1::from_digest(digest("observation")),
-            proposal,
-            ProposalClassV1::Initial,
-        )
-        .unwrap();
-    let halted = service
-        .halt(
-            proposed.state_digest(),
-            HaltReasonRefV1::from_digest(digest("scope-insufficient")),
-        )
-        .unwrap();
-    let delta = CanonicalEffectScopeV1::new(
-        "repair".to_owned(),
-        vec![CanonicalEffectResourceV1 {
-            resource: "repository".to_owned(),
-            path: "bounded/adjacent".to_owned(),
-            operations: vec![CanonicalEffectOperationV1::Modify],
-        }],
-    )
-    .unwrap();
-    let requirement = HumanDecisionRequirementV1::ScopeExpansion(ScopeExpansionRequiredV1 {
-        schema: SCOPE_EXPANSION_REQUIRED_SCHEMA_V1.to_owned(),
-        original_scope: scope.clone(),
-        original_scope_digest: scope.digest(),
-        requested_delta: delta.clone(),
-        requested_delta_digest: delta.digest(),
-        blocked_operation: BlockedEffectOperationV1 {
-            resource: "repository".to_owned(),
-            path: "bounded/adjacent".to_owned(),
-            operation: CanonicalEffectOperationV1::Modify,
-        },
-        reason: digest("reason"),
-        dependency_evidence: sorted(&["dependency"]),
-        limitations: sorted(&["limitation"]),
-        docket_outcome: None,
-        unauthorized_effect_not_performed: true,
-    });
-    let request = service
-        .create_decision_request(CreateDecisionRequestV1 {
-            expected_state_digest: halted.state_digest().clone(),
-            requirement,
-            required_verifier_profile: digest("profile"),
-            decision_consequences: sorted(&["approve", "reject"]),
-            nonclaims: sorted(&["not-standing"]),
-            idempotency_key: digest("request-idempotency"),
-            expires_at_unix_ms: NOW + 50,
-        })
-        .unwrap();
+    let fixture = scope_decision_fixture(directory.path());
+    let database = fixture.database.clone();
+    let halted = fixture.halted;
+    let request = fixture.request;
+    let mut service = GovernedCampaignServiceV1::open(&database).unwrap();
     assert!(
         service
             .state()
             .unwrap()
             .allowed_transitions
-            .contains(&"submit_disposition".to_owned())
+            .contains(&GovernedOperationV1::SubmitDisposition)
+    );
+    assert!(
+        !service
+            .allowed_transitions()
+            .unwrap()
+            .allowed_transitions
+            .contains(&GovernedOperationV1::CreateDecisionRequest),
+        "an already-open exact request is replay-only, not a fresh-request transition"
     );
     let artifact = service
         .artifact(request.reference().as_digest())
         .unwrap()
         .expect("request artifact");
     assert_eq!(artifact.bytes_identity, Digest::hash_bytes(&artifact.bytes));
+    assert_eq!(artifact.kind, GovernedArtifactKindV1::HumanDecisionRequest);
+    let state = service.state().unwrap();
+    for link in state
+        .campaign_artifacts
+        .iter()
+        .chain(state.current.artifacts.iter())
+    {
+        let resolved = service
+            .artifact(&link.identity)
+            .unwrap()
+            .expect("every product-visible artifact link is retrievable");
+        assert_eq!(resolved.kind, link.kind);
+        assert_eq!(resolved.identity, link.identity);
+        assert_eq!(resolved.bytes_identity, Digest::hash_bytes(&resolved.bytes));
+    }
     let request_ref = request.reference();
     assert_eq!(
         service.decision_request(&request_ref).unwrap(),
@@ -655,6 +866,82 @@ fn verifier_root_and_request_are_pinned_and_open_request_view_is_current() {
 }
 
 #[test]
+fn product_refuses_unsafe_disposition_integer_before_identity_or_verifier_use() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = scope_decision_fixture(directory.path());
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    let mut artifact = approval(&fixture);
+    artifact.expires_at_unix_ms = MAX_CANONICAL_JSON_INTEGER_V1 + 1;
+    let before = service.state().unwrap().current;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        service.submit_governed_disposition(SubmitGovernedDispositionV1 {
+            expected_state_digest: before.state_digest.clone(),
+            request: fixture.request.reference(),
+            artifact,
+        })
+    }));
+    assert!(
+        result.is_ok(),
+        "unsafe input must refuse rather than panic in identity derivation"
+    );
+    assert!(result.unwrap().is_err());
+    assert_eq!(service.state().unwrap().current, before);
+    assert_eq!(
+        CampaignStoreV1::open(&fixture.database)
+            .unwrap()
+            .replay()
+            .unwrap()
+            .governed_repair_dispositions,
+        0,
+    );
+}
+
+#[test]
+fn hypothetical_maude_or_phosphor_observer_uses_only_stable_product_reads() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = scope_decision_fixture(directory.path());
+    let service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+
+    // An observer needs no SQLite schema knowledge, Docket client, private
+    // state reconstruction, or authority constructor: state, stable cursor,
+    // occurrence and closed artifact reads form the complete observation seam.
+    let state = service.state().unwrap();
+    let transitions = service.allowed_transitions().unwrap();
+    assert_eq!(transitions.key, state.current.key);
+    assert_eq!(transitions.state_digest, state.current.state_digest);
+    assert_eq!(transitions.event_sequence, state.event_sequence);
+    let page = service
+        .list_events(&PageRequestV1 {
+            after: None,
+            limit: 3,
+        })
+        .unwrap();
+    assert!(!page.items.is_empty());
+    let occurrence = service
+        .occurrence(&state.current.key)
+        .unwrap()
+        .expect("current occurrence is directly readable");
+    assert_eq!(occurrence, state.current);
+    let request = state
+        .open_human_decision_request
+        .expect("halted fixture exposes its exact request");
+    assert_eq!(
+        service
+            .decision_request(&request)
+            .unwrap()
+            .expect("request DTO"),
+        fixture.request
+    );
+    for link in state
+        .campaign_artifacts
+        .iter()
+        .chain(occurrence.artifacts.iter())
+    {
+        assert!(service.artifact(&link.identity).unwrap().is_some());
+    }
+}
+
+#[test]
 fn concurrent_identical_governed_dispositions_have_one_durable_winner() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = scope_decision_fixture(directory.path());
@@ -695,7 +982,7 @@ fn concurrent_identical_governed_dispositions_have_one_durable_winner() {
     let replay = store.replay().unwrap();
     assert_eq!(replay.human_decision_requests, 1);
     assert_eq!(replay.governed_repair_dispositions, 1);
-    assert_eq!(replay.transitions, 5);
+    assert_eq!(replay.transitions, 9);
     assert_eq!(
         store.governed_repair_disposition(&artifact_ref).unwrap(),
         Some(artifact)
@@ -725,6 +1012,40 @@ fn concurrent_identical_governed_dispositions_have_one_durable_winner() {
         )
         .unwrap();
     assert_eq!(consumed, 1, "the request is consumed by one decision only");
+
+    let service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    let first_page = service
+        .list_occurrences(&OccurrencePageRequestV1 {
+            after: None,
+            limit: 1,
+            program_counter: None,
+            governed_repair_pending: None,
+        })
+        .unwrap();
+    assert_eq!(first_page.items.len(), 1);
+    let cursor = first_page.next.expect("a second occurrence exists");
+    let final_page = service
+        .list_occurrences(&OccurrencePageRequestV1 {
+            after: Some(cursor),
+            limit: 1,
+            program_counter: None,
+            governed_repair_pending: None,
+        })
+        .unwrap();
+    assert_eq!(final_page.items.len(), 1);
+    assert_eq!(final_page.next, None, "final page must not emit a cursor");
+
+    let predecessor = service
+        .occurrence(fixture.halted.key())
+        .unwrap()
+        .expect("predecessor occurrence remains product-visible");
+    for link in &predecessor.artifacts {
+        let resolved = service
+            .artifact(&link.identity)
+            .unwrap()
+            .expect("closed lifecycle artifact remains retrievable");
+        assert_eq!(resolved.kind, link.kind);
+    }
 }
 
 #[test]
@@ -805,7 +1126,7 @@ fn concurrent_conflicting_governed_dispositions_have_one_durable_winner() {
         usize::from(approval_won),
         "concurrent conflict cannot duplicate a successor"
     );
-    assert_eq!(replay.transitions, if approval_won { 5 } else { 4 });
+    assert_eq!(replay.transitions, if approval_won { 9 } else { 8 });
     let connection = Connection::open(&fixture.database).unwrap();
     let consumed: u64 = connection
         .query_row(
@@ -939,7 +1260,7 @@ fn structural_census_keeps_store_owned_verification_halt_and_successor_path_excl
     let engine = include_str!("../src/governed_loop.rs");
     let product = include_str!("../src/governed_product.rs");
     let cli = include_str!("../src/bin/ag-loopctl.rs");
-    let store = include_str!("../../ag-store/src/campaign.rs");
+    let store = include_str!("governed_store.rs");
 
     // One engine bridge ingests a sealed Docket result and one bridge invokes
     // the Store-owned verifier/atomic disposition commit.
@@ -967,10 +1288,10 @@ fn structural_census_keeps_store_owned_verification_halt_and_successor_path_excl
     );
 
     // Product clients cannot inject a Docket port. The deployment-owned root
-    // has one private constructor used by the three canonical operations:
-    // dispatch, reconcile, and restart recovery.
-    assert_source_census(product, "fn docket_port(&self)", 1);
-    assert_source_census(product, ".docket_port()?", 3);
+    // has one private constructor used by dispatch (fresh-signing and
+    // reservation-recovery branches), reconcile, and restart recovery.
+    assert_source_census(product, "fn docket_port(", 1);
+    assert_source_census(product, ".docket_port(", 4);
     assert_source_census(product, "CommandDocketCustodyPortV1::new(", 1);
 
     // The CLI is only a client of the canonical product surface. It cannot

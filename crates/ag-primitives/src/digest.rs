@@ -9,6 +9,14 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
+/// Smallest integer represented exactly by the RFC 8785 / ECMAScript number
+/// model used by AG's cross-repository canonical JSON contracts.
+pub const MIN_JCS_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
+/// Largest integer represented exactly by the RFC 8785 / ECMAScript number
+/// model used by AG's cross-repository canonical JSON contracts.
+pub const MAX_JCS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+const MAX_JCS_SAFE_SIGNED_INTEGER: i64 = 9_007_199_254_740_991;
+
 const SHA256_PREFIX: &str = "sha256:";
 const SHA256_HEX_LENGTH: usize = 64;
 const SHA256_TEXT_LENGTH: usize = SHA256_PREFIX.len() + SHA256_HEX_LENGTH;
@@ -314,11 +322,23 @@ impl<'de> Visitor<'de> for StrictValueVisitor {
         Ok(serde_json::Value::Bool(value))
     }
 
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if !(MIN_JCS_SAFE_INTEGER..=MAX_JCS_SAFE_SIGNED_INTEGER).contains(&value) {
+            return Err(E::custom("integer is outside the exact JCS range"));
+        }
         Ok(serde_json::Value::Number(value.into()))
     }
 
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        if value > MAX_JCS_SAFE_INTEGER {
+            return Err(E::custom("integer is outside the exact JCS range"));
+        }
         Ok(serde_json::Value::Number(value.into()))
     }
 
@@ -393,6 +413,11 @@ mod tests {
     use serde::Serialize;
 
     use super::*;
+
+    #[derive(Serialize)]
+    struct NestedIntegers {
+        values: Vec<i64>,
+    }
 
     #[test]
     fn sha256_known_answer_and_roundtrip() {
@@ -492,5 +517,57 @@ mod tests {
         }
 
         assert!(JcsDocument::canonicalize(&HasFloat { value: 1.25 }).is_err());
+    }
+
+    #[test]
+    fn every_constructor_recursively_enforces_the_exact_jcs_integer_range() {
+        let minimum = format!(r#"{{"nested":[{{"value":{MIN_JCS_SAFE_INTEGER}}}]}}"#);
+        let maximum = format!(r#"{{"nested":[{{"value":{MAX_JCS_SAFE_INTEGER}}}]}}"#);
+        assert!(JcsDocument::parse(minimum.as_bytes()).is_ok());
+        assert!(JcsDocument::parse(maximum.as_bytes()).is_ok());
+        assert!(JcsDocument::from_canonical_bytes(minimum.as_bytes()).is_ok());
+        assert!(JcsDocument::from_canonical_bytes(maximum.as_bytes()).is_ok());
+
+        let below = format!(r#"{{"nested":[{{"value":{}}}]}}"#, MIN_JCS_SAFE_INTEGER - 1);
+        let above = format!(r#"{{"nested":[{{"value":{}}}]}}"#, MAX_JCS_SAFE_INTEGER + 1);
+        assert!(JcsDocument::parse(below.as_bytes()).is_err());
+        assert!(JcsDocument::parse(above.as_bytes()).is_err());
+        assert!(JcsDocument::from_canonical_bytes(below.as_bytes()).is_err());
+        assert!(JcsDocument::from_canonical_bytes(above.as_bytes()).is_err());
+
+        assert!(
+            JcsDocument::canonicalize(&NestedIntegers {
+                values: vec![MIN_JCS_SAFE_INTEGER, MAX_JCS_SAFE_SIGNED_INTEGER],
+            })
+            .is_ok()
+        );
+        assert!(
+            JcsDocument::canonicalize(&NestedIntegers {
+                values: vec![MIN_JCS_SAFE_INTEGER - 1],
+            })
+            .is_err()
+        );
+        assert!(
+            JcsDocument::canonicalize(&serde_json::json!({
+                "nested": [{"value": MAX_JCS_SAFE_INTEGER + 1}]
+            }))
+            .is_err()
+        );
+        for unsafe_integer in [9_223_372_036_854_775_807_u64, u64::MAX] {
+            assert!(
+                JcsDocument::canonicalize(&serde_json::json!({
+                    "nested": [{"value": unsafe_integer}]
+                }))
+                .is_err(),
+                "unsafe integer {unsafe_integer} must refuse before any digest can be derived"
+            );
+            assert!(
+                Digest::from_serializable(&serde_json::json!({
+                    "nested": [{"value": unsafe_integer}]
+                }))
+                .is_err(),
+                "unsafe integer {unsafe_integer} must not produce a Digest"
+            );
+        }
     }
 }

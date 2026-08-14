@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Barrier, Mutex};
 
-use ag_app::governed_loop::{
+use crate::governed_loop::{
     CampaignEngineErrorV1, CampaignEngineV1, CampaignRecoveryV1, DocketProgressV1,
     EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1, ExactWorkCatalogV1,
 };
@@ -212,7 +212,7 @@ impl FakeDocket {
         else {
             panic!("issuance was not accepted or was already settled")
         };
-        let settlement = DocketSettlementV1 {
+        let mut settlement = DocketSettlementV1 {
             schema: DOCKET_SETTLEMENT_SCHEMA_V1.to_owned(),
             settlement: SettlementRefV1::from_digest(digest(match outcome {
                 KnownOutcomeV1::Success => "known-success",
@@ -223,8 +223,10 @@ impl FakeDocket {
             executor_marker: custody.executor_marker.clone(),
             receipt: ReceiptRefV1::from_digest(digest("receipt")),
             outcome,
+            cumulative_effect_journal_identity: Some(digest("cumulative-effect-journal")),
             settled_at_unix_ms: NOW + 20,
         };
+        settlement.settlement = settlement.expected_reference().unwrap();
         state.attempts.insert(
             issuance.clone(),
             FakeAttemptState::Settled(custody, settlement),
@@ -272,7 +274,7 @@ impl FakeDocket {
             executor_result: digest("scope-executor-result"),
             executor_receipt: ReceiptRefV1::from_digest(digest("scope-executor-receipt")),
             immutable_work_checkpoint: None,
-            authorized_effects_occurred: false,
+            reported_authorized_effects_occurred: false,
             created_at_unix_ms: NOW,
             expires_at_unix_ms: NOW + 1_000,
             idempotency: digest("scope-requirement-idempotency"),
@@ -301,7 +303,7 @@ impl FakeDocket {
             dependency_evidence: sorted_digests(&["scope-dependency"]),
             limitations: sorted_digests(&["scope-limitation"]),
             docket_outcome: Some(outcome.clone()),
-            unauthorized_effect_not_performed: true,
+            no_unauthorized_effect_reported: true,
         };
         state.attempts.insert(
             issuance.clone(),
@@ -420,20 +422,6 @@ impl DocketCustodyPortV1 for FakeDocket {
                 evidence: None,
             }),
         }
-    }
-}
-
-struct HumanVerifier;
-
-impl HumanDispositionVerifierV1 for HumanVerifier {
-    fn verify_human_disposition(
-        &mut self,
-        request: &HumanDispositionVerificationRequestV1<'_>,
-    ) -> Result<HumanVerificationRefV1, ExternalBoundaryErrorV1> {
-        Ok(HumanVerificationRefV1::from_digest(Digest::hash_domain(
-            "ag-governed-engine-test/human-verification/v1",
-            request.artifact.nonce.as_str().as_bytes(),
-        )))
     }
 }
 
@@ -1040,170 +1028,6 @@ fn logical_crash_after_docket_seal_before_ag_ingestion_reconciles_to_one_halt() 
 }
 
 #[test]
-fn human_return_is_one_use_and_opens_only_an_authority_empty_occurrence() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("campaign.sqlite");
-    let mut engine = create_engine(&directory, ResidualSetV1::default());
-    let halted = engine
-        .halt(
-            HaltReasonRefV1::from_digest(digest("operator-required")),
-            NOW + 1,
-        )
-        .unwrap();
-    let scope = HumanAuthorityScopeV1 {
-        principal: HumanPrincipalRefV1::from_digest(digest("principal")),
-        mandate: MandateRefV1::from_digest(digest("human-mandate")),
-    };
-    let artifact = HumanDispositionV1 {
-        schema: HUMAN_DISPOSITION_SCHEMA_V1.to_owned(),
-        campaign: campaign(),
-        occurrence: occurrence(1),
-        halted_state_digest: halted.state_digest().clone(),
-        disposition: HumanDispositionKindV1::ReturnToObservation,
-        decision: HumanDecisionIdV1::from_digest(digest("decision")),
-        principal: scope.principal.clone(),
-        mandate: scope.mandate.clone(),
-        nonce: HumanNonceRefV1::from_digest(digest("nonce")),
-        expires_at_unix_ms: NOW + 1_000,
-    };
-    let HumanDispositionEffectV1::OpenedOccurrence {
-        halted: consumed_halt,
-        successor,
-        ..
-    } = engine
-        .apply_human_disposition(
-            artifact,
-            &scope,
-            Some(occurrence(2)),
-            &mut ObservationBoundary::current("unused"),
-            &mut HumanVerifier,
-            NOW + 2,
-        )
-        .unwrap()
-    else {
-        panic!("return disposition must open an occurrence")
-    };
-    assert_eq!(consumed_halt.program_counter(), ProgramCounterV1::Halted);
-    assert_eq!(
-        successor.program_counter(),
-        ProgramCounterV1::ObservationRequired
-    );
-    assert!(successor.ag_spend().is_none());
-    assert_eq!(successor.key().occurrence, occurrence(2));
-    assert_eq!(engine.current().unwrap(), successor);
-    assert_eq!(engine.replay().unwrap().transitions, 4);
-    drop(engine);
-
-    let reopened = CampaignEngineV1::open(&database).unwrap();
-    assert_eq!(reopened.current().unwrap(), successor);
-    assert_eq!(reopened.replay().unwrap().transitions, 4);
-}
-
-#[test]
-fn residual_discharge_is_exact_durable_and_nonce_one_shot() {
-    let directory = tempfile::tempdir().unwrap();
-    let residual = ResidualObligationV1 {
-        residual: ResidualIdV1::from_digest(digest("residual-1")),
-        owner: digest("residual-owner"),
-        subject: digest("residual-subject"),
-        statement: digest("residual-statement"),
-    };
-    let mut engine = create_engine(
-        &directory,
-        ResidualSetV1::new(vec![residual.clone()]).unwrap(),
-    );
-    let halted = engine
-        .halt(
-            HaltReasonRefV1::from_digest(digest("residual-disposition-required")),
-            NOW + 1,
-        )
-        .unwrap();
-    let scope = HumanAuthorityScopeV1 {
-        principal: HumanPrincipalRefV1::from_digest(digest("residual-principal")),
-        mandate: MandateRefV1::from_digest(digest("residual-mandate")),
-    };
-    let decision = HumanDecisionIdV1::from_digest(digest("residual-decision"));
-    let nonce = HumanNonceRefV1::from_digest(digest("residual-nonce"));
-    let artifact = HumanDispositionV1 {
-        schema: HUMAN_DISPOSITION_SCHEMA_V1.to_owned(),
-        campaign: campaign(),
-        occurrence: occurrence(1),
-        halted_state_digest: halted.state_digest().clone(),
-        disposition: HumanDispositionKindV1::ExactResidualDisposition(ExactResidualDischargeV1 {
-            campaign: campaign(),
-            occurrence: occurrence(1),
-            program: ProgramBasisRefV1::from_digest(digest("program")),
-            authority: ResidualAuthorityRefV1::from_digest(digest("residual-authority")),
-            disposition: decision.clone(),
-            before: vec![residual.residual.clone()],
-            authorized: vec![residual.residual.clone()],
-            closed: vec![residual.residual.clone()],
-            after: Vec::new(),
-        }),
-        decision,
-        principal: scope.principal.clone(),
-        mandate: scope.mandate.clone(),
-        nonce: nonce.clone(),
-        expires_at_unix_ms: NOW + 1_000,
-    };
-    let HumanDispositionEffectV1::Updated {
-        snapshot: cleared, ..
-    } = engine
-        .apply_human_disposition(
-            artifact,
-            &scope,
-            None,
-            &mut ObservationBoundary::current("unused"),
-            &mut HumanVerifier,
-            NOW + 2,
-        )
-        .unwrap()
-    else {
-        panic!("exact residual discharge must remain halted")
-    };
-    assert!(cleared.state().meta().residuals().is_empty());
-    assert_eq!(engine.replay().unwrap().human_dispositions, 1);
-
-    let second_decision = HumanDecisionIdV1::from_digest(digest("second-decision"));
-    let replayed_nonce = HumanDispositionV1 {
-        schema: HUMAN_DISPOSITION_SCHEMA_V1.to_owned(),
-        campaign: campaign(),
-        occurrence: occurrence(1),
-        halted_state_digest: cleared.state_digest().clone(),
-        disposition: HumanDispositionKindV1::ExactResidualDisposition(ExactResidualDischargeV1 {
-            campaign: campaign(),
-            occurrence: occurrence(1),
-            program: ProgramBasisRefV1::from_digest(digest("program")),
-            authority: ResidualAuthorityRefV1::from_digest(digest("residual-authority-2")),
-            disposition: second_decision.clone(),
-            before: Vec::new(),
-            authorized: Vec::new(),
-            closed: Vec::new(),
-            after: Vec::new(),
-        }),
-        decision: second_decision,
-        principal: scope.principal.clone(),
-        mandate: scope.mandate.clone(),
-        nonce,
-        expires_at_unix_ms: NOW + 1_000,
-    };
-    assert!(
-        engine
-            .apply_human_disposition(
-                replayed_nonce,
-                &scope,
-                None,
-                &mut ObservationBoundary::current("unused"),
-                &mut HumanVerifier,
-                NOW + 3,
-            )
-            .is_err()
-    );
-    assert_eq!(engine.current().unwrap(), cleared);
-    assert_eq!(engine.replay().unwrap().human_dispositions, 1);
-}
-
-#[test]
 fn durable_budget_fact_is_nonauthorizing_and_exhaustion_halts() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("campaign.sqlite");
@@ -1302,79 +1126,6 @@ fn exact_reconciliation_and_settlement_replay_are_idempotent_but_substitution_re
     }
     assert!(engine.poll_docket(&mut docket, NOW + 11).is_err());
     assert_eq!(engine.current().unwrap(), settled);
-}
-
-#[test]
-fn human_disposition_binding_attacks_and_direct_dispatch_refuse_without_transition() {
-    let directory = tempfile::tempdir().unwrap();
-    let mut engine = create_engine(&directory, ResidualSetV1::default());
-    let halted = engine
-        .halt(
-            HaltReasonRefV1::from_digest(digest("human-required")),
-            NOW + 1,
-        )
-        .unwrap();
-    let scope = HumanAuthorityScopeV1 {
-        principal: HumanPrincipalRefV1::from_digest(digest("principal")),
-        mandate: MandateRefV1::from_digest(digest("human-mandate")),
-    };
-    let artifact = HumanDispositionV1 {
-        schema: HUMAN_DISPOSITION_SCHEMA_V1.to_owned(),
-        campaign: campaign(),
-        occurrence: occurrence(1),
-        halted_state_digest: halted.state_digest().clone(),
-        disposition: HumanDispositionKindV1::ReturnToObservation,
-        decision: HumanDecisionIdV1::from_digest(digest("binding-decision")),
-        principal: scope.principal.clone(),
-        mandate: scope.mandate.clone(),
-        nonce: HumanNonceRefV1::from_digest(digest("binding-nonce")),
-        expires_at_unix_ms: NOW + 1_000,
-    };
-    let attacks = [
-        HumanDispositionV1 {
-            campaign: CampaignId::from_digest(digest("wrong-campaign")),
-            ..artifact.clone()
-        },
-        HumanDispositionV1 {
-            occurrence: occurrence(9),
-            ..artifact.clone()
-        },
-        HumanDispositionV1 {
-            halted_state_digest: digest("wrong-halted-state"),
-            ..artifact.clone()
-        },
-        HumanDispositionV1 {
-            principal: HumanPrincipalRefV1::from_digest(digest("wrong-principal")),
-            ..artifact.clone()
-        },
-        HumanDispositionV1 {
-            mandate: MandateRefV1::from_digest(digest("wrong-mandate")),
-            ..artifact.clone()
-        },
-        HumanDispositionV1 {
-            expires_at_unix_ms: NOW + 1,
-            ..artifact
-        },
-    ];
-    for attack in attacks {
-        assert!(
-            engine
-                .apply_human_disposition(
-                    attack,
-                    &scope,
-                    Some(occurrence(2)),
-                    &mut ObservationBoundary::current("unused"),
-                    &mut HumanVerifier,
-                    NOW + 2,
-                )
-                .is_err()
-        );
-        assert_eq!(engine.current().unwrap(), halted);
-    }
-    let mut docket = FakeDocket::default();
-    assert!(engine.dispatch(&mut docket, NOW + 3).is_err());
-    assert_eq!(docket.accept_calls(), 0);
-    assert_eq!(engine.replay().unwrap().human_dispositions, 0);
 }
 
 #[test]
@@ -1524,81 +1275,6 @@ fn concurrent_authorization_consumes_exactly_one_ag_spend() {
 }
 
 #[test]
-fn concurrent_human_resume_consumes_one_disposition_and_opens_one_occurrence() {
-    struct BarrierVerifier(Arc<Barrier>);
-
-    impl HumanDispositionVerifierV1 for BarrierVerifier {
-        fn verify_human_disposition(
-            &mut self,
-            request: &HumanDispositionVerificationRequestV1<'_>,
-        ) -> Result<HumanVerificationRefV1, ExternalBoundaryErrorV1> {
-            self.0.wait();
-            Ok(HumanVerificationRefV1::from_digest(Digest::hash_domain(
-                "ag-governed-engine-test/concurrent-human/v1",
-                request.artifact.decision.as_str().as_bytes(),
-            )))
-        }
-    }
-
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("campaign.sqlite");
-    let mut engine = create_engine(&directory, ResidualSetV1::default());
-    let halted = engine
-        .halt(
-            HaltReasonRefV1::from_digest(digest("human-required")),
-            NOW + 1,
-        )
-        .unwrap();
-    drop(engine);
-    let scope = HumanAuthorityScopeV1 {
-        principal: HumanPrincipalRefV1::from_digest(digest("principal")),
-        mandate: MandateRefV1::from_digest(digest("human-mandate")),
-    };
-    let artifact = HumanDispositionV1 {
-        schema: HUMAN_DISPOSITION_SCHEMA_V1.to_owned(),
-        campaign: campaign(),
-        occurrence: occurrence(1),
-        halted_state_digest: halted.state_digest().clone(),
-        disposition: HumanDispositionKindV1::ReturnToObservation,
-        decision: HumanDecisionIdV1::from_digest(digest("concurrent-decision")),
-        principal: scope.principal.clone(),
-        mandate: scope.mandate.clone(),
-        nonce: HumanNonceRefV1::from_digest(digest("concurrent-nonce")),
-        expires_at_unix_ms: NOW + 1_000,
-    };
-    let barrier = Arc::new(Barrier::new(2));
-    let mut handles = Vec::new();
-    for _ in 0..2 {
-        let database = database.clone();
-        let barrier = Arc::clone(&barrier);
-        let artifact = artifact.clone();
-        let scope = scope.clone();
-        handles.push(std::thread::spawn(move || {
-            let mut engine = CampaignEngineV1::open(&database).unwrap();
-            engine
-                .apply_human_disposition(
-                    artifact,
-                    &scope,
-                    Some(occurrence(2)),
-                    &mut ObservationBoundary::current("unused"),
-                    &mut BarrierVerifier(barrier),
-                    NOW + 2,
-                )
-                .is_ok()
-        }));
-    }
-    let results: Vec<_> = handles
-        .into_iter()
-        .map(|handle| handle.join().unwrap())
-        .collect();
-    assert_eq!(results.iter().filter(|result| **result).count(), 1);
-    let reopened = CampaignEngineV1::open(&database).unwrap();
-    assert_eq!(reopened.replay().unwrap().human_dispositions, 1);
-    assert_eq!(reopened.current().unwrap().key().occurrence, occurrence(2));
-    assert!(reopened.current().unwrap().ag_spend().is_none());
-}
-
-#[test]
 #[allow(
     clippy::too_many_lines,
     reason = "the end-to-end exact-scope successor specimen keeps all bindings visible"
@@ -1648,7 +1324,7 @@ fn governed_scope_expansion_is_durable_exact_one_use_and_opens_only_new_occurren
         dependency_evidence: sorted_digests(&["dependency-a", "dependency-b"]),
         limitations: sorted_digests(&["limitation-a"]),
         docket_outcome: None,
-        unauthorized_effect_not_performed: true,
+        no_unauthorized_effect_reported: true,
     });
     let profile = GovernedRepairVerifierProfileV1 {
         profile: digest("qualification-fixture-not-human-authority-profile"),
@@ -1831,7 +1507,7 @@ fn governed_request_collision_expiry_profile_and_readjudication_mutation_fail_cl
         limitations: sorted_digests(&["limitation-a"]),
         adjudication_scope: read_scope.clone(),
         docket_outcome: None,
-        unauthorized_effect_not_performed: true,
+        no_unauthorized_effect_reported: true,
     });
     let profile = GovernedRepairVerifierProfileV1 {
         profile: digest("qualification-fixture-not-human-authority-profile-r"),
@@ -2014,7 +1690,7 @@ fn governed_repair_rejection_is_terminal_halted_with_exact_residual() {
         dependency_evidence: sorted_digests(&["reject-dependency"]),
         limitations: sorted_digests(&["reject-limitation"]),
         docket_outcome: None,
-        unauthorized_effect_not_performed: true,
+        no_unauthorized_effect_reported: true,
     });
     let profile = GovernedRepairVerifierProfileV1 {
         profile: digest("qualification-fixture-not-human-authority-profile-reject"),

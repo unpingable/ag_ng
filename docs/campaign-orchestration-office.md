@@ -4,7 +4,7 @@ Status: **retired historical disposition**. The fixed-stage implementation and
 `agctl campaign` production path described below were removed by
 `AG-GOVERNED-LOOP-C1`. Current transition ownership is the generic governed-loop
 kernel in `crates/ag-campaign/src/governed.rs`, persisted by
-`crates/ag-store/src/campaign.rs` and composed by
+the private `crates/ag-app/src/governed_store.rs` application Store and composed by
 `crates/ag-app/src/governed_loop.rs`/`ag-loopctl`. The current consequence-bearing
 repair contract is [Canonical governed repair](canonical-governed-repair.md).
 The remainder of this record is preserved only as architectural history; it is

@@ -12,10 +12,23 @@ pub mod effect_executor_adapter;
 pub mod effectd;
 pub mod effectd_activation;
 mod exact_exec;
-pub mod governed_loop;
-pub mod governed_ports;
+mod governed_loop;
+#[cfg(test)]
+mod governed_loop_tests;
+mod governed_ports;
 pub mod governed_product;
+#[cfg(test)]
+mod governed_product_fixture_support;
+#[cfg(test)]
+mod governed_product_tests;
+#[cfg(test)]
+mod governed_repair_docket_process_tests;
+mod governed_store;
+#[cfg(test)]
+mod governed_store_tests;
 pub mod managed_pointer;
+#[cfg(test)]
+mod nq_c1_governed_repair_lifecycle_tests;
 pub mod peer;
 pub mod rpc_auth;
 pub mod runtime;

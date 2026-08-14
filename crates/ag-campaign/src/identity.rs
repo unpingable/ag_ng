@@ -63,4 +63,10 @@ pub enum CampaignLabelError {
         /// Label family.
         kind: &'static str,
     },
+    /// The label is outside the closed lowercase cross-office grammar.
+    #[error("{kind} is not a canonical lowercase governed-wire label")]
+    NonCanonical {
+        /// Label family.
+        kind: &'static str,
+    },
 }

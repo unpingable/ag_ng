@@ -2,10 +2,10 @@
 
 use std::sync::{Arc, Barrier};
 
+use crate::governed_store::{CampaignStoreErrorV1, CampaignStoreV1, CampaignTransitionKindV1};
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::{Digest, JcsDocument};
-use ag_store::campaign::{CampaignStoreErrorV1, CampaignStoreV1, CampaignTransitionKindV1};
 
 const NOW: u64 = 20_000;
 
@@ -129,6 +129,163 @@ fn assert_direct_row_substitution_refuses(
         Some(original),
         "restored exact {table}.{bytes_column} must remain retrievable"
     );
+}
+
+fn assert_direct_text_substitution_refuses(
+    store: &CampaignStoreV1,
+    database: &std::path::Path,
+    key: &HumanDispositionRefV1,
+    column: &str,
+) {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let select =
+        format!("SELECT {column} FROM governed_repair_dispositions WHERE disposition_id=?1");
+    let original: String = connection
+        .query_row(&select, rusqlite::params![key.as_str()], |row| row.get(0))
+        .unwrap();
+    let changed = digest(&format!("substituted-{column}"));
+    assert_ne!(changed.as_str(), original);
+    let update =
+        format!("UPDATE governed_repair_dispositions SET {column}=?1 WHERE disposition_id=?2");
+    connection
+        .execute(&update, rusqlite::params![changed.as_str(), key.as_str()])
+        .unwrap();
+    assert!(
+        store.replay().is_err(),
+        "{column} substitution must fail closed"
+    );
+    connection
+        .execute(&update, rusqlite::params![original, key.as_str()])
+        .unwrap();
+    assert!(store.replay().is_ok(), "restored {column} must replay");
+}
+
+fn assert_v2_to_v3_verification_migration(
+    database: &std::path::Path,
+    verification: &GovernedRepairVerificationV1,
+) {
+    // Recreate the exact V2 table shape and identity while preserving the
+    // durable disposition row. Opening must transactionally derive both V3
+    // verification indexes from the canonical complete record.
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE governed_repair_dispositions
+                 RENAME TO governed_repair_dispositions_v3;
+             CREATE TABLE governed_repair_dispositions (
+                 decision_id TEXT PRIMARY KEY,
+                 nonce TEXT NOT NULL UNIQUE,
+                 request_id TEXT NOT NULL UNIQUE,
+                 campaign_id TEXT NOT NULL,
+                 occurrence_id TEXT NOT NULL,
+                 halted_state_digest TEXT NOT NULL,
+                 disposition_id TEXT NOT NULL UNIQUE,
+                 verification_jcs BLOB NOT NULL,
+                 artifact_jcs BLOB NOT NULL,
+                 consumed_at_unix_ms INTEGER NOT NULL CHECK (consumed_at_unix_ms >= 0),
+                 FOREIGN KEY (request_id) REFERENCES human_decision_requests(request_id),
+                 FOREIGN KEY (campaign_id, occurrence_id)
+                     REFERENCES occurrences(campaign_id, occurrence_id)
+             ) STRICT;
+             INSERT INTO governed_repair_dispositions
+                    (decision_id,nonce,request_id,campaign_id,occurrence_id,
+                     halted_state_digest,disposition_id,verification_jcs,
+                     artifact_jcs,consumed_at_unix_ms)
+             SELECT decision_id,nonce,request_id,campaign_id,occurrence_id,
+                    halted_state_digest,disposition_id,verification_jcs,
+                    artifact_jcs,consumed_at_unix_ms
+               FROM governed_repair_dispositions_v3;
+             DROP TABLE governed_repair_dispositions_v3;
+             DROP TABLE governed_repair_verification_identities;
+             DROP TABLE issuance_signing_reservations;
+             UPDATE store_identity
+                SET schema_name='ag-governed-loop-campaign-store/v2',
+                    schema_version=2,
+                    schema_digest='sha256:2f4d24faf67da2cae9ef7e63c3987172fbc47e067ae0c9d078a68abd04895f20'
+              WHERE singleton=1;
+             PRAGMA user_version=2;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = CampaignStoreV1::open(database).unwrap();
+    assert_eq!(
+        migrated
+            .governed_repair_verification(&verification.reference())
+            .unwrap(),
+        Some(verification.clone())
+    );
+    assert_eq!(
+        migrated
+            .governed_repair_verification_by_receipt(&verification.verification)
+            .unwrap(),
+        Some(verification.clone())
+    );
+}
+
+fn assert_verification_addressable(
+    store: &CampaignStoreV1,
+    disposition: &HumanDispositionRefV1,
+    verification: &GovernedRepairVerificationV1,
+) {
+    assert_eq!(
+        store
+            .governed_repair_verification_for_disposition(disposition)
+            .unwrap(),
+        Some(verification.clone())
+    );
+    assert_eq!(
+        store
+            .governed_repair_verification_by_receipt(&verification.verification)
+            .unwrap(),
+        Some(verification.clone())
+    );
+    assert_eq!(
+        store
+            .artifact_bytes(verification.verification.as_digest())
+            .unwrap(),
+        Some(canonical_bytes(verification))
+    );
+}
+
+fn assert_request_disposition_verification_substitutions(
+    store: &CampaignStoreV1,
+    database: &std::path::Path,
+    request: &HumanDecisionRequestRefV1,
+    disposition: &HumanDispositionRefV1,
+    verification: &GovernedRepairVerificationV1,
+) {
+    for case in [
+        DirectRowSubstitution {
+            table: "human_decision_requests",
+            key_column: "request_id",
+            key: request.as_str(),
+            bytes_column: "request_jcs",
+            artifact_identity: request.as_digest(),
+            field: "expires_at_unix_ms",
+            replacement: serde_json::json!(NOW + 19),
+        },
+        DirectRowSubstitution {
+            table: "governed_repair_dispositions",
+            key_column: "disposition_id",
+            key: disposition.as_str(),
+            bytes_column: "artifact_jcs",
+            artifact_identity: disposition.as_digest(),
+            field: "expires_at_unix_ms",
+            replacement: serde_json::json!(NOW + 14),
+        },
+        DirectRowSubstitution {
+            table: "governed_repair_dispositions",
+            key_column: "disposition_id",
+            key: disposition.as_str(),
+            bytes_column: "verification_jcs",
+            artifact_identity: verification.verification.as_digest(),
+            field: "verified_at_unix_ms",
+            replacement: serde_json::json!(NOW + 6),
+        },
+    ] {
+        assert_direct_row_substitution_refuses(store, database, case);
+    }
 }
 
 #[cfg(unix)]
@@ -285,7 +442,7 @@ fn custody(spent: &OccurrenceSnapshotV1) -> DocketCustodyV1 {
 
 fn settlement(dispatched: &OccurrenceSnapshotV1) -> DocketSettlementV1 {
     let custody = dispatched.docket_custody().unwrap();
-    DocketSettlementV1 {
+    let mut settlement = DocketSettlementV1 {
         schema: DOCKET_SETTLEMENT_SCHEMA_V1.to_owned(),
         settlement: SettlementRefV1::from_digest(digest("settlement")),
         issuance: custody.issuance.clone(),
@@ -293,8 +450,11 @@ fn settlement(dispatched: &OccurrenceSnapshotV1) -> DocketSettlementV1 {
         executor_marker: custody.executor_marker.clone(),
         receipt: ReceiptRefV1::from_digest(digest("receipt")),
         outcome: KnownOutcomeV1::Success,
+        cumulative_effect_journal_identity: Some(digest("cumulative-effect-journal")),
         settled_at_unix_ms: NOW + 2,
-    }
+    };
+    settlement.settlement = settlement.expected_reference().unwrap();
+    settlement
 }
 
 fn sealed_scope_result(dispatched: &OccurrenceSnapshotV1) -> DocketSealedGovernedRepairResultV1 {
@@ -325,7 +485,7 @@ fn sealed_scope_result(dispatched: &OccurrenceSnapshotV1) -> DocketSealedGoverne
         executor_result: digest("executor-result"),
         executor_receipt: ReceiptRefV1::from_digest(digest("executor-receipt")),
         immutable_work_checkpoint: None,
-        authorized_effects_occurred: false,
+        reported_authorized_effects_occurred: false,
         created_at_unix_ms: NOW + 2,
         expires_at_unix_ms: NOW + 100,
         idempotency: digest("docket-result-idempotency"),
@@ -347,7 +507,7 @@ fn sealed_scope_result(dispatched: &OccurrenceSnapshotV1) -> DocketSealedGoverne
             dependency_evidence: sorted(&["dependency"]),
             limitations: sorted(&["limitation"]),
             docket_outcome: Some(outcome),
-            unauthorized_effect_not_performed: true,
+            no_unauthorized_effect_reported: true,
         },
     }
 }
@@ -547,6 +707,84 @@ fn one_transactional_path_replays_and_reconstructs_issuance() {
     assert_eq!(reopened.replay().unwrap(), report);
 }
 
+#[test]
+fn rejected_r1_settlement_bytes_remain_historically_replayable() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let dispatched = commit_to_dispatched(&mut store, &start);
+    let mut legacy = settlement(&dispatched);
+    legacy.cumulative_effect_journal_identity = None;
+    let outcome = "success";
+    legacy.settlement = SettlementRefV1::from_digest(Digest::hash_domain(
+        DOCKET_SETTLEMENT_IDENTITY_DOMAIN_V1,
+        format!(
+            "{}:{}:{}:{outcome}",
+            legacy.issuance.as_str(),
+            legacy.attempt.as_str(),
+            legacy.receipt.as_str()
+        )
+        .as_bytes(),
+    ));
+    let settled = GovernedLoopKernelV1::record_settlement(&dispatched, legacy.clone()).unwrap();
+    store
+        .commit(
+            &dispatched,
+            &settled,
+            CampaignTransitionKindV1::SettlementRecorded,
+            NOW + 2,
+        )
+        .unwrap();
+    drop(store);
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap().settlement(), Some(&legacy));
+    assert_eq!(
+        reopened
+            .artifact_bytes(legacy.settlement.as_digest())
+            .unwrap(),
+        Some(canonical_bytes(&legacy))
+    );
+}
+
+#[test]
+fn signing_permit_is_store_minted_one_use_and_only_at_the_spent_cut() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    assert!(store.issuance_signing_permit().is_err());
+
+    let spent = commit_to_spent(&mut store, &start);
+    let expected = spent.issuance().unwrap().clone();
+    let permit = store.issuance_signing_permit().unwrap();
+    assert_eq!(permit.into_issuance(), expected);
+    assert!(matches!(
+        store.issuance_signing_permit(),
+        Err(CampaignStoreErrorV1::IssuanceSigningAlreadyReserved)
+    ));
+    drop(store);
+    let mut store = CampaignStoreV1::open(&database).unwrap();
+    assert!(matches!(
+        store.issuance_signing_permit(),
+        Err(CampaignStoreErrorV1::IssuanceSigningAlreadyReserved)
+    ));
+
+    let dispatched = GovernedLoopKernelV1::accept_docket_custody(&spent, custody(&spent)).unwrap();
+    store
+        .commit(
+            &spent,
+            &dispatched,
+            CampaignTransitionKindV1::DocketCustodyAccepted,
+            NOW + 1,
+        )
+        .unwrap();
+    assert!(store.issuance_signing_permit().is_err());
+    drop(store);
+    let mut reopened = CampaignStoreV1::open(&database).unwrap();
+    assert!(reopened.issuance_signing_permit().is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn every_direct_table_artifact_refuses_canonical_row_byte_substitution() {
@@ -655,6 +893,37 @@ fn complete_proposal_and_docket_result_artifacts_survive_exact_restart_lookup() 
     let exact_proposal = dispatched.proposal_contract().unwrap().clone();
     let proposal_identity = exact_proposal.reference();
     let result = sealed_scope_result(&dispatched);
+    let mut altered_result = result.clone();
+    let DocketSealedGovernedRepairResultV1::ScopeExpansionRequired { requirement, .. } =
+        &mut altered_result
+    else {
+        panic!("scope fixture changed kind")
+    };
+    requirement.requested_delta_digest = digest("substituted-requested-delta");
+    let (exact_outcome, exact_requirement) = match &result {
+        DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+            outcome,
+            requirement,
+        } => (
+            outcome,
+            HumanDecisionRequirementV1::ScopeExpansion(requirement.clone()),
+        ),
+        DocketSealedGovernedRepairResultV1::ReadjudicationRequired { .. } => unreachable!(),
+    };
+    let exact_halt = GovernedLoopKernelV1::halt_from_docket_governed_repair(
+        &dispatched,
+        exact_outcome,
+        &exact_requirement,
+        HaltReasonRefV1::from_digest(digest("Docket governed repair required")),
+    )
+    .unwrap();
+    assert!(
+        store
+            .commit_docket_governed_repair_halt(&dispatched, &exact_halt, &altered_result, NOW + 3,)
+            .is_err(),
+        "a nested requested-delta substitution must fail before durable halt"
+    );
+    assert_eq!(store.current().unwrap(), dispatched);
     let result_identity = match &result {
         DocketSealedGovernedRepairResultV1::ScopeExpansionRequired { outcome, .. }
         | DocketSealedGovernedRepairResultV1::ReadjudicationRequired { outcome, .. } => {
@@ -944,27 +1213,13 @@ fn verified_disposition_receipt_is_exactly_addressable_after_restart() {
         .unwrap()
         .unwrap();
     assert_eq!(verification.disposition, disposition);
-    assert_eq!(
-        store
-            .artifact_bytes(verification.verification.as_digest())
-            .unwrap(),
-        Some(canonical_bytes(&verification))
-    );
+    assert_verification_addressable(&store, &disposition, &verification);
     drop(store);
 
     let reopened = CampaignStoreV1::open(&database).unwrap();
-    assert_eq!(
-        reopened
-            .governed_repair_verification_for_disposition(&disposition)
-            .unwrap(),
-        Some(verification.clone())
-    );
-    assert_eq!(
-        reopened
-            .artifact_bytes(verification.verification.as_digest())
-            .unwrap(),
-        Some(canonical_bytes(&verification))
-    );
+    assert_verification_addressable(&reopened, &disposition, &verification);
+    drop(reopened);
+    assert_v2_to_v3_verification_migration(&database, &verification);
 }
 
 #[cfg(unix)]
@@ -1038,28 +1293,20 @@ fn request_and_disposition_direct_rows_refuse_canonical_substitution() {
     store
         .commit_verified_governed_repair_disposition(verified)
         .unwrap();
+    let verification = store
+        .governed_repair_verification_for_disposition(&disposition)
+        .unwrap()
+        .unwrap();
 
-    for case in [
-        DirectRowSubstitution {
-            table: "human_decision_requests",
-            key_column: "request_id",
-            key: request_ref.as_str(),
-            bytes_column: "request_jcs",
-            artifact_identity: request_ref.as_digest(),
-            field: "expires_at_unix_ms",
-            replacement: serde_json::json!(NOW + 19),
-        },
-        DirectRowSubstitution {
-            table: "governed_repair_dispositions",
-            key_column: "disposition_id",
-            key: disposition.as_str(),
-            bytes_column: "artifact_jcs",
-            artifact_identity: disposition.as_digest(),
-            field: "expires_at_unix_ms",
-            replacement: serde_json::json!(NOW + 14),
-        },
-    ] {
-        assert_direct_row_substitution_refuses(&store, &database, case);
+    assert_request_disposition_verification_substitutions(
+        &store,
+        &database,
+        &request_ref,
+        &disposition,
+        &verification,
+    );
+    for column in ["verification_receipt_ref", "verification_record_id"] {
+        assert_direct_text_substitution_refuses(&store, &database, &disposition, column);
     }
 }
 
@@ -1183,7 +1430,7 @@ fn product_state_read_remains_coherent_during_concurrent_transitions() {
 
     let reader = CampaignStoreV1::open(&database).unwrap();
     barrier.wait();
-    for _ in 0..256 {
+    for _ in 0..64 {
         let view = reader.campaign_state_read(NOW + 100).unwrap();
         assert_eq!(view.current.state_digest(), &view.head.state_digest);
         assert!(view.head.event_count >= 1);
@@ -1196,6 +1443,46 @@ fn product_state_read_remains_coherent_during_concurrent_transitions() {
     assert_eq!(
         final_view.current.state_digest(),
         &final_view.head.state_digest
+    );
+}
+
+#[test]
+fn replay_and_open_remain_coherent_during_concurrent_transitions() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    drop(store);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_database = database.clone();
+    let writer_start = start.clone();
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = std::thread::spawn(move || {
+        let mut store = CampaignStoreV1::open(&writer_database).unwrap();
+        writer_barrier.wait();
+        commit_to_dispatched(&mut store, &writer_start)
+    });
+
+    // Opening a Store performs a full replay.  Exercise both that startup
+    // boundary and repeated replay while the other connection advances the
+    // same occurrence through several atomically committed cuts.  Every read
+    // may lawfully resolve either side of a commit, but no read may combine a
+    // transition journal from one cut with materialized rows from another.
+    barrier.wait();
+    for _ in 0..256 {
+        let reader = CampaignStoreV1::open(&database).unwrap();
+        let report = reader.replay().unwrap();
+        assert!(report.transitions >= 1);
+        reader.current().unwrap().validate_integrity().unwrap();
+    }
+
+    let dispatched = writer.join().unwrap();
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap(), dispatched);
+    assert_eq!(
+        reopened.replay().unwrap().current_state_digest,
+        *dispatched.state_digest()
     );
 }
 

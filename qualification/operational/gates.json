@@ -6,7 +6,7 @@
       "id": "ag.sqlite_wal_power_loss_recovery",
       "classification": "requires_fault_injection_environment",
       "local_proxy": [
-        "ag-store governed campaign replay and logical crash-cut tests",
+        "ag-app private governed campaign Store replay and logical crash-cut tests",
         "ag-loopctl multi-process reopen and replay"
       ],
       "closure_evidence": "Abrupt VM or block-device loss at declared WAL/commit/checkpoint cuts, followed by image recovery, integrity checking, deterministic replay, and no recreated dispatchability.",

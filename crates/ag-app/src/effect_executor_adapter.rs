@@ -23,7 +23,15 @@ use ag_effect::executor::{
 };
 use ag_primitives::{Digest, JcsDocument};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn deserialize_present_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
 
 /// Exact Docket work-schema accepted by this adapter.
 pub const EFFECT_EXECUTOR_WORK_SCHEMA_V1: &str = "ag-effectd.docket-executor-work/v1";
@@ -135,8 +143,18 @@ pub struct EffectExecutorOutcomeV1 {
     /// outcomes emit an empty journal.
     pub effect_journal: Vec<EffectExecutorJournalEntryV1>,
     /// Always `None`; governed checkpoints belong to a dedicated executor.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub immutable_work_checkpoint: Option<NoGovernedRepairCheckpointV1>,
     /// Always `None`; this adapter never interprets diagnostic meaning.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
     pub governed_repair: Option<NoGovernedRepairRequirementV1>,
 }
 
@@ -1045,6 +1063,23 @@ mod tests {
         assert_eq!(replay, first);
         assert_eq!(std::fs::read(path).unwrap(), b"hostile-after-first\n");
         assert_eq!(reconcile_effect_attempt(&plan, &dispatch).unwrap(), first);
+    }
+
+    #[test]
+    fn ordinary_outcome_omits_absent_governed_fields_and_refuses_explicit_null() {
+        let (_directory, plan, dispatch) = fixture();
+        let outcome = execute_effect_attempt(&plan, &dispatch).unwrap();
+        let canonical = JcsDocument::canonicalize(&outcome).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(canonical.as_bytes()).unwrap();
+        assert!(value.get("immutable_work_checkpoint").is_none());
+        assert!(value.get("governed_repair").is_none());
+
+        let mut explicit_null = value;
+        explicit_null
+            .as_object_mut()
+            .unwrap()
+            .insert("governed_repair".to_owned(), serde_json::Value::Null);
+        assert!(serde_json::from_value::<EffectExecutorOutcomeV1>(explicit_null).is_err());
     }
 
     #[test]

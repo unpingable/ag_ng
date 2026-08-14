@@ -17,11 +17,9 @@ use ag_app::effect_executor_adapter::{
     EFFECT_EXECUTOR_PLAN_SCHEMA_V1, EFFECT_EXECUTOR_WORK_SCHEMA_V1, EffectArtifactFileV1,
     EffectExecutorPlanV1, EffectFilePolicyV1,
 };
-use ag_app::governed_loop::{
-    EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1, ExactWorkCatalogV1,
-};
 use ag_app::governed_product::{
-    CreateCampaignV1, GOVERNED_AG_POLICY_ROOT_SCHEMA_V1, GOVERNED_DOCKET_ADAPTER_ROOT_SCHEMA_V1,
+    CreateCampaignV1, EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1, ExactWorkCatalogV1,
+    GOVERNED_AG_POLICY_ROOT_SCHEMA_V1, GOVERNED_DOCKET_ADAPTER_ROOT_SCHEMA_V1,
     GovernedAgPolicyRootV1, GovernedCampaignServiceV1, GovernedDocketAdapterRootV1,
     PinnedDeploymentFileV1,
 };

@@ -1,0 +1,1 @@
+{"accepted":["a","a-b","a-b_c.d/e:f","a.b","a/b","a:b","a1","a_b"],"effect_class_accepted_resource_rejected":["branch","head","ref"],"rejected":["","-a","A","a-","a--b","a b","a*","a._b","é"],"schema":"ag-docket.governed-repair-label-corpus/v1"}

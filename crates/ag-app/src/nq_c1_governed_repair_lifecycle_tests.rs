@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use ag_app::governed_loop::{
+use crate::governed_loop::{
     CampaignEngineV1, EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1, ExactWorkCatalogV1,
 };
 use ag_campaign::CampaignId;
@@ -255,7 +255,7 @@ impl DocketCustodyPortV1 for PostSpendFixtureDocket {
                     ..checkpoint.clone()
                 },
             ),
-            authorized_effects_occurred: false,
+            reported_authorized_effects_occurred: false,
             created_at_unix_ms: NOW + 6,
             expires_at_unix_ms: NOW + 1_000,
             idempotency: digest("fixture-docket-requirement-idempotency"),
@@ -279,7 +279,7 @@ impl DocketCustodyPortV1 for PostSpendFixtureDocket {
             dependency_evidence: sorted_digests(&["fixture-dependency"]),
             limitations: sorted_digests(&["historical-specimen-not-authority"]),
             docket_outcome: Some(outcome.clone()),
-            unauthorized_effect_not_performed: true,
+            no_unauthorized_effect_reported: true,
         };
         Ok(DocketIssuanceAcceptanceV1::GovernedRepairRequired {
             custody,
@@ -465,7 +465,7 @@ fn post_spend_checkpoint_approval_opens_exact_successor_and_rejection_opens_none
         expansion.requested_delta.resources()[0].path,
         next_missing_path
     );
-    assert!(expansion.unauthorized_effect_not_performed);
+    assert!(expansion.no_unauthorized_effect_reported);
     let successor_scope = expansion.successor_scope().unwrap();
     assert_eq!(successor_scope.resources().len(), 30);
 
@@ -716,7 +716,7 @@ fn architectural_census_yields_readjudication_without_repair_authority() {
         ]),
         adjudication_scope: adjudication_scope.clone(),
         docket_outcome: None,
-        unauthorized_effect_not_performed: true,
+        no_unauthorized_effect_reported: true,
     });
     let profile = verifier_profile("readjudication");
     let request = engine

@@ -11,7 +11,7 @@
     reason = "transition evidence is serialized immediately and retains the exact artifact by value"
 )]
 
-//! Transactional authoritative store for canonical AG governed-loop state.
+//! Crate-private transactional authoritative store for canonical AG governed-loop state.
 //!
 //! One `SQLite` transaction advances the campaign pointer, occurrence snapshot,
 //! transition chain, and all spend/attempt/settlement accounting.  External
@@ -28,18 +28,30 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crate::governed_product::{
+    ADMISSION_DECISION_ARTIFACT_SCHEMA_V1, AdmissionDecisionArtifactV1,
+    COMPLETION_OBSERVATION_ARTIFACT_SCHEMA_V1, CompletionObservationArtifactV1,
+    DOCKET_CHECKPOINT_ARTIFACT_SCHEMA_V1, DOCKET_INDETERMINATE_ARTIFACT_SCHEMA_V1,
+    DocketCheckpointArtifactV1, DocketIndeterminateArtifactV1,
+    EFFECT_JOURNAL_REFERENCE_ARTIFACT_SCHEMA_V1, EffectJournalReferenceArtifactV1,
+    OBSERVATION_RESOLUTION_ARTIFACT_SCHEMA_V1, ObservationResolutionArtifactV1,
+    RESIDUAL_STATE_ARTIFACT_SCHEMA_V1, ResidualStateArtifactV1,
+    STANDING_RESOLUTION_ARTIFACT_SCHEMA_V1, SUCCESSOR_BINDING_ARTIFACT_SCHEMA_V1,
+    StandingResolutionArtifactV1, SuccessorBindingArtifactV1, TERMINAL_WITNESS_ARTIFACT_SCHEMA_V1,
+    TerminalWitnessArtifactV1,
+};
+
 use ag_campaign::CampaignId;
 use ag_campaign::governed::{
-    AG_ISSUANCE_SCHEMA_V2, AgAuthorizationRefV1, AgAuthorizationSpendV1, AgIssuanceRefV1,
-    AgIssuanceV2, AgSpendRefV1, DOCKET_SETTLEMENT_SCHEMA_V1, DocketGovernedRepairOutcomeRefV1,
+    AG_ISSUANCE_SCHEMA_V2, AgAuthorizationRefV1, AgAuthorizationSpendV1, AgIssuanceV2,
+    AgSpendRefV1, DOCKET_SETTLEMENT_SCHEMA_V1, DocketGovernedRepairOutcomeRefV1,
     DocketIssuanceRefusalV1, DocketSealedGovernedRepairResultV1, DocketSettlementV1,
     GovernedLoopKernelV1, GovernedRepairDispositionEffectV1, GovernedRepairDispositionV1,
     GovernedRepairDispositionVerifierV1, GovernedRepairVerificationRequestV1,
     GovernedRepairVerificationV1, GovernedRepairVerifierProfileV1, HumanDecisionRequestRefV1,
-    HumanDecisionRequestV1, HumanDecisionRequirementV1, HumanDispositionEffectV1,
-    HumanDispositionKindV1, HumanDispositionRefV1, HumanDispositionV1, HumanPrincipalRefV1,
-    HumanVerificationRefV1, MandateRefV1, OccurrenceKeyV1, OccurrenceSnapshotV1, ProgramCounterV1,
-    RefusalOutcomeV1,
+    HumanDecisionRequestV1, HumanDecisionRequirementV1, HumanDispositionKindV1,
+    HumanDispositionRefV1, HumanDispositionV1, HumanPrincipalRefV1, HumanVerificationRefV1,
+    MandateRefV1, OccurrenceKeyV1, OccurrenceSnapshotV1, ProgramCounterV1, RefusalOutcomeV1,
 };
 use ag_primitives::{Digest, JcsDocument};
 use rusqlite::{
@@ -49,11 +61,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current governed-loop campaign-store schema version.
-pub const CAMPAIGN_STORE_SCHEMA_VERSION: u32 = 2;
+pub const CAMPAIGN_STORE_SCHEMA_VERSION: u32 = 4;
 /// `SQLite` application identifier for this exact store family (`AGC1`).
 pub const CAMPAIGN_STORE_APPLICATION_ID: u32 = 0x4147_4331;
 /// Human-readable exact store schema identity.
-pub const CAMPAIGN_STORE_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v2";
+pub const CAMPAIGN_STORE_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v4";
 
 const EVENT_DOMAIN_V1: &str = "ag.governed-loop.store-event/v1";
 const EVENT_GENESIS_DOMAIN_V1: &str = "ag.governed-loop.store-event-genesis/v1";
@@ -61,6 +73,12 @@ const REFUSAL_DOMAIN_V1: &str = "ag.governed-loop.store-refusal/v1";
 const CAMPAIGN_STORE_V1_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v1";
 const CAMPAIGN_STORE_V1_SCHEMA_DIGEST: &str =
     "sha256:59e4ea222f522947eaee892e29c5eea3816ad13faf91576ca7ad9be20057bbf1";
+const CAMPAIGN_STORE_V2_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v2";
+const CAMPAIGN_STORE_V2_SCHEMA_DIGEST: &str =
+    "sha256:2f4d24faf67da2cae9ef7e63c3987172fbc47e067ae0c9d078a68abd04895f20";
+const CAMPAIGN_STORE_V3_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v3";
+const CAMPAIGN_STORE_V3_SCHEMA_DIGEST: &str =
+    "sha256:20a0fa1300ffbf0531a892509f0ed22169253ffab277259740cae899fe5948dd";
 const GOVERNED_REPAIR_VERIFIER_ROOT_SCHEMA_V1: &str =
     "ag.governed-loop.governed-repair-verifier-root/v1";
 const GOVERNED_REPAIR_VERIFIER_CATALOG_SCHEMA_V1: &str =
@@ -96,6 +114,7 @@ CREATE TABLE governed_repair_dispositions (
     FOREIGN KEY (campaign_id, occurrence_id)
         REFERENCES occurrences(campaign_id, occurrence_id)
 ) STRICT;
+
 CREATE TABLE governed_repair_verifier_root (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     config_identity TEXT NOT NULL UNIQUE,
@@ -234,12 +253,31 @@ CREATE TABLE governed_repair_dispositions (
     occurrence_id TEXT NOT NULL,
     halted_state_digest TEXT NOT NULL,
     disposition_id TEXT NOT NULL UNIQUE,
+    verification_receipt_ref TEXT NOT NULL UNIQUE,
+    verification_record_id TEXT NOT NULL UNIQUE,
     verification_jcs BLOB NOT NULL,
     artifact_jcs BLOB NOT NULL,
     consumed_at_unix_ms INTEGER NOT NULL CHECK (consumed_at_unix_ms >= 0),
     FOREIGN KEY (request_id) REFERENCES human_decision_requests(request_id),
     FOREIGN KEY (campaign_id, occurrence_id)
         REFERENCES occurrences(campaign_id, occurrence_id)
+) STRICT;
+
+CREATE TABLE governed_repair_verification_identities (
+    identity TEXT PRIMARY KEY,
+    identity_class TEXT NOT NULL CHECK (identity_class IN ('receipt','record')),
+    verification_record_id TEXT NOT NULL,
+    verification_jcs BLOB NOT NULL
+) STRICT;
+
+CREATE TABLE issuance_signing_reservations (
+    issuance_id TEXT PRIMARY KEY,
+    spend_id TEXT NOT NULL UNIQUE,
+    transition_state_digest TEXT NOT NULL UNIQUE,
+    reservation_id TEXT NOT NULL UNIQUE,
+    issuance_jcs BLOB NOT NULL,
+    FOREIGN KEY (issuance_id) REFERENCES ag_authorization_spends(issuance_id),
+    FOREIGN KEY (spend_id) REFERENCES ag_authorization_spends(spend_id)
 ) STRICT;
 
 CREATE TABLE governed_repair_verifier_root (
@@ -423,7 +461,7 @@ pub struct CampaignStateReadV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum CampaignTransitionEvidenceV1 {
     None,
     ProductGenesis {
@@ -459,6 +497,39 @@ enum DirectArtifactKindV1 {
     Refusal,
 }
 
+/// Closed Store-to-product artifact taxonomy used to project a complete
+/// occurrence lifecycle without exposing Store internals.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum StoreLifecycleArtifactKindV1 {
+    ObservationResolution,
+    StandingResolution,
+    AdmissionDecision,
+    AgAuthorizationSpend,
+    AgIssuance,
+    DocketCustody,
+    DocketSettlement,
+    DocketGovernedRepairResult,
+    GovernedRepairDisposition,
+    GovernedRepairVerification,
+    HumanDecisionRequest,
+    DocketCheckpointReference,
+    EffectJournalReference,
+    DocketIndeterminateOutcome,
+    SuccessorBinding,
+    ResidualState,
+    CompletionObservation,
+    TerminalWitness,
+    HistoricalHumanDisposition,
+    DocketIssuanceRefusal,
+    Refusal,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct StoreLifecycleArtifactLinkV1 {
+    pub kind: StoreLifecycleArtifactKindV1,
+    pub identity: Digest,
+}
+
 #[derive(Serialize)]
 struct StoreEventDigestInputV1<'a> {
     campaign: &'a CampaignId,
@@ -490,12 +561,9 @@ pub struct CampaignCommitReceiptV1 {
 /// Fields are private; decoded records or caller-built verification values
 /// cannot cross the persistence membrane.
 ///
-/// ```compile_fail
-/// use ag_store::campaign::StoreVerifiedGovernedRepairEffectV1;
-///
-/// // External crates cannot fabricate the Store-owned persistence witness.
-/// let _forged = StoreVerifiedGovernedRepairEffectV1 {};
-/// ```
+/// The type is crate-private and has no caller-visible constructor. External
+/// API-boundary tests defend that the product root is the only production
+/// path that can obtain and consume this witness.
 pub struct StoreVerifiedGovernedRepairEffectV1 {
     store_file: StoreFileIdentityV1,
     expected: OccurrenceSnapshotV1,
@@ -503,6 +571,36 @@ pub struct StoreVerifiedGovernedRepairEffectV1 {
     effect: GovernedRepairDispositionEffectV1,
     artifact: GovernedRepairDispositionV1,
     recorded_at_unix_ms: u64,
+}
+
+/// Process-local, non-serializable one-use permission to authenticate the
+/// exact issuance produced by this Store's already-consumed AG spend.
+///
+/// The value is intentionally neither `Clone` nor `Copy`; the production
+/// signer must consume it. Raw issuance records remain evidence and cannot be
+/// substituted for this Store-owned boundary.
+///
+/// The type is crate-private and has no caller-visible constructor. External
+/// API-boundary tests defend that decoded issuance evidence cannot mint it.
+pub struct StoreIssuanceSigningPermitV1 {
+    store_file: StoreFileIdentityV1,
+    spend: AgSpendRefV1,
+    issuance: AgIssuanceV2,
+}
+
+impl StoreIssuanceSigningPermitV1 {
+    /// Consumes the one-use Store permission and returns the exact issuance to
+    /// the production authentication boundary.
+    #[must_use]
+    pub fn into_issuance(self) -> AgIssuanceV2 {
+        let Self {
+            store_file,
+            spend,
+            issuance,
+        } = self;
+        let _ = (store_file, spend);
+        issuance
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -634,6 +732,10 @@ pub enum CampaignStoreErrorV1 {
     /// substituted.
     #[error("governed repair request/disposition replay or substitution")]
     GovernedRepairReplay,
+    /// This exact issuance already crossed the one-use authentication seam.
+    /// Callers must reconcile Docket custody instead of signing again.
+    #[error("issuance signing already reserved; reconcile exact issuance")]
+    IssuanceSigningAlreadyReserved,
     /// The deployment-pinned governed-repair verifier refused or was not
     /// available through the exact measured executable.
     #[error("governed repair verifier failure: {0}")]
@@ -648,6 +750,7 @@ pub struct CampaignStoreV1 {
 
 impl CampaignStoreV1 {
     /// Creates a new store around one kernel-produced initial occurrence.
+    #[cfg(test)]
     pub fn create(
         path: &Path,
         initial: &OccurrenceSnapshotV1,
@@ -810,6 +913,8 @@ impl CampaignStoreV1 {
         )?;
         configure_connection(&connection)?;
         migrate_v1_to_v2_if_safe(&mut connection)?;
+        migrate_v2_to_v3_if_safe(&mut connection)?;
+        migrate_v3_to_v4_if_safe(&mut connection)?;
         let store = Self {
             path: path.to_owned(),
             connection,
@@ -825,16 +930,6 @@ impl CampaignStoreV1 {
         &self.path
     }
 
-    /// Returns the sole campaign identity in this store.
-    pub fn campaign_id(&self) -> Result<CampaignId, CampaignStoreErrorV1> {
-        let text: String =
-            self.connection
-                .query_row("SELECT campaign_id FROM campaigns", [], |row| row.get(0))?;
-        let digest = Digest::parse(&text)
-            .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
-        Ok(CampaignId::from_digest(digest))
-    }
-
     /// Loads the authoritative current snapshot.
     pub fn current(&self) -> Result<OccurrenceSnapshotV1, CampaignStoreErrorV1> {
         let bytes: Vec<u8> = self.connection.query_row(
@@ -847,24 +942,12 @@ impl CampaignStoreV1 {
         )?;
         let snapshot: OccurrenceSnapshotV1 = decode(&bytes)?;
         snapshot.validate_integrity()?;
+        if encode(&snapshot)? != bytes {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "current occurrence bytes do not round-trip exactly".to_owned(),
+            ));
+        }
         Ok(snapshot)
-    }
-
-    /// Returns exact authoritative head counters without page-size inference.
-    pub fn head(&self) -> Result<CampaignHeadV1, CampaignStoreErrorV1> {
-        let row: (i64, i64, String, String) = self.connection.query_row(
-            "SELECT revision,event_count,current_state_digest,event_head_digest FROM campaigns",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
-        Ok(CampaignHeadV1 {
-            revision: to_u64(row.0)?,
-            event_count: to_u64(row.1)?,
-            state_digest: Digest::parse(&row.2)
-                .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?,
-            event_head: Digest::parse(&row.3)
-                .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?,
-        })
     }
 
     /// Reads the product-facing current state as one coherent `SQLite` snapshot.
@@ -1106,22 +1189,6 @@ impl CampaignStoreV1 {
             .transpose()
     }
 
-    /// Returns whether an exact unconsumed request exists for this current
-    /// halted-state identity, rather than consulting historical row counts.
-    pub fn has_open_human_decision_request_for_state(
-        &self,
-        state: &Digest,
-    ) -> Result<bool, CampaignStoreErrorV1> {
-        self.connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM human_decision_requests
-                 WHERE halted_state_digest=?1 AND consumed_by_decision_id IS NULL)",
-                params![state.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
-    }
-
     /// Returns the sole exact unconsumed and unexpired decision request for
     /// one halted-state identity.  Historical expired requests remain durable
     /// evidence but are not projected as an open product transition.
@@ -1210,7 +1277,16 @@ impl CampaignStoreV1 {
                 "occurrence page limit outside 1..=1000".to_owned(),
             ));
         }
-        let cursor = after.unwrap_or("");
+        let cursor = after
+            .map(|value| {
+                uuid::Uuid::parse_str(value)
+                    .map(|uuid| uuid.hyphenated().to_string())
+                    .map_err(|_| {
+                        CampaignStoreErrorV1::Corrupt("invalid occurrence UUID cursor".to_owned())
+                    })
+            })
+            .transpose()?
+            .unwrap_or_default();
         let mut statement = self.connection.prepare(
             "SELECT snapshot_jcs FROM occurrences
              WHERE occurrence_id>?1 ORDER BY occurrence_id LIMIT ?2",
@@ -1381,12 +1457,30 @@ impl CampaignStoreV1 {
             }
         }
 
-        // Proposal contracts are embedded in every state that depends on
-        // them.  Recover the exact canonical proposal rather than forcing
-        // product clients to reconstruct it from a partial view.
+        // Known-settlement journal references are Docket-owned identities
+        // surfaced by AG as exact correspondence artifacts.
         let mut statement = self
             .connection
-            .prepare("SELECT snapshot_jcs FROM occurrences ORDER BY occurrence_id")?;
+            .prepare("SELECT settlement_jcs FROM docket_settlements ORDER BY settlement_id")?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        for row in rows {
+            let settlement: DocketSettlementV1 = decode_exact_artifact(&row?, "Docket settlement")?;
+            if settlement.cumulative_effect_journal_identity.as_ref() == Some(identity) {
+                merge_exact_artifact_bytes(
+                    &mut found,
+                    encode(&effect_journal_reference_artifact_for_settlement(
+                        &settlement,
+                    ))?,
+                )?;
+            }
+        }
+
+        // Complete proposal/observation/standing/decision/successor-lineage
+        // records remain in the immutable transition chain after the current
+        // occurrence projection advances beyond their source state.
+        let mut statement = self
+            .connection
+            .prepare("SELECT successor_snapshot_jcs FROM transitions ORDER BY sequence")?;
         let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         for row in rows {
             let snapshot: OccurrenceSnapshotV1 = decode(&row?)?;
@@ -1395,6 +1489,65 @@ impl CampaignStoreV1 {
                 && proposal.reference().as_digest() == identity
             {
                 merge_exact_artifact_bytes(&mut found, encode(proposal)?)?;
+            }
+            if let Some(observation) = snapshot.observation() {
+                let artifact = ObservationResolutionArtifactV1 {
+                    schema: OBSERVATION_RESOLUTION_ARTIFACT_SCHEMA_V1.to_owned(),
+                    state_digest: snapshot.state_digest().clone(),
+                    record: observation.clone(),
+                };
+                if &product_artifact_identity(artifact.identity())? == identity {
+                    merge_exact_artifact_bytes(&mut found, encode(&artifact)?)?;
+                }
+            }
+            if let Some(standing) = snapshot.standing_resolution() {
+                let artifact = StandingResolutionArtifactV1 {
+                    schema: STANDING_RESOLUTION_ARTIFACT_SCHEMA_V1.to_owned(),
+                    state_digest: snapshot.state_digest().clone(),
+                    record: standing.clone(),
+                };
+                if &product_artifact_identity(artifact.identity())? == identity {
+                    merge_exact_artifact_bytes(&mut found, encode(&artifact)?)?;
+                }
+            }
+            if let Some(decision) = snapshot.admission_decision() {
+                let artifact = AdmissionDecisionArtifactV1 {
+                    schema: ADMISSION_DECISION_ARTIFACT_SCHEMA_V1.to_owned(),
+                    state_digest: snapshot.state_digest().clone(),
+                    record: decision.clone(),
+                };
+                if &product_artifact_identity(artifact.identity())? == identity {
+                    merge_exact_artifact_bytes(&mut found, encode(&artifact)?)?;
+                }
+            }
+            if let Some(indeterminate) = snapshot.indeterminate() {
+                let artifact = DocketIndeterminateArtifactV1 {
+                    schema: DOCKET_INDETERMINATE_ARTIFACT_SCHEMA_V1.to_owned(),
+                    state_digest: snapshot.state_digest().clone(),
+                    record: indeterminate.clone(),
+                };
+                if &product_artifact_identity(artifact.identity())? == identity {
+                    merge_exact_artifact_bytes(&mut found, encode(&artifact)?)?;
+                }
+            }
+            if let Some(successor) = successor_binding_artifact(&snapshot)
+                && &successor_binding_identity(&successor)? == identity
+            {
+                merge_exact_artifact_bytes(&mut found, encode(&successor)?)?;
+            }
+            let residual = residual_state_artifact(&snapshot);
+            if &residual_state_identity(&residual)? == identity {
+                merge_exact_artifact_bytes(&mut found, encode(&residual)?)?;
+            }
+            if let Some(completion) = completion_observation_artifact(&snapshot)
+                && &completion_observation_identity(&completion)? == identity
+            {
+                merge_exact_artifact_bytes(&mut found, encode(&completion)?)?;
+            }
+            if let Some(witness) = terminal_witness_artifact(&snapshot)
+                && &terminal_witness_identity(&witness)? == identity
+            {
+                merge_exact_artifact_bytes(&mut found, encode(&witness)?)?;
             }
         }
 
@@ -1414,6 +1567,18 @@ impl CampaignStoreV1 {
                 if outcome.sealed_result.as_digest() == identity {
                     merge_exact_artifact_bytes(&mut found, encode(result)?)?;
                 }
+                if outcome.checkpoint.as_digest() == identity {
+                    merge_exact_artifact_bytes(
+                        &mut found,
+                        encode(&docket_checkpoint_artifact(outcome))?,
+                    )?;
+                }
+                if &outcome.effect_journal == identity {
+                    merge_exact_artifact_bytes(
+                        &mut found,
+                        encode(&effect_journal_reference_artifact(outcome))?,
+                    )?;
+                }
             }
             if let CampaignTransitionEvidenceV1::DocketIssuanceRefusal { ref refusal } = evidence
                 && &refusal.refusal == identity
@@ -1422,27 +1587,244 @@ impl CampaignStoreV1 {
             }
         }
 
-        // A verifier receipt is addressed by the exact external verification
-        // reference embedded in the complete Store-validated verification
-        // record.  Multiple rows may cite the same receipt only when their
-        // complete canonical bytes are identical.
-        let mut statement = self.connection.prepare(
-            "SELECT verification_jcs FROM governed_repair_dispositions ORDER BY decision_id",
-        )?;
-        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-        for row in rows {
-            let bytes = row?;
+        // External receipt and complete-record identities are each unique and
+        // both resolve to the same exact Store-validated verification bytes.
+        let bytes: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT verification_jcs FROM governed_repair_verification_identities
+                 WHERE identity=?1",
+                params![identity.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(bytes) = bytes {
             let verification: GovernedRepairVerificationV1 = decode(&bytes)?;
-            if verification.verification.as_digest() == identity {
-                if encode(&verification)? != bytes {
-                    return Err(CampaignStoreErrorV1::Corrupt(
-                        "governed repair verification bytes are not canonical".to_owned(),
-                    ));
-                }
-                merge_exact_artifact_bytes(&mut found, bytes)?;
+            if encode(&verification)? != bytes
+                || (verification.verification.as_digest() != identity
+                    && verification.reference().as_digest() != identity)
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "governed repair verification identity/bytes mismatch".to_owned(),
+                ));
             }
+            merge_exact_artifact_bytes(&mut found, bytes)?;
         }
         Ok(found)
+    }
+
+    /// Returns the closed product artifact inventory for one occurrence by
+    /// walking the exact immutable transition chain. This is a read-only
+    /// projection; it creates no lifecycle authority.
+    pub(crate) fn lifecycle_artifact_links(
+        &self,
+        key: &OccurrenceKeyV1,
+    ) -> Result<Vec<StoreLifecycleArtifactLinkV1>, CampaignStoreErrorV1> {
+        self.replay()?;
+        let mut links = Vec::new();
+        let mut statement = self.connection.prepare(
+            "SELECT successor_snapshot_jcs,evidence_jcs FROM transitions
+             WHERE campaign_id=?1 AND successor_occurrence_id=?2 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map(
+            params![key.campaign.as_str(), key.occurrence.to_string()],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?;
+        for row in rows {
+            let (snapshot_bytes, evidence_bytes) = row?;
+            let snapshot: OccurrenceSnapshotV1 = decode(&snapshot_bytes)?;
+            snapshot.validate_integrity()?;
+            if let Some(observation) = snapshot.observation() {
+                let artifact = ObservationResolutionArtifactV1 {
+                    schema: OBSERVATION_RESOLUTION_ARTIFACT_SCHEMA_V1.to_owned(),
+                    state_digest: snapshot.state_digest().clone(),
+                    record: observation.clone(),
+                };
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::ObservationResolution,
+                    identity: product_artifact_identity(artifact.identity())?,
+                });
+            }
+            if let Some(spend) = snapshot.ag_spend() {
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::AgAuthorizationSpend,
+                    identity: spend.spend.as_digest().clone(),
+                });
+            }
+            if let Some(issuance) = snapshot.issuance() {
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::AgIssuance,
+                    identity: issuance.issuance.as_digest().clone(),
+                });
+            }
+            if let Some(custody) = snapshot.docket_custody() {
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::DocketCustody,
+                    identity: custody.reference().as_digest().clone(),
+                });
+            }
+            if let Some(settlement) = snapshot.settlement() {
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::DocketSettlement,
+                    identity: settlement.settlement.as_digest().clone(),
+                });
+                if let Some(journal) = &settlement.cumulative_effect_journal_identity {
+                    links.push(StoreLifecycleArtifactLinkV1 {
+                        kind: StoreLifecycleArtifactKindV1::EffectJournalReference,
+                        identity: journal.clone(),
+                    });
+                }
+            }
+            if let Some(standing) = snapshot.standing_resolution() {
+                let artifact = StandingResolutionArtifactV1 {
+                    schema: STANDING_RESOLUTION_ARTIFACT_SCHEMA_V1.to_owned(),
+                    state_digest: snapshot.state_digest().clone(),
+                    record: standing.clone(),
+                };
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::StandingResolution,
+                    identity: product_artifact_identity(artifact.identity())?,
+                });
+            }
+            if let Some(decision) = snapshot.admission_decision() {
+                let artifact = AdmissionDecisionArtifactV1 {
+                    schema: ADMISSION_DECISION_ARTIFACT_SCHEMA_V1.to_owned(),
+                    state_digest: snapshot.state_digest().clone(),
+                    record: decision.clone(),
+                };
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::AdmissionDecision,
+                    identity: product_artifact_identity(artifact.identity())?,
+                });
+            }
+            if let Some(indeterminate) = snapshot.indeterminate() {
+                let artifact = DocketIndeterminateArtifactV1 {
+                    schema: DOCKET_INDETERMINATE_ARTIFACT_SCHEMA_V1.to_owned(),
+                    state_digest: snapshot.state_digest().clone(),
+                    record: indeterminate.clone(),
+                };
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::DocketIndeterminateOutcome,
+                    identity: product_artifact_identity(artifact.identity())?,
+                });
+            }
+            if let Some(successor) = successor_binding_artifact(&snapshot) {
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::SuccessorBinding,
+                    identity: successor_binding_identity(&successor)?,
+                });
+            }
+            let residual = residual_state_artifact(&snapshot);
+            links.push(StoreLifecycleArtifactLinkV1 {
+                kind: StoreLifecycleArtifactKindV1::ResidualState,
+                identity: residual_state_identity(&residual)?,
+            });
+            if let Some(completion) = completion_observation_artifact(&snapshot) {
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::CompletionObservation,
+                    identity: completion_observation_identity(&completion)?,
+                });
+            }
+            if let Some(witness) = terminal_witness_artifact(&snapshot) {
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind: StoreLifecycleArtifactKindV1::TerminalWitness,
+                    identity: terminal_witness_identity(&witness)?,
+                });
+            }
+
+            let evidence: CampaignTransitionEvidenceV1 = decode(&evidence_bytes)?;
+            match evidence {
+                CampaignTransitionEvidenceV1::GovernedRepairDisposition {
+                    request,
+                    artifact,
+                    verification,
+                } => {
+                    links.extend([
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::HumanDecisionRequest,
+                            identity: request.reference().as_digest().clone(),
+                        },
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::GovernedRepairDisposition,
+                            identity: artifact.reference().as_digest().clone(),
+                        },
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::GovernedRepairVerification,
+                            identity: verification.verification.as_digest().clone(),
+                        },
+                    ]);
+                }
+                CampaignTransitionEvidenceV1::DocketGovernedRepairHalt { result } => {
+                    let (outcome, _) = governed_repair_result_parts(&result);
+                    links.extend([
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::DocketGovernedRepairResult,
+                            identity: outcome.sealed_result.as_digest().clone(),
+                        },
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::AgIssuance,
+                            identity: outcome.issuance.as_digest().clone(),
+                        },
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::DocketCustody,
+                            identity: outcome.custody.as_digest().clone(),
+                        },
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::DocketCheckpointReference,
+                            identity: outcome.checkpoint.as_digest().clone(),
+                        },
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::EffectJournalReference,
+                            identity: outcome.effect_journal.clone(),
+                        },
+                    ]);
+                }
+                CampaignTransitionEvidenceV1::HumanDisposition { artifact, .. } => {
+                    links.push(StoreLifecycleArtifactLinkV1 {
+                        kind: StoreLifecycleArtifactKindV1::HistoricalHumanDisposition,
+                        identity: artifact.reference().as_digest().clone(),
+                    });
+                }
+                CampaignTransitionEvidenceV1::DocketIssuanceRefusal { refusal } => {
+                    links.push(StoreLifecycleArtifactLinkV1 {
+                        kind: StoreLifecycleArtifactKindV1::DocketIssuanceRefusal,
+                        identity: refusal.refusal,
+                    });
+                }
+                CampaignTransitionEvidenceV1::None
+                | CampaignTransitionEvidenceV1::ProductGenesis { .. } => {}
+            }
+        }
+        // Requests and no-state-change refusals are durable occurrence
+        // artifacts even after expiry or after later state movement; they do
+        // not necessarily have a dedicated transition row.
+        for (query, kind) in [
+            (
+                "SELECT request_id FROM human_decision_requests
+                 WHERE campaign_id=?1 AND occurrence_id=?2 ORDER BY request_id",
+                StoreLifecycleArtifactKindV1::HumanDecisionRequest,
+            ),
+            (
+                "SELECT refusal_id FROM refusals
+                 WHERE campaign_id=?1 AND occurrence_id=?2 ORDER BY refusal_id",
+                StoreLifecycleArtifactKindV1::Refusal,
+            ),
+        ] {
+            let mut records = self.connection.prepare(query)?;
+            let identities = records.query_map(
+                params![key.campaign.as_str(), key.occurrence.to_string()],
+                |row| row.get::<_, String>(0),
+            )?;
+            for identity in identities {
+                links.push(StoreLifecycleArtifactLinkV1 {
+                    kind,
+                    identity: parse_digest(&identity?)?,
+                });
+            }
+        }
+        links.sort();
+        links.dedup();
+        Ok(links)
     }
 
     /// Appends one exact non-authorizing human-decision request under an exact
@@ -1541,9 +1923,9 @@ impl CampaignStoreV1 {
             .map(|bytes| {
                 let value: HumanDecisionRequestV1 = decode(&bytes)?;
                 value.validate()?;
-                if value.reference() != *request {
+                if value.reference() != *request || encode(&value)? != bytes {
                     return Err(CampaignStoreErrorV1::Corrupt(
-                        "human decision request identity mismatch".to_owned(),
+                        "human decision request identity/canonical bytes mismatch".to_owned(),
                     ));
                 }
                 Ok(value)
@@ -1583,6 +1965,7 @@ impl CampaignStoreV1 {
         &self,
         disposition: &HumanDispositionRefV1,
     ) -> Result<Option<GovernedRepairVerificationV1>, CampaignStoreErrorV1> {
+        self.replay()?;
         let bytes: Option<Vec<u8>> = self
             .connection
             .query_row(
@@ -1602,6 +1985,155 @@ impl CampaignStoreV1 {
                 Ok(value)
             })
             .transpose()
+    }
+
+    /// Retrieves one complete verifier response by its unique exact identity.
+    /// Same nested evidence under a different request/profile/time envelope is
+    /// a different verification record and cannot alias this lookup.
+    #[cfg(test)]
+    pub fn governed_repair_verification(
+        &self,
+        identity: &ag_campaign::governed::GovernedRepairVerificationRefV1,
+    ) -> Result<Option<GovernedRepairVerificationV1>, CampaignStoreErrorV1> {
+        self.replay()?;
+        let bytes: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT verification_jcs FROM governed_repair_verification_identities
+                 WHERE identity=?1 AND identity_class='record'",
+                params![identity.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        bytes
+            .map(|bytes| {
+                let value: GovernedRepairVerificationV1 = decode(&bytes)?;
+                if value.reference() != *identity || encode(&value)? != bytes {
+                    return Err(CampaignStoreErrorV1::Corrupt(
+                        "governed-repair verification record identity mismatch".to_owned(),
+                    ));
+                }
+                Ok(value)
+            })
+            .transpose()
+    }
+
+    /// Retrieves the uniquely bound complete verification record for one
+    /// external verifier receipt. Exact repeats are therefore idempotent
+    /// reads; a receipt cannot name changed complete bytes.
+    #[cfg(test)]
+    pub fn governed_repair_verification_by_receipt(
+        &self,
+        receipt: &HumanVerificationRefV1,
+    ) -> Result<Option<GovernedRepairVerificationV1>, CampaignStoreErrorV1> {
+        self.replay()?;
+        let row: Option<(String, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT verification_record_id,verification_jcs
+                 FROM governed_repair_verification_identities
+                 WHERE identity=?1 AND identity_class='receipt'",
+                params![receipt.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(record, bytes)| {
+            let value: GovernedRepairVerificationV1 = decode(&bytes)?;
+            if value.verification != *receipt
+                || value.reference().as_str() != record
+                || encode(&value)? != bytes
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "verifier receipt is rebound to changed verification bytes".to_owned(),
+                ));
+            }
+            Ok(value)
+        })
+        .transpose()
+    }
+
+    /// Mints one process-local signing permission from this Store's exact
+    /// current authorization-consumed cut. It cannot be created from decoded
+    /// issuance bytes, and later states cannot be signed as fresh issuances.
+    pub fn issuance_signing_permit(
+        &mut self,
+    ) -> Result<StoreIssuanceSigningPermitV1, CampaignStoreErrorV1> {
+        self.replay()?;
+        let current = self.current()?;
+        if current.program_counter() != ProgramCounterV1::AuthorizationConsumed {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        let spend = current
+            .ag_spend()
+            .ok_or(CampaignStoreErrorV1::BindingMismatch)?;
+        let issuance = current
+            .issuance()
+            .ok_or(CampaignStoreErrorV1::BindingMismatch)?;
+        if spend.spend != issuance.spend || spend.key != issuance.key {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        let stored: Option<(Vec<u8>, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT spend_jcs,issuance_jcs FROM ag_authorization_spends
+                 WHERE spend_id=?1 AND issuance_id=?2",
+                params![spend.spend.as_str(), issuance.issuance.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((stored_spend, stored_issuance)) = stored else {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        };
+        if stored_spend != encode(spend)? || stored_issuance != encode(issuance)? {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "signing permit basis differs from spend journal".to_owned(),
+            ));
+        }
+        let issuance_jcs = encode(issuance)?;
+        let reservation_id = Digest::hash_domain(
+            "ag.governed-loop.issuance-signing-reservation/v1",
+            &issuance_jcs,
+        );
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<(String, String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT spend_id,transition_state_digest,issuance_jcs
+                 FROM issuance_signing_reservations WHERE issuance_id=?1",
+                params![issuance.issuance.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some((reserved_spend, reserved_state, reserved_issuance)) = existing {
+            if reserved_spend != spend.spend.as_str()
+                || reserved_state != current.state_digest().as_str()
+                || reserved_issuance != issuance_jcs
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "issuance signing reservation changed under one identity".to_owned(),
+                ));
+            }
+            return Err(CampaignStoreErrorV1::IssuanceSigningAlreadyReserved);
+        }
+        transaction.execute(
+            "INSERT INTO issuance_signing_reservations
+             (issuance_id,spend_id,transition_state_digest,reservation_id,issuance_jcs)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                issuance.issuance.as_str(),
+                spend.spend.as_str(),
+                current.state_digest().as_str(),
+                reservation_id.as_str(),
+                issuance_jcs,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(StoreIssuanceSigningPermitV1 {
+            store_file: store_file_identity(&self.path)?,
+            spend: spend.spend.clone(),
+            issuance: issuance.clone(),
+        })
     }
 
     /// Commits one non-human kernel successor with exact CAS semantics.
@@ -1695,6 +2227,7 @@ impl CampaignStoreV1 {
         result: &DocketSealedGovernedRepairResultV1,
         recorded_at_unix_ms: u64,
     ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
+        result.validate()?;
         let (outcome, requirement) = governed_repair_result_parts(result);
         let halted = successor
             .halted()
@@ -1726,65 +2259,6 @@ impl CampaignStoreV1 {
         )?;
         transaction.commit()?;
         Ok(receipt)
-    }
-
-    /// Atomically consumes one exact human disposition and applies its closed effect.
-    pub fn commit_human_disposition(
-        &mut self,
-        expected: &OccurrenceSnapshotV1,
-        effect: &HumanDispositionEffectV1,
-        artifact: &HumanDispositionV1,
-        recorded_at_unix_ms: u64,
-    ) -> Result<Vec<CampaignCommitReceiptV1>, CampaignStoreErrorV1> {
-        let (verification, first, second) = match effect {
-            HumanDispositionEffectV1::Updated {
-                snapshot,
-                verification,
-            } => (verification, snapshot, None),
-            HumanDispositionEffectV1::OpenedOccurrence {
-                halted,
-                successor,
-                verification,
-            } => (verification, halted, Some(successor)),
-        };
-        validate_human_store_binding(expected, first, second, artifact)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let open_governed_request: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM human_decision_requests
-             WHERE halted_state_digest=?1 AND consumed_by_decision_id IS NULL)",
-            params![expected.state_digest().as_str()],
-            |row| row.get(0),
-        )?;
-        if open_governed_request {
-            return Err(CampaignStoreErrorV1::BindingMismatch);
-        }
-        insert_human_disposition(&transaction, artifact, verification, recorded_at_unix_ms)?;
-        let evidence = CampaignTransitionEvidenceV1::HumanDisposition {
-            artifact: artifact.clone(),
-            verification: verification.clone(),
-        };
-        let mut receipts = vec![write_transition(
-            &transaction,
-            expected,
-            first,
-            CampaignTransitionKindV1::HumanDisposition,
-            &evidence,
-            recorded_at_unix_ms,
-        )?];
-        if let Some(second) = second {
-            receipts.push(write_transition(
-                &transaction,
-                first,
-                second,
-                CampaignTransitionKindV1::HumanDisposition,
-                &evidence,
-                recorded_at_unix_ms,
-            )?);
-        }
-        transaction.commit()?;
-        Ok(receipts)
     }
 
     /// Atomically consumes one exact persisted request and one freshly
@@ -1859,12 +2333,32 @@ impl CampaignStoreV1 {
         if changed != 1 {
             return Err(CampaignStoreErrorV1::GovernedRepairReplay);
         }
+        let verification_record = verification.reference();
+        if verification.verification.as_str() == verification_record.as_str() {
+            return Err(CampaignStoreErrorV1::GovernedRepairReplay);
+        }
+        let verification_jcs = encode(verification)?;
+        // Receipt references and complete verification-record identities share
+        // one namespace. Inserting both identities in this same transaction
+        // makes cross-column collisions impossible, not merely duplicate
+        // receipts or duplicate records within their separate columns.
+        transaction.execute(
+            "INSERT INTO governed_repair_verification_identities
+             (identity,identity_class,verification_record_id,verification_jcs)
+             VALUES (?1,'receipt',?2,?3), (?2,'record',?2,?3)",
+            params![
+                verification.verification.as_str(),
+                verification_record.as_str(),
+                verification_jcs,
+            ],
+        )?;
         transaction.execute(
             "INSERT INTO governed_repair_dispositions
              (decision_id, nonce, request_id, campaign_id, occurrence_id,
-              halted_state_digest, disposition_id, verification_jcs,
-              artifact_jcs, consumed_at_unix_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              halted_state_digest, disposition_id, verification_receipt_ref,
+              verification_record_id, verification_jcs, artifact_jcs,
+              consumed_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 artifact.decision.as_str(),
                 artifact.nonce.as_str(),
@@ -1873,6 +2367,8 @@ impl CampaignStoreV1 {
                 artifact.occurrence.to_string(),
                 artifact.halted_state_digest.as_str(),
                 artifact.reference().as_str(),
+                verification.verification.as_str(),
+                verification_record.as_str(),
                 encode(verification)?,
                 encode(&artifact)?,
                 to_i64(recorded_at_unix_ms)?,
@@ -1939,9 +2435,10 @@ impl CampaignStoreV1 {
     }
 
     /// Reconstructs an exact issuance solely from the authoritative spend journal.
+    #[cfg(test)]
     pub fn issuance(
         &self,
-        issuance: &AgIssuanceRefV1,
+        issuance: &ag_campaign::governed::AgIssuanceRefV1,
     ) -> Result<Option<AgIssuanceV2>, CampaignStoreErrorV1> {
         let bytes: Option<Vec<u8>> = self
             .connection
@@ -1955,6 +2452,7 @@ impl CampaignStoreV1 {
     }
 
     /// Returns exact accounting counts `(spends, attempts, settlements)`.
+    #[cfg(test)]
     pub fn accounting_counts(&self) -> Result<(u64, u64, u64), CampaignStoreErrorV1> {
         Ok((
             table_count(&self.connection, "ag_authorization_spends")?,
@@ -1966,7 +2464,17 @@ impl CampaignStoreV1 {
     /// Performs deterministic transition replay and exact journal accounting.
     pub fn replay(&self) -> Result<CampaignReplayReportV1, CampaignStoreErrorV1> {
         self.verify_identity()?;
-        replay_store(&self.connection)
+        // Replay compares the append-only transition journal with several
+        // materialized/accounting tables.  In WAL mode, independent SELECTs
+        // outside a transaction may observe different committed cuts when a
+        // concurrent process wins a transition between those SELECTs.  That
+        // is a valid CAS race, not store corruption.  Hold one deferred read
+        // transaction so every replay input is resolved from the same exact
+        // SQLite snapshot.
+        let transaction = self.connection.unchecked_transaction()?;
+        let report = replay_store(&transaction)?;
+        transaction.commit()?;
+        Ok(report)
     }
 
     fn verify_identity(&self) -> Result<(), CampaignStoreErrorV1> {
@@ -2043,6 +2551,173 @@ fn migrate_v1_to_v2_if_safe(connection: &mut Connection) -> Result<(), CampaignS
     }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(V2_ADDITIVE_SCHEMA_SQL)?;
+    transaction.execute(
+        "UPDATE store_identity SET schema_name=?1, schema_version=?2,
+         schema_digest=?3 WHERE singleton=1",
+        params![
+            CAMPAIGN_STORE_V2_SCHEMA_NAME,
+            2_i64,
+            CAMPAIGN_STORE_V2_SCHEMA_DIGEST,
+        ],
+    )?;
+    transaction.pragma_update(None, "user_version", 2_u32)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v2_to_v3_if_safe(connection: &mut Connection) -> Result<(), CampaignStoreErrorV1> {
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 2 {
+        return Ok(());
+    }
+    let identity: (u32, String, u32, String) = connection.query_row(
+        "SELECT application_id, schema_name, schema_version, schema_digest
+         FROM store_identity WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if identity.0 != CAMPAIGN_STORE_APPLICATION_ID
+        || identity.1 != CAMPAIGN_STORE_V2_SCHEMA_NAME
+        || identity.2 != 2
+        || identity.3 != CAMPAIGN_STORE_V2_SCHEMA_DIGEST
+    {
+        return Err(CampaignStoreErrorV1::StoreIdentity);
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "ALTER TABLE governed_repair_dispositions
+             ADD COLUMN verification_receipt_ref TEXT;
+         ALTER TABLE governed_repair_dispositions
+             ADD COLUMN verification_record_id TEXT;
+         CREATE UNIQUE INDEX governed_repair_dispositions_verification_receipt_ref
+             ON governed_repair_dispositions(verification_receipt_ref)
+             WHERE verification_receipt_ref IS NOT NULL;
+         CREATE UNIQUE INDEX governed_repair_dispositions_verification_record_id
+             ON governed_repair_dispositions(verification_record_id)
+             WHERE verification_record_id IS NOT NULL;",
+    )?;
+    let mut rows = Vec::new();
+    {
+        let mut statement = transaction
+            .prepare("SELECT decision_id,verification_jcs FROM governed_repair_dispositions")?;
+        let found = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in found {
+            rows.push(row?);
+        }
+    }
+    for (decision, bytes) in rows {
+        let verification: GovernedRepairVerificationV1 = decode(&bytes)?;
+        if encode(&verification)? != bytes {
+            return Err(CampaignStoreErrorV1::StoreIdentity);
+        }
+        transaction.execute(
+            "UPDATE governed_repair_dispositions
+             SET verification_receipt_ref=?1, verification_record_id=?2
+             WHERE decision_id=?3 AND verification_receipt_ref IS NULL
+               AND verification_record_id IS NULL",
+            params![
+                verification.verification.as_str(),
+                verification.reference().as_str(),
+                decision
+            ],
+        )?;
+    }
+    let missing: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM governed_repair_dispositions
+         WHERE verification_receipt_ref IS NULL OR verification_record_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if missing != 0 {
+        return Err(CampaignStoreErrorV1::StoreIdentity);
+    }
+    transaction.execute(
+        "UPDATE store_identity SET schema_name=?1, schema_version=?2,
+         schema_digest=?3 WHERE singleton=1",
+        params![
+            CAMPAIGN_STORE_V3_SCHEMA_NAME,
+            3_i64,
+            CAMPAIGN_STORE_V3_SCHEMA_DIGEST,
+        ],
+    )?;
+    transaction.pragma_update(None, "user_version", 3_u32)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v3_to_v4_if_safe(connection: &mut Connection) -> Result<(), CampaignStoreErrorV1> {
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 3 {
+        return Ok(());
+    }
+    let identity: (u32, String, u32, String) = connection.query_row(
+        "SELECT application_id, schema_name, schema_version, schema_digest
+         FROM store_identity WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if identity.0 != CAMPAIGN_STORE_APPLICATION_ID
+        || identity.1 != CAMPAIGN_STORE_V3_SCHEMA_NAME
+        || identity.2 != 3
+        || identity.3 != CAMPAIGN_STORE_V3_SCHEMA_DIGEST
+    {
+        return Err(CampaignStoreErrorV1::StoreIdentity);
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE governed_repair_verification_identities (
+             identity TEXT PRIMARY KEY,
+             identity_class TEXT NOT NULL CHECK (identity_class IN ('receipt','record')),
+             verification_record_id TEXT NOT NULL,
+             verification_jcs BLOB NOT NULL
+         ) STRICT;
+         CREATE TABLE issuance_signing_reservations (
+             issuance_id TEXT PRIMARY KEY,
+             spend_id TEXT NOT NULL UNIQUE,
+             transition_state_digest TEXT NOT NULL UNIQUE,
+             reservation_id TEXT NOT NULL UNIQUE,
+             issuance_jcs BLOB NOT NULL,
+             FOREIGN KEY (issuance_id) REFERENCES ag_authorization_spends(issuance_id),
+             FOREIGN KEY (spend_id) REFERENCES ag_authorization_spends(spend_id)
+         ) STRICT;",
+    )?;
+    let mut rows = Vec::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT verification_receipt_ref,verification_record_id,verification_jcs
+             FROM governed_repair_dispositions ORDER BY decision_id",
+        )?;
+        let found = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        for row in found {
+            rows.push(row?);
+        }
+    }
+    for (receipt, record, bytes) in rows {
+        if receipt == record {
+            return Err(CampaignStoreErrorV1::StoreIdentity);
+        }
+        let verification: GovernedRepairVerificationV1 =
+            decode_exact_artifact(&bytes, "governed repair verification migration")?;
+        if verification.verification.as_str() != receipt
+            || verification.reference().as_str() != record
+        {
+            return Err(CampaignStoreErrorV1::StoreIdentity);
+        }
+        transaction.execute(
+            "INSERT INTO governed_repair_verification_identities
+             (identity,identity_class,verification_record_id,verification_jcs)
+             VALUES (?1,'receipt',?2,?3), (?2,'record',?2,?3)",
+            params![receipt, record, bytes],
+        )?;
+    }
     let schema_digest =
         Digest::hash_domain("ag.governed-loop.store-schema/v1", SCHEMA_SQL.as_bytes());
     transaction.execute(
@@ -2464,105 +3139,6 @@ fn validate_transition_kind(
     Ok(())
 }
 
-fn insert_human_disposition(
-    transaction: &Transaction<'_>,
-    artifact: &HumanDispositionV1,
-    verification: &HumanVerificationRefV1,
-    consumed_at_unix_ms: u64,
-) -> Result<(), CampaignStoreErrorV1> {
-    let exists: bool = transaction.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM human_dispositions WHERE decision_id=?1 OR nonce=?2
-         )",
-        params![artifact.decision.as_str(), artifact.nonce.as_str()],
-        |row| row.get(0),
-    )?;
-    if exists {
-        return Err(CampaignStoreErrorV1::HumanDispositionReplay);
-    }
-    transaction.execute(
-        "INSERT INTO human_dispositions
-         (decision_id, nonce, campaign_id, occurrence_id, halted_state_digest,
-          verification_ref, artifact_jcs, consumed_at_unix_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            artifact.decision.as_str(),
-            artifact.nonce.as_str(),
-            artifact.campaign.as_str(),
-            artifact.occurrence.to_string(),
-            artifact.halted_state_digest.as_str(),
-            verification.as_str(),
-            encode(artifact)?,
-            to_i64(consumed_at_unix_ms)?,
-        ],
-    )?;
-    if let HumanDispositionKindV1::ExactResidualDisposition(discharge) = &artifact.disposition {
-        transaction.execute(
-            "INSERT INTO residual_discharges
-             (decision_id, authority_ref, before_jcs, closed_jcs, after_jcs)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                artifact.decision.as_str(),
-                discharge.authority.as_str(),
-                encode(&discharge.before)?,
-                encode(&discharge.closed)?,
-                encode(&discharge.after)?,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn validate_human_store_binding(
-    expected: &OccurrenceSnapshotV1,
-    first: &OccurrenceSnapshotV1,
-    second: Option<&OccurrenceSnapshotV1>,
-    artifact: &HumanDispositionV1,
-) -> Result<(), CampaignStoreErrorV1> {
-    GovernedLoopKernelV1::validate_successor(expected, first)?;
-    if artifact.campaign != expected.key().campaign
-        || artifact.occurrence != expected.key().occurrence
-        || artifact.halted_state_digest != *expected.state_digest()
-    {
-        return Err(CampaignStoreErrorV1::BindingMismatch);
-    }
-    let before = expected.state().meta().used_human_decisions();
-    let after = first.state().meta().used_human_decisions();
-    if after.len() != before.len().saturating_add(1)
-        || !after.starts_with(before)
-        || after.last() != Some(&artifact.decision)
-    {
-        return Err(CampaignStoreErrorV1::HumanDispositionReplay);
-    }
-    validate_human_transition_evidence(expected, first, artifact)?;
-    match (&artifact.disposition, second) {
-        (
-            HumanDispositionKindV1::ReturnToObservation | HumanDispositionKindV1::ReplaceProgram(_),
-            Some(successor),
-        ) => {
-            if first.program_counter() != ProgramCounterV1::Halted
-                || successor.program_counter() != ProgramCounterV1::ObservationRequired
-            {
-                return Err(CampaignStoreErrorV1::BindingMismatch);
-            }
-            GovernedLoopKernelV1::validate_successor(first, successor)?;
-            validate_human_transition_evidence(first, successor, artifact)?;
-        }
-        (HumanDispositionKindV1::ExactResidualDisposition(_), None) => {
-            if first.program_counter() != ProgramCounterV1::Halted {
-                return Err(CampaignStoreErrorV1::BindingMismatch);
-            }
-        }
-        (HumanDispositionKindV1::Terminate { .. }, None) => {
-            if first.program_counter() != ProgramCounterV1::Completed {
-                return Err(CampaignStoreErrorV1::BindingMismatch);
-            }
-        }
-        _ => return Err(CampaignStoreErrorV1::BindingMismatch),
-    }
-    Ok(())
-}
-
 fn validate_human_transition_evidence(
     source: &OccurrenceSnapshotV1,
     target: &OccurrenceSnapshotV1,
@@ -2672,7 +3248,9 @@ struct StoredTransitionRow {
     predecessor: Digest,
     successor: Digest,
     snapshot: OccurrenceSnapshotV1,
+    snapshot_jcs: Vec<u8>,
     evidence: CampaignTransitionEvidenceV1,
+    evidence_jcs: Vec<u8>,
     evidence_digest: Digest,
     previous_event: Digest,
     event: Digest,
@@ -2728,6 +3306,8 @@ struct ExpectedGovernedRepairRow {
     occurrence: String,
     halted_state_digest: String,
     disposition: String,
+    verification_receipt: String,
+    verification_record: String,
     verification_jcs: Vec<u8>,
     artifact_jcs: Vec<u8>,
     consumed_at_unix_ms: u64,
@@ -2797,14 +3377,18 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
     let mut transitions = Vec::new();
     for row in rows {
         let raw = row?;
+        let snapshot: OccurrenceSnapshotV1 = decode(&raw.5)?;
+        let evidence: CampaignTransitionEvidenceV1 = decode(&raw.6)?;
         transitions.push(StoredTransitionRow {
             source_occurrence: raw.0,
             successor_occurrence: raw.1,
             kind: CampaignTransitionKindV1::parse(&raw.2)?,
             predecessor: parse_digest(&raw.3)?,
             successor: parse_digest(&raw.4)?,
-            snapshot: decode(&raw.5)?,
-            evidence: decode(&raw.6)?,
+            snapshot,
+            snapshot_jcs: raw.5,
+            evidence,
+            evidence_jcs: raw.6,
             evidence_digest: parse_digest(&raw.7)?,
             previous_event: parse_digest(&raw.8)?,
             event: parse_digest(&raw.9)?,
@@ -2830,6 +3414,13 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
 
     for (index, row) in transitions.iter().enumerate() {
         row.snapshot.validate_integrity()?;
+        if encode(&row.snapshot)? != row.snapshot_jcs || encode(&row.evidence)? != row.evidence_jcs
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(format!(
+                "transition {} canonical bytes do not round-trip exactly",
+                index + 1
+            )));
+        }
         if row.snapshot.key().campaign != campaign
             || row.successor_occurrence != row.snapshot.key().occurrence.to_string()
             || row.predecessor != *row.snapshot.prior_state_digest()
@@ -2840,8 +3431,7 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
                 index + 1
             )));
         }
-        let evidence_jcs = encode(&row.evidence)?;
-        let expected_evidence_digest = Digest::hash_domain(EVENT_DOMAIN_V1, &evidence_jcs);
+        let expected_evidence_digest = Digest::hash_domain(EVENT_DOMAIN_V1, &row.evidence_jcs);
         if row.evidence_digest != expected_evidence_digest || row.previous_event != previous_event {
             return Err(CampaignStoreErrorV1::Corrupt(format!(
                 "transition {} evidence/event chain failed",
@@ -3015,6 +3605,8 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
                 occurrence: artifact.occurrence.to_string(),
                 halted_state_digest: artifact.halted_state_digest.as_str().to_owned(),
                 disposition: artifact.reference().as_str().to_owned(),
+                verification_receipt: verification.verification.as_str().to_owned(),
+                verification_record: verification.reference().as_str().to_owned(),
                 verification_jcs: encode(verification)?,
                 artifact_jcs: encode(artifact)?,
                 consumed_at_unix_ms: row.recorded_at_unix_ms,
@@ -3076,6 +3668,8 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
     }
     verify_human_artifacts(connection, &human_artifacts)?;
     verify_governed_repair_artifacts(connection, &governed_repair_artifacts)?;
+    verify_governed_repair_verification_namespace(connection, &governed_repair_artifacts)?;
+    verify_issuance_signing_reservations(connection, &spends)?;
     verify_refusals(connection, &campaign, &transitions)?;
     let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if quick_check != "ok" {
@@ -3160,6 +3754,7 @@ fn validate_replayed_evidence(
             CampaignTransitionKindV1::DocketGovernedRepairHalted,
             CampaignTransitionEvidenceV1::DocketGovernedRepairHalt { result },
         ) => {
+            result.validate()?;
             let (outcome, requirement) = governed_repair_result_parts(result);
             let halted = target.halted().ok_or_else(|| {
                 CampaignStoreErrorV1::Corrupt(
@@ -3472,8 +4067,9 @@ fn verify_governed_repair_artifacts(
 ) -> Result<(), CampaignStoreErrorV1> {
     let mut statement = connection.prepare(
         "SELECT decision_id,nonce,request_id,campaign_id,occurrence_id,
-                halted_state_digest,disposition_id,verification_jcs,
-                artifact_jcs,consumed_at_unix_ms
+                halted_state_digest,disposition_id,verification_receipt_ref,
+                verification_record_id,verification_jcs,artifact_jcs,
+                consumed_at_unix_ms
          FROM governed_repair_dispositions ORDER BY decision_id",
     )?;
     let rows = statement.query_map([], |row| {
@@ -3486,11 +4082,13 @@ fn verify_governed_repair_artifacts(
                 occurrence: row.get(4)?,
                 halted_state_digest: row.get(5)?,
                 disposition: row.get(6)?,
-                verification_jcs: row.get(7)?,
-                artifact_jcs: row.get(8)?,
-                consumed_at_unix_ms: to_u64(row.get(9)?).map_err(|error| {
+                verification_receipt: row.get(7)?,
+                verification_record: row.get(8)?,
+                verification_jcs: row.get(9)?,
+                artifact_jcs: row.get(10)?,
+                consumed_at_unix_ms: to_u64(row.get(11)?).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
-                        9,
+                        11,
                         rusqlite::types::Type::Integer,
                         Box::new(error),
                     )
@@ -3560,6 +4158,97 @@ fn verify_governed_repair_artifacts(
         return Err(CampaignStoreErrorV1::Corrupt(
             "governed repair disposition lacks durable request".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn verify_governed_repair_verification_namespace(
+    connection: &Connection,
+    expected: &BTreeMap<String, ExpectedGovernedRepairRow>,
+) -> Result<(), CampaignStoreErrorV1> {
+    let mut wanted = BTreeMap::new();
+    for row in expected.values() {
+        for (identity, class) in [
+            (&row.verification_receipt, "receipt"),
+            (&row.verification_record, "record"),
+        ] {
+            if wanted
+                .insert(
+                    identity.clone(),
+                    (
+                        class.to_owned(),
+                        row.verification_record.clone(),
+                        row.verification_jcs.clone(),
+                    ),
+                )
+                .is_some()
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "verification receipt/record identity is reused".to_owned(),
+                ));
+            }
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT identity,identity_class,verification_record_id,verification_jcs
+         FROM governed_repair_verification_identities ORDER BY identity",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ),
+        ))
+    })?;
+    let actual: BTreeMap<_, _> = rows.collect::<Result<_, _>>()?;
+    if actual != wanted {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "verification identity namespace differs from replay".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_issuance_signing_reservations(
+    connection: &Connection,
+    spends: &BTreeMap<String, ExpectedSpendRow>,
+) -> Result<(), CampaignStoreErrorV1> {
+    let mut statement = connection.prepare(
+        "SELECT issuance_id,spend_id,transition_state_digest,reservation_id,issuance_jcs
+         FROM issuance_signing_reservations ORDER BY issuance_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (issuance, spend, transition, reservation, bytes) = row?;
+        let Some(expected) = spends.get(&spend) else {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "issuance signing reservation lacks a replayed spend".to_owned(),
+            ));
+        };
+        let expected_reservation = Digest::hash_domain(
+            "ag.governed-loop.issuance-signing-reservation/v1",
+            &expected.issuance_jcs,
+        );
+        if issuance != expected.issuance
+            || transition != expected.transition
+            || bytes != expected.issuance_jcs
+            || reservation != expected_reservation.as_str()
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "issuance signing reservation differs from replayed spend".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3652,6 +4341,12 @@ fn parse_digest(value: &str) -> Result<Digest, CampaignStoreErrorV1> {
     Digest::parse(value).map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))
 }
 
+fn product_artifact_identity<E: std::fmt::Display>(
+    result: Result<Digest, E>,
+) -> Result<Digest, CampaignStoreErrorV1> {
+    result.map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))
+}
+
 fn decode_exact_artifact<T>(bytes: &[u8], label: &str) -> Result<T, CampaignStoreErrorV1>
 where
     T: serde::de::DeserializeOwned + Serialize,
@@ -3736,6 +4431,11 @@ fn validate_direct_artifact_bytes(
         DirectArtifactKindV1::DocketSettlement => {
             let value: DocketSettlementV1 = decode_exact_artifact(bytes, "Docket settlement")?;
             if value.schema != DOCKET_SETTLEMENT_SCHEMA_V1
+                || (value.cumulative_effect_journal_identity.is_some()
+                    && value
+                        .expected_reference()
+                        .map_err(CampaignStoreErrorV1::Kernel)?
+                        != value.settlement)
                 || value.settlement.as_digest() != identity
             {
                 return Err(CampaignStoreErrorV1::Corrupt(
@@ -3822,6 +4522,115 @@ fn governed_repair_result_parts(
             HumanDecisionRequirementV1::Readjudication(requirement.clone()),
         ),
     }
+}
+
+fn docket_checkpoint_artifact(
+    outcome: &DocketGovernedRepairOutcomeRefV1,
+) -> DocketCheckpointArtifactV1 {
+    DocketCheckpointArtifactV1 {
+        schema: DOCKET_CHECKPOINT_ARTIFACT_SCHEMA_V1.to_owned(),
+        checkpoint: outcome.checkpoint.clone(),
+        sealed_result: outcome.sealed_result.clone(),
+        immutable_work_checkpoint: outcome.immutable_work_checkpoint.clone(),
+    }
+}
+
+fn effect_journal_reference_artifact(
+    outcome: &DocketGovernedRepairOutcomeRefV1,
+) -> EffectJournalReferenceArtifactV1 {
+    EffectJournalReferenceArtifactV1 {
+        schema: EFFECT_JOURNAL_REFERENCE_ARTIFACT_SCHEMA_V1.to_owned(),
+        effect_journal: outcome.effect_journal.clone(),
+    }
+}
+
+fn effect_journal_reference_artifact_for_settlement(
+    settlement: &DocketSettlementV1,
+) -> EffectJournalReferenceArtifactV1 {
+    EffectJournalReferenceArtifactV1 {
+        schema: EFFECT_JOURNAL_REFERENCE_ARTIFACT_SCHEMA_V1.to_owned(),
+        effect_journal: settlement
+            .cumulative_effect_journal_identity
+            .clone()
+            .expect("R2 settlement journal checked before product projection"),
+    }
+}
+
+fn successor_binding_artifact(
+    snapshot: &OccurrenceSnapshotV1,
+) -> Option<SuccessorBindingArtifactV1> {
+    let prior = snapshot.prior_occurrence()?;
+    let binding = prior.authorized_successor.clone()?;
+    Some(SuccessorBindingArtifactV1 {
+        schema: SUCCESSOR_BINDING_ARTIFACT_SCHEMA_V1.to_owned(),
+        predecessor: prior.key.clone(),
+        successor: snapshot.key().clone(),
+        binding,
+    })
+}
+
+fn successor_binding_identity(
+    artifact: &SuccessorBindingArtifactV1,
+) -> Result<Digest, CampaignStoreErrorV1> {
+    artifact
+        .identity()
+        .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))
+}
+
+fn residual_state_artifact(snapshot: &OccurrenceSnapshotV1) -> ResidualStateArtifactV1 {
+    ResidualStateArtifactV1 {
+        schema: RESIDUAL_STATE_ARTIFACT_SCHEMA_V1.to_owned(),
+        key: snapshot.key().clone(),
+        state_digest: snapshot.state_digest().clone(),
+        residuals: snapshot.state().meta().residuals().clone(),
+    }
+}
+
+fn residual_state_identity(
+    artifact: &ResidualStateArtifactV1,
+) -> Result<Digest, CampaignStoreErrorV1> {
+    artifact
+        .identity()
+        .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))
+}
+
+fn completion_observation_artifact(
+    snapshot: &OccurrenceSnapshotV1,
+) -> Option<CompletionObservationArtifactV1> {
+    snapshot
+        .terminal_observation()
+        .map(|record| CompletionObservationArtifactV1 {
+            schema: COMPLETION_OBSERVATION_ARTIFACT_SCHEMA_V1.to_owned(),
+            state_digest: snapshot.state_digest().clone(),
+            record: record.clone(),
+        })
+}
+
+fn completion_observation_identity(
+    artifact: &CompletionObservationArtifactV1,
+) -> Result<Digest, CampaignStoreErrorV1> {
+    artifact
+        .identity()
+        .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))
+}
+
+fn terminal_witness_artifact(snapshot: &OccurrenceSnapshotV1) -> Option<TerminalWitnessArtifactV1> {
+    snapshot
+        .terminal_witness()
+        .map(|witness| TerminalWitnessArtifactV1 {
+            schema: TERMINAL_WITNESS_ARTIFACT_SCHEMA_V1.to_owned(),
+            key: snapshot.key().clone(),
+            state_digest: snapshot.state_digest().clone(),
+            witness: witness.clone(),
+        })
+}
+
+fn terminal_witness_identity(
+    artifact: &TerminalWitnessArtifactV1,
+) -> Result<Digest, CampaignStoreErrorV1> {
+    artifact
+        .identity()
+        .map_err(|error| CampaignStoreErrorV1::Canonical(error.to_string()))
 }
 
 fn open_human_decision_request_record_on(
@@ -3917,7 +4726,8 @@ where
             detail.chars().take(512).collect(),
         ));
     }
-    serde_json::from_slice(&output.stdout)
+    JcsDocument::parse(&output.stdout)
+        .and_then(|document| document.decode::<GovernedRepairVerificationV1>())
         .map_err(|error| CampaignStoreErrorV1::GovernedRepairVerifier(error.to_string()))
 }
 

@@ -18,14 +18,13 @@ use std::path::{Path, PathBuf};
 
 use ag_app::governed_product::{
     CreateCampaignV1, CreateDecisionRequestV1, GovernedAgPolicyRootV1, GovernedCampaignServiceV1,
-    GovernedDocketAdapterRootV1, GovernedRepairVerifierRootV1, OccurrencePageRequestV1,
-    PageRequestV1, SubmitGovernedDispositionV1,
+    GovernedDocketAdapterRootV1, GovernedProductErrorV1, GovernedRepairVerifierRootV1,
+    OccurrencePageRequestV1, PageRequestV1, SubmitGovernedDispositionV1,
 };
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::{Digest, JcsDocument};
 use ag_protocol::strict_json_from_slice;
-use anyhow::{Context as _, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -64,6 +63,34 @@ enum Command {
         #[arg(long)]
         database: PathBuf,
     },
+    /// Get one occurrence through the stable product identity contract.
+    GetOccurrence {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        campaign: String,
+        #[arg(long)]
+        occurrence: String,
+    },
+    /// Get one closed-taxonomy artifact by exact identity.
+    GetArtifact {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        identity: String,
+    },
+    /// Get one exact non-authorizing human-decision request.
+    GetDecisionRequest {
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        identity: String,
+    },
+    /// Print only the exact state identity and legal product transitions.
+    AllowedTransitions {
+        #[arg(long)]
+        database: PathBuf,
+    },
     /// List occurrences through the stable product cursor contract.
     ListOccurrences {
         #[arg(long)]
@@ -96,7 +123,8 @@ enum Command {
         cas: CasArguments,
     },
     /// Submit one exact governed-repair disposition through root-owned profile.
-    SubmitGovernedDisposition {
+    #[command(alias = "submit-governed-disposition")]
+    SubmitDisposition {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
@@ -142,7 +170,8 @@ enum Command {
         cas: CasArguments,
     },
     /// Read-only reconcile/poll the exact Docket attempt.
-    Poll {
+    #[command(alias = "poll")]
+    ReconcileDocket {
         #[arg(long)]
         database: PathBuf,
         #[command(flatten)]
@@ -156,7 +185,8 @@ enum Command {
         cas: CasArguments,
     },
     /// Open a distinct authority-empty occurrence after settlement.
-    Continue {
+    #[command(alias = "continue")]
+    OpenContinuation {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
@@ -199,7 +229,8 @@ enum Command {
         cas: CasArguments,
     },
     /// Record a typed non-authorizing refusal without advancing the PC.
-    Refuse {
+    #[command(alias = "refuse")]
+    RecordRefusal {
         #[arg(long)]
         database: PathBuf,
         #[arg(long)]
@@ -300,8 +331,62 @@ struct RefusalInputV1 {
     evidence: Option<Digest>,
 }
 
-fn main() -> anyhow::Result<()> {
-    let arguments = Arguments::parse();
+const CLI_ERROR_SCHEMA_V1: &str = "ag.governed-loop.cli-error/v1";
+
+#[derive(Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CliErrorRecordV1 {
+    schema: &'static str,
+    code: &'static str,
+    detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_state: Option<Digest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authoritative_state: Option<Digest>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+struct StableCliFailureV1 {
+    code: &'static str,
+    detail: String,
+}
+
+fn main() {
+    if let Err(error) = run() {
+        let (code, detail, expected_state, authoritative_state) =
+            if let Some(failure) = error.downcast_ref::<StableCliFailureV1>() {
+                (failure.code, failure.detail.clone(), None, None)
+            } else if let Some(failure) = error.downcast_ref::<GovernedProductErrorV1>() {
+                (
+                    failure.stable_code(),
+                    failure.to_string(),
+                    failure.cas_expected_state().cloned(),
+                    failure.cas_authoritative_state().cloned(),
+                )
+            } else {
+                ("operation_refused", error.to_string(), None, None)
+            };
+        let record = CliErrorRecordV1 {
+            schema: CLI_ERROR_SCHEMA_V1,
+            code,
+            detail,
+            expected_state,
+            authoritative_state,
+        };
+        match JcsDocument::canonicalize(&record) {
+            Ok(document) => eprintln!("{}", document.as_str()),
+            Err(_) => eprintln!(
+                "{{\"code\":\"internal_error\",\"detail\":\"error serialization failed\",\"schema\":\"{CLI_ERROR_SCHEMA_V1}\"}}"
+            ),
+        }
+        std::process::exit(2);
+    }
+}
+
+fn run() -> anyhow::Result<()> {
+    let arguments = Arguments::try_parse()
+        .map_err(|error| stable_failure("invalid_arguments", error.to_string()))?;
     match arguments.command {
         Command::Init { database, genesis } => {
             let input: GenesisInputV1 = read_exact_record(&genesis)?;
@@ -329,6 +414,51 @@ fn main() -> anyhow::Result<()> {
         }
         Command::ProductState { database } => {
             write_exact(&GovernedCampaignServiceV1::open(&database)?.state()?)
+        }
+        Command::GetOccurrence {
+            database,
+            campaign,
+            occurrence,
+        } => {
+            let campaign = CampaignId::from_digest(
+                Digest::parse(&campaign)
+                    .map_err(|error| stable_failure("invalid_campaign", error.to_string()))?,
+            );
+            let occurrence = OccurrenceId::from_uuid(
+                uuid::Uuid::parse_str(&occurrence)
+                    .map_err(|error| stable_failure("invalid_occurrence", error.to_string()))?,
+            );
+            let service = GovernedCampaignServiceV1::open(&database)?;
+            let value = service
+                .occurrence(&OccurrenceKeyV1 {
+                    campaign,
+                    occurrence,
+                })?
+                .ok_or_else(|| stable_failure("occurrence_not_found", "occurrence is absent"))?;
+            write_exact(&value)
+        }
+        Command::GetArtifact { database, identity } => {
+            let identity = Digest::parse(&identity)
+                .map_err(|error| stable_failure("invalid_artifact_identity", error.to_string()))?;
+            let service = GovernedCampaignServiceV1::open(&database)?;
+            let value = service
+                .artifact(&identity)?
+                .ok_or_else(|| stable_failure("artifact_not_found", "artifact is absent"))?;
+            write_exact(&value)
+        }
+        Command::GetDecisionRequest { database, identity } => {
+            let identity =
+                HumanDecisionRequestRefV1::from_digest(Digest::parse(&identity).map_err(
+                    |error| stable_failure("invalid_decision_request_identity", error.to_string()),
+                )?);
+            let service = GovernedCampaignServiceV1::open(&database)?;
+            let value = service.decision_request(&identity)?.ok_or_else(|| {
+                stable_failure("decision_request_not_found", "decision request is absent")
+            })?;
+            write_exact(&value)
+        }
+        Command::AllowedTransitions { database } => {
+            write_exact(&GovernedCampaignServiceV1::open(&database)?.allowed_transitions()?)
         }
         Command::ListOccurrences {
             database,
@@ -362,12 +492,15 @@ fn main() -> anyhow::Result<()> {
             let request: CreateDecisionRequestV1 = read_exact_record(&input)?;
             let expected = parse_expected_state(&cas)?;
             if request.expected_state_digest != expected {
-                bail!("input and --expected-state differ");
+                return Err(stable_failure(
+                    "cas_input_mismatch",
+                    "input and --expected-state differ",
+                ));
             }
             let mut service = GovernedCampaignServiceV1::open(&database)?;
             write_exact(&service.create_decision_request(request)?)
         }
-        Command::SubmitGovernedDisposition {
+        Command::SubmitDisposition {
             database,
             input,
             cas,
@@ -375,7 +508,10 @@ fn main() -> anyhow::Result<()> {
             let request: SubmitGovernedDispositionV1 = read_exact_record(&input)?;
             let expected = parse_expected_state(&cas)?;
             if request.expected_state_digest != expected {
-                bail!("input and --expected-state differ");
+                return Err(stable_failure(
+                    "cas_input_mismatch",
+                    "input and --expected-state differ",
+                ));
             }
             let mut service = GovernedCampaignServiceV1::open(&database)?;
             write_exact(&service.submit_governed_disposition(request)?)
@@ -416,7 +552,7 @@ fn main() -> anyhow::Result<()> {
             let expected = parse_expected_state(&cas)?;
             write_exact(&service.dispatch(&expected)?)
         }
-        Command::Poll { database, cas } => {
+        Command::ReconcileDocket { database, cas } => {
             let mut service = GovernedCampaignServiceV1::open(&database)?;
             let expected = parse_expected_state(&cas)?;
             write_exact(&service.reconcile_docket(&expected)?)
@@ -426,7 +562,7 @@ fn main() -> anyhow::Result<()> {
             let expected = parse_expected_state(&cas)?;
             write_exact(&service.recover(&expected)?)
         }
-        Command::Continue {
+        Command::OpenContinuation {
             database,
             input,
             cas,
@@ -476,7 +612,7 @@ fn main() -> anyhow::Result<()> {
                 input.terminal_witness,
             )?)
         }
-        Command::Refuse {
+        Command::RecordRefusal {
             database,
             input,
             cas,
@@ -490,21 +626,42 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+fn stable_failure(code: &'static str, detail: impl Into<String>) -> anyhow::Error {
+    StableCliFailureV1 {
+        code,
+        detail: detail.into(),
+    }
+    .into()
+}
+
 fn read_exact_record<T>(path: &Path) -> anyhow::Result<T>
 where
     T: DeserializeOwned + Serialize,
 {
-    let bytes = fs::read(path).with_context(|| format!("read exact record {}", path.display()))?;
-    let value: T = strict_json_from_slice(&bytes)
-        .with_context(|| format!("parse exact record {}", path.display()))?;
-    let canonical = JcsDocument::canonicalize(&value)?;
+    let bytes = fs::read(path).map_err(|error| {
+        stable_failure(
+            "input_read_failed",
+            format!("read exact record {}: {error}", path.display()),
+        )
+    })?;
+    let value: T = strict_json_from_slice(&bytes).map_err(|error| {
+        stable_failure(
+            "invalid_input_record",
+            format!("parse exact record {}: {error}", path.display()),
+        )
+    })?;
+    let canonical = JcsDocument::canonicalize(&value)
+        .map_err(|error| stable_failure("invalid_input_record", error.to_string()))?;
     if bytes != canonical.as_bytes()
         && !(bytes.ends_with(b"\n") && &bytes[..bytes.len() - 1] == canonical.as_bytes())
     {
-        bail!(
-            "record is not canonical JSON (with at most one final LF): {}",
-            path.display()
-        );
+        return Err(stable_failure(
+            "noncanonical_input_record",
+            format!(
+                "record is not canonical JSON (with at most one final LF): {}",
+                path.display()
+            ),
+        ));
     }
     Ok(value)
 }
@@ -516,5 +673,6 @@ fn write_exact<T: Serialize + ?Sized>(value: &T) -> anyhow::Result<()> {
 }
 
 fn parse_expected_state(arguments: &CasArguments) -> anyhow::Result<Digest> {
-    Digest::parse(&arguments.expected_state).context("parse --expected-state")
+    Digest::parse(&arguments.expected_state)
+        .map_err(|error| stable_failure("invalid_expected_state", error.to_string()))
 }

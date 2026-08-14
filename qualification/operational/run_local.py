@@ -102,8 +102,8 @@ def main() -> int:
         ("harness-self-test", ["python3", "qualification/operational/self_test.py"]),
         ("build-loopctl", ["cargo", "build", "--locked", "-p", "ag-app", "--bin", "ag-loopctl"]),
         ("kernel", ["cargo", "test", "--locked", "-p", "ag-campaign", "--test", "governed_loop"]),
-        ("store", ["cargo", "test", "--locked", "-p", "ag-store", "--test", "governed_campaign_store"]),
-        ("engine", ["cargo", "test", "--locked", "-p", "ag-app", "--test", "governed_loop_engine"]),
+        ("store", ["cargo", "test", "--locked", "-p", "ag-app", "--lib", "governed_store_tests"]),
+        ("engine", ["cargo", "test", "--locked", "-p", "ag-app", "--lib", "governed_loop_tests"]),
         (
             "nq-c1-hostile-specimens",
             ["cargo", "test", "--locked", "-p", "ag-campaign", "--test", "nq_c1_repair_specimens"],

@@ -17,7 +17,9 @@ pub use capability::{
     InferenceMethodId, InferenceUsageV1, ModelId, ProviderEndpointId, RevocationStateV1,
     SessionLifecycleStateV1, ValidatedInferenceUseV1,
 };
-pub use digest::{Digest, DigestParseError, JcsDocument, JcsError};
+pub use digest::{
+    Digest, DigestParseError, JcsDocument, JcsError, MAX_JCS_SAFE_INTEGER, MIN_JCS_SAFE_INTEGER,
+};
 pub use identity::{
     BootIdentity, CgroupIdentity, DaemonPrincipalV1, EnrollmentId, ExecutableIdentityV1,
     HostCredentialObservationV1, InputSetIdentity, LaunchProfileIdentityV1, OperatorPrincipalV1,
