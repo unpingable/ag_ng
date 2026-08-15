@@ -4,8 +4,8 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 use ag_app::effect_executor_adapter::{
-    EffectExecutorDispatchV1, execute_effect_attempt, load_effect_executor_plan,
-    reconcile_effect_attempt,
+    DocketExecutorReconciliationDispatchV1, EffectExecutorDispatchV1, execute_effect_attempt,
+    load_effect_executor_plan, reconcile_effect_round,
 };
 use ag_primitives::JcsDocument;
 use anyhow::Context as _;
@@ -59,8 +59,8 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Reconcile { plan } => {
             let plan = load_effect_executor_plan(&plan).map_err(anyhow::Error::msg)?;
-            let dispatch: EffectExecutorDispatchV1 = read_stdin_strict()?;
-            let outcome = reconcile_effect_attempt(&plan, &dispatch).map_err(anyhow::Error::msg)?;
+            let dispatch: DocketExecutorReconciliationDispatchV1 = read_stdin_strict()?;
+            let outcome = reconcile_effect_round(&plan, &dispatch).map_err(anyhow::Error::msg)?;
             write_canonical(&outcome)?;
         }
     }

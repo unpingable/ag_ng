@@ -27,6 +27,17 @@ copied-corpus match alone is not a pass. Any step exits nonzero on drift.
 `--ag-target-dir` and `--docket-target-dir` may name external build roots;
 they do not alter the contract or its qualification status.
 
+The AG-owned R5 corpus extension
+`conformance/governed-repair-r2/reconciliation-rounds.v1.json` pins the
+intentional-round request and signature domain, Docket reservation/completion
+and flattened response, and Docket-to-executor reconciliation envelope. The
+directory name preserves the historical R2 base contract; the closed R5
+manifest identity is
+`sha256:74c429d8d32341fc31fba45e4cdd1a0b6d994bace4c7d4d8ccfccfc9dad8aded`.
+The ordinary gate executes actual producer/consumer validators over this
+extension and its hostile mutations; byte mirroring alone remains
+insufficient.
+
 ## Closed Promotion Loop v1 qualification
 
 The fixed qualification baseline is commit `10b7aa9`. The current environment

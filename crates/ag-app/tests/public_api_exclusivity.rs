@@ -429,6 +429,7 @@ fn assert_product_public_types(source: &str) {
             "PreSpendRevisionConstraintViewV1",
             "PreSpendScopeDiscoveryResultV1",
             "ProposalContractViewV1",
+            "ReconcileDocketResultV1",
             "RecordPreSpendScopeDiscoveryV1",
             "ResidualStateArtifactV1",
             "StandingResolutionArtifactV1",
@@ -446,7 +447,10 @@ fn assert_product_public_types(source: &str) {
 fn assert_product_consequence_edges(source: &str) {
     for (needle, expected) in [
         ("CampaignEngineV1::open(", 1),
-        ("CampaignStoreV1::open(", 14),
+        // The fifteenth Store entry is the canonical product reconciliation
+        // operation; it prepares and commits the exact signed round rather
+        // than exposing a second mutation root.
+        ("CampaignStoreV1::open(", 15),
         ("AgIssuanceSignerV2::from_pkcs8(", 2),
         ("self.engine.replay(", 1),
         ("self.engine.governed_repair_request(", 1),
@@ -473,12 +477,15 @@ fn assert_product_consequence_edges(source: &str) {
             "canonical product consequence call-edge census changed for {needle:?}"
         );
     }
+    let ports = include_str!("../src/governed_ports.rs");
+    assert_eq!(ports.matches(".sign(").count(), 2);
+    assert_eq!(ports.matches("sign_permitted(permit)").count(), 1);
     assert_eq!(
-        include_str!("../src/governed_ports.rs")
-            .matches(".sign(")
+        ports
+            .matches("sign_reconciliation_round_permitted(permit)")
             .count(),
         1,
-        "issuance-signature production call-edge census changed"
+        "issuance/reconciliation signature production call-edge census changed"
     );
 }
 

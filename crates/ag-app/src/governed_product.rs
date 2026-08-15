@@ -19,9 +19,10 @@ use serde::{Deserialize, Serialize};
 use ag_campaign::governed::{
     AG_ISSUANCE_SCHEMA_V2, AdmissionDecisionV1, AuthorityHistoryV1, AuthorizedSuccessorBasisV1,
     C1RejectedReviewBasisV1, CanonicalEffectScopeV1, CurrentStandingResolutionV1,
-    DOCKET_CUSTODY_SCHEMA_V1, DOCKET_SETTLEMENT_SCHEMA_V1, DocketAttemptRefV1,
-    DocketCheckpointRefV1, DocketIssuanceRefusalV1, DocketSealedResultRefV1,
-    EXACT_WORK_PROPOSAL_SCHEMA_V1, ExactWorkProposalV1, GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1,
+    DOCKET_CUSTODY_SCHEMA_V1, DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1,
+    DOCKET_SETTLEMENT_SCHEMA_V1, DocketAttemptRefV1, DocketCheckpointRefV1,
+    DocketIssuanceRefusalV1, DocketSealedResultRefV1, EXACT_WORK_PROPOSAL_SCHEMA_V1,
+    ExactWorkProposalV1, GOVERNED_REPAIR_DISPOSITION_SCHEMA_V1,
     GOVERNED_REPAIR_VERIFICATION_SCHEMA_V1, GovernedRepairCheckpointV1, GovernedRepairClosedV1,
     GovernedRepairDispositionV1, GovernedRepairVerifierProfileV1, HUMAN_DECISION_REQUEST_SCHEMA_V1,
     HUMAN_DISPOSITION_SCHEMA_V1, HaltReasonRefV1, HumanDecisionIdV1, HumanDecisionRequestRefV1,
@@ -30,7 +31,9 @@ use ag_campaign::governed::{
     ObservationResolutionV1, OccurrenceId, OccurrenceKeyV1, OccurrenceSnapshotV1,
     PRE_SPEND_SCOPE_DISCOVERY_SCHEMA_V1, PreSpendScopeDiscoveryParametersV1,
     PreSpendScopeDiscoveryRefV1, PreSpendScopeInsufficiencyV1, ProgramBasisRefV1, ProgramCounterV1,
-    ProposalClassV1, ProposalRefV1, RefusalCodeV1, ResidualSetV1, TerminalWitnessRefV1,
+    ProposalClassV1, ProposalRefV1, RECONCILIATION_ROUND_REQUEST_SCHEMA_V1,
+    ReconciliationRoundParametersV1, ReconciliationRoundRefV1, ReconciliationRoundRequestRefV1,
+    RefusalCodeV1, ResidualSetV1, TerminalWitnessRefV1,
 };
 
 use crate::governed_loop::{CampaignEngineErrorV1, CampaignEngineV1};
@@ -73,6 +76,12 @@ impl CampaignEngineErrorV1 {
                 }
                 CampaignStoreErrorV1::IssuanceSigningAlreadyReserved => {
                     "issuance_reconciliation_required"
+                }
+                CampaignStoreErrorV1::ReconciliationRoundReplay => {
+                    "reconciliation_round_replay_or_substitution"
+                }
+                CampaignStoreErrorV1::ReconciliationRoundOutstanding => {
+                    "reconciliation_round_outstanding"
                 }
                 CampaignStoreErrorV1::GovernedRepairVerifier(_) => "verifier_refused",
             },
@@ -586,6 +595,9 @@ impl GovernedDocketAdapterRootV1 {
     fn open_port(
         &self,
         signing_permit: Option<crate::governed_store::StoreIssuanceSigningPermitV1>,
+        reconciliation_round_permit: Option<
+            crate::governed_store::StoreReconciliationRoundSigningPermitV1,
+        >,
     ) -> Result<CommandDocketCustodyPortV1, CampaignEngineErrorV1> {
         self.verify_runtime_correspondence()?;
         // Reread and reparse at the actual port-construction boundary. The
@@ -609,6 +621,7 @@ impl GovernedDocketAdapterRootV1 {
                 .map(|file| file.path.clone()),
             signer,
             signing_permit,
+            reconciliation_round_permit,
         ))
     }
 }
@@ -769,6 +782,10 @@ pub enum GovernedArtifactKindV1 {
     DocketSettlement,
     /// Exact indeterminate Docket reconciliation evidence.
     DocketIndeterminateOutcome,
+    /// Exact nonauthorizing AG reconciliation-round request.
+    ReconciliationRoundRequest,
+    /// Exact Docket reservation/completion response for one round.
+    DocketReconciliationRoundResponse,
     /// Exact Docket issuance refusal.
     DocketIssuanceRefusal,
     /// Complete Docket-sealed governed-repair result.
@@ -1345,6 +1362,9 @@ pub struct CampaignStateViewV1 {
     pub campaign_artifacts: Vec<GovernedArtifactLinkV1>,
     /// Exact current unconsumed, unexpired decision request, when one exists.
     pub open_human_decision_request: Option<HumanDecisionRequestRefV1>,
+    /// Exact prepared/in-flight reconciliation request, when this cut is
+    /// fenced against every operation except exact round observation/replay.
+    pub open_reconciliation_round_request: Option<ReconciliationRoundRequestRefV1>,
     /// Closed operations legal from the current program counter.
     pub allowed_transitions: Vec<GovernedOperationV1>,
     /// Last durable event sequence.
@@ -1371,6 +1391,8 @@ pub struct AllowedTransitionsViewV1 {
     /// Exact currently open request, when request expiry participates in the
     /// legal transition projection.
     pub open_human_decision_request: Option<HumanDecisionRequestRefV1>,
+    /// Exact prepared/in-flight reconciliation request fencing this cut.
+    pub open_reconciliation_round_request: Option<ReconciliationRoundRequestRefV1>,
     /// Closed product operations legal from this exact state.
     pub allowed_transitions: Vec<GovernedOperationV1>,
 }
@@ -1472,6 +1494,23 @@ pub struct PreSpendScopeDiscoveryResultV1 {
     pub revised_proposal: ProposalRefV1,
     /// Whether this call observed an already committed exact replay.
     pub replayed: bool,
+}
+
+/// Stable result of preparing and observing one explicit reconciliation poll.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileDocketResultV1 {
+    /// Exact Store-persisted request.
+    pub request: ReconciliationRoundRequestRefV1,
+    /// Exact intentional poll round.
+    pub round: ReconciliationRoundRefV1,
+    /// Whether the Store request was an exact durable replay.
+    pub request_replayed: bool,
+    /// Whether AG returned an already committed response without crossing the
+    /// Docket boundary.
+    pub response_replayed: bool,
+    /// Exact resulting durable campaign view.
+    pub state: CampaignStateViewV1,
 }
 
 /// Stable request-creation operation with explicit CAS and idempotency.
@@ -1697,6 +1736,7 @@ impl GovernedCampaignServiceV1 {
         }
         let current = read.current;
         let open_request = read.open_human_decision_request;
+        let open_reconciliation_round_request = read.open_reconciliation_round_request;
         let governed_state = governed_decision_state(&current, open_request.is_some())?;
         let mut current_view = project_occurrence(&store, &current, now_unix_ms)?;
         if let Some(halted) = current_view.halted.as_mut() {
@@ -1747,11 +1787,13 @@ impl GovernedCampaignServiceV1 {
                         .is_some_and(|proposal| proposal.governed_repair_checkpoint().is_none()),
                     docket,
                     verifier,
+                    reconciliation_round_outstanding: open_reconciliation_round_request.is_some(),
                 },
             ),
             current: current_view,
             campaign_artifacts,
             open_human_decision_request: open_request,
+            open_reconciliation_round_request,
             event_sequence: read.head.event_count,
             observed_at_unix_ms: now_unix_ms,
         })
@@ -1772,6 +1814,7 @@ impl GovernedCampaignServiceV1 {
             event_sequence: state.event_sequence,
             observed_at_unix_ms: state.observed_at_unix_ms,
             open_human_decision_request: state.open_human_decision_request,
+            open_reconciliation_round_request: state.open_reconciliation_round_request,
             allowed_transitions: state.allowed_transitions,
         })
     }
@@ -2183,15 +2226,35 @@ impl GovernedCampaignServiceV1 {
     /// Returns an error for stale state, absent/mismatched adapter root, Docket refusal, or Store failure.
     pub fn reconcile_docket(
         &mut self,
-        expected_state_digest: &Digest,
-    ) -> Result<CampaignStateViewV1, CampaignEngineErrorV1> {
-        self.require_allowed(expected_state_digest, GovernedOperationV1::ReconcileDocket)?;
+        parameters: impl std::borrow::Borrow<ReconciliationRoundParametersV1>,
+    ) -> Result<ReconcileDocketResultV1, CampaignEngineErrorV1> {
+        let parameters = std::borrow::Borrow::borrow(&parameters);
         let now_unix_ms = self.consequence_now()?;
-        let mut docket = self.docket_port(None)?;
+        let mut store = CampaignStoreV1::open(self.engine.store_path())?;
+        if let Some((request, _response)) =
+            store.reconciliation_round_response_replay(parameters)?
+        {
+            return Ok(ReconcileDocketResultV1 {
+                request: request.request,
+                round: request.round,
+                request_replayed: true,
+                response_replayed: true,
+                state: self.state()?,
+            });
+        }
+        let (request, permit, request_replayed) =
+            store.reconciliation_round_signing_permit(parameters)?;
+        let mut docket = self.docket_port(None, Some(permit))?;
         let _ = self
             .engine
-            .poll_docket(expected_state_digest, &mut docket, now_unix_ms)?;
-        self.state()
+            .poll_docket_round(&request, &mut docket, now_unix_ms)?;
+        Ok(ReconcileDocketResultV1 {
+            request: request.request,
+            round: request.round,
+            request_replayed,
+            response_replayed: false,
+            state: self.state()?,
+        })
     }
 
     /// Opens one ordinary post-settlement continuation through the canonical
@@ -2395,7 +2458,7 @@ impl GovernedCampaignServiceV1 {
         let mut store = CampaignStoreV1::open(self.engine.store_path())?;
         match store.issuance_signing_permit(expected) {
             Ok(permit) => {
-                let mut docket = self.docket_port(Some(permit))?;
+                let mut docket = self.docket_port(Some(permit), None)?;
                 OccurrenceViewV1::try_from(&self.engine.dispatch(
                     expected,
                     &mut docket,
@@ -2406,7 +2469,7 @@ impl GovernedCampaignServiceV1 {
                 // A prior process already crossed the one-use authentication
                 // boundary. Never mint or sign again: reconcile the exact
                 // issuance through Docket's replay-safe read boundary.
-                let mut docket = self.docket_port(None)?;
+                let mut docket = self.docket_port(None, None)?;
                 let _ = self.engine.recover(expected, &mut docket, now_unix_ms)?;
                 OccurrenceViewV1::try_from(&self.engine.current()?)
             }
@@ -2425,7 +2488,7 @@ impl GovernedCampaignServiceV1 {
     ) -> Result<CampaignStateViewV1, CampaignEngineErrorV1> {
         self.require_allowed(expected, GovernedOperationV1::Recover)?;
         let now_unix_ms = self.consequence_now()?;
-        let mut docket = self.docket_port(None)?;
+        let mut docket = self.docket_port(None, None)?;
         let _ = self.engine.recover(expected, &mut docket, now_unix_ms)?;
         self.state()
     }
@@ -2433,6 +2496,9 @@ impl GovernedCampaignServiceV1 {
     fn docket_port(
         &self,
         signing_permit: Option<crate::governed_store::StoreIssuanceSigningPermitV1>,
+        reconciliation_round_permit: Option<
+            crate::governed_store::StoreReconciliationRoundSigningPermitV1,
+        >,
     ) -> Result<CommandDocketCustodyPortV1, CampaignEngineErrorV1> {
         self.docket_root
             .as_ref()
@@ -2441,7 +2507,7 @@ impl GovernedCampaignServiceV1 {
                     "deployment-owned Docket adapter root is not configured".to_owned(),
                 )
             })?
-            .open_port(signing_permit)
+            .open_port(signing_permit, reconciliation_round_permit)
     }
 
     /// Samples the deployment-owned consequence clock and refuses regression
@@ -2616,67 +2682,11 @@ fn project_occurrence(
         }
     }
     for link in store.lifecycle_artifact_links(snapshot.key())? {
-        let kind = match link.kind {
-            StoreLifecycleArtifactKindV1::ObservationResolution => {
-                GovernedArtifactKindV1::ObservationResolution
-            }
-            StoreLifecycleArtifactKindV1::StandingResolution => {
-                GovernedArtifactKindV1::StandingResolution
-            }
-            StoreLifecycleArtifactKindV1::AdmissionDecision => {
-                GovernedArtifactKindV1::AdmissionDecision
-            }
-            StoreLifecycleArtifactKindV1::AgAuthorizationSpend => {
-                GovernedArtifactKindV1::AgAuthorizationSpend
-            }
-            StoreLifecycleArtifactKindV1::AgIssuance => GovernedArtifactKindV1::AgIssuance,
-            StoreLifecycleArtifactKindV1::DocketCustody => GovernedArtifactKindV1::DocketCustody,
-            StoreLifecycleArtifactKindV1::DocketSettlement => {
-                GovernedArtifactKindV1::DocketSettlement
-            }
-            StoreLifecycleArtifactKindV1::DocketGovernedRepairResult => {
-                GovernedArtifactKindV1::DocketGovernedRepairResult
-            }
-            StoreLifecycleArtifactKindV1::GovernedRepairDisposition => {
-                GovernedArtifactKindV1::GovernedRepairDisposition
-            }
-            StoreLifecycleArtifactKindV1::GovernedRepairVerification => {
-                GovernedArtifactKindV1::GovernedRepairVerification
-            }
-            StoreLifecycleArtifactKindV1::HumanDecisionRequest => {
-                GovernedArtifactKindV1::HumanDecisionRequest
-            }
-            StoreLifecycleArtifactKindV1::DocketCheckpointReference => {
-                GovernedArtifactKindV1::DocketCheckpointReference
-            }
-            StoreLifecycleArtifactKindV1::EffectJournalReference => {
-                GovernedArtifactKindV1::EffectJournalReference
-            }
-            StoreLifecycleArtifactKindV1::DocketIndeterminateOutcome => {
-                GovernedArtifactKindV1::DocketIndeterminateOutcome
-            }
-            StoreLifecycleArtifactKindV1::SuccessorBinding => {
-                GovernedArtifactKindV1::SuccessorBinding
-            }
-            StoreLifecycleArtifactKindV1::PreSpendScopeDiscovery => {
-                GovernedArtifactKindV1::PreSpendScopeDiscovery
-            }
-            StoreLifecycleArtifactKindV1::ResidualState => GovernedArtifactKindV1::ResidualState,
-            StoreLifecycleArtifactKindV1::CompletionObservation => {
-                GovernedArtifactKindV1::CompletionObservation
-            }
-            StoreLifecycleArtifactKindV1::TerminalWitness => {
-                GovernedArtifactKindV1::TerminalWitness
-            }
-            StoreLifecycleArtifactKindV1::HistoricalHumanDisposition => {
-                GovernedArtifactKindV1::HistoricalHumanDisposition
-            }
-            StoreLifecycleArtifactKindV1::DocketIssuanceRefusal => {
-                GovernedArtifactKindV1::DocketIssuanceRefusal
-            }
-            StoreLifecycleArtifactKindV1::Refusal => GovernedArtifactKindV1::Refusal,
-        };
-        push_artifact_link(&mut view.artifacts, kind, &link.identity);
+        push_artifact_link(
+            &mut view.artifacts,
+            governed_artifact_kind(link.kind),
+            &link.identity,
+        );
     }
     view.artifacts.sort();
     view.artifacts.dedup();
@@ -2854,6 +2864,69 @@ fn push_artifact_link(
     });
 }
 
+fn governed_artifact_kind(kind: StoreLifecycleArtifactKindV1) -> GovernedArtifactKindV1 {
+    match kind {
+        StoreLifecycleArtifactKindV1::ObservationResolution => {
+            GovernedArtifactKindV1::ObservationResolution
+        }
+        StoreLifecycleArtifactKindV1::StandingResolution => {
+            GovernedArtifactKindV1::StandingResolution
+        }
+        StoreLifecycleArtifactKindV1::AdmissionDecision => {
+            GovernedArtifactKindV1::AdmissionDecision
+        }
+        StoreLifecycleArtifactKindV1::AgAuthorizationSpend => {
+            GovernedArtifactKindV1::AgAuthorizationSpend
+        }
+        StoreLifecycleArtifactKindV1::AgIssuance => GovernedArtifactKindV1::AgIssuance,
+        StoreLifecycleArtifactKindV1::DocketCustody => GovernedArtifactKindV1::DocketCustody,
+        StoreLifecycleArtifactKindV1::DocketSettlement => GovernedArtifactKindV1::DocketSettlement,
+        StoreLifecycleArtifactKindV1::DocketGovernedRepairResult => {
+            GovernedArtifactKindV1::DocketGovernedRepairResult
+        }
+        StoreLifecycleArtifactKindV1::GovernedRepairDisposition => {
+            GovernedArtifactKindV1::GovernedRepairDisposition
+        }
+        StoreLifecycleArtifactKindV1::GovernedRepairVerification => {
+            GovernedArtifactKindV1::GovernedRepairVerification
+        }
+        StoreLifecycleArtifactKindV1::HumanDecisionRequest => {
+            GovernedArtifactKindV1::HumanDecisionRequest
+        }
+        StoreLifecycleArtifactKindV1::DocketCheckpointReference => {
+            GovernedArtifactKindV1::DocketCheckpointReference
+        }
+        StoreLifecycleArtifactKindV1::EffectJournalReference => {
+            GovernedArtifactKindV1::EffectJournalReference
+        }
+        StoreLifecycleArtifactKindV1::DocketIndeterminateOutcome => {
+            GovernedArtifactKindV1::DocketIndeterminateOutcome
+        }
+        StoreLifecycleArtifactKindV1::ReconciliationRoundRequest => {
+            GovernedArtifactKindV1::ReconciliationRoundRequest
+        }
+        StoreLifecycleArtifactKindV1::DocketReconciliationRoundResponse => {
+            GovernedArtifactKindV1::DocketReconciliationRoundResponse
+        }
+        StoreLifecycleArtifactKindV1::SuccessorBinding => GovernedArtifactKindV1::SuccessorBinding,
+        StoreLifecycleArtifactKindV1::PreSpendScopeDiscovery => {
+            GovernedArtifactKindV1::PreSpendScopeDiscovery
+        }
+        StoreLifecycleArtifactKindV1::ResidualState => GovernedArtifactKindV1::ResidualState,
+        StoreLifecycleArtifactKindV1::CompletionObservation => {
+            GovernedArtifactKindV1::CompletionObservation
+        }
+        StoreLifecycleArtifactKindV1::TerminalWitness => GovernedArtifactKindV1::TerminalWitness,
+        StoreLifecycleArtifactKindV1::HistoricalHumanDisposition => {
+            GovernedArtifactKindV1::HistoricalHumanDisposition
+        }
+        StoreLifecycleArtifactKindV1::DocketIssuanceRefusal => {
+            GovernedArtifactKindV1::DocketIssuanceRefusal
+        }
+        StoreLifecycleArtifactKindV1::Refusal => GovernedArtifactKindV1::Refusal,
+    }
+}
+
 fn artifact_schema(kind: GovernedArtifactKindV1) -> &'static str {
     match kind {
         GovernedArtifactKindV1::ProductCreation => "ag.governed-loop.product-create/v1",
@@ -2870,6 +2943,12 @@ fn artifact_schema(kind: GovernedArtifactKindV1) -> &'static str {
         GovernedArtifactKindV1::DocketSettlement => DOCKET_SETTLEMENT_SCHEMA_V1,
         GovernedArtifactKindV1::DocketIndeterminateOutcome => {
             DOCKET_INDETERMINATE_ARTIFACT_SCHEMA_V1
+        }
+        GovernedArtifactKindV1::ReconciliationRoundRequest => {
+            RECONCILIATION_ROUND_REQUEST_SCHEMA_V1
+        }
+        GovernedArtifactKindV1::DocketReconciliationRoundResponse => {
+            DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1
         }
         GovernedArtifactKindV1::DocketIssuanceRefusal => "docket.governed-loop.issuance-refusal/v1",
         GovernedArtifactKindV1::DocketGovernedRepairResult => {
@@ -2912,74 +2991,7 @@ fn artifact_occurrences(
                     .lifecycle_artifact_links(snapshot.key())?
                     .into_iter()
                     .map(|link| GovernedArtifactLinkV1 {
-                        kind: match link.kind {
-                            StoreLifecycleArtifactKindV1::ObservationResolution => {
-                                GovernedArtifactKindV1::ObservationResolution
-                            }
-                            StoreLifecycleArtifactKindV1::StandingResolution => {
-                                GovernedArtifactKindV1::StandingResolution
-                            }
-                            StoreLifecycleArtifactKindV1::AdmissionDecision => {
-                                GovernedArtifactKindV1::AdmissionDecision
-                            }
-                            StoreLifecycleArtifactKindV1::AgAuthorizationSpend => {
-                                GovernedArtifactKindV1::AgAuthorizationSpend
-                            }
-                            StoreLifecycleArtifactKindV1::AgIssuance => {
-                                GovernedArtifactKindV1::AgIssuance
-                            }
-                            StoreLifecycleArtifactKindV1::DocketCustody => {
-                                GovernedArtifactKindV1::DocketCustody
-                            }
-                            StoreLifecycleArtifactKindV1::DocketSettlement => {
-                                GovernedArtifactKindV1::DocketSettlement
-                            }
-                            StoreLifecycleArtifactKindV1::DocketGovernedRepairResult => {
-                                GovernedArtifactKindV1::DocketGovernedRepairResult
-                            }
-                            StoreLifecycleArtifactKindV1::GovernedRepairDisposition => {
-                                GovernedArtifactKindV1::GovernedRepairDisposition
-                            }
-                            StoreLifecycleArtifactKindV1::GovernedRepairVerification => {
-                                GovernedArtifactKindV1::GovernedRepairVerification
-                            }
-                            StoreLifecycleArtifactKindV1::HumanDecisionRequest => {
-                                GovernedArtifactKindV1::HumanDecisionRequest
-                            }
-                            StoreLifecycleArtifactKindV1::DocketCheckpointReference => {
-                                GovernedArtifactKindV1::DocketCheckpointReference
-                            }
-                            StoreLifecycleArtifactKindV1::EffectJournalReference => {
-                                GovernedArtifactKindV1::EffectJournalReference
-                            }
-                            StoreLifecycleArtifactKindV1::DocketIndeterminateOutcome => {
-                                GovernedArtifactKindV1::DocketIndeterminateOutcome
-                            }
-                            StoreLifecycleArtifactKindV1::SuccessorBinding => {
-                                GovernedArtifactKindV1::SuccessorBinding
-                            }
-                            StoreLifecycleArtifactKindV1::PreSpendScopeDiscovery => {
-                                GovernedArtifactKindV1::PreSpendScopeDiscovery
-                            }
-                            StoreLifecycleArtifactKindV1::ResidualState => {
-                                GovernedArtifactKindV1::ResidualState
-                            }
-                            StoreLifecycleArtifactKindV1::CompletionObservation => {
-                                GovernedArtifactKindV1::CompletionObservation
-                            }
-                            StoreLifecycleArtifactKindV1::TerminalWitness => {
-                                GovernedArtifactKindV1::TerminalWitness
-                            }
-                            StoreLifecycleArtifactKindV1::HistoricalHumanDisposition => {
-                                GovernedArtifactKindV1::HistoricalHumanDisposition
-                            }
-                            StoreLifecycleArtifactKindV1::DocketIssuanceRefusal => {
-                                GovernedArtifactKindV1::DocketIssuanceRefusal
-                            }
-                            StoreLifecycleArtifactKindV1::Refusal => {
-                                GovernedArtifactKindV1::Refusal
-                            }
-                        },
+                        kind: governed_artifact_kind(link.kind),
                         identity: link.identity,
                     }),
             );
@@ -3014,6 +3026,12 @@ fn classify_artifact(bytes: &[u8]) -> Result<GovernedArtifactKindV1, CampaignEng
         Some(AG_ISSUANCE_SCHEMA_V2) => GovernedArtifactKindV1::AgIssuance,
         Some(DOCKET_CUSTODY_SCHEMA_V1) => GovernedArtifactKindV1::DocketCustody,
         Some(DOCKET_SETTLEMENT_SCHEMA_V1) => GovernedArtifactKindV1::DocketSettlement,
+        Some(RECONCILIATION_ROUND_REQUEST_SCHEMA_V1) => {
+            GovernedArtifactKindV1::ReconciliationRoundRequest
+        }
+        Some(DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1) => {
+            GovernedArtifactKindV1::DocketReconciliationRoundResponse
+        }
         Some(DOCKET_INDETERMINATE_ARTIFACT_SCHEMA_V1) => {
             GovernedArtifactKindV1::DocketIndeterminateOutcome
         }
@@ -3113,6 +3131,7 @@ struct AllowedTransitionStateV1 {
     pre_spend_revision_eligible: bool,
     docket: DocketDeploymentStateV1,
     verifier: VerifierDeploymentStateV1,
+    reconciliation_round_outstanding: bool,
 }
 
 fn governed_decision_state(
@@ -3162,104 +3181,151 @@ fn allow_halted_transition(names: &mut Vec<GovernedOperationV1>, state: AllowedT
     }
 }
 
+fn push_transition(
+    names: &mut Vec<GovernedOperationV1>,
+    legal: bool,
+    operation: GovernedOperationV1,
+) {
+    if legal {
+        names.push(operation);
+    }
+}
+
+fn allow_observation_required(
+    names: &mut Vec<GovernedOperationV1>,
+    state: AllowedTransitionStateV1,
+) {
+    push_transition(
+        names,
+        state.proposal == ProposalTimeStateV1::Current,
+        GovernedOperationV1::RecordProposal,
+    );
+    push_transition(names, state.residuals_empty, GovernedOperationV1::Complete);
+    push_transition(
+        names,
+        state.budget.probe_available(),
+        GovernedOperationV1::NoteProbe,
+    );
+    names.push(GovernedOperationV1::Halt);
+    push_transition(
+        names,
+        state.budget.escalation_available(),
+        GovernedOperationV1::Escalate,
+    );
+}
+
+fn allow_proposal_recorded(names: &mut Vec<GovernedOperationV1>, state: AllowedTransitionStateV1) {
+    names.push(GovernedOperationV1::RequireStanding);
+    names.push(GovernedOperationV1::Halt);
+    push_transition(
+        names,
+        state.pre_spend_revision_eligible && state.proposal == ProposalTimeStateV1::Current,
+        GovernedOperationV1::HaltPreSpendScopeInsufficiency,
+    );
+    push_transition(
+        names,
+        state.budget.escalation_available(),
+        GovernedOperationV1::Escalate,
+    );
+}
+
+fn allow_settled_observation_required(
+    names: &mut Vec<GovernedOperationV1>,
+    state: AllowedTransitionStateV1,
+) {
+    // The settlement and its correspondence artifacts are already durable
+    // and independently retrievable. Explicit executor reconciliation rounds
+    // are legal only while an attempt remains Dispatched or
+    // ReconciliationRequired; a terminal Docket replay is therefore
+    // observation through the artifact surface, not a new product mutation.
+    names.push(GovernedOperationV1::OpenContinuation);
+    push_transition(
+        names,
+        state.budget.probe_available(),
+        GovernedOperationV1::NoteProbe,
+    );
+    names.push(GovernedOperationV1::Halt);
+    push_transition(
+        names,
+        state.budget.escalation_available(),
+        GovernedOperationV1::Escalate,
+    );
+}
+
 fn allowed_transitions(
     pc: ProgramCounterV1,
     state: AllowedTransitionStateV1,
 ) -> Vec<GovernedOperationV1> {
+    if state.reconciliation_round_outstanding {
+        return if state.docket == DocketDeploymentStateV1::RuntimeCurrent {
+            vec![GovernedOperationV1::ReconcileDocket]
+        } else {
+            Vec::new()
+        };
+    }
     let mut names = Vec::new();
-    let mut allow = |legal: bool, operation: GovernedOperationV1| {
-        if legal {
-            names.push(operation);
-        }
-    };
     let docket_current = state.docket == DocketDeploymentStateV1::RuntimeCurrent;
     match pc {
-        ProgramCounterV1::ObservationRequired => {
-            allow(
-                state.proposal == ProposalTimeStateV1::Current,
-                GovernedOperationV1::RecordProposal,
-            );
-            allow(state.residuals_empty, GovernedOperationV1::Complete);
-            allow(
-                state.budget.probe_available(),
-                GovernedOperationV1::NoteProbe,
-            );
-            allow(true, GovernedOperationV1::Halt);
-            allow(
-                state.budget.escalation_available(),
-                GovernedOperationV1::Escalate,
-            );
-        }
-        ProgramCounterV1::ProposalRecorded => {
-            allow(true, GovernedOperationV1::RequireStanding);
-            allow(true, GovernedOperationV1::Halt);
-            allow(
-                state.pre_spend_revision_eligible && state.proposal == ProposalTimeStateV1::Current,
-                GovernedOperationV1::HaltPreSpendScopeInsufficiency,
-            );
-            allow(
-                state.budget.escalation_available(),
-                GovernedOperationV1::Escalate,
-            );
-        }
+        ProgramCounterV1::ObservationRequired => allow_observation_required(&mut names, state),
+        ProgramCounterV1::ProposalRecorded => allow_proposal_recorded(&mut names, state),
         ProgramCounterV1::StandingRequired => {
-            allow(
+            push_transition(
+                &mut names,
                 state.proposal == ProposalTimeStateV1::Current,
                 GovernedOperationV1::Decide,
             );
-            allow(true, GovernedOperationV1::Halt);
-            allow(
+            names.push(GovernedOperationV1::Halt);
+            push_transition(
+                &mut names,
                 state.budget.escalation_available(),
                 GovernedOperationV1::Escalate,
             );
         }
         ProgramCounterV1::AdmissiblePendingAuthorization => {
-            allow(
+            push_transition(
+                &mut names,
                 state.proposal == ProposalTimeStateV1::Current && docket_current,
                 GovernedOperationV1::Authorize,
             );
-            allow(true, GovernedOperationV1::Halt);
-            allow(
+            names.push(GovernedOperationV1::Halt);
+            push_transition(
+                &mut names,
                 state.budget.escalation_available(),
                 GovernedOperationV1::Escalate,
             );
         }
         ProgramCounterV1::AuthorizationConsumed => {
-            allow(
+            push_transition(
+                &mut names,
                 state.proposal == ProposalTimeStateV1::Current && docket_current,
                 GovernedOperationV1::Dispatch,
             );
-            allow(docket_current, GovernedOperationV1::Recover);
+            push_transition(&mut names, docket_current, GovernedOperationV1::Recover);
         }
         ProgramCounterV1::Dispatched => {
-            allow(docket_current, GovernedOperationV1::ReconcileDocket);
-            allow(docket_current, GovernedOperationV1::Recover);
+            push_transition(
+                &mut names,
+                docket_current,
+                GovernedOperationV1::ReconcileDocket,
+            );
+            push_transition(&mut names, docket_current, GovernedOperationV1::Recover);
         }
         ProgramCounterV1::ReconciliationRequired => {
-            allow(docket_current, GovernedOperationV1::ReconcileDocket);
-            allow(docket_current, GovernedOperationV1::Recover);
-            allow(true, GovernedOperationV1::Halt);
-            allow(
+            push_transition(
+                &mut names,
+                docket_current,
+                GovernedOperationV1::ReconcileDocket,
+            );
+            push_transition(&mut names, docket_current, GovernedOperationV1::Recover);
+            names.push(GovernedOperationV1::Halt);
+            push_transition(
+                &mut names,
                 state.budget.escalation_available(),
                 GovernedOperationV1::Escalate,
             );
         }
         ProgramCounterV1::SettledObservationRequired => {
-            // Exact settlement replay is a read-only reconciliation. Docket
-            // re-emits the already sealed result and the kernel requires byte
-            // equality, so this never repeats executor mechanics or creates a
-            // fresh transition.
-            allow(docket_current, GovernedOperationV1::ReconcileDocket);
-            allow(true, GovernedOperationV1::OpenContinuation);
-            allow(
-                state.budget.probe_available(),
-                GovernedOperationV1::NoteProbe,
-            );
-            allow(true, GovernedOperationV1::Halt);
-            allow(
-                state.budget.escalation_available(),
-                GovernedOperationV1::Escalate,
-            );
+            allow_settled_observation_required(&mut names, state);
         }
         ProgramCounterV1::Halted => allow_halted_transition(&mut names, state),
         ProgramCounterV1::Completed => {}
@@ -3295,6 +3361,7 @@ mod tests {
             pre_spend_revision_eligible: true,
             docket: DocketDeploymentStateV1::RuntimeCurrent,
             verifier: VerifierDeploymentStateV1::RuntimeCurrent,
+            reconciliation_round_outstanding: false,
         };
         let cases = [
             (
@@ -3373,7 +3440,6 @@ mod tests {
                 ProgramCounterV1::SettledObservationRequired,
                 ordinary,
                 &[
-                    GovernedOperationV1::ReconcileDocket,
                     GovernedOperationV1::OpenContinuation,
                     GovernedOperationV1::NoteProbe,
                     GovernedOperationV1::Halt,
@@ -3448,6 +3514,16 @@ mod tests {
                 GovernedOperationV1::Recover,
                 GovernedOperationV1::RecordRefusal,
             ],
+        );
+        assert_eq!(
+            allowed_transitions(
+                ProgramCounterV1::ReconciliationRequired,
+                AllowedTransitionStateV1 {
+                    reconciliation_round_outstanding: true,
+                    ..ordinary
+                },
+            ),
+            [GovernedOperationV1::ReconcileDocket],
         );
     }
 }

@@ -32,6 +32,270 @@ fn sorted(labels: &[&str]) -> Vec<Digest> {
     values
 }
 
+fn product_round_reservation(
+    request: &ReconciliationRoundRequestV1,
+) -> DocketReconciliationRoundReservationV1 {
+    let source_cut = digest("product-replay-source-cut");
+    let executor_binding = digest("product-replay-executor");
+    let claimed_at_unix_ms = 4_000_000_000_000;
+    let body = serde_json::json!({
+        "schema": DOCKET_RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1,
+        "request": request.request,
+        "round": request.round,
+        "issuance": request.issuance,
+        "attempt": request.attempt,
+        "caller_state_digest": request.caller_state_digest,
+        "source_cut": source_cut,
+        "executor_binding": executor_binding,
+        "claimed_at_unix_ms": claimed_at_unix_ms,
+    });
+    let bytes = ag_primitives::JcsDocument::canonicalize(&body).unwrap();
+    DocketReconciliationRoundReservationV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1.to_owned(),
+        reservation: DocketReconciliationReservationRefV1::from_digest(Digest::hash_domain(
+            "docket.governed-loop.reconciliation-round-reservation/v1",
+            bytes.as_bytes(),
+        )),
+        request: request.request.clone(),
+        round: request.round.clone(),
+        issuance: request.issuance.clone(),
+        attempt: request.attempt.clone(),
+        caller_state_digest: request.caller_state_digest.clone(),
+        predecessor_round: None,
+        predecessor_reconciliation: None,
+        source_cut,
+        checkpoint_identity: None,
+        executor_binding,
+        claimed_at_unix_ms,
+    }
+}
+
+fn product_round_completion(
+    request: &ReconciliationRoundRequestV1,
+    reservation: &DocketReconciliationRoundReservationV1,
+    result_identity: Digest,
+) -> DocketReconciliationRoundCompletionV1 {
+    let completed_at_unix_ms = 4_000_000_000_000;
+    let body = serde_json::json!({
+        "schema": DOCKET_RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1,
+        "reservation": reservation.reservation,
+        "round": request.round,
+        "result_identity": result_identity,
+        "completed_at_unix_ms": completed_at_unix_ms,
+    });
+    let bytes = ag_primitives::JcsDocument::canonicalize(&body).unwrap();
+    DocketReconciliationRoundCompletionV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1.to_owned(),
+        completion: DocketReconciliationCompletionRefV1::from_digest(Digest::hash_domain(
+            "docket.governed-loop.reconciliation-round-completion/v1",
+            bytes.as_bytes(),
+        )),
+        reservation: reservation.reservation.clone(),
+        round: request.round.clone(),
+        result_identity,
+        completed_at_unix_ms,
+    }
+}
+
+#[test]
+fn completed_reconciliation_round_product_replay_never_calls_docket_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        governed_product_fixture_support::authorized_successor_issuance(directory.path(), None);
+    let mut store = CampaignStoreV1::open(&fixture.database).unwrap();
+    let authorized = store.current().unwrap();
+    let issuance = authorized.issuance().unwrap();
+    let custody = DocketCustodyV1 {
+        schema: DOCKET_CUSTODY_SCHEMA_V1.to_owned(),
+        issuance: issuance.issuance.clone(),
+        ag_spend: issuance.spend.clone(),
+        execution_standing: DocketExecutionStandingRefV1::from_digest(digest(
+            "product-replay-standing",
+        )),
+        standing_currentness: StandingCurrentnessRefV1::from_digest(digest(
+            "product-replay-currentness",
+        )),
+        attempt: DocketAttemptRefV1::for_issuance(&issuance.issuance),
+        executor_marker: ExecutorAttemptMarkerRefV1::from_digest(digest("product-replay-marker")),
+        accepted_at_unix_ms: 4_000_000_000_000,
+    };
+    let dispatched =
+        GovernedLoopKernelV1::accept_docket_custody(&authorized, custody.clone()).unwrap();
+    store
+        .commit(
+            authorized.state_digest(),
+            &authorized,
+            &dispatched,
+            CampaignTransitionKindV1::DocketCustodyAccepted,
+            4_000_000_000_000,
+        )
+        .unwrap();
+    let parameters = ReconciliationRoundParametersV1 {
+        expected_state_digest: dispatched.state_digest().clone(),
+        idempotency: digest("product-completed-round-replay"),
+    };
+    let (request, _permit, _) = store
+        .reconciliation_round_signing_permit(&parameters)
+        .unwrap();
+    let reservation = product_round_reservation(&request);
+    let indeterminate = IndeterminateOutcomeV1 {
+        issuance: request.issuance.clone(),
+        attempt: request.attempt.clone(),
+        reconciliation: ReconciliationRefV1::from_digest(digest("product-public-reconciliation")),
+        evidence: digest("product-reconciliation-evidence"),
+    };
+    let completion = product_round_completion(
+        &request,
+        &reservation,
+        indeterminate.reconciliation.as_digest().clone(),
+    );
+    let response = DocketReconciliationRoundResponseV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1.to_owned(),
+        request: request.request.clone(),
+        round: request.round.clone(),
+        state: DocketReconciliationRoundStatusV1::Completed {
+            reservation: reservation.clone(),
+            completion: completion.clone(),
+            response: DocketIssuanceReconciliationV1::Indeterminate {
+                custody,
+                indeterminate: indeterminate.clone(),
+            },
+        },
+    };
+    let completed = GovernedLoopKernelV1::record_completed_indeterminate_round(
+        &dispatched,
+        request.clone(),
+        reservation,
+        completion,
+        indeterminate,
+    )
+    .unwrap();
+    store
+        .commit_reconciliation_round_response(
+            &dispatched,
+            &completed,
+            &request,
+            &response,
+            CampaignTransitionKindV1::ReconciliationRequired,
+            4_000_000_000_000,
+        )
+        .unwrap();
+    drop(store);
+
+    // The fixture pins `/bin/true` as a deliberately dormant Docket command.
+    // Any external call would return empty output and fail strict decoding;
+    // success therefore proves the stable public product returned AG's exact
+    // completed response replay without crossing the Docket boundary.
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    let replay = service.reconcile_docket(parameters).unwrap();
+    assert!(replay.request_replayed);
+    assert!(replay.response_replayed);
+    assert_eq!(replay.request, request.request);
+    assert_eq!(replay.round, request.round);
+    assert_eq!(replay.state.current.state_digest, *completed.state_digest());
+}
+
+#[test]
+fn terminal_reconciliation_round_product_replay_never_calls_docket_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture =
+        governed_product_fixture_support::authorized_successor_issuance(directory.path(), None);
+    let mut store = CampaignStoreV1::open(&fixture.database).unwrap();
+    let authorized = store.current().unwrap();
+    let issuance = authorized.issuance().unwrap();
+    let custody = DocketCustodyV1 {
+        schema: DOCKET_CUSTODY_SCHEMA_V1.to_owned(),
+        issuance: issuance.issuance.clone(),
+        ag_spend: issuance.spend.clone(),
+        execution_standing: DocketExecutionStandingRefV1::from_digest(digest(
+            "terminal-product-replay-standing",
+        )),
+        standing_currentness: StandingCurrentnessRefV1::from_digest(digest(
+            "terminal-product-replay-currentness",
+        )),
+        attempt: DocketAttemptRefV1::for_issuance(&issuance.issuance),
+        executor_marker: ExecutorAttemptMarkerRefV1::from_digest(digest(
+            "terminal-product-replay-marker",
+        )),
+        accepted_at_unix_ms: 4_000_000_000_000,
+    };
+    let dispatched =
+        GovernedLoopKernelV1::accept_docket_custody(&authorized, custody.clone()).unwrap();
+    store
+        .commit(
+            authorized.state_digest(),
+            &authorized,
+            &dispatched,
+            CampaignTransitionKindV1::DocketCustodyAccepted,
+            4_000_000_000_000,
+        )
+        .unwrap();
+    let parameters = ReconciliationRoundParametersV1 {
+        expected_state_digest: dispatched.state_digest().clone(),
+        idempotency: digest("terminal-product-completed-round-replay"),
+    };
+    let (request, _permit, _) = store
+        .reconciliation_round_signing_permit(&parameters)
+        .unwrap();
+    let reservation = product_round_reservation(&request);
+    let mut settlement = DocketSettlementV1 {
+        schema: DOCKET_SETTLEMENT_SCHEMA_V1.to_owned(),
+        settlement: SettlementRefV1::from_digest(digest("terminal-settlement-placeholder")),
+        issuance: request.issuance.clone(),
+        attempt: request.attempt.clone(),
+        executor_marker: custody.executor_marker.clone(),
+        receipt: ReceiptRefV1::from_digest(digest("terminal-settlement-receipt")),
+        outcome: KnownOutcomeV1::Success,
+        cumulative_effect_journal_identity: Some(digest("terminal-cumulative-journal")),
+        settled_at_unix_ms: 4_000_000_000_000,
+    };
+    settlement.settlement = settlement.expected_reference().unwrap();
+    let completion = product_round_completion(
+        &request,
+        &reservation,
+        settlement.settlement.as_digest().clone(),
+    );
+    let response = DocketReconciliationRoundResponseV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1.to_owned(),
+        request: request.request.clone(),
+        round: request.round.clone(),
+        state: DocketReconciliationRoundStatusV1::Completed {
+            reservation: reservation.clone(),
+            completion,
+            response: DocketIssuanceReconciliationV1::Settled {
+                custody,
+                settlement: settlement.clone(),
+            },
+        },
+    };
+    let settled = GovernedLoopKernelV1::record_settlement(&dispatched, settlement).unwrap();
+    store
+        .commit_reconciliation_round_response(
+            &dispatched,
+            &settled,
+            &request,
+            &response,
+            CampaignTransitionKindV1::SettlementRecorded,
+            4_000_000_000_000,
+        )
+        .unwrap();
+    drop(store);
+
+    // `/bin/true` would fail strict Docket decoding. Successful replay proves
+    // terminal observation is served from AG's artifact/store surface only.
+    let mut service = GovernedCampaignServiceV1::open(&fixture.database).unwrap();
+    let replay = service.reconcile_docket(parameters).unwrap();
+    assert!(replay.request_replayed);
+    assert!(replay.response_replayed);
+    assert_eq!(replay.request, request.request);
+    assert_eq!(replay.round, request.round);
+    assert_eq!(replay.state.current.state_digest, *settled.state_digest());
+    assert_eq!(
+        replay.state.current.program_counter,
+        ProgramCounterV1::SettledObservationRequired
+    );
+}
+
 fn root() -> GovernedRepairVerifierRootV1 {
     root_with_executable(Path::new("/bin/true"))
 }
@@ -2032,8 +2296,13 @@ fn concurrent_identical_governed_dispositions_have_one_durable_winner() {
             let submission = submission.clone();
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
-                let mut service = GovernedCampaignServiceV1::open(&database).unwrap();
                 barrier.wait();
+                // Exercise both simultaneous ordinary Store opens and the
+                // following identical consequence submissions. An ordinary
+                // open must only observe the persistent WAL format; it must
+                // not compete with the other caller by reissuing the WAL
+                // assignment pragma.
+                let mut service = GovernedCampaignServiceV1::open(&database).unwrap();
                 service.submit_governed_disposition(submission)
             })
         })

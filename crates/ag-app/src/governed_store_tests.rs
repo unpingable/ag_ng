@@ -28,6 +28,8 @@ fn demote_safe_integer_schema_to_v4(connection: &rusqlite::Connection) {
              DROP TRIGGER governed_repair_dispositions_safe_integer_update_v1;
              DROP TRIGGER refusals_safe_integer_insert_v1;
              DROP TRIGGER refusals_safe_integer_update_v1;
+             DROP TABLE reconciliation_round_responses;
+             DROP TABLE reconciliation_round_requests;
              UPDATE store_identity
                 SET schema_name='ag-governed-loop-campaign-store/v4',
                     schema_version=4,
@@ -36,6 +38,53 @@ fn demote_safe_integer_schema_to_v4(connection: &rusqlite::Connection) {
              PRAGMA user_version=4;",
         )
         .unwrap();
+}
+
+fn demote_reconciliation_schema_to_v5(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            "DROP TABLE reconciliation_round_responses;
+             DROP TABLE reconciliation_round_requests;
+             UPDATE store_identity
+                SET schema_name='ag-governed-loop-campaign-store/v5',
+                    schema_version=5,
+                    schema_digest='sha256:113f72a6b3df31d52ab0f745e04d2596c3ddce3a6c6ad0f309860e3da926a033'
+              WHERE singleton=1;
+             PRAGMA user_version=5;",
+        )
+        .unwrap();
+}
+
+fn rewrite_reconciliation_round_schema(
+    connection: &rusqlite::Connection,
+    rewrite: impl FnOnce(String, String) -> (String, String),
+) {
+    let request_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type='table' AND name='reconciliation_round_requests'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let response_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_schema
+             WHERE type='table' AND name='reconciliation_round_responses'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let (request_sql, response_sql) = rewrite(request_sql, response_sql);
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DROP TABLE reconciliation_round_responses;
+             DROP TABLE reconciliation_round_requests;",
+        )
+        .unwrap();
+    connection.execute_batch(&request_sql).unwrap();
+    connection.execute_batch(&response_sql).unwrap();
 }
 
 fn digest(label: &str) -> Digest {
@@ -227,6 +276,8 @@ fn assert_v2_to_v3_verification_migration(
              DROP TABLE governed_repair_dispositions_v3;
              DROP TABLE governed_repair_verification_identities;
              DROP TABLE issuance_signing_reservations;
+             DROP TABLE reconciliation_round_responses;
+             DROP TABLE reconciliation_round_requests;
              UPDATE store_identity
                 SET schema_name='ag-governed-loop-campaign-store/v2',
                     schema_version=2,
@@ -684,6 +735,275 @@ fn commit_to_dispatched(
     dispatched
 }
 
+fn round_reservation(
+    request: &ReconciliationRoundRequestV1,
+    label: &str,
+) -> DocketReconciliationRoundReservationV1 {
+    let source_cut = digest(&format!("{label}-source-cut"));
+    let executor_binding = digest(&format!("{label}-executor"));
+    let claimed_at_unix_ms = NOW + 10;
+    let body = serde_json::json!({
+        "schema": DOCKET_RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1,
+        "request": request.request,
+        "round": request.round,
+        "issuance": request.issuance,
+        "attempt": request.attempt,
+        "caller_state_digest": request.caller_state_digest,
+        "source_cut": source_cut,
+        "executor_binding": executor_binding,
+        "claimed_at_unix_ms": claimed_at_unix_ms,
+    });
+    let bytes = JcsDocument::canonicalize(&body).unwrap();
+    DocketReconciliationRoundReservationV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1.to_owned(),
+        reservation: DocketReconciliationReservationRefV1::from_digest(Digest::hash_domain(
+            "docket.governed-loop.reconciliation-round-reservation/v1",
+            bytes.as_bytes(),
+        )),
+        request: request.request.clone(),
+        round: request.round.clone(),
+        issuance: request.issuance.clone(),
+        attempt: request.attempt.clone(),
+        caller_state_digest: request.caller_state_digest.clone(),
+        predecessor_round: request.predecessor_round.clone(),
+        predecessor_reconciliation: request.predecessor_reconciliation.clone(),
+        source_cut,
+        checkpoint_identity: None,
+        executor_binding,
+        claimed_at_unix_ms,
+    }
+}
+
+fn round_completion(
+    request: &ReconciliationRoundRequestV1,
+    reservation: &DocketReconciliationRoundReservationV1,
+    result_identity: Digest,
+    completed_at_unix_ms: u64,
+) -> DocketReconciliationRoundCompletionV1 {
+    let body = serde_json::json!({
+        "schema": DOCKET_RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1,
+        "reservation": reservation.reservation,
+        "round": request.round,
+        "result_identity": result_identity,
+        "completed_at_unix_ms": completed_at_unix_ms,
+    });
+    let bytes = JcsDocument::canonicalize(&body).unwrap();
+    DocketReconciliationRoundCompletionV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1.to_owned(),
+        completion: DocketReconciliationCompletionRefV1::from_digest(Digest::hash_domain(
+            "docket.governed-loop.reconciliation-round-completion/v1",
+            bytes.as_bytes(),
+        )),
+        reservation: reservation.reservation.clone(),
+        round: request.round.clone(),
+        result_identity,
+        completed_at_unix_ms,
+    }
+}
+
+#[test]
+fn prepared_round_fences_refusal_and_replays_exact_request_after_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let dispatched = commit_to_dispatched(&mut store, &start);
+    let parameters = ReconciliationRoundParametersV1 {
+        expected_state_digest: dispatched.state_digest().clone(),
+        idempotency: digest("round-idempotency"),
+    };
+    let (request, permit, replayed) = store
+        .reconciliation_round_signing_permit(&parameters)
+        .unwrap();
+    assert!(!replayed);
+    assert_eq!(permit.into_request(), request);
+    let view = store.campaign_state_read(NOW + 10).unwrap();
+    assert_eq!(
+        view.open_reconciliation_round_request,
+        Some(request.request.clone())
+    );
+    let refusal = RefusalOutcomeV1 {
+        key: dispatched.key().clone(),
+        at_state_digest: dispatched.state_digest().clone(),
+        code: RefusalCodeV1::RecoveryRequired,
+        evidence: Some(digest("prepared-round-refusal")),
+    };
+    assert!(matches!(
+        store
+            .record_refusal(dispatched.state_digest(), &refusal, NOW + 11)
+            .unwrap_err(),
+        CampaignStoreErrorV1::ReconciliationRoundOutstanding
+    ));
+    drop(store);
+
+    let mut reopened = CampaignStoreV1::open(&database).unwrap();
+    let (same, _permit, replayed) = reopened
+        .reconciliation_round_signing_permit(&parameters)
+        .unwrap();
+    assert!(replayed);
+    assert_eq!(same, request);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let refusals: i64 = connection
+        .query_row("SELECT COUNT(*) FROM refusals", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(refusals, 0);
+}
+
+#[test]
+fn unresolved_then_completed_round_replays_without_losing_response_accounting() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let dispatched = commit_to_dispatched(&mut store, &start);
+    let parameters = ReconciliationRoundParametersV1 {
+        expected_state_digest: dispatched.state_digest().clone(),
+        idempotency: digest("round-progress-idempotency"),
+    };
+    let (request, _permit, _) = store
+        .reconciliation_round_signing_permit(&parameters)
+        .unwrap();
+    let reservation = round_reservation(&request, "progress");
+    let unresolved_response = DocketReconciliationRoundResponseV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1.to_owned(),
+        request: request.request.clone(),
+        round: request.round.clone(),
+        state: DocketReconciliationRoundStatusV1::Unresolved(reservation.clone()),
+    };
+    let unresolved = GovernedLoopKernelV1::record_unresolved_reconciliation_round(
+        &dispatched,
+        request.clone(),
+        reservation.clone(),
+    )
+    .unwrap();
+    store
+        .commit_reconciliation_round_response(
+            &dispatched,
+            &unresolved,
+            &request,
+            &unresolved_response,
+            CampaignTransitionKindV1::ReconciliationRequired,
+            NOW + 10,
+        )
+        .unwrap();
+    assert!(
+        store
+            .reconciliation_round_response_replay(&parameters)
+            .unwrap()
+            .is_none()
+    );
+
+    let indeterminate = IndeterminateOutcomeV1 {
+        issuance: request.issuance.clone(),
+        attempt: request.attempt.clone(),
+        reconciliation: ReconciliationRefV1::from_digest(digest("public-reconciliation")),
+        evidence: digest("round-progress-evidence"),
+    };
+    let completion = round_completion(
+        &request,
+        &reservation,
+        indeterminate.reconciliation.as_digest().clone(),
+        NOW + 11,
+    );
+    let completed_response = DocketReconciliationRoundResponseV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1.to_owned(),
+        request: request.request.clone(),
+        round: request.round.clone(),
+        state: DocketReconciliationRoundStatusV1::Completed {
+            reservation: reservation.clone(),
+            completion: completion.clone(),
+            response: DocketIssuanceReconciliationV1::Indeterminate {
+                custody: dispatched.docket_custody().unwrap().clone(),
+                indeterminate: indeterminate.clone(),
+            },
+        },
+    };
+    let completed = GovernedLoopKernelV1::record_completed_indeterminate_round(
+        &unresolved,
+        request.clone(),
+        reservation,
+        completion,
+        indeterminate,
+    )
+    .unwrap();
+    store
+        .commit_reconciliation_round_response(
+            &unresolved,
+            &completed,
+            &request,
+            &completed_response,
+            CampaignTransitionKindV1::ReconciliationRequired,
+            NOW + 11,
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    let replay = reopened
+        .reconciliation_round_response_replay(&parameters)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replay, (request, completed_response));
+    assert_eq!(reopened.current().unwrap(), completed);
+    assert_eq!(reopened.replay().unwrap().transitions, 8);
+}
+
+#[test]
+fn untrusted_round_timestamps_refuse_before_identity_hash_without_panic() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let dispatched = commit_to_dispatched(&mut store, &start);
+    let parameters = ReconciliationRoundParametersV1 {
+        expected_state_digest: dispatched.state_digest().clone(),
+        idempotency: digest("unsafe-round-time"),
+    };
+    let (request, _permit, _) = store
+        .reconciliation_round_signing_permit(&parameters)
+        .unwrap();
+    let mut reservation = round_reservation(&request, "unsafe-time");
+    reservation.claimed_at_unix_ms = u64::MAX;
+    let unresolved = DocketReconciliationRoundResponseV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1.to_owned(),
+        request: request.request.clone(),
+        round: request.round.clone(),
+        state: DocketReconciliationRoundStatusV1::Unresolved(reservation.clone()),
+    };
+    let validation = std::panic::catch_unwind(|| unresolved.validate_for_request(&request));
+    assert!(matches!(validation, Ok(Err(_))));
+
+    reservation = round_reservation(&request, "unsafe-time");
+    let indeterminate = IndeterminateOutcomeV1 {
+        issuance: request.issuance.clone(),
+        attempt: request.attempt.clone(),
+        reconciliation: ReconciliationRefV1::from_digest(digest("unsafe-time-result")),
+        evidence: digest("unsafe-time-evidence"),
+    };
+    let mut completion = round_completion(
+        &request,
+        &reservation,
+        indeterminate.reconciliation.as_digest().clone(),
+        NOW + 11,
+    );
+    completion.completed_at_unix_ms = u64::MAX;
+    let completed = DocketReconciliationRoundResponseV1 {
+        schema: DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1.to_owned(),
+        request: request.request.clone(),
+        round: request.round.clone(),
+        state: DocketReconciliationRoundStatusV1::Completed {
+            reservation,
+            completion,
+            response: DocketIssuanceReconciliationV1::Indeterminate {
+                custody: dispatched.docket_custody().unwrap().clone(),
+                indeterminate,
+            },
+        },
+    };
+    let validation = std::panic::catch_unwind(|| completed.validate_for_request(&request));
+    assert!(matches!(validation, Ok(Err(_))));
+}
+
 fn commit_normal_path(
     store: &mut CampaignStoreV1,
     start: &OccurrenceSnapshotV1,
@@ -746,6 +1066,35 @@ fn one_transactional_path_replays_and_reconstructs_issuance() {
     let reopened = CampaignStoreV1::open(&database).unwrap();
     assert_eq!(reopened.current().unwrap(), settled);
     assert_eq!(reopened.replay().unwrap(), report);
+}
+
+#[test]
+fn ordinary_open_refuses_non_wal_store_without_reconfiguring_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    drop(CampaignStoreV1::create(&database, &start, NOW).unwrap());
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let changed: String = connection
+        .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
+        .unwrap();
+    assert!(changed.eq_ignore_ascii_case("delete"));
+    drop(connection);
+
+    assert!(matches!(
+        CampaignStoreV1::open(&database),
+        Err(CampaignStoreErrorV1::Corrupt(message))
+            if message == "campaign store is not in WAL journal mode"
+    ));
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let observed: String = connection
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert!(
+        observed.eq_ignore_ascii_case("delete"),
+        "a refusing ordinary open must not rewrite the persistent journal mode"
+    );
 }
 
 #[test]
@@ -1893,6 +2242,127 @@ fn v4_safe_integer_migration_rolls_back_then_cleanly_retries_exact_sequence_coun
             .is_err(),
         "the migrated additive trigger must reject the same counterexample"
     );
+}
+
+#[test]
+fn v5_reconciliation_migration_refuses_partial_object_and_cleanly_retries() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    drop(CampaignStoreV1::create(&database, &start, NOW).unwrap());
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    demote_reconciliation_schema_to_v5(&connection);
+    connection
+        .execute_batch(
+            "CREATE TABLE reconciliation_round_responses (
+                 response_identity TEXT PRIMARY KEY NOT NULL,
+                 hostile_extra TEXT
+             ) STRICT;",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(CampaignStoreV1::open(&database).is_err());
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let requests: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type='table' AND name='reconciliation_round_requests'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 5, "failed migration retains V5 identity");
+    assert_eq!(requests, 0, "failed migration rolls back its first table");
+    connection
+        .execute_batch("DROP TABLE reconciliation_round_responses;")
+        .unwrap();
+    drop(connection);
+
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap(), start);
+    drop(reopened);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+             AND name IN ('reconciliation_round_requests','reconciliation_round_responses')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 6);
+    assert_eq!(tables, 2);
+}
+
+#[test]
+fn exact_reconciliation_round_schema_reopens() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    drop(CampaignStoreV1::create(&database, &start, NOW).unwrap());
+
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap(), start);
+}
+
+#[test]
+fn reconciliation_round_schema_refuses_weakened_check_foreign_key_unique_and_strict() {
+    for (name, rewrite) in [
+        ("timestamp-check", 0_u8),
+        ("request-foreign-key", 1_u8),
+        ("round-identity-unique", 2_u8),
+        ("response-strict", 3_u8),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("campaign.sqlite");
+        drop(CampaignStoreV1::create(&database, &initial(), NOW).unwrap());
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        rewrite_reconciliation_round_schema(&connection, |request_sql, response_sql| {
+            let (weakened_request, weakened_response) = match rewrite {
+                0 => (
+                    request_sql.clone(),
+                    response_sql.replace(
+                        "\n        CHECK (observed_at_unix_ms BETWEEN 0 AND 9007199254740991)",
+                        "",
+                    ),
+                ),
+                1 => (
+                    request_sql.replace(
+                        ",\n    FOREIGN KEY (attempt_id) REFERENCES docket_attempts(attempt_id)",
+                        "",
+                    ),
+                    response_sql.clone(),
+                ),
+                2 => (
+                    request_sql.replace("round_id TEXT NOT NULL UNIQUE", "round_id TEXT NOT NULL"),
+                    response_sql.clone(),
+                ),
+                3 => (request_sql.clone(), response_sql.replace(") STRICT", ")")),
+                _ => unreachable!(),
+            };
+            assert!(
+                weakened_request != request_sql || weakened_response != response_sql,
+                "hostile {name} rewrite must actually change the canonical schema"
+            );
+            (weakened_request, weakened_response)
+        });
+        drop(connection);
+
+        assert!(
+            matches!(
+                CampaignStoreV1::open(&database),
+                Err(CampaignStoreErrorV1::StoreIdentity)
+            ),
+            "complete but weakened {name} schema must refuse reopen"
+        );
+    }
 }
 
 #[test]

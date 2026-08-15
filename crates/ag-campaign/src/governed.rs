@@ -82,6 +82,18 @@ pub const PRE_SPEND_SCOPE_INSUFFICIENCY_SCHEMA_V1: &str =
 /// Wire schema for the durable, non-authorizing pre-spend discovery artifact.
 pub const PRE_SPEND_SCOPE_DISCOVERY_SCHEMA_V1: &str =
     "ag.governed-loop.pre-spend-scope-discovery/v1";
+/// Wire schema for one explicit AG reconciliation-round request.
+pub const RECONCILIATION_ROUND_REQUEST_SCHEMA_V1: &str =
+    "ag.governed-loop.reconciliation-round-request/v1";
+/// Wire schema for one Docket reconciliation-round response.
+pub const DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1: &str =
+    "docket.governed-loop.reconciliation-round-response/v1";
+/// Wire schema for one Docket reconciliation-round reservation.
+pub const DOCKET_RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1: &str =
+    "docket.governed-loop.reconciliation-round-reservation/v1";
+/// Wire schema for one completed Docket reconciliation round.
+pub const DOCKET_RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1: &str =
+    "docket.governed-loop.reconciliation-round-completion/v1";
 
 const STATE_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.state/v1";
 const GENESIS_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.genesis/v1";
@@ -91,6 +103,9 @@ const AG_SPEND_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.spend/v1";
 const AG_ISSUANCE_DIGEST_DOMAIN_V2: &str = "ag.governed-loop.issuance/v2";
 const HUMAN_DECISION_REQUEST_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.human-decision-request/v1";
 const HUMAN_DISPOSITION_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.human-disposition/v1";
+const RECONCILIATION_ROUND_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.reconciliation-round/v1";
+const RECONCILIATION_ROUND_REQUEST_DIGEST_DOMAIN_V1: &str =
+    "ag.governed-loop.reconciliation-round-request/v1";
 
 fn digest_value<T: Serialize + ?Sized>(domain: &str, value: &T) -> Digest {
     let document = JcsDocument::canonicalize(value)
@@ -225,6 +240,22 @@ exact_digest_ref!(
 exact_digest_ref!(
     /// Exact reconciliation record identity.
     ReconciliationRefV1
+);
+exact_digest_ref!(
+    /// Exact identity of one intentional reconciliation poll.
+    ReconciliationRoundRefV1
+);
+exact_digest_ref!(
+    /// Exact canonical AG request for one reconciliation round.
+    ReconciliationRoundRequestRefV1
+);
+exact_digest_ref!(
+    /// Exact Docket reservation for one reconciliation round.
+    DocketReconciliationReservationRefV1
+);
+exact_digest_ref!(
+    /// Exact Docket completion record for one reconciliation round.
+    DocketReconciliationCompletionRefV1
 );
 exact_digest_ref!(
     /// Exact residual-obligation identity.
@@ -2480,6 +2511,277 @@ impl DocketSettlementV1 {
     }
 }
 
+/// Exact caller input used to create or replay one intentional reconciliation
+/// round.  This is a non-authorizing idempotency coordinate; the Store derives
+/// and persists the complete request before a signer may authenticate it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationRoundParametersV1 {
+    /// Exact caller state/head cut.
+    pub expected_state_digest: Digest,
+    /// Caller-selected exact replay identity. It grants no authority.
+    pub idempotency: Digest,
+}
+
+/// One explicit, canonical AG request for a Docket reconciliation poll.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationRoundRequestV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Complete request identity.
+    pub request: ReconciliationRoundRequestRefV1,
+    /// Intentional poll occurrence identity.
+    pub round: ReconciliationRoundRefV1,
+    /// Exact already-spent issuance.
+    pub issuance: AgIssuanceRefV1,
+    /// Exact Docket attempt.
+    pub attempt: DocketAttemptRefV1,
+    /// Exact caller-observed AG state before request preparation.
+    pub caller_state_digest: Digest,
+    /// Immediately preceding completed round, omitted for the first round.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub predecessor_round: Option<ReconciliationRoundRefV1>,
+    /// Result of the immediately preceding completed indeterminate round.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub predecessor_reconciliation: Option<ReconciliationRefV1>,
+    /// Exact non-authorizing replay coordinate.
+    pub idempotency: Digest,
+}
+
+#[derive(Serialize)]
+struct ReconciliationRoundIdentityBodyV1<'a> {
+    schema: &'a str,
+    issuance: &'a AgIssuanceRefV1,
+    attempt: &'a DocketAttemptRefV1,
+    caller_state_digest: &'a Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_round: Option<&'a ReconciliationRoundRefV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_reconciliation: Option<&'a ReconciliationRefV1>,
+    idempotency: &'a Digest,
+}
+
+#[derive(Serialize)]
+struct ReconciliationRoundRequestIdentityBodyV1<'a> {
+    schema: &'a str,
+    round: &'a ReconciliationRoundRefV1,
+    issuance: &'a AgIssuanceRefV1,
+    attempt: &'a DocketAttemptRefV1,
+    caller_state_digest: &'a Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_round: Option<&'a ReconciliationRoundRefV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_reconciliation: Option<&'a ReconciliationRefV1>,
+    idempotency: &'a Digest,
+}
+
+impl ReconciliationRoundRequestV1 {
+    /// Constructs a request with both identities derived from its exact body.
+    #[must_use]
+    pub fn new(
+        issuance: AgIssuanceRefV1,
+        attempt: DocketAttemptRefV1,
+        caller_state_digest: Digest,
+        predecessor_round: Option<ReconciliationRoundRefV1>,
+        predecessor_reconciliation: Option<ReconciliationRefV1>,
+        idempotency: Digest,
+    ) -> Self {
+        let schema = RECONCILIATION_ROUND_REQUEST_SCHEMA_V1.to_owned();
+        let round = ReconciliationRoundRefV1::from_digest(digest_value(
+            RECONCILIATION_ROUND_DIGEST_DOMAIN_V1,
+            &ReconciliationRoundIdentityBodyV1 {
+                schema: &schema,
+                issuance: &issuance,
+                attempt: &attempt,
+                caller_state_digest: &caller_state_digest,
+                predecessor_round: predecessor_round.as_ref(),
+                predecessor_reconciliation: predecessor_reconciliation.as_ref(),
+                idempotency: &idempotency,
+            },
+        ));
+        let request = ReconciliationRoundRequestRefV1::from_digest(digest_value(
+            RECONCILIATION_ROUND_REQUEST_DIGEST_DOMAIN_V1,
+            &ReconciliationRoundRequestIdentityBodyV1 {
+                schema: &schema,
+                round: &round,
+                issuance: &issuance,
+                attempt: &attempt,
+                caller_state_digest: &caller_state_digest,
+                predecessor_round: predecessor_round.as_ref(),
+                predecessor_reconciliation: predecessor_reconciliation.as_ref(),
+                idempotency: &idempotency,
+            },
+        ));
+        Self {
+            schema,
+            request,
+            round,
+            issuance,
+            attempt,
+            caller_state_digest,
+            predecessor_round,
+            predecessor_reconciliation,
+            idempotency,
+        }
+    }
+
+    /// Strictly validates schema, paired predecessor fields, and both
+    /// deterministic identities.
+    pub fn validate(&self) -> Result<(), KernelErrorV1> {
+        if self.schema != RECONCILIATION_ROUND_REQUEST_SCHEMA_V1
+            || self.predecessor_round.is_some() != self.predecessor_reconciliation.is_some()
+        {
+            return Err(KernelErrorV1::BindingMismatch(
+                "reconciliation round request shape",
+            ));
+        }
+        let expected = Self::new(
+            self.issuance.clone(),
+            self.attempt.clone(),
+            self.caller_state_digest.clone(),
+            self.predecessor_round.clone(),
+            self.predecessor_reconciliation.clone(),
+            self.idempotency.clone(),
+        );
+        if expected.round != self.round || expected.request != self.request {
+            return Err(KernelErrorV1::BindingMismatch(
+                "reconciliation round request identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Docket's exact durable reservation for one request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocketReconciliationRoundReservationV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Docket reservation identity.
+    pub reservation: DocketReconciliationReservationRefV1,
+    /// Exact AG request identity.
+    pub request: ReconciliationRoundRequestRefV1,
+    /// Exact intentional reconciliation round.
+    pub round: ReconciliationRoundRefV1,
+    /// Exact already-spent issuance.
+    pub issuance: AgIssuanceRefV1,
+    /// Exact Docket attempt.
+    pub attempt: DocketAttemptRefV1,
+    /// Caller-observed AG cut authenticated by the request.
+    pub caller_state_digest: Digest,
+    /// Immediately preceding completed round, when this is a later poll.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub predecessor_round: Option<ReconciliationRoundRefV1>,
+    /// Result of the immediately preceding completed indeterminate round.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub predecessor_reconciliation: Option<ReconciliationRefV1>,
+    /// Exact Docket source cut claimed before crossing the executor boundary.
+    pub source_cut: Digest,
+    /// Immutable checkpoint identity, when the attempt has one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    pub checkpoint_identity: Option<Digest>,
+    /// Exact executor binding.
+    pub executor_binding: Digest,
+    /// Canonically representable claim time.
+    pub claimed_at_unix_ms: u64,
+}
+
+/// Docket's exact completion for one previously committed reservation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocketReconciliationRoundCompletionV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Exact completion identity.
+    pub completion: DocketReconciliationCompletionRefV1,
+    /// Exact claimed reservation.
+    pub reservation: DocketReconciliationReservationRefV1,
+    /// Exact intentional reconciliation round.
+    pub round: ReconciliationRoundRefV1,
+    /// Exact terminal or indeterminate result identity.
+    pub result_identity: Digest,
+    /// Canonically representable completion time.
+    pub completed_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct DocketReconciliationReservationIdentityBasisV1<'a> {
+    schema: &'a str,
+    request: &'a ReconciliationRoundRequestRefV1,
+    round: &'a ReconciliationRoundRefV1,
+    issuance: &'a AgIssuanceRefV1,
+    attempt: &'a DocketAttemptRefV1,
+    caller_state_digest: &'a Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_round: Option<&'a ReconciliationRoundRefV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_reconciliation: Option<&'a ReconciliationRefV1>,
+    source_cut: &'a Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint_identity: Option<&'a Digest>,
+    executor_binding: &'a Digest,
+    claimed_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct DocketReconciliationCompletionIdentityBasisV1<'a> {
+    schema: &'a str,
+    reservation: &'a DocketReconciliationReservationRefV1,
+    round: &'a ReconciliationRoundRefV1,
+    result_identity: &'a Digest,
+    completed_at_unix_ms: u64,
+}
+
+/// Durable AG observation of the latest round. Prepared and unresolved rounds
+/// are not authority and cannot enable a later round.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    content = "record",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ReconciliationRoundStateV1 {
+    /// Docket durably claimed the request, but no completed response is known.
+    Unresolved {
+        /// Exact authenticated AG request.
+        request: ReconciliationRoundRequestV1,
+        /// Exact Docket claim.
+        reservation: DocketReconciliationRoundReservationV1,
+    },
+    /// Docket completed the round with another indeterminate observation.
+    CompletedIndeterminate {
+        /// Exact authenticated AG request.
+        request: ReconciliationRoundRequestV1,
+        /// Exact Docket claim.
+        reservation: DocketReconciliationRoundReservationV1,
+        /// Exact Docket completion.
+        completion: DocketReconciliationRoundCompletionV1,
+    },
+}
+
 /// Exact indeterminate-attempt evidence requiring reconciliation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2500,6 +2802,12 @@ pub struct IndeterminateOutcomeV1 {
 pub struct ReconciliationRequiredV1 {
     dispatch: DispatchBasisV1,
     indeterminate: IndeterminateOutcomeV1,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_some"
+    )]
+    reconciliation_round: Option<ReconciliationRoundStateV1>,
 }
 
 /// State carrying an exact known settlement and requiring fresh observation.
@@ -3124,6 +3432,121 @@ pub enum DocketIssuanceReconciliationV1 {
     },
 }
 
+/// Closed durable status for one explicit Docket reconciliation round.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    content = "record",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum DocketReconciliationRoundStatusV1 {
+    /// No custody exists. This path invokes no executor.
+    NotAccepted,
+    /// Docket durably refused the issuance before custody.
+    Refused(DocketIssuanceRefusalV1),
+    /// A durable claim exists, but completion is not durably known. Docket
+    /// must never reinvoke this round implicitly.
+    Unresolved(DocketReconciliationRoundReservationV1),
+    /// The exact round completed and sealed one exact ordinary response.
+    Completed {
+        /// Exact reservation claimed before executor entry.
+        reservation: DocketReconciliationRoundReservationV1,
+        /// Exact durable completion record.
+        completion: DocketReconciliationRoundCompletionV1,
+        /// Exact reconciliation result produced by this round.
+        response: DocketIssuanceReconciliationV1,
+    },
+}
+
+/// Versioned Docket response bound to one authenticated AG round request.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocketReconciliationRoundResponseV1 {
+    /// Exact response schema.
+    pub schema: String,
+    /// Exact AG request.
+    pub request: ReconciliationRoundRequestRefV1,
+    /// Exact intentional poll occurrence.
+    pub round: ReconciliationRoundRefV1,
+    /// Closed durable response state.
+    #[serde(flatten)]
+    pub state: DocketReconciliationRoundStatusV1,
+}
+
+impl DocketReconciliationRoundResponseV1 {
+    /// Strictly validates the closed Docket response against one exact AG
+    /// request, including reservation/completion identities and the public
+    /// result identity for every completed result class.
+    pub fn validate_for_request(
+        &self,
+        request: &ReconciliationRoundRequestV1,
+    ) -> Result<(), KernelErrorV1> {
+        request.validate()?;
+        if self.schema != DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1
+            || self.request != request.request
+            || self.round != request.round
+        {
+            return Err(KernelErrorV1::BindingMismatch(
+                "Docket reconciliation round response",
+            ));
+        }
+        match &self.state {
+            DocketReconciliationRoundStatusV1::NotAccepted
+            | DocketReconciliationRoundStatusV1::Refused(_) => Ok(()),
+            DocketReconciliationRoundStatusV1::Unresolved(reservation) => {
+                validate_round_reservation(request, reservation)
+            }
+            DocketReconciliationRoundStatusV1::Completed {
+                reservation,
+                completion,
+                response,
+            } => {
+                validate_round_completion(request, reservation, completion)?;
+                let result_identity = match response {
+                    DocketIssuanceReconciliationV1::Settled { settlement, .. } => {
+                        if settlement.expected_reference()? != settlement.settlement {
+                            return Err(KernelErrorV1::BindingMismatch(
+                                "Docket reconciliation settlement identity",
+                            ));
+                        }
+                        settlement.settlement.as_digest()
+                    }
+                    DocketIssuanceReconciliationV1::Indeterminate { indeterminate, .. } => {
+                        indeterminate.reconciliation.as_digest()
+                    }
+                    DocketIssuanceReconciliationV1::GovernedRepairRequired { result, .. } => {
+                        result.validate()?;
+                        match result {
+                            DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+                                outcome,
+                                ..
+                            }
+                            | DocketSealedGovernedRepairResultV1::ReadjudicationRequired {
+                                outcome,
+                                ..
+                            } => outcome.sealed_result.as_digest(),
+                        }
+                    }
+                    DocketIssuanceReconciliationV1::NotAccepted
+                    | DocketIssuanceReconciliationV1::Refused(_)
+                    | DocketIssuanceReconciliationV1::Accepted(_) => {
+                        return Err(KernelErrorV1::BindingMismatch(
+                            "completed Docket reconciliation result class",
+                        ));
+                    }
+                };
+                if &completion.result_identity != result_identity {
+                    return Err(KernelErrorV1::BindingMismatch(
+                        "Docket reconciliation public result identity",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Closed exact Docket-sealed governed-repair result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -3222,12 +3645,27 @@ pub trait DocketCustodyPortV1 {
         issuance: &AgIssuanceV2,
     ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1>;
 
-    /// Read-only reconciliation of an exact Docket attempt.
+    /// Legacy internal observation seam. Canonical production adapters refuse
+    /// this raw form and require an explicit authenticated round.
     fn reconcile_attempt(
         &mut self,
         issuance: &AgIssuanceV2,
         custody: &DocketCustodyV1,
     ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1>;
+
+    /// Reconciliation of an exact Docket attempt through one explicit,
+    /// Store-persisted and authenticated poll round.
+    fn reconcile_round(
+        &mut self,
+        issuance: &AgIssuanceV2,
+        custody: &DocketCustodyV1,
+        request: &ReconciliationRoundRequestV1,
+    ) -> Result<DocketReconciliationRoundResponseV1, ExternalBoundaryErrorV1> {
+        let _ = (issuance, custody, request);
+        Err(ExternalBoundaryErrorV1::Unavailable {
+            code: "explicit-reconciliation-round-not-implemented".to_owned(),
+        })
+    }
 }
 
 /// Closed external human disposition vocabulary.
@@ -3935,7 +4373,14 @@ impl GovernedLoopKernelV1 {
                 OccurrenceStateV1::Dispatched(from),
                 OccurrenceStateV1::ReconciliationRequired(to),
             ) if same_key && from.0 == to.dispatch => {
-                validate_indeterminate(&to.indeterminate, &to.dispatch)
+                validate_indeterminate(&to.indeterminate, &to.dispatch)?;
+                validate_initial_reconciliation_round_successor(source, to)
+            }
+            (
+                OccurrenceStateV1::ReconciliationRequired(from),
+                OccurrenceStateV1::ReconciliationRequired(to),
+            ) if same_key && from.dispatch == to.dispatch => {
+                validate_reconciliation_round_successor(source, from, to)
             }
             (
                 OccurrenceStateV1::ReconciliationRequired(from),
@@ -4312,6 +4757,122 @@ impl GovernedLoopKernelV1 {
         let state = OccurrenceStateV1::ReconciliationRequired(ReconciliationRequiredV1 {
             dispatch: dispatched.0.clone(),
             indeterminate,
+            reconciliation_round: None,
+        });
+        let next = successor_snapshot(current, state);
+        next.validate_integrity()?;
+        Ok(next)
+    }
+
+    /// Records Docket's conservative claimed/in-flight-or-unknown response.
+    /// The round cannot be reinvoked or used as a predecessor for a new poll.
+    pub fn record_unresolved_reconciliation_round(
+        current: &OccurrenceSnapshotV1,
+        request: ReconciliationRoundRequestV1,
+        reservation: DocketReconciliationRoundReservationV1,
+    ) -> Result<OccurrenceSnapshotV1, KernelErrorV1> {
+        validate_round_reservation(&request, &reservation)?;
+        current.validate_integrity()?;
+        let (dispatch, indeterminate, prior) = reconciliation_basis(current)?;
+        if matches!(
+            prior,
+            Some(ReconciliationRoundStateV1::Unresolved {
+                request: old,
+                reservation: old_reservation,
+            }) if old == &request && old_reservation == &reservation
+        ) {
+            return Ok(current.clone());
+        }
+        validate_round_request_for_current(current, &request, dispatch, prior)?;
+        if prior.is_some()
+            && !matches!(
+                prior,
+                Some(ReconciliationRoundStateV1::CompletedIndeterminate { .. })
+            )
+        {
+            return Err(KernelErrorV1::BindingMismatch(
+                "unresolved reconciliation preparation",
+            ));
+        }
+        let indeterminate = if current.program_counter() == ProgramCounterV1::Dispatched {
+            IndeterminateOutcomeV1 {
+                issuance: request.issuance.clone(),
+                attempt: request.attempt.clone(),
+                reconciliation: ReconciliationRefV1::from_digest(digest_value(
+                    "ag.governed-loop.unresolved-reconciliation-round/v1",
+                    &(
+                        &request.request,
+                        &reservation.reservation,
+                        &reservation.source_cut,
+                    ),
+                )),
+                evidence: reservation.source_cut.clone(),
+            }
+        } else {
+            indeterminate
+                .ok_or(KernelErrorV1::StateInvariant(
+                    "reconciliation state missing indeterminate evidence",
+                ))?
+                .clone()
+        };
+        let state = OccurrenceStateV1::ReconciliationRequired(ReconciliationRequiredV1 {
+            dispatch: dispatch.clone(),
+            indeterminate,
+            reconciliation_round: Some(ReconciliationRoundStateV1::Unresolved {
+                request,
+                reservation,
+            }),
+        });
+        let next = successor_snapshot(current, state);
+        next.validate_integrity()?;
+        Ok(next)
+    }
+
+    /// Records one completed indeterminate round. This advances the durable AG
+    /// cut even when the executor evidence bytes equal a prior observation.
+    pub fn record_completed_indeterminate_round(
+        current: &OccurrenceSnapshotV1,
+        request: ReconciliationRoundRequestV1,
+        reservation: DocketReconciliationRoundReservationV1,
+        completion: DocketReconciliationRoundCompletionV1,
+        indeterminate: IndeterminateOutcomeV1,
+    ) -> Result<OccurrenceSnapshotV1, KernelErrorV1> {
+        current.validate_integrity()?;
+        validate_round_completion(&request, &reservation, &completion)?;
+        let (dispatch, _, prior) = reconciliation_basis(current)?;
+        if let Some(ReconciliationRoundStateV1::CompletedIndeterminate {
+            request: old,
+            reservation: old_reservation,
+            completion: old_completion,
+        }) = prior
+            && old == &request
+            && old_reservation == &reservation
+            && old_completion == &completion
+            && current.indeterminate() == Some(&indeterminate)
+        {
+            return Ok(current.clone());
+        }
+        validate_round_request_for_current(current, &request, dispatch, prior)?;
+        validate_indeterminate(&indeterminate, dispatch)?;
+        if completion.result_identity != *indeterminate.reconciliation.as_digest() {
+            return Err(KernelErrorV1::BindingMismatch(
+                "completed reconciliation result identity",
+            ));
+        }
+        if matches!(prior, Some(ReconciliationRoundStateV1::Unresolved { request: prepared, reservation: prior_reservation }) if prepared != &request || prior_reservation != &reservation)
+        {
+            return Err(KernelErrorV1::BindingMismatch(
+                "completed reconciliation preparation",
+            ));
+        }
+        let state = OccurrenceStateV1::ReconciliationRequired(ReconciliationRequiredV1 {
+            dispatch: dispatch.clone(),
+            indeterminate,
+            reconciliation_round: Some(ReconciliationRoundStateV1::CompletedIndeterminate {
+                request,
+                reservation,
+                completion,
+            }),
         });
         let next = successor_snapshot(current, state);
         next.validate_integrity()?;
@@ -5016,6 +5577,15 @@ impl OccurrenceSnapshotV1 {
         }
     }
 
+    /// Returns the latest durable reconciliation-round state, when present.
+    #[must_use]
+    pub fn reconciliation_round(&self) -> Option<&ReconciliationRoundStateV1> {
+        match &self.state {
+            OccurrenceStateV1::ReconciliationRequired(value) => value.reconciliation_round.as_ref(),
+            _ => None,
+        }
+    }
+
     /// Returns the exact fresh observation that closed this occurrence.
     #[must_use]
     pub fn terminal_observation(&self) -> Option<&ObservationResolutionV1> {
@@ -5453,6 +6023,273 @@ fn validate_indeterminate(
     }
     if indeterminate.attempt != dispatch.custody.attempt {
         return Err(KernelErrorV1::BindingMismatch("indeterminate attempt"));
+    }
+    Ok(())
+}
+
+fn validate_round_reservation(
+    request: &ReconciliationRoundRequestV1,
+    reservation: &DocketReconciliationRoundReservationV1,
+) -> Result<(), KernelErrorV1> {
+    request.validate()?;
+    if reservation.schema != DOCKET_RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1
+        || reservation.request != request.request
+        || reservation.round != request.round
+        || reservation.issuance != request.issuance
+        || reservation.attempt != request.attempt
+        || reservation.caller_state_digest != request.caller_state_digest
+        || reservation.predecessor_round != request.predecessor_round
+        || reservation.predecessor_reconciliation != request.predecessor_reconciliation
+    {
+        return Err(KernelErrorV1::BindingMismatch(
+            "Docket reconciliation round reservation",
+        ));
+    }
+    validate_canonical_timestamp(
+        reservation.claimed_at_unix_ms,
+        "reconciliation reservation time is not canonically representable",
+    )?;
+    let expected = DocketReconciliationReservationRefV1::from_digest(digest_value(
+        "docket.governed-loop.reconciliation-round-reservation/v1",
+        &DocketReconciliationReservationIdentityBasisV1 {
+            schema: &reservation.schema,
+            request: &reservation.request,
+            round: &reservation.round,
+            issuance: &reservation.issuance,
+            attempt: &reservation.attempt,
+            caller_state_digest: &reservation.caller_state_digest,
+            predecessor_round: reservation.predecessor_round.as_ref(),
+            predecessor_reconciliation: reservation.predecessor_reconciliation.as_ref(),
+            source_cut: &reservation.source_cut,
+            checkpoint_identity: reservation.checkpoint_identity.as_ref(),
+            executor_binding: &reservation.executor_binding,
+            claimed_at_unix_ms: reservation.claimed_at_unix_ms,
+        },
+    ));
+    if reservation.reservation != expected {
+        return Err(KernelErrorV1::BindingMismatch(
+            "Docket reconciliation reservation identity",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_round_completion(
+    request: &ReconciliationRoundRequestV1,
+    reservation: &DocketReconciliationRoundReservationV1,
+    completion: &DocketReconciliationRoundCompletionV1,
+) -> Result<(), KernelErrorV1> {
+    validate_round_reservation(request, reservation)?;
+    if completion.schema != DOCKET_RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1
+        || completion.reservation != reservation.reservation
+        || completion.round != request.round
+    {
+        return Err(KernelErrorV1::BindingMismatch(
+            "Docket reconciliation round completion",
+        ));
+    }
+    validate_canonical_timestamp(
+        completion.completed_at_unix_ms,
+        "reconciliation completion time is not canonically representable",
+    )?;
+    let expected = DocketReconciliationCompletionRefV1::from_digest(digest_value(
+        "docket.governed-loop.reconciliation-round-completion/v1",
+        &DocketReconciliationCompletionIdentityBasisV1 {
+            schema: &completion.schema,
+            reservation: &completion.reservation,
+            round: &completion.round,
+            result_identity: &completion.result_identity,
+            completed_at_unix_ms: completion.completed_at_unix_ms,
+        },
+    ));
+    if completion.completion != expected {
+        return Err(KernelErrorV1::BindingMismatch(
+            "Docket reconciliation completion identity",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_initial_reconciliation_round_successor(
+    source: &OccurrenceSnapshotV1,
+    target: &ReconciliationRequiredV1,
+) -> Result<(), KernelErrorV1> {
+    let Some(round) = &target.reconciliation_round else {
+        // Existing non-round paths (initial executor result and restart
+        // recovery observation) remain legal historical/current cuts.
+        return Ok(());
+    };
+    let (request, reservation, completion) = match round {
+        ReconciliationRoundStateV1::Unresolved {
+            request,
+            reservation,
+        } => (request, reservation, None),
+        ReconciliationRoundStateV1::CompletedIndeterminate {
+            request,
+            reservation,
+            completion,
+        } => (request, reservation, Some(completion)),
+    };
+    if request.caller_state_digest != *source.state_digest()
+        || request.predecessor_round.is_some()
+        || request.predecessor_reconciliation.is_some()
+    {
+        return Err(KernelErrorV1::BindingMismatch(
+            "initial reconciliation round source",
+        ));
+    }
+    validate_round_reservation(request, reservation)?;
+    if let Some(completion) = completion {
+        validate_round_completion(request, reservation, completion)?;
+    }
+    Ok(())
+}
+
+fn validate_reconciliation_round_successor(
+    source_snapshot: &OccurrenceSnapshotV1,
+    source: &ReconciliationRequiredV1,
+    target: &ReconciliationRequiredV1,
+) -> Result<(), KernelErrorV1> {
+    validate_indeterminate(&target.indeterminate, &target.dispatch)?;
+    let Some(target_round) = &target.reconciliation_round else {
+        return Err(KernelErrorV1::BindingMismatch(
+            "reconciliation successor lost round state",
+        ));
+    };
+    let (request, reservation, completion) = match target_round {
+        ReconciliationRoundStateV1::Unresolved {
+            request,
+            reservation,
+        } => (request, reservation, None),
+        ReconciliationRoundStateV1::CompletedIndeterminate {
+            request,
+            reservation,
+            completion,
+        } => (request, reservation, Some(completion)),
+    };
+    validate_round_reservation(request, reservation)?;
+    if let Some(completion) = completion {
+        validate_round_completion(request, reservation, completion)?;
+    }
+    match &source.reconciliation_round {
+        None => {
+            if request.caller_state_digest != *source_snapshot.state_digest()
+                || request.predecessor_round.is_some()
+                || request.predecessor_reconciliation.is_some()
+            {
+                return Err(KernelErrorV1::BindingMismatch(
+                    "first reconciliation successor round",
+                ));
+            }
+        }
+        Some(ReconciliationRoundStateV1::Unresolved {
+            request: old_request,
+            reservation: old_reservation,
+        }) => {
+            if request != old_request || reservation != old_reservation || completion.is_none() {
+                return Err(KernelErrorV1::BindingMismatch(
+                    "unresolved reconciliation completion",
+                ));
+            }
+        }
+        Some(ReconciliationRoundStateV1::CompletedIndeterminate {
+            request: predecessor,
+            ..
+        }) => {
+            if request.caller_state_digest != *source_snapshot.state_digest()
+                || request.predecessor_round.as_ref() != Some(&predecessor.round)
+                || request.predecessor_reconciliation.as_ref()
+                    != Some(&source.indeterminate.reconciliation)
+            {
+                return Err(KernelErrorV1::BindingMismatch(
+                    "later reconciliation successor round",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+type ReconciliationBasis<'a> = (
+    &'a DispatchBasisV1,
+    Option<&'a IndeterminateOutcomeV1>,
+    Option<&'a ReconciliationRoundStateV1>,
+);
+
+fn reconciliation_basis(
+    current: &OccurrenceSnapshotV1,
+) -> Result<ReconciliationBasis<'_>, KernelErrorV1> {
+    match current.state() {
+        OccurrenceStateV1::Dispatched(value) => Ok((&value.0, None, None)),
+        OccurrenceStateV1::ReconciliationRequired(value) => Ok((
+            &value.dispatch,
+            Some(&value.indeterminate),
+            value.reconciliation_round.as_ref(),
+        )),
+        _ => Err(illegal(current, "record_reconciliation_round")),
+    }
+}
+
+fn validate_round_request_for_current(
+    current: &OccurrenceSnapshotV1,
+    request: &ReconciliationRoundRequestV1,
+    dispatch: &DispatchBasisV1,
+    prior: Option<&ReconciliationRoundStateV1>,
+) -> Result<(), KernelErrorV1> {
+    request.validate()?;
+    if request.issuance != dispatch.authorized.issuance.issuance
+        || request.attempt != dispatch.custody.attempt
+    {
+        return Err(KernelErrorV1::BindingMismatch(
+            "reconciliation round current cut",
+        ));
+    }
+    if let Some(ReconciliationRoundStateV1::Unresolved {
+        request: prior_request,
+        ..
+    }) = prior
+    {
+        if prior_request == request {
+            return Ok(());
+        }
+        return Err(KernelErrorV1::BindingMismatch(
+            "unresolved reconciliation round cannot enable a later poll",
+        ));
+    }
+    if request.caller_state_digest != *current.state_digest() {
+        return Err(KernelErrorV1::BindingMismatch(
+            "reconciliation round caller cut",
+        ));
+    }
+    match prior {
+        None => {
+            if request.predecessor_round.is_some() || request.predecessor_reconciliation.is_some() {
+                return Err(KernelErrorV1::BindingMismatch(
+                    "first reconciliation round predecessor",
+                ));
+            }
+        }
+        Some(ReconciliationRoundStateV1::CompletedIndeterminate {
+            request: predecessor,
+            ..
+        }) => {
+            let Some(indeterminate) = current.indeterminate() else {
+                return Err(KernelErrorV1::StateInvariant(
+                    "completed reconciliation round without indeterminate state",
+                ));
+            };
+            if request.predecessor_round.as_ref() != Some(&predecessor.round)
+                || request.predecessor_reconciliation.as_ref()
+                    != Some(&indeterminate.reconciliation)
+            {
+                return Err(KernelErrorV1::BindingMismatch(
+                    "later reconciliation round predecessor",
+                ));
+            }
+        }
+        Some(ReconciliationRoundStateV1::Unresolved { .. }) => {
+            unreachable!("unresolved prior returned or refused before caller-cut validation")
+        }
     }
     Ok(())
 }
@@ -6246,6 +7083,21 @@ fn validate_state(state: &OccurrenceStateV1) -> Result<(), KernelErrorV1> {
             validate_authorized(&value.dispatch.authorized)?;
             validate_custody(&value.dispatch.custody, &value.dispatch.authorized)?;
             validate_indeterminate(&value.indeterminate, &value.dispatch)?;
+            if let Some(round) = &value.reconciliation_round {
+                match round {
+                    ReconciliationRoundStateV1::Unresolved {
+                        request,
+                        reservation,
+                    } => validate_round_reservation(request, reservation)?,
+                    ReconciliationRoundStateV1::CompletedIndeterminate {
+                        request,
+                        reservation,
+                        completion,
+                    } => {
+                        validate_round_completion(request, reservation, completion)?;
+                    }
+                }
+            }
         }
         OccurrenceStateV1::SettledObservationRequired(value) => {
             validate_authorized(&value.dispatch.authorized)?;

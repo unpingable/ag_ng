@@ -132,6 +132,7 @@ if sys.argv[1] == "execute" and r["work_schema"].endswith("/initial/v1"):
 elif sys.argv[1] == "execute":
     out={"attempt":r["attempt"],"marker":r["marker"],"receipt":q("indeterminate-receipt"),"outcome":"indeterminate","effect_journal":[entry]}
 elif sys.argv[1] == "reconcile":
+    r=r["dispatch"]
     out={"attempt":r["attempt"],"marker":r["marker"],"receipt":q("settlement-receipt"),"outcome":"success","effect_journal":[]}
 else:
     sys.exit(64)
@@ -319,6 +320,7 @@ r=json.load(sys.stdin)
 if sys.argv[1] == "execute":
     sys.exit(75)
 if sys.argv[1] == "reconcile":
+    r=r["dispatch"]
     delta={{"schema":"ag.governed-loop.canonical-effect-scope/v1","effect_class":"repository-write/v1","resources":[{{"resource":"repository","path":"{requested}","operations":["modify"]}}]}}
     payload=json.dumps(delta,sort_keys=True,separators=(",",":")).encode()
     out={{"attempt":r["attempt"],"marker":r["marker"],"receipt":q("receipt"),"outcome":"scope_expansion_required","effect_journal":[],"governed_repair":{{"requirement":"scope_expansion_required","requested_delta":delta,"requested_delta_digest":ag_hash("ag.governed-loop.canonical-effect-scope/v1",payload),"blocked_effect":{{"effect_class":"repository-write/v1","resource":"repository","path":"{requested}","operation":"modify"}},"reason":q("reason"),"dependency_evidence":[q("dependency")],"created_at_unix_ms":0,"expires_at_unix_ms":9007199254740991,"idempotency":q("idempotency"),"limitations":[q("fixture-only")]}}}}
@@ -449,7 +451,42 @@ sys.stdout.write(json.dumps(o,sort_keys=True,separators=(",",":")))
     let mut reopened = GovernedCampaignServiceV1::open(&database).unwrap();
     let before = reopened.state().unwrap();
     let recovered = reopened.recover(before.current.state_digest()).unwrap();
-    let halted = recovered.current;
+    assert_eq!(
+        recovered.current.program_counter(),
+        ProgramCounterV1::ReconciliationRequired,
+        "restart recovery classifies the custody-bearing attempt but never performs an implicit executor poll"
+    );
+    let reconciled = reopened
+        .reconcile_docket(ReconciliationRoundParametersV1 {
+            expected_state_digest: recovered.current.state_digest.clone(),
+            idempotency: digest("governed-halt-reconciliation-round"),
+        })
+        .expect("one explicit authenticated round observes the exact sealed governed result");
+    let round_link = reconciled
+        .state
+        .current
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.kind == GovernedArtifactKindV1::DocketReconciliationRoundResponse)
+        .expect("actual Docket completed-round response is product-addressable");
+    let round_record = reopened
+        .artifact(&round_link.identity)
+        .unwrap()
+        .expect("actual Docket completed-round response is retrievable");
+    let round_response: DocketReconciliationRoundResponseV1 =
+        JcsDocument::parse(&round_record.bytes)
+            .and_then(|document| document.decode())
+            .expect("adapted Docket wire is a strict internal round record");
+    let DocketReconciliationRoundStatusV1::Completed { response, .. } = round_response.state else {
+        panic!("actual Docket governed-repair wire must complete the explicit round")
+    };
+    let DocketIssuanceReconciliationV1::GovernedRepairRequired { result, .. } = response else {
+        panic!("actual Docket sealed-result wire must adapt before AG persists it")
+    };
+    result
+        .validate()
+        .expect("adapted Docket sealed result retains every exact binding");
+    let halted = reconciled.state.current;
     assert_eq!(halted.program_counter(), ProgramCounterV1::Halted);
     let requirement = halted
         .halted()
@@ -526,10 +563,13 @@ fn real_product_successor_bytes_round_trip_through_docket_and_settle() {
         assert_eq!(dispatched.program_counter(), ProgramCounterV1::Dispatched);
 
         let reconciled = service
-            .reconcile_docket(&dispatched.state_digest)
+            .reconcile_docket(ReconciliationRoundParametersV1 {
+                expected_state_digest: dispatched.state_digest.clone(),
+                idempotency: digest("successor-reconciliation-round"),
+            })
             .expect("checkpoint is freshly verified before reconciliation");
         assert_eq!(
-            reconciled.current.program_counter(),
+            reconciled.state.current.program_counter(),
             ProgramCounterV1::SettledObservationRequired
         );
 
@@ -564,12 +604,14 @@ fn real_product_successor_bytes_round_trip_through_docket_and_settle() {
 
         assert!(
             reconciled
+                .state
                 .current
                 .artifacts
                 .iter()
                 .any(|artifact| artifact.kind == GovernedArtifactKindV1::DocketSettlement)
         );
         let journal_link = reconciled
+            .state
             .current
             .artifacts
             .iter()
@@ -583,12 +625,16 @@ fn real_product_successor_bytes_round_trip_through_docket_and_settle() {
             journal_record.kind,
             GovernedArtifactKindV1::EffectJournalReference
         );
-        assert!(journal_record.occurrences.contains(&reconciled.current.key));
+        assert!(
+            journal_record
+                .occurrences
+                .contains(&reconciled.state.current.key)
+        );
 
         // The stable product surface exposes every artifact for both the
         // halted predecessor and completed successor. A future client needs
         // neither AG SQLite schema knowledge nor a direct Docket call.
-        for key in [&fixture.predecessor.key, &reconciled.current.key] {
+        for key in [&fixture.predecessor.key, &reconciled.state.current.key] {
             let occurrence = service
                 .occurrence(key)
                 .unwrap()

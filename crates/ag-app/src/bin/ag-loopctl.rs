@@ -175,6 +175,9 @@ enum Command {
     ReconcileDocket {
         #[arg(long)]
         database: PathBuf,
+        /// Exact caller cut and one intentional poll idempotency identity.
+        #[arg(long)]
+        input: PathBuf,
         #[command(flatten)]
         cas: CasArguments,
     },
@@ -571,10 +574,21 @@ fn run() -> anyhow::Result<()> {
             let expected = parse_expected_state(&cas)?;
             write_exact(&service.dispatch(&expected)?)
         }
-        Command::ReconcileDocket { database, cas } => {
+        Command::ReconcileDocket {
+            database,
+            input,
+            cas,
+        } => {
+            let request: ReconciliationRoundParametersV1 = read_exact_record(&input)?;
             let mut service = GovernedCampaignServiceV1::open(&database)?;
             let expected = parse_expected_state(&cas)?;
-            write_exact(&service.reconcile_docket(&expected)?)
+            if request.expected_state_digest != expected {
+                return Err(stable_failure(
+                    "cas_input_mismatch",
+                    "input and --expected-state differ",
+                ));
+            }
+            write_exact(&service.reconcile_docket(request)?)
         }
         Command::Recover { database, cas } => {
             let mut service = GovernedCampaignServiceV1::open(&database)?;

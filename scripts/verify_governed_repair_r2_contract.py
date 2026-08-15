@@ -16,11 +16,13 @@ from pathlib import Path
 
 PINNED_FILES = {
     Path("conformance/governed-repair-r2/manifest.v1.json"):
-        "b71a2e7a9a606c7209f95522c20c2ae221c99a5dbebc6a6eba3d303b738b97ae",
+        "74c429d8d32341fc31fba45e4cdd1a0b6d994bace4c7d4d8ccfccfc9dad8aded",
     Path("conformance/governed-repair-r2/contract.v1.json"):
         "d3fc470761d8550f733e2528f0a2589e93717bd120e9b1ffbae687942168458b",
     Path("conformance/governed-repair-r2/labels.v1.json"):
         "47a2a8d97e700c0296044d5bb7d795e51b609860875062aaa633ced7498215b6",
+    Path("conformance/governed-repair-r2/reconciliation-rounds.v1.json"):
+        "408a2fe3ddf75621c43da441cbdcd33c7fe0845abadd9b02adc72038d01496fc",
     Path("conformance/governed-repair-r2/scopes.v1.json"):
         "905e9b96ba81a2dcc072f243b3bb1b8a02381377b2cebf61e98eaff033c3abaa",
     Path("conformance/governed-repair-r2/wire-hostiles.v1.json"):

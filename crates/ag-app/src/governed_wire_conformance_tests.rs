@@ -1,7 +1,10 @@
 //! Ordinary-gate tests for AG's complete producer/Docket-consumer wire corpus.
 
 use super::*;
+use crate::effect_executor_adapter::DocketExecutorReconciliationDispatchV1;
 use ag_primitives::{Digest, JcsDocument};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
@@ -9,6 +12,8 @@ const WIRE_VECTORS: &[u8] =
     include_bytes!("../../../conformance/governed-repair-r2/wire-vectors.v1.json");
 const WIRE_HOSTILES: &[u8] =
     include_bytes!("../../../conformance/governed-repair-r2/wire-hostiles.v1.json");
+const RECONCILIATION_ROUNDS: &[u8] =
+    include_bytes!("../../../conformance/governed-repair-r2/reconciliation-rounds.v1.json");
 
 fn corpus() -> Value {
     serde_json::from_slice(WIRE_VECTORS).expect("pinned wire corpus")
@@ -238,6 +243,178 @@ fn hostile_optional_unknown_integer_and_identity_mutations_refuse_at_the_boundar
         assert!(
             result.is_err(),
             "hostile case unexpectedly acquired a valid exact interpretation: {name}"
+        );
+    }
+}
+
+fn round_corpus() -> Value {
+    serde_json::from_slice(RECONCILIATION_ROUNDS).expect("pinned reconciliation-round corpus")
+}
+
+fn round_record<'a>(corpus: &'a Value, name: &str) -> &'a Value {
+    &corpus["records"][name]
+}
+
+fn verify_signed_round_envelope(
+    envelope: &SignedReconciliationRoundRequestEnvelopeV1,
+) -> Result<ReconciliationRoundRequestV1, String> {
+    if envelope.schema != SIGNED_RECONCILIATION_ROUND_REQUEST_SCHEMA_V1 {
+        return Err("signed reconciliation schema".to_owned());
+    }
+    let body = URL_SAFE_NO_PAD
+        .decode(&envelope.body_b64)
+        .map_err(|error| error.to_string())?;
+    let document = JcsDocument::from_canonical_bytes(&body).map_err(|error| error.to_string())?;
+    let request = document
+        .decode::<ReconciliationRoundRequestV1>()
+        .map_err(|error| error.to_string())?;
+    request.validate().map_err(|error| error.to_string())?;
+    let public = URL_SAFE_NO_PAD
+        .decode(&envelope.authentication.signer_public_key)
+        .map_err(|error| error.to_string())?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(&envelope.authentication.signature)
+        .map_err(|error| error.to_string())?;
+    let mut message = RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1.to_vec();
+    message.extend_from_slice(&body);
+    UnparsedPublicKey::new(&ED25519, public)
+        .verify(&message, &signature)
+        .map_err(|_| "reconciliation round signature".to_owned())?;
+    Ok(request)
+}
+
+#[test]
+fn reconciliation_round_corpus_exercises_actual_ag_types_and_signature_domain() {
+    let corpus = round_corpus();
+    let initial: ReconciliationRoundRequestV1 =
+        round_trip(round_record(&corpus, "reconciliation_request_initial"));
+    initial.validate().unwrap();
+    assert_digest(
+        initial.request.as_str(),
+        round_record(&corpus, "reconciliation_request_initial"),
+        "request",
+    );
+    assert_digest(
+        initial.round.as_str(),
+        round_record(&corpus, "reconciliation_request_initial"),
+        "round",
+    );
+
+    let later: ReconciliationRoundRequestV1 =
+        round_trip(round_record(&corpus, "reconciliation_request_later"));
+    later.validate().unwrap();
+    assert_eq!(later.predecessor_round.as_ref(), Some(&initial.round));
+
+    for (response_name, request) in [
+        ("reconciliation_response_unresolved", &initial),
+        ("reconciliation_response_completed_indeterminate", &initial),
+        ("reconciliation_response_completed_settled", &later),
+    ] {
+        let response: DocketReconciliationRoundResponseV1 =
+            round_trip(round_record(&corpus, response_name));
+        response.validate_for_request(request).unwrap();
+    }
+
+    let envelope: SignedReconciliationRoundRequestEnvelopeV1 = round_trip(round_record(
+        &corpus,
+        "signed_reconciliation_request_initial",
+    ));
+    assert_eq!(verify_signed_round_envelope(&envelope).unwrap(), initial);
+
+    let executor: DocketExecutorReconciliationDispatchV1 =
+        round_trip(round_record(&corpus, "executor_reconciliation_dispatch"));
+    assert_eq!(executor.request.as_str(), initial.request.as_str());
+    assert_eq!(executor.round.as_str(), initial.round.as_str());
+    executor.dispatch.effect_scope.validate().unwrap();
+    assert_eq!(
+        executor.dispatch.effect_scope.digest(),
+        executor.dispatch.effect_scope_digest
+    );
+}
+
+fn mutate_round_hostile(mut value: Value, case: &Value) -> Value {
+    let pointer = case["pointer"].as_str().unwrap();
+    let (parent, member) = pointer.rsplit_once('/').expect("non-root pointer");
+    let target = value
+        .pointer_mut(parent)
+        .expect("round hostile names an exact parent");
+    let object = target
+        .as_object_mut()
+        .expect("round hostile parent is an object");
+    let replacement = if case["value_encoding"] == "json_integer_decimal" {
+        serde_json::from_str::<Value>(case["value"].as_str().unwrap())
+            .expect("round hostile decimal spelling must be a JSON integer")
+    } else {
+        case["value"].clone()
+    };
+    match case["operation"].as_str().unwrap() {
+        "add" | "replace" => {
+            object.insert(member.to_owned(), replacement);
+        }
+        "remove" => {
+            object
+                .remove(member)
+                .expect("round hostile removes a member");
+        }
+        operation => panic!("unknown round hostile operation {operation}"),
+    }
+    value
+}
+
+#[test]
+fn every_reconciliation_round_hostile_refuses_at_its_exact_boundary() {
+    let corpus = round_corpus();
+    for case in corpus["hostiles"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let base = case["base"].as_str().unwrap();
+        let original = &corpus["records"][base]["value"];
+        let mutated = mutate_round_hostile(original.clone(), case);
+        let result = if base.starts_with("reconciliation_request_") {
+            canonical_decode::<ReconciliationRoundRequestV1>(&mutated)
+                .and_then(|request| request.validate().map_err(|error| error.to_string()))
+        } else if base == "signed_reconciliation_request_initial" {
+            canonical_decode::<SignedReconciliationRoundRequestEnvelopeV1>(&mutated)
+                .and_then(|envelope| verify_signed_round_envelope(&envelope).map(|_| ()))
+        } else if base.starts_with("reconciliation_response_") {
+            canonical_decode::<DocketReconciliationRoundResponseV1>(&mutated).and_then(|response| {
+                let request_name = if response.request.as_str()
+                    == corpus["records"]["reconciliation_request_later"]["identities"]["request"]
+                        .as_str()
+                        .unwrap()
+                {
+                    "reconciliation_request_later"
+                } else {
+                    "reconciliation_request_initial"
+                };
+                let request: ReconciliationRoundRequestV1 =
+                    serde_json::from_value(corpus["records"][request_name]["value"].clone())
+                        .unwrap();
+                response
+                    .validate_for_request(&request)
+                    .map_err(|error| error.to_string())
+            })
+        } else if base == "executor_reconciliation_dispatch" {
+            canonical_decode::<DocketExecutorReconciliationDispatchV1>(&mutated).and_then(
+                |envelope| {
+                    let exact: DocketExecutorReconciliationDispatchV1 =
+                        serde_json::from_value(original.clone()).unwrap();
+                    if envelope.request == exact.request
+                        && envelope.round == exact.round
+                        && envelope.reservation == exact.reservation
+                        && envelope != exact
+                    {
+                        Err("changed executor envelope bytes under exact round".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        } else {
+            panic!("round hostile has unknown base {base}");
+        };
+        assert!(
+            result.is_err(),
+            "round hostile unexpectedly accepted: {name}"
         );
     }
 }

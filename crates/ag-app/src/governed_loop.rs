@@ -163,7 +163,9 @@ impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV1<'_> {
 /// Exact result of polling/reconciling Docket.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DocketProgressV1 {
-    /// Custody exists but no exact outcome is yet available.
+    /// Custody exists but no exact outcome is yet available (historical
+    /// internal test seam; production uses explicit unresolved rounds).
+    #[cfg(test)]
     Pending,
     /// Known settlement was consumed by AG.
     Settled(OccurrenceSnapshotV1),
@@ -549,8 +551,31 @@ impl CampaignEngineV1 {
         }
     }
 
-    /// Polls Docket read-only and consumes only exact custody/settlement evidence.
-    pub fn poll_docket<D: DocketCustodyPortV1>(
+    /// Executes or exactly replays one Store-persisted reconciliation round
+    /// and consumes only its exact Docket reservation/completion evidence.
+    pub fn poll_docket_round<D: DocketCustodyPortV1>(
+        &mut self,
+        request: &ReconciliationRoundRequestV1,
+        docket: &mut D,
+        now_unix_ms: u64,
+    ) -> Result<DocketProgressV1, CampaignEngineErrorV1> {
+        let current = self.store.current()?;
+        let custody = current
+            .docket_custody()
+            .cloned()
+            .ok_or(CampaignEngineErrorV1::DocketResponse)?;
+        let issuance = current
+            .issuance()
+            .cloned()
+            .ok_or(CampaignEngineErrorV1::DocketResponse)?;
+        let response = docket.reconcile_round(&issuance, &custody, request)?;
+        self.apply_docket_round_response(&current, request, response, now_unix_ms)
+    }
+
+    /// Historical internal test seam. The production product/CLI graph has no
+    /// call edge to this raw observation operation.
+    #[cfg(test)]
+    pub(crate) fn poll_docket<D: DocketCustodyPortV1>(
         &mut self,
         expected_state_digest: &Digest,
         docket: &mut D,
@@ -901,63 +926,16 @@ impl CampaignEngineV1 {
                     CampaignTransitionKindV1::RecoveryReconciliation,
                     now_unix_ms,
                 )?;
-                let custody = reconciling
-                    .docket_custody()
-                    .cloned()
-                    .ok_or(CampaignEngineErrorV1::DocketResponse)?;
-                let issuance = reconciling
-                    .issuance()
-                    .cloned()
-                    .ok_or(CampaignEngineErrorV1::DocketResponse)?;
-                let response = docket.reconcile_attempt(&issuance, &custody)?;
-                Self::recovery_from_progress(
-                    self.apply_docket_progress(
-                        reconciling.state_digest(),
-                        &reconciling,
-                        response,
-                        now_unix_ms,
-                    )?,
-                    &self.store,
-                )
+                Ok(CampaignRecoveryV1::Advanced(reconciling))
             }
             ProgramCounterV1::ReconciliationRequired => {
-                let custody = current
-                    .docket_custody()
-                    .cloned()
-                    .ok_or(CampaignEngineErrorV1::DocketResponse)?;
-                let issuance = current
-                    .issuance()
-                    .cloned()
-                    .ok_or(CampaignEngineErrorV1::DocketResponse)?;
-                let response = docket.reconcile_attempt(&issuance, &custody)?;
-                Self::recovery_from_progress(
-                    self.apply_docket_progress(
-                        expected_state_digest,
-                        &current,
-                        response,
-                        now_unix_ms,
-                    )?,
-                    &self.store,
-                )
+                Ok(CampaignRecoveryV1::ExternalRevalidation(
+                    GovernedLoopKernelV1::recovery_requirement(&current),
+                ))
             }
             _ => Ok(CampaignRecoveryV1::ExternalRevalidation(
                 GovernedLoopKernelV1::recovery_requirement(&current),
             )),
-        }
-    }
-
-    fn recovery_from_progress(
-        progress: DocketProgressV1,
-        store: &CampaignStoreV1,
-    ) -> Result<CampaignRecoveryV1, CampaignEngineErrorV1> {
-        match progress {
-            DocketProgressV1::Pending | DocketProgressV1::ReconciliationRequired(_) => {
-                Ok(CampaignRecoveryV1::Advanced(store.current()?))
-            }
-            DocketProgressV1::Settled(snapshot) => Ok(CampaignRecoveryV1::Advanced(snapshot)),
-            DocketProgressV1::GovernedRepairRequired { halted, .. } => {
-                Ok(CampaignRecoveryV1::Advanced(halted))
-            }
         }
     }
 
@@ -1082,6 +1060,7 @@ impl CampaignEngineV1 {
         Ok(halted)
     }
 
+    #[cfg(test)]
     fn apply_docket_progress(
         &mut self,
         caller_expected: &Digest,
@@ -1177,6 +1156,234 @@ impl CampaignEngineV1 {
                 self.apply_sealed_governed_repair(caller_expected, current, result, now_unix_ms)
             }
         }
+    }
+
+    fn apply_docket_round_response(
+        &mut self,
+        current: &OccurrenceSnapshotV1,
+        request: &ReconciliationRoundRequestV1,
+        response: DocketReconciliationRoundResponseV1,
+        now_unix_ms: u64,
+    ) -> Result<DocketProgressV1, CampaignEngineErrorV1> {
+        if response.validate_for_request(request).is_err() {
+            return Err(CampaignEngineErrorV1::DocketResponse);
+        }
+        let exact_response = response.clone();
+        match response.state {
+            DocketReconciliationRoundStatusV1::NotAccepted
+            | DocketReconciliationRoundStatusV1::Refused(_) => {
+                Err(CampaignEngineErrorV1::DocketResponse)
+            }
+            DocketReconciliationRoundStatusV1::Unresolved(reservation) => {
+                let successor = GovernedLoopKernelV1::record_unresolved_reconciliation_round(
+                    current,
+                    request.clone(),
+                    reservation,
+                )?;
+                if &successor != current {
+                    self.store.commit_reconciliation_round_response(
+                        current,
+                        &successor,
+                        request,
+                        &exact_response,
+                        CampaignTransitionKindV1::ReconciliationRequired,
+                        now_unix_ms,
+                    )?;
+                }
+                Ok(DocketProgressV1::ReconciliationRequired(successor))
+            }
+            DocketReconciliationRoundStatusV1::Completed { .. } => self
+                .apply_completed_docket_round_response(
+                    current,
+                    request,
+                    &exact_response,
+                    now_unix_ms,
+                ),
+        }
+    }
+
+    fn apply_completed_docket_round_response(
+        &mut self,
+        current: &OccurrenceSnapshotV1,
+        request: &ReconciliationRoundRequestV1,
+        exact_response: &DocketReconciliationRoundResponseV1,
+        now_unix_ms: u64,
+    ) -> Result<DocketProgressV1, CampaignEngineErrorV1> {
+        let DocketReconciliationRoundStatusV1::Completed {
+            reservation,
+            completion,
+            response,
+        } = &exact_response.state
+        else {
+            return Err(CampaignEngineErrorV1::DocketResponse);
+        };
+        match response {
+            DocketIssuanceReconciliationV1::Indeterminate {
+                custody,
+                indeterminate,
+            } => {
+                if current.docket_custody() != Some(custody) {
+                    return Err(CampaignEngineErrorV1::DocketResponse);
+                }
+                let successor = GovernedLoopKernelV1::record_completed_indeterminate_round(
+                    current,
+                    request.clone(),
+                    reservation.clone(),
+                    completion.clone(),
+                    indeterminate.clone(),
+                )?;
+                if &successor != current {
+                    self.store.commit_reconciliation_round_response(
+                        current,
+                        &successor,
+                        request,
+                        exact_response,
+                        CampaignTransitionKindV1::ReconciliationRequired,
+                        now_unix_ms,
+                    )?;
+                }
+                Ok(DocketProgressV1::ReconciliationRequired(successor))
+            }
+            DocketIssuanceReconciliationV1::Settled { .. } => {
+                self.apply_completed_settlement_round(current, request, exact_response, now_unix_ms)
+            }
+            DocketIssuanceReconciliationV1::GovernedRepairRequired { custody, result } => {
+                if current.docket_custody() != Some(custody) {
+                    return Err(CampaignEngineErrorV1::DocketResponse);
+                }
+                let result_identity = match result {
+                    DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+                        outcome, ..
+                    }
+                    | DocketSealedGovernedRepairResultV1::ReadjudicationRequired {
+                        outcome, ..
+                    } => outcome.sealed_result.as_digest(),
+                };
+                if completion.result_identity != *result_identity {
+                    return Err(CampaignEngineErrorV1::DocketResponse);
+                }
+                self.apply_sealed_governed_repair_round(
+                    current,
+                    request,
+                    result.clone(),
+                    exact_response,
+                    now_unix_ms,
+                )
+            }
+            _ => Err(CampaignEngineErrorV1::DocketResponse),
+        }
+    }
+
+    fn apply_completed_settlement_round(
+        &mut self,
+        current: &OccurrenceSnapshotV1,
+        request: &ReconciliationRoundRequestV1,
+        exact_response: &DocketReconciliationRoundResponseV1,
+        now_unix_ms: u64,
+    ) -> Result<DocketProgressV1, CampaignEngineErrorV1> {
+        let DocketReconciliationRoundStatusV1::Completed {
+            reservation,
+            completion,
+            response:
+                DocketIssuanceReconciliationV1::Settled {
+                    custody,
+                    settlement,
+                },
+        } = &exact_response.state
+        else {
+            return Err(CampaignEngineErrorV1::DocketResponse);
+        };
+        // Reservation/completion correspondence is validated by the response
+        // owner and again by result-specific identity checks before any AG
+        // consequence is committed.
+        if reservation.request != request.request
+            || reservation.round != request.round
+            || completion.reservation != reservation.reservation
+            || completion.round != request.round
+        {
+            return Err(CampaignEngineErrorV1::DocketResponse);
+        }
+        if current.docket_custody() != Some(custody)
+            || completion.result_identity != *settlement.settlement.as_digest()
+        {
+            return Err(CampaignEngineErrorV1::DocketResponse);
+        }
+        if current.program_counter() == ProgramCounterV1::SettledObservationRequired {
+            return if current.settlement() == Some(settlement) {
+                Ok(DocketProgressV1::Settled(current.clone()))
+            } else {
+                Err(CampaignEngineErrorV1::DocketResponse)
+            };
+        }
+        let successor = if current.program_counter() == ProgramCounterV1::ReconciliationRequired {
+            GovernedLoopKernelV1::record_reconciled_settlement(current, settlement.clone())?
+        } else {
+            GovernedLoopKernelV1::record_settlement(current, settlement.clone())?
+        };
+        self.store.commit_reconciliation_round_response(
+            current,
+            &successor,
+            request,
+            exact_response,
+            if current.program_counter() == ProgramCounterV1::ReconciliationRequired {
+                CampaignTransitionKindV1::ReconciledSettlement
+            } else {
+                CampaignTransitionKindV1::SettlementRecorded
+            },
+            now_unix_ms,
+        )?;
+        Ok(DocketProgressV1::Settled(successor))
+    }
+
+    fn apply_sealed_governed_repair_round(
+        &mut self,
+        current: &OccurrenceSnapshotV1,
+        request: &ReconciliationRoundRequestV1,
+        result: DocketSealedGovernedRepairResultV1,
+        response: &DocketReconciliationRoundResponseV1,
+        now_unix_ms: u64,
+    ) -> Result<DocketProgressV1, CampaignEngineErrorV1> {
+        let exact_result = result.clone();
+        let (outcome, requirement, domain) = match result {
+            DocketSealedGovernedRepairResultV1::ScopeExpansionRequired {
+                outcome,
+                requirement,
+            } => (
+                outcome,
+                HumanDecisionRequirementV1::ScopeExpansion(requirement),
+                "ag.governed-loop.docket-scope-expansion-required/v1",
+            ),
+            DocketSealedGovernedRepairResultV1::ReadjudicationRequired {
+                outcome,
+                requirement,
+            } => (
+                outcome,
+                HumanDecisionRequirementV1::Readjudication(requirement),
+                "ag.governed-loop.docket-readjudication-required/v1",
+            ),
+        };
+        let reason = HaltReasonRefV1::from_digest(Digest::hash_domain(
+            domain,
+            outcome.sealed_result.as_digest().as_str().as_bytes(),
+        ));
+        let halted = GovernedLoopKernelV1::halt_from_docket_governed_repair(
+            current,
+            &outcome,
+            &requirement,
+            reason,
+        )?;
+        self.store.commit_docket_governed_repair_round_halt(
+            current,
+            &halted,
+            request,
+            &exact_result,
+            response,
+            now_unix_ms,
+        )?;
+        Ok(DocketProgressV1::GovernedRepairRequired {
+            halted,
+            requirement,
+        })
     }
 
     fn apply_sealed_governed_repair(

@@ -19,7 +19,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::governed_store::StoreIssuanceSigningPermitV1;
+use crate::governed_store::{
+    StoreIssuanceSigningPermitV1, StoreReconciliationRoundSigningPermitV1,
+};
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::JcsDocument;
@@ -32,6 +34,9 @@ use thiserror::Error;
 
 /// Schema for the authenticated canonical AG issuance handed to Docket.
 pub const SIGNED_AG_ISSUANCE_SCHEMA_V2: &str = "ag.governed-loop.signed-issuance/v2";
+/// Schema for an authenticated, Store-persisted reconciliation-round request.
+pub const SIGNED_RECONCILIATION_ROUND_REQUEST_SCHEMA_V1: &str =
+    "ag.governed-loop.signed-reconciliation-round-request/v1";
 /// Schema for process observation-resolution requests.
 pub const OBSERVATION_REQUEST_SCHEMA_V1: &str = "ag.governed-loop.observation-request/v1";
 /// Schema for process standing-resolution requests.
@@ -39,6 +44,9 @@ pub const STANDING_REQUEST_SCHEMA_V1: &str = "ag.governed-loop.standing-request/
 
 /// Exact closed signature-domain prefix for the V2 issuance wire contract.
 pub const SIGNATURE_PREFIX_V2: &[u8] = b"ag-ng\0governed-loop-issuance-signature\0v2\0";
+/// Distinct signature domain for reconciliation-round requests.
+pub const RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1: &[u8] =
+    b"ag-ng\0governed-loop-reconciliation-round-signature\0v1\0";
 
 fn deserialize_present_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
@@ -71,6 +79,19 @@ pub struct SignedAgIssuanceEnvelopeV2 {
     /// Canonical `AgIssuanceV2` bytes, base64url-no-pad.
     pub body_b64: String,
     /// Exact authentication over `body_b64`'s decoded bytes.
+    pub authentication: AgIssuanceAuthenticationV2,
+}
+
+/// Authenticated immutable envelope for one Store-persisted reconciliation
+/// request. The signature authenticates evidence; it creates no custody.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedReconciliationRoundRequestEnvelopeV1 {
+    /// Exact envelope schema.
+    pub schema: String,
+    /// Canonical `ReconciliationRoundRequestV1` bytes, base64url-no-pad.
+    pub body_b64: String,
+    /// Exact authentication over the decoded body bytes.
     pub authentication: AgIssuanceAuthenticationV2,
 }
 
@@ -129,6 +150,40 @@ impl AgIssuanceSignerV2 {
             },
         };
         Ok((issuance, envelope))
+    }
+
+    fn sign_reconciliation_round_permitted(
+        &self,
+        permit: StoreReconciliationRoundSigningPermitV1,
+    ) -> Result<
+        (
+            ReconciliationRoundRequestV1,
+            SignedReconciliationRoundRequestEnvelopeV1,
+        ),
+        GovernedPortErrorV1,
+    > {
+        let request = permit.into_request();
+        let body = JcsDocument::canonicalize(&request)
+            .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
+        let mut signed = Vec::with_capacity(
+            RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1.len() + body.as_bytes().len(),
+        );
+        signed.extend_from_slice(RECONCILIATION_ROUND_SIGNATURE_PREFIX_V1);
+        signed.extend_from_slice(body.as_bytes());
+        let signature = self.key_pair.sign(&signed);
+        Ok((
+            request,
+            SignedReconciliationRoundRequestEnvelopeV1 {
+                schema: SIGNED_RECONCILIATION_ROUND_REQUEST_SCHEMA_V1.to_owned(),
+                body_b64: URL_SAFE_NO_PAD.encode(body.as_bytes()),
+                authentication: AgIssuanceAuthenticationV2 {
+                    issuer_principal: self.issuer_principal.clone(),
+                    signer_key_id: self.key_id.clone(),
+                    signer_public_key: URL_SAFE_NO_PAD.encode(self.key_pair.public_key().as_ref()),
+                    signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
+                },
+            },
+        ))
     }
 }
 
@@ -398,6 +453,39 @@ enum DocketReconciliationWireV1 {
     },
 }
 
+/// Strict process-wire status for one Docket reconciliation round.  The
+/// nested completed response remains in Docket's external representation and
+/// is adapted through the same validation path as ordinary reconciliation;
+/// it is not decoded directly into AG's durable internal result model.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    content = "record",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+enum DocketReconciliationRoundStatusWireV1 {
+    NotAccepted,
+    Refused(DocketIssuanceRefusalWireV1),
+    Unresolved(DocketReconciliationRoundReservationV1),
+    Completed {
+        reservation: DocketReconciliationRoundReservationV1,
+        completion: DocketReconciliationRoundCompletionV1,
+        response: Box<DocketReconciliationWireV1>,
+    },
+}
+
+/// Strict Docket process response before conversion to AG's durable model.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocketReconciliationRoundResponseWireV1 {
+    schema: String,
+    request: ReconciliationRoundRequestRefV1,
+    round: ReconciliationRoundRefV1,
+    #[serde(flatten)]
+    state: DocketReconciliationRoundStatusWireV1,
+}
+
 #[cfg(test)]
 #[path = "governed_wire_conformance_tests.rs"]
 mod governed_wire_conformance_tests;
@@ -485,6 +573,7 @@ pub(crate) struct CommandDocketCustodyPortV1 {
     checkpoint_verifier: Option<PathBuf>,
     signer: AgIssuanceSignerV2,
     signing_permit: Option<StoreIssuanceSigningPermitV1>,
+    reconciliation_round_permit: Option<StoreReconciliationRoundSigningPermitV1>,
 }
 
 impl CommandDocketCustodyPortV1 {
@@ -501,6 +590,7 @@ impl CommandDocketCustodyPortV1 {
         checkpoint_verifier: Option<PathBuf>,
         signer: AgIssuanceSignerV2,
         signing_permit: Option<StoreIssuanceSigningPermitV1>,
+        reconciliation_round_permit: Option<StoreReconciliationRoundSigningPermitV1>,
     ) -> Self {
         Self {
             docket_program: docket_program.into(),
@@ -512,6 +602,7 @@ impl CommandDocketCustodyPortV1 {
             checkpoint_verifier,
             signer,
             signing_permit,
+            reconciliation_round_permit,
         }
     }
 
@@ -592,32 +683,54 @@ impl DocketCustodyPortV1 for CommandDocketCustodyPortV1 {
 
     fn reconcile_attempt(
         &mut self,
+        _issuance: &AgIssuanceV2,
+        _custody: &DocketCustodyV1,
+    ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
+        Err(ExternalBoundaryErrorV1::Unavailable {
+            code: "raw-attempt-reconciliation-retired-use-explicit-round".to_owned(),
+        })
+    }
+
+    fn reconcile_round(
+        &mut self,
         issuance: &AgIssuanceV2,
         custody: &DocketCustodyV1,
-    ) -> Result<DocketIssuanceReconciliationV1, ExternalBoundaryErrorV1> {
-        #[derive(Serialize)]
-        #[serde(deny_unknown_fields)]
-        struct Request<'a> {
-            issuance: &'a AgIssuanceRefV1,
-            attempt: &'a DocketAttemptRefV1,
-        }
-        let arguments = self.arguments("reconcile-attempt");
-        let wire: DocketReconciliationWireV1 = run_json_program(
-            &self.docket_program,
-            &arguments,
-            &Request {
-                issuance: &custody.issuance,
-                attempt: &custody.attempt,
-            },
-        )
-        .map_err(external_error)?;
-        if issuance.issuance != custody.issuance {
+        request: &ReconciliationRoundRequestV1,
+    ) -> Result<DocketReconciliationRoundResponseV1, ExternalBoundaryErrorV1> {
+        if issuance.issuance != custody.issuance
+            || request.issuance != issuance.issuance
+            || request.attempt != custody.attempt
+        {
             return Err(ExternalBoundaryErrorV1::Refused {
-                code: "reconciliation-issuance-custody-substitution".to_owned(),
+                code: "reconciliation-round-binding-substitution".to_owned(),
                 evidence: None,
             });
         }
-        adapt_docket_reconciliation(issuance, wire).map_err(external_error)
+        let permit = self.reconciliation_round_permit.take().ok_or_else(|| {
+            ExternalBoundaryErrorV1::Unavailable {
+                code: "store-reconciliation-round-signing-permit-absent".to_owned(),
+            }
+        })?;
+        let (permitted_request, envelope) = self
+            .signer
+            .sign_reconciliation_round_permitted(permit)
+            .map_err(external_error)?;
+        if &permitted_request != request {
+            return Err(ExternalBoundaryErrorV1::Refused {
+                code: "store-reconciliation-round-signing-permit-substitution".to_owned(),
+                evidence: None,
+            });
+        }
+        let arguments = self.arguments("reconcile-attempt");
+        let wire: DocketReconciliationRoundResponseWireV1 =
+            run_json_program(&self.docket_program, &arguments, &envelope)
+                .map_err(external_error)?;
+        adapt_docket_round_response(issuance, request, wire).map_err(|_| {
+            ExternalBoundaryErrorV1::Refused {
+                code: "reconciliation-round-response-substitution".to_owned(),
+                evidence: None,
+            }
+        })
     }
 }
 
@@ -1123,6 +1236,43 @@ fn adapt_docket_reconciliation(
     }
 }
 
+fn adapt_docket_round_response(
+    issuance: &AgIssuanceV2,
+    request: &ReconciliationRoundRequestV1,
+    wire: DocketReconciliationRoundResponseWireV1,
+) -> Result<DocketReconciliationRoundResponseV1, GovernedPortErrorV1> {
+    let state = match wire.state {
+        DocketReconciliationRoundStatusWireV1::NotAccepted => {
+            DocketReconciliationRoundStatusV1::NotAccepted
+        }
+        DocketReconciliationRoundStatusWireV1::Refused(refusal) => {
+            DocketReconciliationRoundStatusV1::Refused(adapt_docket_refusal(issuance, refusal)?)
+        }
+        DocketReconciliationRoundStatusWireV1::Unresolved(reservation) => {
+            DocketReconciliationRoundStatusV1::Unresolved(reservation)
+        }
+        DocketReconciliationRoundStatusWireV1::Completed {
+            reservation,
+            completion,
+            response,
+        } => DocketReconciliationRoundStatusV1::Completed {
+            reservation,
+            completion,
+            response: adapt_docket_reconciliation(issuance, *response)?,
+        },
+    };
+    let response = DocketReconciliationRoundResponseV1 {
+        schema: wire.schema,
+        request: wire.request,
+        round: wire.round,
+        state,
+    };
+    response
+        .validate_for_request(request)
+        .map_err(|error| GovernedPortErrorV1::MalformedResponse(error.to_string()))?;
+    Ok(response)
+}
+
 fn adapt_docket_refusal(
     issuance: &AgIssuanceV2,
     wire: DocketIssuanceRefusalWireV1,
@@ -1347,5 +1497,104 @@ mod tests {
         let clean_identity = wire.requirement_identity.clone();
         wire.no_unauthorized_effect_reported = false;
         assert_ne!(docket_scope_requirement_identity(&wire), clean_identity);
+    }
+
+    #[test]
+    fn completed_governed_repair_round_wire_rejects_unknown_nested_result_fields() {
+        let (requirement, _) = unsafe_timestamp_fixture(MAX_CANONICAL_JSON_INTEGER_V1);
+        let custody = DocketCustodyV1 {
+            schema: DOCKET_CUSTODY_SCHEMA_V1.to_owned(),
+            issuance: requirement.binding.issuance.clone(),
+            ag_spend: requirement.binding.spend.clone(),
+            execution_standing: DocketExecutionStandingRefV1::from_digest(digest("execution")),
+            standing_currentness: StandingCurrentnessRefV1::from_digest(digest("currentness")),
+            attempt: requirement.binding.attempt.clone(),
+            executor_marker: ExecutorAttemptMarkerRefV1::from_digest(digest("marker")),
+            accepted_at_unix_ms: 1,
+        };
+        let checkpoint = DocketCheckpointWireV1 {
+            schema: DOCKET_CHECKPOINT_SCHEMA_V1.to_owned(),
+            checkpoint: DocketCheckpointRefV1::from_digest(digest("checkpoint")),
+            issuance: requirement.binding.issuance.clone(),
+            custody: requirement.binding.custody.clone(),
+            attempt: requirement.binding.attempt.clone(),
+            executor_binding: requirement.binding.executor_binding.clone(),
+            executor_result: requirement.binding.executor_result.clone(),
+            executor_receipt: ReceiptRefV1::from_digest(digest("receipt")),
+            requirement_kind: "scope_expansion_required".to_owned(),
+            requirement_identity: requirement.requirement_identity.clone(),
+            effect_journal_digest: requirement.binding.effect_journal_digest.clone(),
+            immutable_work_checkpoint: None,
+            idempotency: requirement.binding.idempotency.clone(),
+            created_at_unix_ms: requirement.binding.created_at_unix_ms,
+            expires_at_unix_ms: requirement.binding.expires_at_unix_ms,
+        };
+        let request = ReconciliationRoundRequestV1::new(
+            requirement.binding.issuance.clone(),
+            requirement.binding.attempt.clone(),
+            digest("caller-state"),
+            None,
+            None,
+            digest("round-idempotency"),
+        );
+        let reservation = DocketReconciliationRoundReservationV1 {
+            schema: DOCKET_RECONCILIATION_ROUND_RESERVATION_SCHEMA_V1.to_owned(),
+            reservation: DocketReconciliationReservationRefV1::from_digest(digest("reservation")),
+            request: request.request.clone(),
+            round: request.round.clone(),
+            issuance: request.issuance.clone(),
+            attempt: request.attempt.clone(),
+            caller_state_digest: request.caller_state_digest.clone(),
+            predecessor_round: None,
+            predecessor_reconciliation: None,
+            source_cut: digest("source-cut"),
+            checkpoint_identity: None,
+            executor_binding: requirement.binding.executor_binding.clone(),
+            claimed_at_unix_ms: 2,
+        };
+        let response = DocketReconciliationRoundResponseWireV1 {
+            schema: DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1.to_owned(),
+            request: request.request.clone(),
+            round: request.round.clone(),
+            state: DocketReconciliationRoundStatusWireV1::Completed {
+                reservation: reservation.clone(),
+                completion: DocketReconciliationRoundCompletionV1 {
+                    schema: DOCKET_RECONCILIATION_ROUND_COMPLETION_SCHEMA_V1.to_owned(),
+                    completion: DocketReconciliationCompletionRefV1::from_digest(digest(
+                        "completion",
+                    )),
+                    reservation: reservation.reservation,
+                    round: request.round,
+                    result_identity: digest("sealed-result"),
+                    completed_at_unix_ms: 3,
+                },
+                response: Box::new(DocketReconciliationWireV1::GovernedRepairRequired {
+                    custody,
+                    result: Box::new(DocketSealedResultWireV1 {
+                        schema: DOCKET_SEALED_RESULT_SCHEMA_V1.to_owned(),
+                        sealed_result: DocketSealedResultRefV1::from_digest(digest(
+                            "sealed-result",
+                        )),
+                        checkpoint,
+                        outcome: DocketSealedRequirementWireV1::ScopeExpansionRequired(requirement),
+                    }),
+                }),
+            },
+        };
+        let mut value = serde_json::to_value(response).unwrap();
+        serde_json::from_value::<DocketReconciliationRoundResponseWireV1>(value.clone())
+            .expect("complete actual Docket wire shape decodes strictly");
+        value
+            .pointer_mut("/record/response/record/result")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "unknown_nested_field".to_owned(),
+                serde_json::Value::Bool(true),
+            );
+        let error = serde_json::from_value::<DocketReconciliationRoundResponseWireV1>(value)
+            .expect_err("unknown nested result field must refuse");
+        assert!(error.to_string().contains("unknown field"));
     }
 }

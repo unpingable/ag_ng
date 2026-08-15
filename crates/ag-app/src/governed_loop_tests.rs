@@ -789,11 +789,11 @@ fn custody_crash_recovers_to_reconciliation_without_respend_or_repeat() {
     assert_eq!(recovered.replay().unwrap().docket_attempts, 1);
 
     docket.settle(&issuance, KnownOutcomeV1::Failure);
-    let CampaignRecoveryV1::Advanced(settled) = recovered
-        .recover(&current_state_digest(&recovered), &mut docket, NOW + 7)
+    let DocketProgressV1::Settled(settled) = recovered
+        .poll_docket(&current_state_digest(&recovered), &mut docket, NOW + 7)
         .unwrap()
     else {
-        panic!("exact reconciliation must settle")
+        panic!("explicit exact reconciliation must settle")
     };
     assert_eq!(
         settled.program_counter(),
@@ -912,11 +912,11 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
 
     docket.settle(&issuance, KnownOutcomeV1::Success);
     engine = CampaignEngineV1::open(&database).unwrap();
-    let CampaignRecoveryV1::Advanced(settled) = engine
-        .recover(&current_state_digest(&engine), &mut docket, NOW + 8)
+    let DocketProgressV1::Settled(settled) = engine
+        .poll_docket(&current_state_digest(&engine), &mut docket, NOW + 8)
         .unwrap()
     else {
-        panic!("exact Docket settlement must close reconciliation")
+        panic!("explicit exact Docket settlement must close reconciliation")
     };
     assert_eq!(
         settled.program_counter(),
@@ -1135,11 +1135,21 @@ fn logical_crash_after_docket_seal_before_ag_ingestion_reconciles_to_one_halt() 
     drop(engine);
 
     let mut reopened = CampaignEngineV1::open(&database).unwrap();
-    let CampaignRecoveryV1::Advanced(halted) = reopened
+    let CampaignRecoveryV1::Advanced(reconciling) = reopened
         .recover(&current_state_digest(&reopened), &mut docket, NOW + 6)
         .unwrap()
     else {
-        panic!("sealed Docket result must reconcile to one durable AG halt")
+        panic!("dispatched restart must enter explicit reconciliation")
+    };
+    assert_eq!(
+        reconciling.program_counter(),
+        ProgramCounterV1::ReconciliationRequired
+    );
+    let DocketProgressV1::GovernedRepairRequired { halted, .. } = reopened
+        .poll_docket(&current_state_digest(&reopened), &mut docket, NOW + 7)
+        .unwrap()
+    else {
+        panic!("explicit sealed Docket result must reconcile to one durable AG halt")
     };
     assert_eq!(halted.program_counter(), ProgramCounterV1::Halted);
     assert!(

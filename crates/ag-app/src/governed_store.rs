@@ -45,14 +45,17 @@ use ag_campaign::CampaignId;
 use ag_campaign::governed::{
     AG_ISSUANCE_SCHEMA_V2, AgAuthorizationRefV1, AgAuthorizationSpendV1, AgIssuanceV2,
     AgSpendRefV1, DOCKET_SETTLEMENT_SCHEMA_V1, DocketGovernedRepairOutcomeRefV1,
-    DocketIssuanceRefusalV1, DocketSealedGovernedRepairResultV1, DocketSettlementV1,
+    DocketIssuanceReconciliationV1, DocketIssuanceRefusalV1, DocketReconciliationRoundResponseV1,
+    DocketReconciliationRoundStatusV1, DocketSealedGovernedRepairResultV1, DocketSettlementV1,
     GovernedLoopKernelV1, GovernedRepairDispositionEffectV1, GovernedRepairDispositionV1,
     GovernedRepairDispositionVerifierV1, GovernedRepairVerificationRequestV1,
     GovernedRepairVerificationV1, GovernedRepairVerifierProfileV1, HumanDecisionRequestRefV1,
     HumanDecisionRequestV1, HumanDecisionRequirementV1, HumanDispositionKindV1,
     HumanDispositionRefV1, HumanDispositionV1, HumanPrincipalRefV1, HumanVerificationRefV1,
     MandateRefV1, OccurrenceKeyV1, OccurrenceSnapshotV1, PreSpendScopeDiscoveryParametersV1,
-    PreSpendScopeDiscoveryV1, PreSpendScopeInsufficiencyV1, ProgramCounterV1, RefusalOutcomeV1,
+    PreSpendScopeDiscoveryV1, PreSpendScopeInsufficiencyV1, ProgramCounterV1,
+    ReconciliationRoundParametersV1, ReconciliationRoundRequestV1, ReconciliationRoundStateV1,
+    RefusalOutcomeV1,
 };
 use ag_primitives::{Digest, JcsDocument};
 use rusqlite::{
@@ -62,11 +65,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current governed-loop campaign-store schema version.
-pub const CAMPAIGN_STORE_SCHEMA_VERSION: u32 = 5;
+pub const CAMPAIGN_STORE_SCHEMA_VERSION: u32 = 6;
 /// `SQLite` application identifier for this exact store family (`AGC1`).
 pub const CAMPAIGN_STORE_APPLICATION_ID: u32 = 0x4147_4331;
 /// Human-readable exact store schema identity.
-pub const CAMPAIGN_STORE_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v5";
+pub const CAMPAIGN_STORE_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v6";
 
 const EVENT_DOMAIN_V1: &str = "ag.governed-loop.store-event/v1";
 const EVENT_GENESIS_DOMAIN_V1: &str = "ag.governed-loop.store-event-genesis/v1";
@@ -83,6 +86,9 @@ const CAMPAIGN_STORE_V3_SCHEMA_DIGEST: &str =
 const CAMPAIGN_STORE_V4_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v4";
 const CAMPAIGN_STORE_V4_SCHEMA_DIGEST: &str =
     "sha256:2a4aea8855baf0caa6e3c9ccd8b8f57159ec84f45d9a7b3379057c534b49869e";
+const CAMPAIGN_STORE_V5_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v5";
+const CAMPAIGN_STORE_V5_SCHEMA_DIGEST: &str =
+    "sha256:113f72a6b3df31d52ab0f745e04d2596c3ddce3a6c6ad0f309860e3da926a033";
 const MAX_DURABLE_SAFE_INTEGER_V1: u64 = ag_primitives::MAX_JCS_SAFE_INTEGER;
 const MAX_DURABLE_SAFE_INTEGER_SQL_V1: i64 = 9_007_199_254_740_991;
 const GOVERNED_REPAIR_VERIFIER_ROOT_SCHEMA_V1: &str =
@@ -422,6 +428,41 @@ BEGIN
 END;
 ";
 
+// A prepared reconciliation request is a durable, non-authorizing Store cut.
+// It is intentionally separate from the occurrence snapshot: preparation
+// cannot fabricate a Docket reservation, executor observation, or outcome.
+const V6_RECONCILIATION_ROUND_SCHEMA_SQL: &str = r"
+CREATE TABLE reconciliation_round_requests (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    round_id TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    campaign_id TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    caller_state_digest TEXT NOT NULL,
+    issuance_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    request_jcs BLOB NOT NULL,
+    UNIQUE (campaign_id, occurrence_id, caller_state_digest),
+    FOREIGN KEY (campaign_id, occurrence_id)
+        REFERENCES occurrences(campaign_id, occurrence_id),
+    FOREIGN KEY (issuance_id) REFERENCES docket_attempts(issuance_id),
+    FOREIGN KEY (attempt_id) REFERENCES docket_attempts(attempt_id)
+) STRICT;
+CREATE TABLE reconciliation_round_responses (
+    response_identity TEXT PRIMARY KEY NOT NULL,
+    request_id TEXT NOT NULL,
+    round_id TEXT NOT NULL,
+    source_state_digest TEXT NOT NULL,
+    resulting_state_digest TEXT NOT NULL,
+    response_jcs BLOB NOT NULL,
+    observed_at_unix_ms INTEGER NOT NULL
+        CHECK (observed_at_unix_ms BETWEEN 0 AND 9007199254740991),
+    UNIQUE (request_id, response_identity),
+    FOREIGN KEY (request_id) REFERENCES reconciliation_round_requests(request_id),
+    FOREIGN KEY (round_id) REFERENCES reconciliation_round_requests(round_id)
+) STRICT;
+";
+
 /// Exact semantic transition kind stored in the authoritative journal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -572,6 +613,9 @@ pub struct CampaignStateReadV1 {
     pub head: CampaignHeadV1,
     /// Sole unconsumed and unexpired request for the current state, if any.
     pub open_human_decision_request: Option<HumanDecisionRequestRefV1>,
+    /// Exact prepared/in-flight reconciliation request fencing this cut.
+    pub open_reconciliation_round_request:
+        Option<ag_campaign::governed::ReconciliationRoundRequestRefV1>,
     /// Latest consequence timestamp in the transition journal at this cut.
     pub last_recorded_at_unix_ms: u64,
 }
@@ -605,6 +649,15 @@ enum CampaignTransitionEvidenceV1 {
     PreSpendScopeDiscovery {
         artifact: PreSpendScopeDiscoveryV1,
     },
+    DocketReconciliationRound {
+        request: ReconciliationRoundRequestV1,
+        response: DocketReconciliationRoundResponseV1,
+    },
+    DocketGovernedRepairRoundHalt {
+        request: ReconciliationRoundRequestV1,
+        result: DocketSealedGovernedRepairResultV1,
+        response: DocketReconciliationRoundResponseV1,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -617,6 +670,8 @@ enum DirectArtifactKindV1 {
     ProductCreation,
     GovernedRepairVerifierRoot,
     Refusal,
+    ReconciliationRoundRequest,
+    DocketReconciliationRoundResponse,
 }
 
 /// Closed Store-to-product artifact taxonomy used to project a complete
@@ -644,6 +699,8 @@ pub(crate) enum StoreLifecycleArtifactKindV1 {
     HistoricalHumanDisposition,
     DocketIssuanceRefusal,
     PreSpendScopeDiscovery,
+    ReconciliationRoundRequest,
+    DocketReconciliationRoundResponse,
     Refusal,
 }
 
@@ -709,6 +766,30 @@ pub struct StoreIssuanceSigningPermitV1 {
     store_file: StoreFileIdentityV1,
     spend: AgSpendRefV1,
     issuance: AgIssuanceV2,
+}
+
+/// Process-local, non-serializable one-use permission to authenticate one
+/// exact Store-persisted reconciliation-round request.
+///
+/// The request is nonauthorizing evidence. This opaque value proves only that
+/// the exact Store performed the caller-CAS and durable request reservation;
+/// it grants no issuance, custody, attempt, or executor authority by itself.
+pub struct StoreReconciliationRoundSigningPermitV1 {
+    store_file: StoreFileIdentityV1,
+    request: ReconciliationRoundRequestV1,
+}
+
+impl StoreReconciliationRoundSigningPermitV1 {
+    /// Consumes the process-local permission at the authentication boundary.
+    #[must_use]
+    pub fn into_request(self) -> ReconciliationRoundRequestV1 {
+        let Self {
+            store_file,
+            request,
+        } = self;
+        let _ = store_file;
+        request
+    }
 }
 
 impl StoreIssuanceSigningPermitV1 {
@@ -881,6 +962,14 @@ pub enum CampaignStoreErrorV1 {
     /// Callers must reconcile Docket custody instead of signing again.
     #[error("issuance signing already reserved; reconcile exact issuance")]
     IssuanceSigningAlreadyReserved,
+    /// A reconciliation idempotency identity was rebound to changed complete
+    /// request bytes or a different caller cut.
+    #[error("reconciliation round request replay/substitution")]
+    ReconciliationRoundReplay,
+    /// A prepared round fences every other consequence from its exact source
+    /// cut until an exact Docket response is committed.
+    #[error("reconciliation round is outstanding at this campaign cut")]
+    ReconciliationRoundOutstanding,
     /// The deployment-pinned governed-repair verifier refused or was not
     /// available through the exact measured executable.
     #[error("governed repair verifier failure: {0}")]
@@ -943,10 +1032,11 @@ impl CampaignStoreV1 {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        configure_connection(&connection)?;
+        configure_new_connection(&connection)?;
         let transaction = connection.unchecked_transaction()?;
         transaction.execute_batch(SCHEMA_SQL)?;
         transaction.execute_batch(V5_SAFE_INTEGER_SCHEMA_SQL)?;
+        transaction.execute_batch(V6_RECONCILIATION_ROUND_SCHEMA_SQL)?;
         let schema_digest = current_schema_digest();
         transaction.execute(
             "INSERT INTO store_identity
@@ -1061,11 +1151,12 @@ impl CampaignStoreV1 {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        configure_connection(&connection)?;
+        configure_existing_connection(&connection)?;
         migrate_v1_to_v2_if_safe(&mut connection)?;
         migrate_v2_to_v3_if_safe(&mut connection)?;
         migrate_v3_to_v4_if_safe(&mut connection)?;
         migrate_v4_to_v5_if_safe(&mut connection)?;
+        migrate_v5_to_v6_if_safe(&mut connection)?;
         let store = Self {
             path: path.to_owned(),
             connection,
@@ -1156,12 +1247,15 @@ impl CampaignStoreV1 {
             now_unix_ms,
         )?
         .map(|request| request.reference());
+        let open_reconciliation_round_request =
+            open_reconciliation_round_request_on(&transaction, &current)?;
         let last_recorded_at_unix_ms = to_u64(row.5)?;
         transaction.commit()?;
         Ok(CampaignStateReadV1 {
             current,
             head,
             open_human_decision_request,
+            open_reconciliation_round_request,
             last_recorded_at_unix_ms,
         })
     }
@@ -1676,6 +1770,18 @@ impl CampaignStoreV1 {
                 "refusal_jcs",
                 DirectArtifactKindV1::Refusal,
             ),
+            (
+                "reconciliation_round_requests",
+                "request_id",
+                "request_jcs",
+                DirectArtifactKindV1::ReconciliationRoundRequest,
+            ),
+            (
+                "reconciliation_round_responses",
+                "response_identity",
+                "response_jcs",
+                DirectArtifactKindV1::DocketReconciliationRoundResponse,
+            ),
         ] {
             let query = format!("SELECT {bytes} FROM {table} WHERE {id}=?1");
             let value: Option<Vec<u8>> = self
@@ -1825,7 +1931,10 @@ impl CampaignStoreV1 {
         let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         for row in rows {
             let evidence: CampaignTransitionEvidenceV1 = decode(&row?)?;
-            if let CampaignTransitionEvidenceV1::DocketGovernedRepairHalt { ref result } = evidence
+            if let CampaignTransitionEvidenceV1::DocketGovernedRepairHalt { ref result }
+            | CampaignTransitionEvidenceV1::DocketGovernedRepairRoundHalt {
+                ref result, ..
+            } = evidence
             {
                 let (outcome, _) = governed_repair_result_parts(result);
                 if outcome.sealed_result.as_digest() == identity {
@@ -2052,6 +2161,31 @@ impl CampaignStoreV1 {
                         StoreLifecycleArtifactLinkV1 {
                             kind: StoreLifecycleArtifactKindV1::DocketCustody,
                             identity: outcome.custody.as_digest().clone(),
+                        },
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::DocketCheckpointReference,
+                            identity: outcome.checkpoint.as_digest().clone(),
+                        },
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::EffectJournalReference,
+                            identity: outcome.effect_journal.clone(),
+                        },
+                    ]);
+                }
+                CampaignTransitionEvidenceV1::DocketReconciliationRound { response, .. } => {
+                    links.extend(round_response_links(&response)?);
+                }
+                CampaignTransitionEvidenceV1::DocketGovernedRepairRoundHalt {
+                    result,
+                    response,
+                    ..
+                } => {
+                    links.extend(round_response_links(&response)?);
+                    let (outcome, _) = governed_repair_result_parts(&result);
+                    links.extend([
+                        StoreLifecycleArtifactLinkV1 {
+                            kind: StoreLifecycleArtifactKindV1::DocketGovernedRepairResult,
+                            identity: outcome.sealed_result.as_digest().clone(),
                         },
                         StoreLifecycleArtifactLinkV1 {
                             kind: StoreLifecycleArtifactKindV1::DocketCheckpointReference,
@@ -2432,6 +2566,204 @@ impl CampaignStoreV1 {
         })
     }
 
+    /// Atomically persists or exactly replays one explicit reconciliation
+    /// request and mints its process-local one-use authentication permission.
+    ///
+    /// No occurrence transition is written here. In particular, preparing a
+    /// request does not synthesize indeterminate evidence. Only Docket's exact
+    /// reserved/completed response can advance the occurrence state.
+    pub fn reconciliation_round_signing_permit(
+        &mut self,
+        parameters: &ReconciliationRoundParametersV1,
+    ) -> Result<
+        (
+            ReconciliationRoundRequestV1,
+            StoreReconciliationRoundSigningPermitV1,
+            bool,
+        ),
+        CampaignStoreErrorV1,
+    > {
+        self.replay()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(bytes) = transaction
+            .query_row(
+                "SELECT request_jcs FROM reconciliation_round_requests
+                 WHERE idempotency_key=?1",
+                params![parameters.idempotency.as_str()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        {
+            let request: ReconciliationRoundRequestV1 = decode(&bytes)?;
+            request.validate()?;
+            if encode(&request)? != bytes
+                || request.idempotency != parameters.idempotency
+                || request.caller_state_digest != parameters.expected_state_digest
+            {
+                return Err(CampaignStoreErrorV1::ReconciliationRoundReplay);
+            }
+            transaction.commit()?;
+            let permit = StoreReconciliationRoundSigningPermitV1 {
+                store_file: store_file_identity(&self.path)?,
+                request: request.clone(),
+            };
+            return Ok((request, permit, true));
+        }
+
+        let head = campaign_head(&transaction)?;
+        require_caller_expected(&head, &parameters.expected_state_digest)?;
+        let current = current_snapshot_on(&transaction)?;
+        if current.state_digest() != &parameters.expected_state_digest {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        let conflicting_cut: Option<String> = transaction
+            .query_row(
+                "SELECT request_id FROM reconciliation_round_requests
+                 WHERE campaign_id=?1 AND occurrence_id=?2 AND caller_state_digest=?3",
+                params![
+                    current.key().campaign.as_str(),
+                    current.key().occurrence.to_string(),
+                    parameters.expected_state_digest.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if conflicting_cut.is_some() {
+            return Err(CampaignStoreErrorV1::ReconciliationRoundReplay);
+        }
+        let issuance = current
+            .issuance()
+            .ok_or(CampaignStoreErrorV1::BindingMismatch)?;
+        let custody = current
+            .docket_custody()
+            .ok_or(CampaignStoreErrorV1::BindingMismatch)?;
+        let (predecessor_round, predecessor_reconciliation) = match current.program_counter() {
+            ProgramCounterV1::Dispatched => (None, None),
+            ProgramCounterV1::ReconciliationRequired => match current.reconciliation_round() {
+                None => (None, None),
+                Some(ReconciliationRoundStateV1::CompletedIndeterminate { request, .. }) => (
+                    Some(request.round.clone()),
+                    Some(
+                        current
+                            .indeterminate()
+                            .ok_or(CampaignStoreErrorV1::BindingMismatch)?
+                            .reconciliation
+                            .clone(),
+                    ),
+                ),
+                Some(ReconciliationRoundStateV1::Unresolved { .. }) => {
+                    return Err(CampaignStoreErrorV1::ReconciliationRoundReplay);
+                }
+            },
+            _ => return Err(CampaignStoreErrorV1::BindingMismatch),
+        };
+        let request = ReconciliationRoundRequestV1::new(
+            issuance.issuance.clone(),
+            custody.attempt.clone(),
+            parameters.expected_state_digest.clone(),
+            predecessor_round,
+            predecessor_reconciliation,
+            parameters.idempotency.clone(),
+        );
+        let bytes = encode(&request)?;
+        transaction.execute(
+            "INSERT INTO reconciliation_round_requests
+             (request_id,round_id,idempotency_key,campaign_id,occurrence_id,
+              caller_state_digest,issuance_id,attempt_id,request_jcs)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![
+                request.request.as_str(),
+                request.round.as_str(),
+                request.idempotency.as_str(),
+                current.key().campaign.as_str(),
+                current.key().occurrence.to_string(),
+                request.caller_state_digest.as_str(),
+                request.issuance.as_str(),
+                request.attempt.as_str(),
+                bytes,
+            ],
+        )?;
+        transaction.commit()?;
+        let permit = StoreReconciliationRoundSigningPermitV1 {
+            store_file: store_file_identity(&self.path)?,
+            request: request.clone(),
+        };
+        Ok((request, permit, false))
+    }
+
+    /// Returns the latest exact response already committed for an exact
+    /// idempotent request. This is the product replay cut: once AG has
+    /// durably observed a Docket response, a caller replay never crosses the
+    /// Docket or executor boundary again.
+    pub fn reconciliation_round_response_replay(
+        &self,
+        parameters: &ReconciliationRoundParametersV1,
+    ) -> Result<
+        Option<(
+            ReconciliationRoundRequestV1,
+            DocketReconciliationRoundResponseV1,
+        )>,
+        CampaignStoreErrorV1,
+    > {
+        let request_bytes: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT request_jcs FROM reconciliation_round_requests
+                 WHERE idempotency_key=?1",
+                params![parameters.idempotency.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(request_bytes) = request_bytes else {
+            return Ok(None);
+        };
+        let request: ReconciliationRoundRequestV1 = decode(&request_bytes)?;
+        request.validate()?;
+        if encode(&request)? != request_bytes
+            || request.idempotency != parameters.idempotency
+            || request.caller_state_digest != parameters.expected_state_digest
+        {
+            return Err(CampaignStoreErrorV1::ReconciliationRoundReplay);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT response_identity,response_jcs
+             FROM reconciliation_round_responses
+             WHERE request_id=?1 ORDER BY rowid DESC",
+        )?;
+        let rows = statement.query_map(params![request.request.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (stored_identity, response_bytes) = row?;
+            let response: DocketReconciliationRoundResponseV1 = decode(&response_bytes)?;
+            if encode(&response)? != response_bytes
+                || response.schema
+                    != ag_campaign::governed::DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1
+                || response.request != request.request
+                || response.round != request.round
+                || docket_round_response_identity(&response_bytes).as_str() != stored_identity
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "reconciliation response replay bytes changed".to_owned(),
+                ));
+            }
+            response.validate_for_request(&request)?;
+            if matches!(
+                response.state,
+                DocketReconciliationRoundStatusV1::Completed { .. }
+            ) {
+                return Ok(Some((request, response)));
+            }
+        }
+        // An unresolved observation is not a terminal replay cut: Docket may
+        // have completed the already claimed round after AG persisted it.
+        // Re-querying that exact request is safe because Docket returns its
+        // durable reservation/completion without reinvoking the executor.
+        Ok(None)
+    }
+
     /// Commits one non-human kernel successor with exact CAS semantics.
     pub(crate) fn commit_pre_spend_scope_insufficiency(
         &mut self,
@@ -2584,6 +2916,46 @@ impl CampaignStoreV1 {
         Ok(receipt)
     }
 
+    /// Atomically binds one exact Docket round observation to the occurrence
+    /// transition it caused. This is the sole bypass of the outstanding-round
+    /// fence and accepts only the request already persisted at the source cut.
+    pub fn commit_reconciliation_round_response(
+        &mut self,
+        expected: &OccurrenceSnapshotV1,
+        successor: &OccurrenceSnapshotV1,
+        request: &ReconciliationRoundRequestV1,
+        response: &DocketReconciliationRoundResponseV1,
+        kind: CampaignTransitionKindV1,
+        recorded_at_unix_ms: u64,
+    ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
+        if !matches!(
+            kind,
+            CampaignTransitionKindV1::ReconciliationRequired
+                | CampaignTransitionKindV1::ReconciledSettlement
+                | CampaignTransitionKindV1::SettlementRecorded
+        ) {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        validate_transition_kind(expected, successor, kind)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = write_transition(
+            &transaction,
+            expected.state_digest(),
+            expected,
+            successor,
+            kind,
+            &CampaignTransitionEvidenceV1::DocketReconciliationRound {
+                request: request.clone(),
+                response: response.clone(),
+            },
+            recorded_at_unix_ms,
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
     /// Atomically records one exact Docket refusal before custody. The
     /// issuance spend remains consumed and the refusal bytes are retained as
     /// replayable transition evidence.
@@ -2673,6 +3045,52 @@ impl CampaignStoreV1 {
             CampaignTransitionKindV1::DocketGovernedRepairHalted,
             &CampaignTransitionEvidenceV1::DocketGovernedRepairHalt {
                 result: result.clone(),
+            },
+            recorded_at_unix_ms,
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Round-bound counterpart of `commit_docket_governed_repair_halt`; the
+    /// sealed governed result and complete round response share one commit.
+    pub fn commit_docket_governed_repair_round_halt(
+        &mut self,
+        expected: &OccurrenceSnapshotV1,
+        successor: &OccurrenceSnapshotV1,
+        request: &ReconciliationRoundRequestV1,
+        result: &DocketSealedGovernedRepairResultV1,
+        response: &DocketReconciliationRoundResponseV1,
+        recorded_at_unix_ms: u64,
+    ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
+        result.validate()?;
+        let (outcome, requirement) = governed_repair_result_parts(result);
+        let halted = successor
+            .halted()
+            .ok_or(CampaignStoreErrorV1::BindingMismatch)?;
+        if halted.governed_repair_requirement() != Some(&requirement)
+            || GovernedLoopKernelV1::halt_from_docket_governed_repair(
+                expected,
+                outcome,
+                &requirement,
+                halted.reason().clone(),
+            )? != *successor
+        {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = write_transition(
+            &transaction,
+            expected.state_digest(),
+            expected,
+            successor,
+            CampaignTransitionKindV1::DocketGovernedRepairHalted,
+            &CampaignTransitionEvidenceV1::DocketGovernedRepairRoundHalt {
+                request: request.clone(),
+                result: result.clone(),
+                response: response.clone(),
             },
             recorded_at_unix_ms,
         )?;
@@ -2844,6 +3262,13 @@ impl CampaignStoreV1 {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let head = campaign_head(&transaction)?;
         require_caller_expected(&head, caller_expected)?;
+        let current = current_snapshot_on(&transaction)?;
+        if current.state_digest() != caller_expected {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+        if has_outstanding_round_at(&transaction, &current)? {
+            return Err(CampaignStoreErrorV1::ReconciliationRoundOutstanding);
+        }
         if refusal.key.campaign.as_str() != head.campaign
             || refusal.key.occurrence.to_string() != head.occurrence
             || refusal.at_state_digest != *caller_expected
@@ -2935,15 +3360,21 @@ impl CampaignStoreV1 {
             return Err(CampaignStoreErrorV1::StoreIdentity);
         }
         verify_safe_integer_schema(&self.connection)?;
+        verify_reconciliation_round_schema(&self.connection)?;
         verify_safe_integer_materialization(&self.connection)?;
         Ok(())
     }
 }
 
 fn current_schema_digest() -> Digest {
-    let mut schema = Vec::with_capacity(SCHEMA_SQL.len() + V5_SAFE_INTEGER_SCHEMA_SQL.len());
+    let mut schema = Vec::with_capacity(
+        SCHEMA_SQL.len()
+            + V5_SAFE_INTEGER_SCHEMA_SQL.len()
+            + V6_RECONCILIATION_ROUND_SCHEMA_SQL.len(),
+    );
     schema.extend_from_slice(SCHEMA_SQL.as_bytes());
     schema.extend_from_slice(V5_SAFE_INTEGER_SCHEMA_SQL.as_bytes());
+    schema.extend_from_slice(V6_RECONCILIATION_ROUND_SCHEMA_SQL.as_bytes());
     Digest::hash_domain("ag.governed-loop.store-schema/v1", &schema)
 }
 
@@ -2970,6 +3401,53 @@ fn verify_safe_integer_schema(connection: &Connection) -> Result<(), CampaignSto
         |row| row.get(0),
     )?;
     if trigger_count != 14 {
+        return Err(CampaignStoreErrorV1::StoreIdentity);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ReconciliationRoundSchemaObjectV1 {
+    object_type: String,
+    name: String,
+    table_name: String,
+    sql: Option<String>,
+}
+
+fn reconciliation_round_schema_objects(
+    connection: &Connection,
+) -> Result<Vec<ReconciliationRoundSchemaObjectV1>, CampaignStoreErrorV1> {
+    let mut statement = connection.prepare(
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema
+         WHERE tbl_name IN (
+             'reconciliation_round_requests',
+             'reconciliation_round_responses'
+         )
+         ORDER BY type,name,tbl_name",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ReconciliationRoundSchemaObjectV1 {
+            object_type: row.get(0)?,
+            name: row.get(1)?,
+            table_name: row.get(2)?,
+            sql: row.get(3)?,
+        })
+    })?;
+    let objects = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(objects)
+}
+
+fn expected_reconciliation_round_schema_objects()
+-> Result<Vec<ReconciliationRoundSchemaObjectV1>, CampaignStoreErrorV1> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(V6_RECONCILIATION_ROUND_SCHEMA_SQL)?;
+    reconciliation_round_schema_objects(&expected)
+}
+
+fn verify_reconciliation_round_schema(connection: &Connection) -> Result<(), CampaignStoreErrorV1> {
+    if reconciliation_round_schema_objects(connection)?
+        != expected_reconciliation_round_schema_objects()?
+    {
         return Err(CampaignStoreErrorV1::StoreIdentity);
     }
     Ok(())
@@ -3054,15 +3532,36 @@ fn verify_safe_integer_materialization(
     Ok(())
 }
 
-fn configure_connection(connection: &Connection) -> Result<(), CampaignStoreErrorV1> {
+fn configure_common_connection(connection: &Connection) -> Result<(), CampaignStoreErrorV1> {
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.pragma_update(None, "foreign_keys", true)?;
     connection.pragma_update(None, "trusted_schema", false)?;
     connection.pragma_update(None, "synchronous", "FULL")?;
-    let mode: String = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    Ok(())
+}
+
+fn configure_new_connection(connection: &Connection) -> Result<(), CampaignStoreErrorV1> {
+    configure_common_connection(connection)?;
+    let mode: String =
+        connection.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(CampaignStoreErrorV1::Corrupt(
             "SQLite refused WAL journal mode".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn configure_existing_connection(connection: &Connection) -> Result<(), CampaignStoreErrorV1> {
+    configure_common_connection(connection)?;
+    // WAL is a persistent Store-format property established at creation. An
+    // ordinary open must only observe and verify it: spelling the assignment
+    // form again takes a write-ish SQLite lock and can race an otherwise
+    // unrelated consequence transaction on another connection.
+    let mode: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "campaign store is not in WAL journal mode".to_owned(),
         ));
     }
     Ok(())
@@ -3306,10 +3805,46 @@ fn migrate_v4_to_v5_if_safe(connection: &mut Connection) -> Result<(), CampaignS
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     verify_safe_integer_materialization(&transaction)?;
     transaction.execute_batch(V5_SAFE_INTEGER_SCHEMA_SQL)?;
-    let schema_digest = current_schema_digest();
     transaction.execute(
         "UPDATE store_identity SET schema_name=?1, schema_version=?2,
          schema_digest=?3 WHERE singleton=1",
+        params![
+            CAMPAIGN_STORE_V5_SCHEMA_NAME,
+            5_i64,
+            CAMPAIGN_STORE_V5_SCHEMA_DIGEST,
+        ],
+    )?;
+    transaction.pragma_update(None, "user_version", 5_u32)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6_if_safe(connection: &mut Connection) -> Result<(), CampaignStoreErrorV1> {
+    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != 5 {
+        return Ok(());
+    }
+    let identity: (u32, String, u32, String) = connection.query_row(
+        "SELECT application_id, schema_name, schema_version, schema_digest
+         FROM store_identity WHERE singleton=1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if identity.0 != CAMPAIGN_STORE_APPLICATION_ID
+        || identity.1 != CAMPAIGN_STORE_V5_SCHEMA_NAME
+        || identity.2 != 5
+        || identity.3 != CAMPAIGN_STORE_V5_SCHEMA_DIGEST
+    {
+        return Err(CampaignStoreErrorV1::StoreIdentity);
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    verify_safe_integer_schema(&transaction)?;
+    verify_safe_integer_materialization(&transaction)?;
+    transaction.execute_batch(V6_RECONCILIATION_ROUND_SCHEMA_SQL)?;
+    let schema_digest = current_schema_digest();
+    transaction.execute(
+        "UPDATE store_identity SET schema_name=?1,schema_version=?2,schema_digest=?3
+         WHERE singleton=1",
         params![
             CAMPAIGN_STORE_SCHEMA_NAME,
             i64::from(CAMPAIGN_STORE_SCHEMA_VERSION),
@@ -3648,6 +4183,18 @@ fn write_transition(
     recorded_at_unix_ms: u64,
 ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
     GovernedLoopKernelV1::validate_successor(expected, successor)?;
+    let round_response = match evidence {
+        CampaignTransitionEvidenceV1::DocketReconciliationRound { response, .. }
+        | CampaignTransitionEvidenceV1::DocketGovernedRepairRoundHalt { response, .. } => {
+            Some(response)
+        }
+        _ => None,
+    };
+    if let Some(response) = round_response {
+        validate_round_response_source(transaction, expected, response)?;
+    } else if has_outstanding_round_at(transaction, expected)? {
+        return Err(CampaignStoreErrorV1::ReconciliationRoundOutstanding);
+    }
     if expected.program_counter() == ProgramCounterV1::AuthorizationConsumed
         && successor.program_counter() == ProgramCounterV1::Halted
         && kind != CampaignTransitionKindV1::DocketIssuanceRefused
@@ -3783,12 +4330,154 @@ fn write_transition(
                 .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?,
         });
     }
+    if let Some(response) = round_response {
+        insert_round_response_observation(
+            transaction,
+            expected,
+            successor,
+            response,
+            recorded_at_unix_ms,
+        )?;
+    }
     Ok(CampaignCommitReceiptV1 {
         revision: next_revision,
         predecessor_state_digest: expected.state_digest().clone(),
         successor_state_digest: successor.state_digest().clone(),
         event_digest,
     })
+}
+
+fn has_outstanding_round_at(
+    transaction: &Transaction<'_>,
+    current: &OccurrenceSnapshotV1,
+) -> Result<bool, CampaignStoreErrorV1> {
+    let direct: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM reconciliation_round_requests
+         WHERE campaign_id=?1 AND occurrence_id=?2 AND caller_state_digest=?3",
+        params![
+            current.key().campaign.as_str(),
+            current.key().occurrence.to_string(),
+            current.state_digest().as_str(),
+        ],
+        |row| row.get(0),
+    )?;
+    if direct != 0 {
+        return Ok(true);
+    }
+    let Some(ReconciliationRoundStateV1::Unresolved { request, .. }) =
+        current.reconciliation_round()
+    else {
+        return Ok(false);
+    };
+    let retained: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM reconciliation_round_requests WHERE request_id=?1",
+        params![request.request.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(retained == 1)
+}
+
+fn open_reconciliation_round_request_on(
+    transaction: &Transaction<'_>,
+    current: &OccurrenceSnapshotV1,
+) -> Result<Option<ag_campaign::governed::ReconciliationRoundRequestRefV1>, CampaignStoreErrorV1> {
+    let direct: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT request_jcs FROM reconciliation_round_requests
+             WHERE campaign_id=?1 AND occurrence_id=?2 AND caller_state_digest=?3",
+            params![
+                current.key().campaign.as_str(),
+                current.key().occurrence.to_string(),
+                current.state_digest().as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(bytes) = direct {
+        let request: ReconciliationRoundRequestV1 = decode(&bytes)?;
+        request.validate()?;
+        if encode(&request)? != bytes {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "open reconciliation request bytes changed".to_owned(),
+            ));
+        }
+        return Ok(Some(request.request));
+    }
+    Ok(match current.reconciliation_round() {
+        Some(ReconciliationRoundStateV1::Unresolved { request, .. }) => {
+            Some(request.request.clone())
+        }
+        _ => None,
+    })
+}
+
+fn validate_round_response_source(
+    transaction: &Transaction<'_>,
+    current: &OccurrenceSnapshotV1,
+    response: &DocketReconciliationRoundResponseV1,
+) -> Result<(), CampaignStoreErrorV1> {
+    if response.schema != ag_campaign::governed::DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1 {
+        return Err(CampaignStoreErrorV1::BindingMismatch);
+    }
+    let bytes: Vec<u8> = transaction
+        .query_row(
+            "SELECT request_jcs FROM reconciliation_round_requests
+             WHERE request_id=?1 AND round_id=?2",
+            params![response.request.as_str(), response.round.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|_| CampaignStoreErrorV1::BindingMismatch)?;
+    let request: ReconciliationRoundRequestV1 = decode(&bytes)?;
+    request.validate()?;
+    if encode(&request)? != bytes {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "reconciliation response request bytes changed".to_owned(),
+        ));
+    }
+    let direct = request.caller_state_digest == *current.state_digest();
+    let completing_unresolved = matches!(
+        current.reconciliation_round(),
+        Some(ReconciliationRoundStateV1::Unresolved { request: old, .. }) if old == &request
+    );
+    if !direct && !completing_unresolved {
+        return Err(CampaignStoreErrorV1::BindingMismatch);
+    }
+    response.validate_for_request(&request)?;
+    Ok(())
+}
+
+fn insert_round_response_observation(
+    transaction: &Transaction<'_>,
+    source: &OccurrenceSnapshotV1,
+    successor: &OccurrenceSnapshotV1,
+    response: &DocketReconciliationRoundResponseV1,
+    observed_at_unix_ms: u64,
+) -> Result<(), CampaignStoreErrorV1> {
+    let bytes = encode(response)?;
+    let identity = docket_round_response_identity(&bytes);
+    transaction.execute(
+        "INSERT INTO reconciliation_round_responses
+         (response_identity,request_id,round_id,source_state_digest,
+          resulting_state_digest,response_jcs,observed_at_unix_ms)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            identity.as_str(),
+            response.request.as_str(),
+            response.round.as_str(),
+            source.state_digest().as_str(),
+            successor.state_digest().as_str(),
+            bytes,
+            to_i64(observed_at_unix_ms)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn docket_round_response_identity(bytes: &[u8]) -> Digest {
+    Digest::hash_domain(
+        "ag.governed-loop.docket-reconciliation-round-response/v1",
+        bytes,
+    )
 }
 
 fn account_new_facts(
@@ -3876,6 +4565,8 @@ fn validate_transition_kind(
         K::SettlementRecorded => pair == (P::Dispatched, P::SettledObservationRequired),
         K::ReconciliationRequired | K::RecoveryReconciliation => {
             pair == (P::Dispatched, P::ReconciliationRequired)
+                || (kind == K::ReconciliationRequired
+                    && pair == (P::ReconciliationRequired, P::ReconciliationRequired))
         }
         K::ReconciledSettlement => {
             pair == (P::ReconciliationRequired, P::SettledObservationRequired)
@@ -4533,6 +5224,8 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
     verify_governed_repair_artifacts(connection, &governed_repair_artifacts)?;
     verify_governed_repair_verification_namespace(connection, &governed_repair_artifacts)?;
     verify_issuance_signing_reservations(connection, &spends)?;
+    verify_reconciliation_round_requests(connection)?;
+    verify_reconciliation_round_responses(connection, &transitions)?;
     verify_refusals(connection, &campaign, &transitions)?;
     let quick_check: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if quick_check != "ok" {
@@ -4705,6 +5398,70 @@ fn validate_replayed_evidence(
             Ok(())
         }
         (
+            CampaignTransitionKindV1::DocketGovernedRepairHalted,
+            CampaignTransitionEvidenceV1::DocketGovernedRepairRoundHalt {
+                request,
+                result,
+                response,
+            },
+        ) => {
+            result.validate()?;
+            let DocketReconciliationRoundStatusV1::Completed {
+                response:
+                    DocketIssuanceReconciliationV1::GovernedRepairRequired {
+                        result: response_result,
+                        ..
+                    },
+                ..
+            } = &response.state
+            else {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "governed-repair round response has wrong result class".to_owned(),
+                ));
+            };
+            if response_result != result {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "governed-repair round result substitution".to_owned(),
+                ));
+            }
+            if response.request != request.request || response.round != request.round {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "governed-repair round request substitution".to_owned(),
+                ));
+            }
+            let (outcome, requirement) = governed_repair_result_parts(result);
+            let halted = target
+                .halted()
+                .ok_or(CampaignStoreErrorV1::BindingMismatch)?;
+            if halted.governed_repair_requirement() != Some(&requirement)
+                || GovernedLoopKernelV1::halt_from_docket_governed_repair(
+                    source,
+                    outcome,
+                    &requirement,
+                    halted.reason().clone(),
+                )? != *target
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "governed-repair round transition reconstruction mismatch".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        (
+            CampaignTransitionKindV1::ReconciliationRequired
+            | CampaignTransitionKindV1::SettlementRecorded
+            | CampaignTransitionKindV1::ReconciledSettlement,
+            CampaignTransitionEvidenceV1::DocketReconciliationRound { request, response },
+        ) => {
+            let reconstructed = reconstruct_round_response_successor(source, request, response)?;
+            if reconstructed != *target {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "reconciliation round transition reconstruction mismatch".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+        (
             CampaignTransitionKindV1::DocketIssuanceRefused,
             CampaignTransitionEvidenceV1::DocketIssuanceRefusal { refusal },
         ) => {
@@ -4811,6 +5568,58 @@ fn validate_replayed_evidence(
         }
         (_, _) => Err(CampaignStoreErrorV1::Corrupt(
             "non-human transition carries human authority evidence".to_owned(),
+        )),
+    }
+}
+
+fn reconstruct_round_response_successor(
+    source: &OccurrenceSnapshotV1,
+    request: &ReconciliationRoundRequestV1,
+    response: &DocketReconciliationRoundResponseV1,
+) -> Result<OccurrenceSnapshotV1, CampaignStoreErrorV1> {
+    request.validate()?;
+    if response.request != request.request || response.round != request.round {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "reconciliation response request substitution".to_owned(),
+        ));
+    }
+    match &response.state {
+        DocketReconciliationRoundStatusV1::Unresolved(reservation) => Ok(
+            GovernedLoopKernelV1::record_unresolved_reconciliation_round(
+                source,
+                request.clone(),
+                reservation.clone(),
+            )?,
+        ),
+        DocketReconciliationRoundStatusV1::Completed {
+            reservation,
+            completion,
+            response: DocketIssuanceReconciliationV1::Indeterminate { indeterminate, .. },
+        } => Ok(GovernedLoopKernelV1::record_completed_indeterminate_round(
+            source,
+            request.clone(),
+            reservation.clone(),
+            completion.clone(),
+            indeterminate.clone(),
+        )?),
+        DocketReconciliationRoundStatusV1::Completed {
+            response: DocketIssuanceReconciliationV1::Settled { settlement, .. },
+            ..
+        } => {
+            if source.program_counter() == ProgramCounterV1::ReconciliationRequired {
+                Ok(GovernedLoopKernelV1::record_reconciled_settlement(
+                    source,
+                    settlement.clone(),
+                )?)
+            } else {
+                Ok(GovernedLoopKernelV1::record_settlement(
+                    source,
+                    settlement.clone(),
+                )?)
+            }
+        }
+        _ => Err(CampaignStoreErrorV1::Corrupt(
+            "unsupported reconciliation round replay result".to_owned(),
         )),
     }
 }
@@ -5189,6 +5998,202 @@ fn verify_issuance_signing_reservations(
     Ok(())
 }
 
+fn verify_reconciliation_round_requests(
+    connection: &Connection,
+) -> Result<(), CampaignStoreErrorV1> {
+    let mut statement = connection.prepare(
+        "SELECT request_id,round_id,idempotency_key,campaign_id,occurrence_id,
+                caller_state_digest,issuance_id,attempt_id,request_jcs
+         FROM reconciliation_round_requests ORDER BY request_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, Vec<u8>>(8)?,
+        ))
+    })?;
+    for row in rows {
+        let (
+            request_id,
+            round_id,
+            idempotency,
+            campaign,
+            occurrence,
+            caller,
+            issuance,
+            attempt,
+            bytes,
+        ) = row?;
+        let request: ReconciliationRoundRequestV1 = decode(&bytes)?;
+        request.validate()?;
+        if encode(&request)? != bytes
+            || request.request.as_str() != request_id
+            || request.round.as_str() != round_id
+            || request.idempotency.as_str() != idempotency
+            || request.caller_state_digest.as_str() != caller
+            || request.issuance.as_str() != issuance
+            || request.attempt.as_str() != attempt
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "reconciliation round request materialization mismatch".to_owned(),
+            ));
+        }
+        let source_bytes: Vec<u8> = connection
+            .query_row(
+                "SELECT successor_snapshot_jcs FROM transitions
+                 WHERE campaign_id=?1 AND successor_occurrence_id=?2
+                   AND successor_state_digest=?3",
+                params![campaign, occurrence, caller],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                CampaignStoreErrorV1::Corrupt(
+                    "reconciliation request source cut is absent".to_owned(),
+                )
+            })?;
+        let source: OccurrenceSnapshotV1 = decode(&source_bytes)?;
+        source.validate_integrity()?;
+        if source.issuance().map(|value| &value.issuance) != Some(&request.issuance)
+            || source.docket_custody().map(|value| &value.attempt) != Some(&request.attempt)
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "reconciliation request differs from source custody".to_owned(),
+            ));
+        }
+        let expected_predecessor = match source.program_counter() {
+            ProgramCounterV1::Dispatched => (None, None),
+            ProgramCounterV1::ReconciliationRequired => match source.reconciliation_round() {
+                None => (None, None),
+                Some(ReconciliationRoundStateV1::CompletedIndeterminate { request, .. }) => (
+                    Some(request.round.clone()),
+                    Some(
+                        source
+                            .indeterminate()
+                            .ok_or_else(|| {
+                                CampaignStoreErrorV1::Corrupt(
+                                    "completed round source lacks indeterminate evidence"
+                                        .to_owned(),
+                                )
+                            })?
+                            .reconciliation
+                            .clone(),
+                    ),
+                ),
+                Some(ReconciliationRoundStateV1::Unresolved { .. }) => {
+                    return Err(CampaignStoreErrorV1::Corrupt(
+                        "unresolved round enabled another persisted request".to_owned(),
+                    ));
+                }
+            },
+            _ => {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "reconciliation request source is not custody-bearing".to_owned(),
+                ));
+            }
+        };
+        if (
+            request.predecessor_round,
+            request.predecessor_reconciliation,
+        ) != expected_predecessor
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "reconciliation request predecessor chain mismatch".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_reconciliation_round_responses(
+    connection: &Connection,
+    transitions: &[StoredTransitionRow],
+) -> Result<(), CampaignStoreErrorV1> {
+    let mut expected = BTreeMap::new();
+    for row in transitions {
+        let (CampaignTransitionEvidenceV1::DocketReconciliationRound { request, response }
+        | CampaignTransitionEvidenceV1::DocketGovernedRepairRoundHalt {
+            request, response, ..
+        }) = &row.evidence
+        else {
+            continue;
+        };
+        response.validate_for_request(request)?;
+        let bytes = encode(response)?;
+        let identity = docket_round_response_identity(&bytes);
+        let prior = expected.insert(
+            identity.as_str().to_owned(),
+            (
+                request.request.as_str().to_owned(),
+                request.round.as_str().to_owned(),
+                row.predecessor.as_str().to_owned(),
+                row.successor.as_str().to_owned(),
+                bytes,
+                row.recorded_at_unix_ms,
+            ),
+        );
+        if prior.is_some() {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "one Docket round response appears in multiple transitions".to_owned(),
+            ));
+        }
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT response_identity,request_id,round_id,source_state_digest,
+                resulting_state_digest,response_jcs,observed_at_unix_ms
+         FROM reconciliation_round_responses ORDER BY response_identity",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Vec<u8>>(5)?,
+            row.get::<_, i64>(6)?,
+        ))
+    })?;
+    let mut actual = BTreeMap::new();
+    for row in rows {
+        let (identity, request, round, source, resulting, bytes, observed) = row?;
+        let response: DocketReconciliationRoundResponseV1 = decode(&bytes)?;
+        if encode(&response)? != bytes
+            || response.request.as_str() != request
+            || response.round.as_str() != round
+            || docket_round_response_identity(&bytes).as_str() != identity
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "Docket round response materialization mismatch".to_owned(),
+            ));
+        }
+        if actual
+            .insert(
+                identity,
+                (request, round, source, resulting, bytes, to_u64(observed)?),
+            )
+            .is_some()
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "duplicate Docket round response identity".to_owned(),
+            ));
+        }
+    }
+    if actual != expected {
+        return Err(CampaignStoreErrorV1::Corrupt(
+            "Docket round response accounting differs from transition evidence".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn verify_residual_discharge_accounting(
     connection: &Connection,
     humans: &BTreeMap<String, ExpectedHumanRow>,
@@ -5426,6 +6431,31 @@ fn validate_direct_artifact_bytes(
                 ));
             }
         }
+        DirectArtifactKindV1::ReconciliationRoundRequest => {
+            let artifact: ReconciliationRoundRequestV1 =
+                decode_exact_artifact(bytes, "reconciliation round request")?;
+            artifact.validate()?;
+            if artifact.request.as_digest() != identity {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "reconciliation round request artifact identity mismatch".to_owned(),
+                ));
+            }
+        }
+        DirectArtifactKindV1::DocketReconciliationRoundResponse => {
+            let response: DocketReconciliationRoundResponseV1 =
+                decode_exact_artifact(bytes, "Docket reconciliation round response")?;
+            if response.schema
+                != ag_campaign::governed::DOCKET_RECONCILIATION_ROUND_RESPONSE_SCHEMA_V1
+                || Digest::hash_domain(
+                    "ag.governed-loop.docket-reconciliation-round-response/v1",
+                    bytes,
+                ) != *identity
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "Docket reconciliation round response identity mismatch".to_owned(),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -5444,6 +6474,25 @@ fn merge_exact_artifact_bytes(
         *found = Some(candidate);
     }
     Ok(())
+}
+
+fn round_response_links(
+    response: &DocketReconciliationRoundResponseV1,
+) -> Result<Vec<StoreLifecycleArtifactLinkV1>, CampaignStoreErrorV1> {
+    let bytes = encode(response)?;
+    Ok(vec![
+        StoreLifecycleArtifactLinkV1 {
+            kind: StoreLifecycleArtifactKindV1::ReconciliationRoundRequest,
+            identity: response.request.as_digest().clone(),
+        },
+        StoreLifecycleArtifactLinkV1 {
+            kind: StoreLifecycleArtifactKindV1::DocketReconciliationRoundResponse,
+            identity: Digest::hash_domain(
+                "ag.governed-loop.docket-reconciliation-round-response/v1",
+                &bytes,
+            ),
+        },
+    ])
 }
 
 fn governed_repair_result_parts(

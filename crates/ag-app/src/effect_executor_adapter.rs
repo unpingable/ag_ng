@@ -4,7 +4,7 @@
 //! idempotency journal.  It consumes no AG authorization or standing, creates
 //! no campaign transition, and has no continuation operation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Read as _;
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS docket_effect_attempt (
     (status!='started' AND receipt IS NOT NULL AND receipt_body IS NOT NULL)
   )
 ) STRICT;
+CREATE TABLE IF NOT EXISTS docket_reconciliation_context (
+  round TEXT PRIMARY KEY NOT NULL,
+  request TEXT UNIQUE NOT NULL,
+  reservation TEXT UNIQUE NOT NULL,
+  source_cut TEXT NOT NULL,
+  attempt TEXT NOT NULL,
+  dispatch_jcs BLOB NOT NULL
+) STRICT;
 ";
 
 /// Docket-to-executor message.  Its fields are exact references, not bearer
@@ -76,6 +84,32 @@ pub struct EffectExecutorDispatchV1 {
     /// Mechanically derived identity of `effect_scope`.
     pub effect_scope_digest: Digest,
 }
+
+/// Exact Docket-owned envelope for one explicit reconciliation round.
+///
+/// This adapter treats the round coordinates opaquely but durably binds each
+/// round to one exact canonical envelope before returning executor-local
+/// evidence. It cannot mint or approve a reconciliation round.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DocketExecutorReconciliationDispatchV1 {
+    /// Exact Docket executor-envelope schema.
+    pub schema: String,
+    /// Exact authenticated AG request identity.
+    pub request: Digest,
+    /// Exact intentional reconciliation round.
+    pub round: Digest,
+    /// Exact Docket reservation claimed before this call.
+    pub reservation: Digest,
+    /// Exact Docket durable source cut.
+    pub source_cut: Digest,
+    /// Existing exact attempt mechanics binding.
+    pub dispatch: EffectExecutorDispatchV1,
+}
+
+/// Exact Docket reconciliation-envelope schema accepted by `ag-effectd`.
+pub const DOCKET_EXECUTOR_RECONCILIATION_DISPATCH_SCHEMA_V1: &str =
+    "docket.governed-loop.executor-reconciliation-dispatch/v1";
 
 /// Exact logical scope row that the sealed plan associates with its one
 /// physical effect.  Docket independently verifies the emitted journal row
@@ -348,6 +382,46 @@ pub fn reconcile_effect_attempt(
             None => store.mark_indeterminate(
                 plan,
                 dispatch,
+                "reconciliation-found-reserved-attempt",
+                None,
+            ),
+        },
+        None => Err("effect-executor-attempt-not-found".to_owned()),
+    }
+}
+
+/// Reads executor-local evidence for one exact Docket reconciliation round.
+///
+/// The complete wrapper is transactionally registered before evidence is
+/// returned, so changed bytes under a reused request, round, or reservation
+/// fail closed. This registration is an idempotency/correspondence record,
+/// not execution authority and never invokes mechanics.
+///
+/// # Errors
+///
+/// Returns a refusal for malformed wrapper bindings, changed round bytes, or
+/// a missing/substituted attempt.
+pub fn reconcile_effect_round(
+    plan: &EffectExecutorPlanV1,
+    envelope: &DocketExecutorReconciliationDispatchV1,
+) -> Result<EffectExecutorOutcomeV1, String> {
+    if envelope.schema != DOCKET_EXECUTOR_RECONCILIATION_DISPATCH_SCHEMA_V1 {
+        return Err("effect-executor-reconciliation-envelope-schema".to_owned());
+    }
+    validate_dispatch(plan, &envelope.dispatch)?;
+    let canonical = JcsDocument::canonicalize(envelope)
+        .map_err(|error| format!("effect-executor-reconciliation-envelope-canonical:{error}"))?;
+    let mut store = EffectAttemptStoreV1::open(&plan.attempt_store)?;
+    store.register_reconciliation(envelope, canonical.as_bytes())?;
+    match store.get(&envelope.dispatch.attempt)? {
+        Some(record) if !record.matches(&envelope.dispatch) => {
+            Err("effect-executor-attempt-substitution".to_owned())
+        }
+        Some(record) => match record.outcome(plan)? {
+            Some(outcome) => Ok(outcome),
+            None => store.mark_indeterminate(
+                plan,
+                &envelope.dispatch,
                 "reconciliation-found-reserved-attempt",
                 None,
             ),
@@ -752,6 +826,7 @@ impl EffectAttemptStoreV1 {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;",
         )?;
         execute_batch_with_lock_retry(&connection, "effect-executor-store-schema", STORE_SCHEMA)?;
+        verify_reconciliation_context_schema(&connection)?;
         Ok(Self { connection })
     }
 
@@ -796,6 +871,64 @@ impl EffectAttemptStoreV1 {
             .map_err(|error| format!("effect-executor-reserve-commit:{error}"))?;
         checkpoint(&self.connection)?;
         Ok(result)
+    }
+
+    fn register_reconciliation(
+        &mut self,
+        envelope: &DocketExecutorReconciliationDispatchV1,
+        canonical: &[u8],
+    ) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("effect-executor-reconciliation-begin:{error}"))?;
+        let existing: Option<(String, String, String, String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT request,reservation,source_cut,attempt,dispatch_jcs
+                 FROM docket_reconciliation_context WHERE round=?1",
+                params![envelope.round.as_str()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("effect-executor-reconciliation-read:{error}"))?;
+        if let Some((request, reservation, source_cut, attempt, bytes)) = existing {
+            if request != envelope.request.as_str()
+                || reservation != envelope.reservation.as_str()
+                || source_cut != envelope.source_cut.as_str()
+                || attempt != envelope.dispatch.attempt.as_str()
+                || bytes != canonical
+            {
+                return Err("effect-executor-reconciliation-round-substitution".to_owned());
+            }
+        } else {
+            transaction
+                .execute(
+                    "INSERT INTO docket_reconciliation_context
+                     (round,request,reservation,source_cut,attempt,dispatch_jcs)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![
+                        envelope.round.as_str(),
+                        envelope.request.as_str(),
+                        envelope.reservation.as_str(),
+                        envelope.source_cut.as_str(),
+                        envelope.dispatch.attempt.as_str(),
+                        canonical,
+                    ],
+                )
+                .map_err(|error| format!("effect-executor-reconciliation-insert:{error}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("effect-executor-reconciliation-commit:{error}"))?;
+        checkpoint(&self.connection)
     }
 
     fn get(&mut self, attempt: &Digest) -> Result<Option<AttemptRecordV1>, String> {
@@ -883,6 +1016,79 @@ impl EffectAttemptStoreV1 {
             body.as_bytes(),
         )
     }
+}
+
+fn verify_reconciliation_context_schema(connection: &Connection) -> Result<(), String> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(docket_reconciliation_context)")
+        .map_err(|error| format!("effect-executor-reconciliation-schema-prepare:{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|error| format!("effect-executor-reconciliation-schema-read:{error}"))?;
+    let columns = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("effect-executor-reconciliation-schema-row:{error}"))?;
+    let expected = vec![
+        ("round".to_owned(), "TEXT".to_owned(), 1, 1),
+        ("request".to_owned(), "TEXT".to_owned(), 1, 0),
+        ("reservation".to_owned(), "TEXT".to_owned(), 1, 0),
+        ("source_cut".to_owned(), "TEXT".to_owned(), 1, 0),
+        ("attempt".to_owned(), "TEXT".to_owned(), 1, 0),
+        ("dispatch_jcs".to_owned(), "BLOB".to_owned(), 1, 0),
+    ];
+    if columns != expected {
+        return Err("effect-executor-reconciliation-schema-columns".to_owned());
+    }
+    let mut statement = connection
+        .prepare("PRAGMA index_list(docket_reconciliation_context)")
+        .map_err(|error| format!("effect-executor-reconciliation-index-prepare:{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|error| format!("effect-executor-reconciliation-index-read:{error}"))?;
+    let mut indexed = BTreeSet::new();
+    for row in rows {
+        let (name, unique, partial) =
+            row.map_err(|error| format!("effect-executor-reconciliation-index-row:{error}"))?;
+        if unique != 1 || partial != 0 {
+            return Err("effect-executor-reconciliation-index-shape".to_owned());
+        }
+        let escaped = name.replace('"', "\"\"");
+        let query = format!("PRAGMA index_info(\"{escaped}\")");
+        let mut columns_statement = connection
+            .prepare(&query)
+            .map_err(|error| format!("effect-executor-reconciliation-index-info:{error}"))?;
+        let names = columns_statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .map_err(|error| format!("effect-executor-reconciliation-index-columns:{error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("effect-executor-reconciliation-index-column:{error}"))?;
+        if names.len() != 1 || !indexed.insert(names[0].clone()) {
+            return Err("effect-executor-reconciliation-index-shape".to_owned());
+        }
+    }
+    if indexed.into_iter().collect::<Vec<_>>()
+        != [
+            "request".to_owned(),
+            "reservation".to_owned(),
+            "round".to_owned(),
+        ]
+    {
+        return Err("effect-executor-reconciliation-index-set".to_owned());
+    }
+    Ok(())
 }
 
 fn execute_batch_with_lock_retry(
@@ -1063,6 +1269,62 @@ mod tests {
         assert_eq!(replay, first);
         assert_eq!(std::fs::read(path).unwrap(), b"hostile-after-first\n");
         assert_eq!(reconcile_effect_attempt(&plan, &dispatch).unwrap(), first);
+    }
+
+    #[test]
+    fn reconciliation_envelope_is_strict_and_round_bytes_are_one_use() {
+        let (_directory, plan, dispatch) = fixture();
+        let outcome = execute_effect_attempt(&plan, &dispatch).unwrap();
+        let envelope = DocketExecutorReconciliationDispatchV1 {
+            schema: DOCKET_EXECUTOR_RECONCILIATION_DISPATCH_SCHEMA_V1.to_owned(),
+            request: Digest::hash_bytes(b"round-request"),
+            round: Digest::hash_bytes(b"round"),
+            reservation: Digest::hash_bytes(b"round-reservation"),
+            source_cut: Digest::hash_bytes(b"round-source-cut"),
+            dispatch,
+        };
+        assert_eq!(reconcile_effect_round(&plan, &envelope).unwrap(), outcome);
+        assert_eq!(reconcile_effect_round(&plan, &envelope).unwrap(), outcome);
+
+        let mut changed = envelope.clone();
+        changed.source_cut = Digest::hash_bytes(b"changed-source-cut");
+        assert_eq!(
+            reconcile_effect_round(&plan, &changed).unwrap_err(),
+            "effect-executor-reconciliation-round-substitution"
+        );
+
+        let mut wrong_schema = envelope;
+        wrong_schema.schema = "docket.governed-loop.executor-reconciliation-dispatch/v2".to_owned();
+        assert_eq!(
+            reconcile_effect_round(&plan, &wrong_schema).unwrap_err(),
+            "effect-executor-reconciliation-envelope-schema"
+        );
+    }
+
+    #[test]
+    fn reconciliation_context_reopen_refuses_incompatible_precreated_schema() {
+        let (_directory, plan, dispatch) = fixture();
+        let connection = Connection::open(&plan.attempt_store).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE docket_reconciliation_context (
+                     round TEXT PRIMARY KEY NOT NULL
+                 ) STRICT;",
+            )
+            .unwrap();
+        drop(connection);
+        let envelope = DocketExecutorReconciliationDispatchV1 {
+            schema: DOCKET_EXECUTOR_RECONCILIATION_DISPATCH_SCHEMA_V1.to_owned(),
+            request: Digest::hash_bytes(b"round-request"),
+            round: Digest::hash_bytes(b"round"),
+            reservation: Digest::hash_bytes(b"round-reservation"),
+            source_cut: Digest::hash_bytes(b"round-source-cut"),
+            dispatch,
+        };
+        assert_eq!(
+            reconcile_effect_round(&plan, &envelope).unwrap_err(),
+            "effect-executor-reconciliation-schema-columns"
+        );
     }
 
     #[test]

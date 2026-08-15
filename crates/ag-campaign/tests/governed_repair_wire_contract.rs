@@ -9,6 +9,8 @@ use ag_primitives::{Digest, JcsDocument};
 const CONTRACT: &[u8] = include_bytes!("../../../conformance/governed-repair-r2/contract.v1.json");
 const MANIFEST: &[u8] = include_bytes!("../../../conformance/governed-repair-r2/manifest.v1.json");
 const LABELS: &[u8] = include_bytes!("../../../conformance/governed-repair-r2/labels.v1.json");
+const RECONCILIATION_ROUNDS: &[u8] =
+    include_bytes!("../../../conformance/governed-repair-r2/reconciliation-rounds.v1.json");
 const SCOPES: &[u8] = include_bytes!("../../../conformance/governed-repair-r2/scopes.v1.json");
 const WIRE_HOSTILES: &[u8] =
     include_bytes!("../../../conformance/governed-repair-r2/wire-hostiles.v1.json");
@@ -21,7 +23,9 @@ const LABELS_SHA256: &str =
 const SCOPES_SHA256: &str =
     "sha256:905e9b96ba81a2dcc072f243b3bb1b8a02381377b2cebf61e98eaff033c3abaa";
 const MANIFEST_SHA256: &str =
-    "sha256:b71a2e7a9a606c7209f95522c20c2ae221c99a5dbebc6a6eba3d303b738b97ae";
+    "sha256:74c429d8d32341fc31fba45e4cdd1a0b6d994bace4c7d4d8ccfccfc9dad8aded";
+const RECONCILIATION_ROUNDS_SHA256: &str =
+    "sha256:408a2fe3ddf75621c43da441cbdcd33c7fe0845abadd9b02adc72038d01496fc";
 const WIRE_HOSTILES_SHA256: &str =
     "sha256:9862a1e38bb9db11cd39aebe04b3bd8ffaed7d315b67becc1e164176a20858b9";
 const WIRE_VECTORS_SHA256: &str =
@@ -40,6 +44,8 @@ fn canonical_contract_and_label_corpus_have_pinned_exact_bytes() {
         .expect("manifest body must be exact canonical JSON");
     JcsDocument::from_canonical_bytes(canonical_body(LABELS))
         .expect("label corpus body must be exact canonical JSON");
+    JcsDocument::from_canonical_bytes(canonical_body(RECONCILIATION_ROUNDS))
+        .expect("reconciliation-round corpus body must be exact canonical JSON");
     JcsDocument::from_canonical_bytes(canonical_body(SCOPES))
         .expect("scope corpus body must be exact canonical JSON");
     JcsDocument::from_canonical_bytes(canonical_body(WIRE_HOSTILES))
@@ -49,6 +55,10 @@ fn canonical_contract_and_label_corpus_have_pinned_exact_bytes() {
     assert_eq!(Digest::hash_bytes(CONTRACT).to_string(), CONTRACT_SHA256);
     assert_eq!(Digest::hash_bytes(MANIFEST).to_string(), MANIFEST_SHA256);
     assert_eq!(Digest::hash_bytes(LABELS).to_string(), LABELS_SHA256);
+    assert_eq!(
+        Digest::hash_bytes(RECONCILIATION_ROUNDS).to_string(),
+        RECONCILIATION_ROUNDS_SHA256
+    );
     assert_eq!(Digest::hash_bytes(SCOPES).to_string(), SCOPES_SHA256);
     assert_eq!(
         Digest::hash_bytes(WIRE_HOSTILES).to_string(),
@@ -66,6 +76,10 @@ fn manifest_closes_the_complete_conformance_corpus() {
     let expected = [
         ("contract.v1.json", CONTRACT_SHA256),
         ("labels.v1.json", LABELS_SHA256),
+        (
+            "reconciliation-rounds.v1.json",
+            RECONCILIATION_ROUNDS_SHA256,
+        ),
         ("scopes.v1.json", SCOPES_SHA256),
         ("wire-hostiles.v1.json", WIRE_HOSTILES_SHA256),
         ("wire-vectors.v1.json", WIRE_VECTORS_SHA256),
