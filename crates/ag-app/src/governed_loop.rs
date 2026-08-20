@@ -26,7 +26,7 @@
 //! never performs physical effect mechanics and never accepts executor output
 //! as a campaign transition.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use ag_campaign::CampaignId;
@@ -42,6 +42,47 @@ use thiserror::Error;
 /// Root-owned exact-work catalog schema.
 pub const EXACT_WORK_CATALOG_SCHEMA_V1: &str = "ag.governed-loop.exact-work-catalog/v1";
 
+/// Finite per-workflow precondition over `DecisionBasisV1` atoms.
+///
+/// The judgment is exactly `required ⊆ basis.atoms` and
+/// `forbidden ∩ basis.atoms = ∅`. An omitted precondition is unconditional.
+/// This is catalog policy, not evidence health: it is evaluated only over a
+/// validated `Current` observation basis, never over the sentinel basis a
+/// negative resolution carries for wire completeness.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkPreconditionV1 {
+    /// Atoms that must all be present in the evidence basis.
+    #[serde(default)]
+    pub required: BTreeSet<String>,
+    /// Atoms that must all be absent from the evidence basis.
+    #[serde(default)]
+    pub forbidden: BTreeSet<String>,
+}
+
+impl WorkPreconditionV1 {
+    /// Catalog-definition validity: no atom may be both required and
+    /// forbidden, and only frozen v1 basis atoms may be named.
+    fn validate(&self) -> Result<(), CampaignEngineErrorV1> {
+        if !self.required.is_disjoint(&self.forbidden) {
+            return Err(CampaignEngineErrorV1::InvalidCatalog);
+        }
+        if self
+            .required
+            .union(&self.forbidden)
+            .any(|atom| !DECISION_BASIS_ATOM_VOCABULARY_V1.contains(&atom.as_str()))
+        {
+            return Err(CampaignEngineErrorV1::InvalidCatalog);
+        }
+        Ok(())
+    }
+
+    /// The exact predicate over one validated observation basis.
+    fn holds_over(&self, basis: &DecisionBasisV1) -> bool {
+        self.required.is_subset(&basis.atoms) && self.forbidden.is_disjoint(&basis.atoms)
+    }
+}
+
 /// One exact admissibility catalog entry.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,16 +93,23 @@ pub struct ExactWorkCatalogEntryV1 {
     pub subject: Digest,
     /// Exact governed scope.
     pub scope: Digest,
+    /// Finite workflow precondition; absent means unconditional.
+    #[serde(default)]
+    pub precondition: WorkPreconditionV1,
 }
 
 /// Root-owned exact admissibility policy basis.
+///
+/// The catalog carries no asserted policy identity: its policy basis is
+/// derived from the exact semantic content (schema and entries), so recorded
+/// judgment provenance always identifies the catalog actually evaluated.
+/// Callers have no API path to attach an unrelated policy identity, and a
+/// stale wire document carrying one fails `deny_unknown_fields` parsing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExactWorkCatalogV1 {
     /// Exact schema.
     pub schema: String,
-    /// Exact versioned policy identity.
-    pub policy_basis: Digest,
     /// Entries keyed by typed work schema.
     pub entries: BTreeMap<String, ExactWorkCatalogEntryV1>,
 }
@@ -79,11 +127,23 @@ impl ExactWorkCatalogV1 {
         {
             return Err(CampaignEngineErrorV1::InvalidCatalog);
         }
+        if self
+            .entries
+            .values()
+            .any(|entry| entry.precondition.validate().is_err())
+        {
+            return Err(CampaignEngineErrorV1::InvalidCatalog);
+        }
         Ok(())
     }
 
-    /// Returns the exact catalog transcript digest.
-    pub fn digest(&self) -> Result<Digest, CampaignEngineErrorV1> {
+    /// The exact policy identity: canonical digest of the complete semantic
+    /// catalog content. Every admission-relevant field (`work_schema`,
+    /// `subject`, `scope`, and each entry's `precondition`) participates;
+    /// the identity field itself does not exist inside its own preimage.
+    /// Deterministic under construction order because entries and atom sets
+    /// are ordered maps/sets canonicalized with JCS.
+    pub fn policy_basis(&self) -> Result<Digest, CampaignEngineErrorV1> {
         self.validate()?;
         let bytes = JcsDocument::canonicalize(self)
             .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
@@ -97,13 +157,18 @@ impl ExactWorkCatalogV1 {
 /// AG-owned exact catalog admission policy.
 pub struct CatalogAdmissibilityDeciderV1<'a> {
     catalog: &'a ExactWorkCatalogV1,
+    policy_basis: Digest,
 }
 
 impl<'a> CatalogAdmissibilityDeciderV1<'a> {
-    /// Binds one consequence-time decision pass to an exact catalog.
+    /// Binds one consequence-time decision pass to an exact catalog and its
+    /// content-derived policy identity.
     pub fn new(catalog: &'a ExactWorkCatalogV1) -> Result<Self, CampaignEngineErrorV1> {
-        catalog.validate()?;
-        Ok(Self { catalog })
+        let policy_basis = catalog.policy_basis()?;
+        Ok(Self {
+            catalog,
+            policy_basis,
+        })
     }
 }
 
@@ -119,6 +184,7 @@ impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV1<'_> {
             .is_some_and(|entry| {
                 entry.subject == *request.proposal.subject()
                     && entry.scope == *request.proposal.scope()
+                    && entry.precondition.holds_over(&request.observation.basis)
             });
         #[derive(Serialize)]
         struct DecisionBasis<'a> {
@@ -134,7 +200,7 @@ impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV1<'_> {
             observation: &request.observation.observation,
             proposal: &request.standing.proposal,
             standing: &request.standing.resolution,
-            policy: &self.catalog.policy_basis,
+            policy: &self.policy_basis,
             admitted,
         };
         let bytes = JcsDocument::canonicalize(&basis).map_err(|error| {
@@ -156,7 +222,7 @@ impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV1<'_> {
             } else {
                 AdmissionDispositionV1::Refused
             },
-            policy_basis: self.catalog.policy_basis.clone(),
+            policy_basis: self.policy_basis.clone(),
         })
     }
 }
@@ -256,6 +322,7 @@ impl CampaignEngineV1 {
         proposal: ExactWorkProposalV1,
         class: ProposalClassV1,
         resolver: &mut O,
+        expected_observation_resolver: &str,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
         let current = self.store.current()?;
@@ -265,6 +332,7 @@ impl CampaignEngineV1 {
             proposal,
             class,
             resolver,
+            expected_observation_resolver,
             now_unix_ms,
         ) {
             Ok(successor) => successor,
@@ -306,6 +374,9 @@ impl CampaignEngineV1 {
         standing: &mut S,
         catalog: &ExactWorkCatalogV1,
         controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
     where
@@ -320,6 +391,9 @@ impl CampaignEngineV1 {
             standing,
             &mut decider,
             controlling_review,
+            expected_observation_resolver,
+            expected_standing_resolver,
+            max_standing_ttl_ms,
             now_unix_ms,
         )?;
         self.store.commit(
@@ -339,6 +413,9 @@ impl CampaignEngineV1 {
         standing: &mut S,
         catalog: &ExactWorkCatalogV1,
         controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
     where
@@ -353,6 +430,9 @@ impl CampaignEngineV1 {
             standing,
             &mut decider,
             controlling_review,
+            expected_observation_resolver,
+            expected_standing_resolver,
+            max_standing_ttl_ms,
             now_unix_ms,
         )?;
         self.store.commit(
@@ -495,6 +575,7 @@ impl CampaignEngineV1 {
         expected_scope: &HumanAuthorityScopeV1,
         new_occurrence: Option<OccurrenceId>,
         observation: &mut O,
+        expected_observation_resolver: &str,
         verifier: &mut H,
         now_unix_ms: u64,
     ) -> Result<HumanDispositionEffectV1, CampaignEngineErrorV1>
@@ -509,6 +590,7 @@ impl CampaignEngineV1 {
             expected_scope,
             new_occurrence,
             observation,
+            expected_observation_resolver,
             verifier,
             now_unix_ms,
         )?;
@@ -525,6 +607,7 @@ impl CampaignEngineV1 {
         subject: &Digest,
         terminal_witness: TerminalWitnessRefV1,
         observation: &mut O,
+        expected_observation_resolver: &str,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
         let current = self.store.current()?;
@@ -534,6 +617,7 @@ impl CampaignEngineV1 {
             subject,
             terminal_witness,
             observation,
+            expected_observation_resolver,
             now_unix_ms,
         )?;
         self.store.commit(

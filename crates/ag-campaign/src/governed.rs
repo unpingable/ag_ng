@@ -42,9 +42,9 @@ use crate::transcript::validate_label;
 /// Wire schema for exact-work proposals.
 pub const EXACT_WORK_PROPOSAL_SCHEMA_V1: &str = "ag.governed-loop.exact-work-proposal/v1";
 /// Wire schema for fresh observation records.
-pub const OBSERVATION_RESOLUTION_SCHEMA_V1: &str = "ag.governed-loop.observation-resolution/v1";
+pub const OBSERVATION_RESOLUTION_SCHEMA_V2: &str = "ag.governed-loop.observation-resolution/v2";
 /// Wire schema for current standing resolutions.
-pub const STANDING_RESOLUTION_SCHEMA_V1: &str = "ag.governed-loop.standing-resolution/v1";
+pub const STANDING_RESOLUTION_SCHEMA_V2: &str = "ag.governed-loop.standing-resolution/v2";
 /// Wire schema for AG issuances.
 pub const AG_ISSUANCE_SCHEMA_V1: &str = "ag.governed-loop.issuance/v1";
 /// Wire schema for Docket custody records.
@@ -582,9 +582,15 @@ pub enum ObservationStatusV1 {
 }
 
 /// Exact observation/currentness record returned by an external resolver.
+///
+/// Version 2 carries the semantic `DecisionBasisV1` whose canonical digest
+/// must equal `normalized_preconditions`, plus the explicit identity of the
+/// resolver that produced the record.  The digest remains the kernel
+/// equality/pinning token; the structured basis makes the pinned content
+/// inspectable.  Neither field authorizes anything.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ObservationResolutionV1 {
+pub struct ObservationResolutionV2 {
     /// Exact schema.
     pub schema: String,
     /// Occurrence being observed.
@@ -593,8 +599,12 @@ pub struct ObservationResolutionV1 {
     pub observation: ObservationRefV1,
     /// Exact currentness/freshness witness.
     pub currentness: ObservationCurrentnessRefV1,
-    /// Exact normalized relevant-precondition basis.
+    /// Canonical digest of `basis`; the exact pinned precondition basis.
     pub normalized_preconditions: PreconditionBasisRefV1,
+    /// Semantic decision basis produced by the resolver's normalization rule.
+    pub basis: DecisionBasisV1,
+    /// Exact identity of the resolver that produced this record.
+    pub resolver_id: String,
     /// Exact observed subject.
     pub subject: Digest,
     /// Resolver status.
@@ -624,7 +634,7 @@ pub trait ObservationResolverV1 {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV1, ExternalBoundaryErrorV1>;
+    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1>;
 }
 
 /// Standing status returned by the authoritative Standing/Docket resolver.
@@ -644,9 +654,14 @@ pub enum StandingStatusV1 {
 }
 
 /// Historical record of one authoritative current-standing resolution.
+///
+/// Version 2 adds the explicit identity of the standing resolver/authority
+/// that produced the record. The identity is deployment provenance and
+/// substitution defense; it is not a capability, a signature, or any form of
+/// authorization.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CurrentStandingResolutionV1 {
+pub struct CurrentStandingResolutionV2 {
     /// Exact schema.
     pub schema: String,
     /// Exact resolution identity.
@@ -665,6 +680,8 @@ pub struct CurrentStandingResolutionV1 {
     pub subject: Digest,
     /// Exact scope.
     pub scope: Digest,
+    /// Exact identity of the standing resolver/authority.
+    pub resolver_id: String,
     /// Resolver status.
     pub status: StandingStatusV1,
     /// Resolver clock lower bound.
@@ -696,7 +713,7 @@ pub trait StandingResolverV1 {
     fn resolve_standing(
         &mut self,
         request: &StandingResolutionRequestV1<'_>,
-    ) -> Result<CurrentStandingResolutionV1, ExternalBoundaryErrorV1>;
+    ) -> Result<CurrentStandingResolutionV2, ExternalBoundaryErrorV1>;
 }
 
 /// Closed result vocabulary for AG's exact-work admission policy.
@@ -737,9 +754,9 @@ pub struct AdmissibilityRequestV1<'a> {
     /// Exact proposal.
     pub proposal: &'a ExactWorkProposalV1,
     /// Fresh observation resolution.
-    pub observation: &'a ObservationResolutionV1,
+    pub observation: &'a ObservationResolutionV2,
     /// Current standing resolution.
-    pub standing: &'a CurrentStandingResolutionV1,
+    pub standing: &'a CurrentStandingResolutionV2,
     /// Optional controlling rejected-review basis for C1 repair.
     pub controlling_rejected_review: Option<&'a C1RejectedReviewBasisV1>,
 }
@@ -864,7 +881,7 @@ pub struct ObservationRequiredV1 {
 #[serde(deny_unknown_fields)]
 pub struct ProposalBasisV1 {
     meta: OccurrenceMetaV1,
-    observation: ObservationResolutionV1,
+    observation: ObservationResolutionV2,
     proposal: ExactWorkProposalV1,
     proposal_ref: ProposalRefV1,
     link: OccurrenceLinkV1,
@@ -885,7 +902,7 @@ pub struct StandingRequiredV1(ProposalBasisV1);
 #[serde(deny_unknown_fields)]
 pub struct AdmissibleBasisV1 {
     proposal: ProposalBasisV1,
-    standing: CurrentStandingResolutionV1,
+    standing: CurrentStandingResolutionV2,
     decision: AdmissionDecisionV1,
 }
 
@@ -1085,7 +1102,7 @@ pub struct HaltedV1 {
 #[serde(deny_unknown_fields)]
 pub struct CompletedV1 {
     meta: OccurrenceMetaV1,
-    terminal_observation: ObservationResolutionV1,
+    terminal_observation: ObservationResolutionV2,
     terminal_witness: TerminalWitnessRefV1,
     history: AuthorityHistoryV1,
 }
@@ -1909,6 +1926,7 @@ impl GovernedLoopKernelV1 {
         proposal: ExactWorkProposalV1,
         class: ProposalClassV1,
         resolver: &mut O,
+        expected_observation_resolver: &str,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, KernelErrorV1> {
         current.validate_integrity()?;
@@ -1924,6 +1942,7 @@ impl GovernedLoopKernelV1 {
             pending.meta.key(),
             &observation,
             proposal.subject(),
+            expected_observation_resolver,
             now_unix_ms,
         )?;
 
@@ -2003,6 +2022,9 @@ impl GovernedLoopKernelV1 {
         standing_resolver: &mut S,
         decider: &mut A,
         controlling_rejected_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, KernelErrorV1>
     where
@@ -2020,6 +2042,9 @@ impl GovernedLoopKernelV1 {
             standing_resolver,
             decider,
             controlling_rejected_review,
+            expected_observation_resolver,
+            expected_standing_resolver,
+            max_standing_ttl_ms,
             now_unix_ms,
         )?;
         let mut proposal = required.0.clone();
@@ -2044,6 +2069,9 @@ impl GovernedLoopKernelV1 {
         standing_resolver: &mut S,
         decider: &mut A,
         controlling_rejected_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, KernelErrorV1>
     where
@@ -2061,6 +2089,9 @@ impl GovernedLoopKernelV1 {
             standing_resolver,
             decider,
             controlling_rejected_review,
+            expected_observation_resolver,
+            expected_standing_resolver,
+            max_standing_ttl_ms,
             now_unix_ms,
         )?;
         let mut proposal = pending.0.proposal.clone();
@@ -2359,6 +2390,7 @@ impl GovernedLoopKernelV1 {
         subject: &Digest,
         terminal_witness: TerminalWitnessRefV1,
         resolver: &mut O,
+        expected_observation_resolver: &str,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, KernelErrorV1> {
         current.validate_integrity()?;
@@ -2373,6 +2405,7 @@ impl GovernedLoopKernelV1 {
             pending.meta.key(),
             &observation,
             subject,
+            expected_observation_resolver,
             now_unix_ms,
         )?;
         let state = OccurrenceStateV1::Completed(CompletedV1 {
@@ -2394,6 +2427,7 @@ impl GovernedLoopKernelV1 {
         expected_scope: &HumanAuthorityScopeV1,
         new_occurrence: Option<OccurrenceId>,
         observation_resolver: &mut O,
+        expected_observation_resolver: &str,
         verifier: &mut H,
         now_unix_ms: u64,
     ) -> Result<HumanDispositionEffectV1, KernelErrorV1>
@@ -2492,6 +2526,7 @@ impl GovernedLoopKernelV1 {
                     halted.meta.key(),
                     observation,
                     subject,
+                    expected_observation_resolver,
                     now_unix_ms,
                 )?;
                 let mut meta = halted.meta.clone();
@@ -2522,7 +2557,7 @@ impl OccurrenceSnapshotV1 {
 
     /// Returns the exact historical observation basis, when any.
     #[must_use]
-    pub fn observation(&self) -> Option<&ObservationResolutionV1> {
+    pub fn observation(&self) -> Option<&ObservationResolutionV2> {
         self.state.proposal_basis().map(|basis| &basis.observation)
     }
 
@@ -2574,6 +2609,24 @@ impl OccurrenceSnapshotV1 {
     pub fn settlement(&self) -> Option<&DocketSettlementV1> {
         match &self.state {
             OccurrenceStateV1::SettledObservationRequired(value) => Some(&value.settlement),
+            _ => None,
+        }
+    }
+
+    /// Returns the recorded admission decision with its policy basis, once
+    /// AG has judged the proposal.
+    #[must_use]
+    pub fn admission_decision(&self) -> Option<&AdmissionDecisionV1> {
+        match &self.state {
+            OccurrenceStateV1::AdmissiblePendingAuthorization(value) => Some(&value.0.decision),
+            OccurrenceStateV1::AuthorizationConsumed(value) => Some(&value.admitted.decision),
+            OccurrenceStateV1::Dispatched(value) => Some(&value.0.authorized.admitted.decision),
+            OccurrenceStateV1::ReconciliationRequired(value) => {
+                Some(&value.dispatch.authorized.admitted.decision)
+            }
+            OccurrenceStateV1::SettledObservationRequired(value) => {
+                Some(&value.dispatch.authorized.admitted.decision)
+            }
             _ => None,
         }
     }
@@ -2649,16 +2702,22 @@ fn resolve_observation<O: ObservationResolverV1>(
     key: &OccurrenceKeyV1,
     observation: &ObservationRefV1,
     subject: &Digest,
+    expected_resolver_id: &str,
     now_unix_ms: u64,
-) -> Result<ObservationResolutionV1, KernelErrorV1> {
+) -> Result<ObservationResolutionV2, KernelErrorV1> {
     let resolved = resolver.resolve_observation(&ObservationResolutionRequestV1 {
         key,
         observation,
         subject,
         now_unix_ms,
     })?;
-    if resolved.schema != OBSERVATION_RESOLUTION_SCHEMA_V1 {
+    if resolved.schema != OBSERVATION_RESOLUTION_SCHEMA_V2 {
         return Err(KernelErrorV1::ForeignSchema("observation resolution"));
+    }
+    if expected_resolver_id.is_empty() || resolved.resolver_id != expected_resolver_id {
+        return Err(KernelErrorV1::BindingMismatch(
+            "observation resolver identity",
+        ));
     }
     if &resolved.key != key {
         return Err(KernelErrorV1::OccurrenceMismatch);
@@ -2668,6 +2727,19 @@ fn resolve_observation<O: ObservationResolverV1>(
     }
     if &resolved.subject != subject {
         return Err(KernelErrorV1::BindingMismatch("observation subject"));
+    }
+    // In-process resolvers can construct a basis without going through the
+    // validating wire parser, so the kernel re-validates the semantic content
+    // itself before trusting the pinned digest.
+    if resolved.basis.validate().is_err() {
+        return Err(KernelErrorV1::ForeignSchema("decision basis"));
+    }
+    let basis_digest = resolved
+        .basis
+        .decision_basis_digest()
+        .map_err(|_| KernelErrorV1::ForeignSchema("decision basis"))?;
+    if resolved.normalized_preconditions.as_digest() != &basis_digest {
+        return Err(KernelErrorV1::BindingMismatch("precondition basis"));
     }
     if resolved.resolved_at_unix_ms > now_unix_ms || now_unix_ms >= resolved.fresh_until_unix_ms {
         return Err(KernelErrorV1::ObservationNotCurrent);
@@ -2684,9 +2756,11 @@ fn resolve_observation<O: ObservationResolverV1>(
 fn resolve_standing<S: StandingResolverV1>(
     resolver: &mut S,
     basis: &ProposalBasisV1,
-    observation: &ObservationResolutionV1,
+    observation: &ObservationResolutionV2,
+    expected_resolver_id: &str,
+    max_standing_ttl_ms: u64,
     now_unix_ms: u64,
-) -> Result<CurrentStandingResolutionV1, KernelErrorV1> {
+) -> Result<CurrentStandingResolutionV2, KernelErrorV1> {
     let resolved = resolver.resolve_standing(&StandingResolutionRequestV1 {
         key: basis.meta.key(),
         observation: &observation.observation,
@@ -2695,8 +2769,11 @@ fn resolve_standing<S: StandingResolverV1>(
         scope: basis.proposal.scope(),
         now_unix_ms,
     })?;
-    if resolved.schema != STANDING_RESOLUTION_SCHEMA_V1 {
+    if resolved.schema != STANDING_RESOLUTION_SCHEMA_V2 {
         return Err(KernelErrorV1::ForeignSchema("standing resolution"));
+    }
+    if expected_resolver_id.is_empty() || resolved.resolver_id != expected_resolver_id {
+        return Err(KernelErrorV1::BindingMismatch("standing resolver identity"));
     }
     if resolved.key != basis.meta.key {
         return Err(KernelErrorV1::OccurrenceMismatch);
@@ -2712,6 +2789,21 @@ fn resolve_standing<S: StandingResolverV1>(
     }
     if resolved.scope != *basis.proposal.scope() {
         return Err(KernelErrorV1::BindingMismatch("standing scope"));
+    }
+    // `expires_at` is resolver-asserted evidence. The configured maximum
+    // bounds how long AG may treat one answer as live: a resolver answering
+    // "current until 2099" cannot stretch acceptance beyond
+    // `max_standing_ttl_ms`. Checked subtraction rejects reversed windows
+    // instead of wrapping. The cap bounds answer lifetime only; it cannot
+    // make a malicious trusted resolver truthful.
+    let Some(window_ms) = resolved
+        .expires_at_unix_ms
+        .checked_sub(resolved.resolved_at_unix_ms)
+    else {
+        return Err(KernelErrorV1::StandingNotCurrent);
+    };
+    if window_ms > max_standing_ttl_ms {
+        return Err(KernelErrorV1::StandingNotCurrent);
     }
     if resolved.resolved_at_unix_ms > now_unix_ms || now_unix_ms >= resolved.expires_at_unix_ms {
         return Err(KernelErrorV1::StandingNotCurrent);
@@ -2732,11 +2824,14 @@ fn resolve_admissibility<O, S, A>(
     standing_resolver: &mut S,
     decider: &mut A,
     controlling_rejected_review: Option<&C1RejectedReviewBasisV1>,
+    expected_observation_resolver: &str,
+    expected_standing_resolver: &str,
+    max_standing_ttl_ms: u64,
     now_unix_ms: u64,
 ) -> Result<
     (
-        ObservationResolutionV1,
-        CurrentStandingResolutionV1,
+        ObservationResolutionV2,
+        CurrentStandingResolutionV2,
         AdmissionDecisionV1,
     ),
     KernelErrorV1,
@@ -2751,12 +2846,20 @@ where
         basis.meta.key(),
         &basis.observation.observation,
         basis.proposal.subject(),
+        expected_observation_resolver,
         now_unix_ms,
     )?;
     if observation.normalized_preconditions != basis.observation.normalized_preconditions {
         return Err(KernelErrorV1::ObservationNotCurrent);
     }
-    let standing = resolve_standing(standing_resolver, basis, &observation, now_unix_ms)?;
+    let standing = resolve_standing(
+        standing_resolver,
+        basis,
+        &observation,
+        expected_standing_resolver,
+        max_standing_ttl_ms,
+        now_unix_ms,
+    )?;
     match (&basis.proposal.repair, controlling_rejected_review) {
         (Some(citation), Some(controlling)) => validate_exact_c1_repair(citation, controlling)?,
         (Some(_), None) => return Err(KernelErrorV1::AlteredFindingSet),
@@ -3315,7 +3418,7 @@ fn validate_state(state: &OccurrenceStateV1) -> Result<(), KernelErrorV1> {
 }
 
 fn validate_admissible_basis(value: &AdmissibleBasisV1) -> Result<(), KernelErrorV1> {
-    if value.standing.schema != STANDING_RESOLUTION_SCHEMA_V1
+    if value.standing.schema != STANDING_RESOLUTION_SCHEMA_V2
         || value.standing.key != value.proposal.meta.key
         || value.standing.observation != value.proposal.observation.observation
         || value.standing.proposal != value.proposal.proposal_ref
@@ -3356,4 +3459,301 @@ fn validate_authorized(value: &AuthorizationConsumedV1) -> Result<(), KernelErro
         return Err(KernelErrorV1::StateInvariant("AG issuance"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `DecisionBasisV1` wire mirror (Nightshift posture decision basis)
+//
+// This is a wire-format mirror only: AG sees semantic atom strings and the
+// normalization-rule identity, never Nightshift Rust enums. The basis is
+// carried by `ObservationResolutionV2`, but nothing here evaluates workflow
+// policy; catalog preconditions belong to a later docket phase.
+
+/// Exact v1 decision-basis wire schema.
+pub const DECISION_BASIS_SCHEMA_V1: &str = "nightshift.decision-basis.v1";
+/// Frozen v1 normalization-rule identity.
+pub const DECISION_BASIS_RULE_ID_V1: &str = "nightshift.posture-normalization";
+/// Frozen v1 normalization-rule version.
+pub const DECISION_BASIS_RULE_VERSION_V1: &str = "1";
+/// Domain separator for the canonical basis digest.
+pub const DECISION_BASIS_DIGEST_DOMAIN_V1: &[u8] = b"nightshift.decision-basis.v1\0";
+/// The complete v1 wire atom vocabulary (condition and delivery axes only).
+pub const DECISION_BASIS_ATOM_VOCABULARY_V1: [&str; 8] = [
+    "condition.clean",
+    "condition.condition_present",
+    "condition.unresolved",
+    "delivery.qualified",
+    "delivery.partial_delivery",
+    "delivery.failed",
+    "delivery.not_configured",
+    "delivery.not_required",
+];
+
+/// Mirror of the Nightshift semantic-identity shape used for the rule.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionBasisRuleV1 {
+    /// Exact rule identity.
+    pub id: String,
+    /// Exact rule version.
+    pub version: String,
+    /// Exact rule digest: `sha256("{id}.v{version}")`.
+    pub digest: String,
+}
+
+/// The v1 decision basis: semantic evidence content with no observation,
+/// subject, time, or workflow binding. Parsing always validates.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "RawDecisionBasisV1")]
+pub struct DecisionBasisV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Exact normalization-rule identity.
+    pub rule: DecisionBasisRuleV1,
+    /// Canonical, strictly sorted, unique semantic atoms.
+    pub atoms: BTreeSet<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDecisionBasisV1 {
+    schema: String,
+    rule: DecisionBasisRuleV1,
+    atoms: Vec<String>,
+}
+
+impl TryFrom<RawDecisionBasisV1> for DecisionBasisV1 {
+    type Error = String;
+
+    fn try_from(raw: RawDecisionBasisV1) -> Result<Self, String> {
+        // Strictly ascending byte order rejects duplicates and any
+        // non-canonical ordering, so structurally ambiguous but
+        // semantically equivalent wire documents cannot parse.
+        if !raw.atoms.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Err("decision basis atoms must be strictly sorted and unique".to_owned());
+        }
+        let basis = Self {
+            schema: raw.schema,
+            rule: raw.rule,
+            atoms: raw.atoms.into_iter().collect(),
+        };
+        basis.validate()?;
+        Ok(basis)
+    }
+}
+
+/// The expected v1 rule digest, derived from the rule preimage convention
+/// `sha256("{id}.v{version}")`.
+#[must_use]
+pub fn decision_basis_rule_digest_v1() -> Digest {
+    Digest::hash_bytes(
+        format!("{DECISION_BASIS_RULE_ID_V1}.v{DECISION_BASIS_RULE_VERSION_V1}").as_bytes(),
+    )
+}
+
+impl DecisionBasisV1 {
+    /// The v1 wire invariants: exact schema, the frozen v1 rule identity,
+    /// the finite v1 vocabulary, and exactly one `condition.*` plus one
+    /// `delivery.*` atom.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != DECISION_BASIS_SCHEMA_V1 {
+            return Err(format!("unsupported decision basis schema {}", self.schema));
+        }
+        if self.rule.id != DECISION_BASIS_RULE_ID_V1 {
+            return Err("unknown decision-basis normalization rule identity".to_owned());
+        }
+        if self.rule.version != DECISION_BASIS_RULE_VERSION_V1 {
+            return Err("unsupported decision-basis normalization rule version".to_owned());
+        }
+        let digest = self
+            .rule
+            .digest
+            .parse::<Digest>()
+            .map_err(|error| format!("rule.digest is not a canonical digest: {error}"))?;
+        if digest != decision_basis_rule_digest_v1() {
+            return Err("rule digest does not match the v1 normalization rule preimage".to_owned());
+        }
+        if self.atoms.len() != 2 {
+            return Err(
+                "v1 decision basis must contain exactly one condition and one delivery atom"
+                    .to_owned(),
+            );
+        }
+        let conditions = self
+            .atoms
+            .iter()
+            .filter(|atom| atom.starts_with("condition."))
+            .count();
+        let deliveries = self
+            .atoms
+            .iter()
+            .filter(|atom| atom.starts_with("delivery."))
+            .count();
+        if conditions != 1 || deliveries != 1 {
+            return Err(
+                "v1 decision basis must contain exactly one condition and one delivery atom"
+                    .to_owned(),
+            );
+        }
+        for atom in &self.atoms {
+            if !DECISION_BASIS_ATOM_VOCABULARY_V1.contains(&atom.as_str()) {
+                return Err(format!("unknown v1 decision-basis atom {atom}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// RFC 8785 (JCS) canonical bytes of the exact basis document.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, String> {
+        Ok(JcsDocument::canonicalize(self)
+            .map_err(|error| error.to_string())?
+            .as_bytes()
+            .to_vec())
+    }
+
+    /// Domain-separated digest: `SHA256("nightshift.decision-basis.v1\0" ||
+    /// JCS(basis))`. Observation identity, subject identity, timestamps,
+    /// freshness, and workflow identity are never part of this preimage.
+    pub fn decision_basis_digest(&self) -> Result<Digest, String> {
+        let mut payload = DECISION_BASIS_DIGEST_DOMAIN_V1.to_vec();
+        payload.extend(self.canonical_bytes()?);
+        Ok(Digest::hash_bytes(&payload))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frozen nightshift.decision-basis.v1 cross-repo vector: the identical
+    /// literal JSON and digest are asserted independently in Nightshift.
+    const CROSS_REPO_VECTOR_JSON: &str = "{\"atoms\":[\"condition.clean\",\"delivery.not_required\"],\"rule\":{\"digest\":\"sha256:5f8bd1a497e034633d6fd465a6834a2ca8e9a4b20158322fd0a4bc36095f8e67\",\"id\":\"nightshift.posture-normalization\",\"version\":\"1\"},\"schema\":\"nightshift.decision-basis.v1\"}";
+    const CROSS_REPO_VECTOR_DIGEST: &str =
+        "sha256:d67f86277b1604cad1916d01bcd5e01fc3a9002d4630cb8fdf5b749febf4b2c7";
+
+    #[test]
+    fn ag_parses_the_frozen_nightshift_vector_and_computes_the_same_digest() {
+        let basis: DecisionBasisV1 = serde_json::from_str(CROSS_REPO_VECTOR_JSON).unwrap();
+        assert_eq!(basis.schema, DECISION_BASIS_SCHEMA_V1);
+        assert_eq!(basis.rule.id, DECISION_BASIS_RULE_ID_V1);
+        assert_eq!(basis.rule.version, DECISION_BASIS_RULE_VERSION_V1);
+        assert_eq!(
+            basis.atoms,
+            BTreeSet::from([
+                "condition.clean".to_owned(),
+                "delivery.not_required".to_owned(),
+            ])
+        );
+        let canonical = String::from_utf8(basis.canonical_bytes().unwrap()).unwrap();
+        assert_eq!(canonical, CROSS_REPO_VECTOR_JSON);
+        assert_eq!(
+            basis.decision_basis_digest().unwrap().as_str(),
+            CROSS_REPO_VECTOR_DIGEST
+        );
+    }
+
+    fn parse_error(json: &str) -> String {
+        match serde_json::from_str::<DecisionBasisV1>(json) {
+            Ok(_) => panic!("invalid basis must not parse: {json}"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    fn vector_json_with(atoms: &str) -> String {
+        format!(
+            "{{\"atoms\":[{atoms}],\"rule\":{{\"digest\":\"{}\",\"id\":\"nightshift.posture-normalization\",\"version\":\"1\"}},\"schema\":\"nightshift.decision-basis.v1\"}}",
+            decision_basis_rule_digest_v1().as_str()
+        )
+    }
+
+    #[test]
+    fn wrong_schema_is_rejected() {
+        let json = vector_json_with("\"condition.clean\",\"delivery.not_required\"").replace(
+            "nightshift.decision-basis.v1",
+            "nightshift.decision-basis.v0",
+        );
+        assert!(parse_error(&json).contains("schema"));
+    }
+
+    #[test]
+    fn duplicate_atoms_are_rejected() {
+        let json =
+            vector_json_with("\"condition.clean\",\"condition.clean\",\"delivery.qualified\"");
+        assert!(parse_error(&json).contains("sorted and unique"));
+    }
+
+    #[test]
+    fn unsorted_atoms_are_rejected() {
+        let json = vector_json_with("\"delivery.not_required\",\"condition.clean\"");
+        assert!(parse_error(&json).contains("sorted and unique"));
+    }
+
+    #[test]
+    fn missing_condition_atom_is_rejected() {
+        let json = vector_json_with("\"delivery.not_required\"");
+        assert!(parse_error(&json).contains("exactly one"));
+    }
+
+    #[test]
+    fn multiple_condition_atoms_are_rejected() {
+        let json = vector_json_with("\"condition.clean\",\"condition.unresolved\"");
+        assert!(parse_error(&json).contains("exactly one"));
+    }
+
+    #[test]
+    fn missing_delivery_atom_is_rejected() {
+        let json = vector_json_with("\"condition.clean\"");
+        assert!(parse_error(&json).contains("exactly one"));
+    }
+
+    #[test]
+    fn multiple_delivery_atoms_are_rejected() {
+        let json =
+            vector_json_with("\"condition.clean\",\"delivery.failed\",\"delivery.qualified\"");
+        assert!(parse_error(&json).contains("exactly one"));
+    }
+
+    #[test]
+    fn unknown_atom_is_rejected() {
+        let json = vector_json_with("\"condition.unknown\",\"delivery.qualified\"");
+        assert!(parse_error(&json).contains("unknown v1 decision-basis atom"));
+        let json =
+            vector_json_with("\"condition.clean\",\"delivery.qualified\",\"support.current\"");
+        assert!(parse_error(&json).contains("exactly one"));
+    }
+
+    #[test]
+    fn malformed_rule_identity_is_rejected() {
+        let wrong_digest = vector_json_with("\"condition.clean\",\"delivery.not_required\"")
+            .replace(
+                decision_basis_rule_digest_v1().as_str(),
+                &format!("sha256:{}", "0".repeat(64)),
+            );
+        assert!(parse_error(&wrong_digest).contains("preimage"));
+        let non_hex = vector_json_with("\"condition.clean\",\"delivery.not_required\"")
+            .replace(decision_basis_rule_digest_v1().as_str(), "sha256:not-hex");
+        assert!(parse_error(&non_hex).contains("digest"));
+        let wrong_id = vector_json_with("\"condition.clean\",\"delivery.not_required\"")
+            .replace("nightshift.posture-normalization", "nightshift.other-rule");
+        assert!(parse_error(&wrong_id).contains("identity"));
+        let wrong_version = vector_json_with("\"condition.clean\",\"delivery.not_required\"")
+            .replace("\"version\":\"1\"", "\"version\":\"2\"");
+        assert!(parse_error(&wrong_version).contains("version"));
+    }
+
+    /// A verbatim `Current` resolution emitted by the production
+    /// `nightshift-observation-resolver` binary (captured against a real
+    /// canonical store) must parse as `ObservationResolutionV2`, and its
+    /// pinned ref must equal the basis digest AG computes.
+    #[test]
+    fn nightshift_resolver_output_parses_as_v2_with_matching_basis_digest() {
+        let captured = "{\"basis\":{\"atoms\":[\"condition.clean\",\"delivery.not_required\"],\"rule\":{\"digest\":\"sha256:5f8bd1a497e034633d6fd465a6834a2ca8e9a4b20158322fd0a4bc36095f8e67\",\"id\":\"nightshift.posture-normalization\",\"version\":\"1\"},\"schema\":\"nightshift.decision-basis.v1\"},\"currentness\":\"sha256:ac737119ad40a194ce896295683ceffbea8b61000d1277a7e20307ea8403928b\",\"fresh_until_unix_ms\":1785183010000,\"key\":{\"campaign\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"occurrence\":\"00000000-0000-4000-8000-000000000000\"},\"normalized_preconditions\":\"sha256:d67f86277b1604cad1916d01bcd5e01fc3a9002d4630cb8fdf5b749febf4b2c7\",\"observation\":\"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"resolved_at_unix_ms\":1785182710000,\"resolver_id\":\"nightshift-observation-resolver/v1\",\"schema\":\"ag.governed-loop.observation-resolution/v2\",\"status\":\"current\",\"subject\":\"sha256:6262626262626262626262626262626262626262626262626262626262626262\"}";
+        let resolution: ObservationResolutionV2 = serde_json::from_str(captured).unwrap();
+        assert_eq!(resolution.schema, OBSERVATION_RESOLUTION_SCHEMA_V2);
+        assert_eq!(resolution.status, ObservationStatusV1::Current);
+        assert_eq!(resolution.resolver_id, "nightshift-observation-resolver/v1");
+        let digest = resolution.basis.decision_basis_digest().unwrap();
+        assert_eq!(resolution.normalized_preconditions.as_digest(), &digest);
+        assert_eq!(digest.as_str(), CROSS_REPO_VECTOR_DIGEST);
+    }
 }

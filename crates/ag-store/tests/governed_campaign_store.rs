@@ -1,5 +1,6 @@
 //! Transactional, replay, concurrency, and restart tests for canonical campaign state.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Barrier};
 
 use ag_campaign::CampaignId;
@@ -8,9 +9,30 @@ use ag_primitives::Digest;
 use ag_store::campaign::{CampaignStoreErrorV1, CampaignStoreV1, CampaignTransitionKindV1};
 
 const NOW: u64 = 20_000;
+/// The resolver identity these tests configure the kernel to expect.
+const OBSERVATION_RESOLVER_ID: &str = "test.observation-resolver/v1";
+/// The standing resolver identity these tests configure the kernel to expect.
+const STANDING_RESOLVER_ID: &str = "test.standing-resolver/v1";
+/// Maximum accepted standing-answer lifetime in these tests.
+const MAX_STANDING_TTL_MS: u64 = 60_000;
 
 fn digest(label: &str) -> Digest {
     Digest::hash_domain("ag-governed-store-test/v1", label.as_bytes())
+}
+
+fn clean_basis() -> DecisionBasisV1 {
+    DecisionBasisV1 {
+        schema: DECISION_BASIS_SCHEMA_V1.to_owned(),
+        rule: DecisionBasisRuleV1 {
+            id: DECISION_BASIS_RULE_ID_V1.to_owned(),
+            version: DECISION_BASIS_RULE_VERSION_V1.to_owned(),
+            digest: decision_basis_rule_digest_v1().as_str().to_owned(),
+        },
+        atoms: BTreeSet::from([
+            "condition.clean".to_owned(),
+            "delivery.not_required".to_owned(),
+        ]),
+    }
 }
 
 fn campaign() -> CampaignId {
@@ -53,13 +75,13 @@ fn proposal(work: &str) -> ExactWorkProposalV1 {
 
 #[derive(Clone)]
 struct Observation {
-    preconditions: PreconditionBasisRefV1,
+    basis: DecisionBasisV1,
 }
 
 impl Observation {
-    fn new(label: &str) -> Self {
+    fn new() -> Self {
         Self {
-            preconditions: PreconditionBasisRefV1::from_digest(digest(label)),
+            basis: clean_basis(),
         }
     }
 }
@@ -68,13 +90,17 @@ impl ObservationResolverV1 for Observation {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV1, ExternalBoundaryErrorV1> {
-        Ok(ObservationResolutionV1 {
-            schema: OBSERVATION_RESOLUTION_SCHEMA_V1.to_owned(),
+    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+        Ok(ObservationResolutionV2 {
+            schema: OBSERVATION_RESOLUTION_SCHEMA_V2.to_owned(),
             key: request.key.clone(),
             observation: request.observation.clone(),
             currentness: ObservationCurrentnessRefV1::from_digest(digest("observation-current")),
-            normalized_preconditions: self.preconditions.clone(),
+            normalized_preconditions: PreconditionBasisRefV1::from_digest(
+                self.basis.decision_basis_digest().unwrap(),
+            ),
+            basis: self.basis.clone(),
+            resolver_id: OBSERVATION_RESOLVER_ID.to_owned(),
             subject: request.subject.clone(),
             status: ObservationStatusV1::Current,
             resolved_at_unix_ms: request.now_unix_ms,
@@ -89,9 +115,9 @@ impl StandingResolverV1 for Standing {
     fn resolve_standing(
         &mut self,
         request: &StandingResolutionRequestV1<'_>,
-    ) -> Result<CurrentStandingResolutionV1, ExternalBoundaryErrorV1> {
-        Ok(CurrentStandingResolutionV1 {
-            schema: STANDING_RESOLUTION_SCHEMA_V1.to_owned(),
+    ) -> Result<CurrentStandingResolutionV2, ExternalBoundaryErrorV1> {
+        Ok(CurrentStandingResolutionV2 {
+            schema: STANDING_RESOLUTION_SCHEMA_V2.to_owned(),
             resolution: StandingResolutionRefV1::from_digest(digest("standing-resolution")),
             currentness: StandingCurrentnessRefV1::from_digest(digest("standing-currentness")),
             mandate: MandateRefV1::from_digest(digest("mandate")),
@@ -100,6 +126,7 @@ impl StandingResolverV1 for Standing {
             proposal: request.proposal.clone(),
             subject: request.subject.clone(),
             scope: request.scope.clone(),
+            resolver_id: STANDING_RESOLVER_ID.to_owned(),
             status: StandingStatusV1::Current,
             resolved_at_unix_ms: request.now_unix_ms,
             expires_at_unix_ms: request.now_unix_ms + 1_000,
@@ -158,13 +185,14 @@ fn commit_normal_path(
     store: &mut CampaignStoreV1,
     start: &OccurrenceSnapshotV1,
 ) -> OccurrenceSnapshotV1 {
-    let mut observation = Observation::new("preconditions");
+    let mut observation = Observation::new();
     let proposed = GovernedLoopKernelV1::record_proposal(
         start,
         ObservationRefV1::from_digest(digest("observation")),
         proposal("work"),
         ProposalClassV1::Initial,
         &mut observation,
+        OBSERVATION_RESOLVER_ID,
         NOW,
     )
     .unwrap();
@@ -191,6 +219,9 @@ fn commit_normal_path(
         &mut Standing,
         &mut Decider,
         None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
         NOW,
     )
     .unwrap();
@@ -208,6 +239,9 @@ fn commit_normal_path(
         &mut Standing,
         &mut Decider,
         None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
         NOW,
     )
     .unwrap();
@@ -275,23 +309,25 @@ fn stale_writer_and_duplicate_successor_refuse_without_partial_accounting() {
     let store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
     drop(store);
 
-    let mut first_observation = Observation::new("preconditions");
+    let mut first_observation = Observation::new();
     let first = GovernedLoopKernelV1::record_proposal(
         &start,
         ObservationRefV1::from_digest(digest("observation-a")),
-        proposal("work-a"),
+        proposal("work"),
         ProposalClassV1::Initial,
         &mut first_observation,
+        OBSERVATION_RESOLVER_ID,
         NOW,
     )
     .unwrap();
-    let mut second_observation = Observation::new("preconditions");
+    let mut second_observation = Observation::new();
     let second = GovernedLoopKernelV1::record_proposal(
         &start,
         ObservationRefV1::from_digest(digest("observation-b")),
-        proposal("work-b"),
+        proposal("work"),
         ProposalClassV1::Initial,
         &mut second_observation,
+        OBSERVATION_RESOLVER_ID,
         NOW,
     )
     .unwrap();

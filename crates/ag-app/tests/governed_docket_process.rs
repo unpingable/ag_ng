@@ -19,7 +19,7 @@ use ag_app::effect_executor_adapter::{
 };
 use ag_app::governed_loop::{
     CampaignEngineV1, DocketProgressV1, EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1,
-    ExactWorkCatalogV1,
+    ExactWorkCatalogV1, WorkPreconditionV1,
 };
 use ag_app::governed_ports::{AgIssuanceSignerV1, CommandDocketCustodyPortV1};
 use ag_campaign::CampaignId;
@@ -36,19 +36,42 @@ fn digest(label: &str) -> Digest {
     Digest::hash_domain("ag-governed-process-test/v1", label.as_bytes())
 }
 
+/// The resolver identity this test configures the engine to expect.
+const OBSERVATION_RESOLVER_ID: &str = "test.observation-resolver/v1";
+
+fn clean_basis() -> DecisionBasisV1 {
+    DecisionBasisV1 {
+        schema: DECISION_BASIS_SCHEMA_V1.to_owned(),
+        rule: DecisionBasisRuleV1 {
+            id: DECISION_BASIS_RULE_ID_V1.to_owned(),
+            version: DECISION_BASIS_RULE_VERSION_V1.to_owned(),
+            digest: decision_basis_rule_digest_v1().as_str().to_owned(),
+        },
+        atoms: std::collections::BTreeSet::from([
+            "condition.clean".to_owned(),
+            "delivery.not_required".to_owned(),
+        ]),
+    }
+}
+
 struct Observation;
 
 impl ObservationResolverV1 for Observation {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV1, ExternalBoundaryErrorV1> {
-        Ok(ObservationResolutionV1 {
-            schema: OBSERVATION_RESOLUTION_SCHEMA_V1.to_owned(),
+    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+        let basis = clean_basis();
+        Ok(ObservationResolutionV2 {
+            schema: OBSERVATION_RESOLUTION_SCHEMA_V2.to_owned(),
             key: request.key.clone(),
             observation: request.observation.clone(),
             currentness: ObservationCurrentnessRefV1::from_digest(digest("observation-current")),
-            normalized_preconditions: PreconditionBasisRefV1::from_digest(digest("preconditions")),
+            normalized_preconditions: PreconditionBasisRefV1::from_digest(
+                basis.decision_basis_digest().unwrap(),
+            ),
+            basis,
+            resolver_id: OBSERVATION_RESOLVER_ID.to_owned(),
             subject: request.subject.clone(),
             status: ObservationStatusV1::Current,
             resolved_at_unix_ms: request.now_unix_ms,
@@ -59,13 +82,18 @@ impl ObservationResolverV1 for Observation {
 
 struct Standing;
 
+/// The standing resolver identity this test configures the engine to expect.
+const STANDING_RESOLVER_ID: &str = "test.standing-resolver/v1";
+/// Maximum accepted standing-answer lifetime in this test.
+const MAX_STANDING_TTL_MS: u64 = 60_000;
+
 impl StandingResolverV1 for Standing {
     fn resolve_standing(
         &mut self,
         request: &StandingResolutionRequestV1<'_>,
-    ) -> Result<CurrentStandingResolutionV1, ExternalBoundaryErrorV1> {
-        Ok(CurrentStandingResolutionV1 {
-            schema: STANDING_RESOLUTION_SCHEMA_V1.to_owned(),
+    ) -> Result<CurrentStandingResolutionV2, ExternalBoundaryErrorV1> {
+        Ok(CurrentStandingResolutionV2 {
+            schema: STANDING_RESOLUTION_SCHEMA_V2.to_owned(),
             resolution: StandingResolutionRefV1::from_digest(digest("ag-standing-resolution")),
             currentness: StandingCurrentnessRefV1::from_digest(digest("ag-standing-current")),
             mandate: MandateRefV1::from_digest(digest("mandate")),
@@ -74,6 +102,7 @@ impl StandingResolverV1 for Standing {
             proposal: request.proposal.clone(),
             subject: request.subject.clone(),
             scope: request.scope.clone(),
+            resolver_id: STANDING_RESOLVER_ID.to_owned(),
             status: StandingStatusV1::Current,
             resolved_at_unix_ms: request.now_unix_ms,
             expires_at_unix_ms: request.now_unix_ms + 60_000,
@@ -162,13 +191,13 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
     .unwrap();
     let catalog = ExactWorkCatalogV1 {
         schema: EXACT_WORK_CATALOG_SCHEMA_V1.to_owned(),
-        policy_basis: digest("policy"),
         entries: BTreeMap::from([(
             EFFECT_EXECUTOR_WORK_SCHEMA_V1.to_owned(),
             ExactWorkCatalogEntryV1 {
                 work_schema: EFFECT_EXECUTOR_WORK_SCHEMA_V1.to_owned(),
                 subject,
                 scope,
+                precondition: WorkPreconditionV1::default(),
             },
         )]),
     };
@@ -180,15 +209,34 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
             proposal,
             ProposalClassV1::Initial,
             &mut observation,
+            OBSERVATION_RESOLVER_ID,
             2,
         )
         .unwrap();
     engine.require_standing(3).unwrap();
     engine
-        .decide(&mut observation, &mut standing, &catalog, None, 4)
+        .decide(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            4,
+        )
         .unwrap();
     engine
-        .authorize(&mut observation, &mut standing, &catalog, None, 5)
+        .authorize(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            5,
+        )
         .unwrap();
 
     let resolver_path = root.path().join("docket-standing-resolver");

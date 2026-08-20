@@ -68,6 +68,8 @@ enum Command {
         input: PathBuf,
         #[arg(long)]
         observation_resolver: PathBuf,
+        #[arg(long)]
+        expected_observation_resolver_id: String,
     },
     /// Enter the explicit current-standing-required state.
     RequireStanding {
@@ -144,6 +146,8 @@ enum Command {
         #[arg(long)]
         observation_resolver: PathBuf,
         #[arg(long)]
+        expected_observation_resolver_id: String,
+        #[arg(long)]
         human_verifier: PathBuf,
     },
     /// Complete only from a fresh observation boundary with no residuals.
@@ -154,6 +158,8 @@ enum Command {
         input: PathBuf,
         #[arg(long)]
         observation_resolver: PathBuf,
+        #[arg(long)]
+        expected_observation_resolver_id: String,
     },
     /// Record a typed non-authorizing refusal without advancing the PC.
     Refuse {
@@ -171,7 +177,14 @@ struct GateArguments {
     #[arg(long)]
     observation_resolver: PathBuf,
     #[arg(long)]
+    expected_observation_resolver_id: String,
+    #[arg(long)]
     standing_resolver: PathBuf,
+    #[arg(long)]
+    expected_standing_resolver_id: String,
+    /// Maximum accepted standing-answer lifetime in milliseconds.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    max_standing_ttl_ms: u64,
     #[arg(long)]
     controlling_review: Option<PathBuf>,
 }
@@ -275,6 +288,7 @@ fn main() -> anyhow::Result<()> {
             database,
             input,
             observation_resolver,
+            expected_observation_resolver_id,
         } => {
             let input: ProposalInputV1 = read_exact_record(&input)?;
             let mut engine = CampaignEngineV1::open(&database)?;
@@ -284,6 +298,7 @@ fn main() -> anyhow::Result<()> {
                 input.proposal,
                 input.class,
                 &mut observation,
+                &expected_observation_resolver_id,
                 now,
             )?;
             write_exact(&state)
@@ -307,6 +322,9 @@ fn main() -> anyhow::Result<()> {
                 &mut standing,
                 &catalog,
                 review.as_ref(),
+                &gate.expected_observation_resolver_id,
+                &gate.expected_standing_resolver_id,
+                gate.max_standing_ttl_ms,
                 now,
             )?)
         }
@@ -325,6 +343,9 @@ fn main() -> anyhow::Result<()> {
                 &mut standing,
                 &catalog,
                 review.as_ref(),
+                &gate.expected_observation_resolver_id,
+                &gate.expected_standing_resolver_id,
+                gate.max_standing_ttl_ms,
                 now,
             )?)
         }
@@ -367,6 +388,7 @@ fn main() -> anyhow::Result<()> {
             database,
             input,
             observation_resolver,
+            expected_observation_resolver_id,
             human_verifier,
         } => {
             let input: HumanDispositionInputV1 = read_exact_record(&input)?;
@@ -382,6 +404,7 @@ fn main() -> anyhow::Result<()> {
                 &scope,
                 input.new_occurrence,
                 &mut observation,
+                &expected_observation_resolver_id,
                 &mut verifier,
                 now,
             )?;
@@ -391,6 +414,7 @@ fn main() -> anyhow::Result<()> {
             database,
             input,
             observation_resolver,
+            expected_observation_resolver_id,
         } => {
             let input: CompletionInputV1 = read_exact_record(&input)?;
             let mut engine = CampaignEngineV1::open(&database)?;
@@ -400,6 +424,7 @@ fn main() -> anyhow::Result<()> {
                 &input.subject,
                 input.terminal_witness,
                 &mut observation,
+                &expected_observation_resolver_id,
                 now,
             )?)
         }

@@ -195,7 +195,7 @@ impl ObservationResolverV1 for CommandObservationResolverV1 {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV1, ExternalBoundaryErrorV1> {
+    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
         run_json_program(
             &self.program,
             &[],
@@ -230,7 +230,7 @@ impl StandingResolverV1 for CommandStandingResolverV1 {
     fn resolve_standing(
         &mut self,
         request: &StandingResolutionRequestV1<'_>,
-    ) -> Result<CurrentStandingResolutionV1, ExternalBoundaryErrorV1> {
+    ) -> Result<CurrentStandingResolutionV2, ExternalBoundaryErrorV1> {
         run_json_program(
             &self.program,
             &[],

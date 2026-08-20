@@ -5,15 +5,43 @@
     reason = "hostile scenarios keep full setup and assertion chains visible"
 )]
 
+use std::collections::BTreeSet;
+
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::Digest;
 use uuid::Uuid;
 
 const NOW: u64 = 10_000;
+/// The resolver identity these tests configure the kernel to expect.
+const OBSERVATION_RESOLVER_ID: &str = "test.observation-resolver/v1";
+/// The standing resolver identity these tests configure the kernel to expect.
+const STANDING_RESOLVER_ID: &str = "test.standing-resolver/v1";
+/// Maximum accepted standing-answer lifetime in these tests.
+const MAX_STANDING_TTL_MS: u64 = 60_000;
 
 fn digest(label: &str) -> Digest {
     Digest::hash_domain("ag-governed-loop-test/v1", label.as_bytes())
+}
+
+fn decision_basis(condition: &str, delivery: &str) -> DecisionBasisV1 {
+    DecisionBasisV1 {
+        schema: DECISION_BASIS_SCHEMA_V1.to_owned(),
+        rule: DecisionBasisRuleV1 {
+            id: DECISION_BASIS_RULE_ID_V1.to_owned(),
+            version: DECISION_BASIS_RULE_VERSION_V1.to_owned(),
+            digest: decision_basis_rule_digest_v1().as_str().to_owned(),
+        },
+        atoms: BTreeSet::from([condition.to_owned(), delivery.to_owned()]),
+    }
+}
+
+fn clean_basis() -> DecisionBasisV1 {
+    decision_basis("condition.clean", "delivery.not_required")
+}
+
+fn changed_basis() -> DecisionBasisV1 {
+    decision_basis("condition.condition_present", "delivery.qualified")
 }
 
 fn campaign() -> CampaignId {
@@ -49,21 +77,27 @@ fn proposal(campaign: &CampaignId, work: &str) -> ExactWorkProposalV1 {
 
 #[derive(Clone)]
 struct ObservationBoundary {
-    preconditions: PreconditionBasisRefV1,
+    basis: DecisionBasisV1,
     status: ObservationStatusV1,
     substitute_occurrence: Option<OccurrenceId>,
     substitute_observation: Option<ObservationRefV1>,
     substitute_subject: Option<Digest>,
+    substitute_schema: Option<String>,
+    substitute_preconditions: Option<PreconditionBasisRefV1>,
+    substitute_resolver_id: Option<String>,
 }
 
 impl ObservationBoundary {
-    fn current(preconditions: &str) -> Self {
+    fn current(basis: DecisionBasisV1) -> Self {
         Self {
-            preconditions: PreconditionBasisRefV1::from_digest(digest(preconditions)),
+            basis,
             status: ObservationStatusV1::Current,
             substitute_occurrence: None,
             substitute_observation: None,
             substitute_subject: None,
+            substitute_schema: None,
+            substitute_preconditions: None,
+            substitute_resolver_id: None,
         }
     }
 }
@@ -72,20 +106,30 @@ impl ObservationResolverV1 for ObservationBoundary {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV1, ExternalBoundaryErrorV1> {
+    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
         let mut key = request.key.clone();
         if let Some(occurrence) = self.substitute_occurrence {
             key.occurrence = occurrence;
         }
-        Ok(ObservationResolutionV1 {
-            schema: OBSERVATION_RESOLUTION_SCHEMA_V1.to_owned(),
+        Ok(ObservationResolutionV2 {
+            schema: self
+                .substitute_schema
+                .clone()
+                .unwrap_or_else(|| OBSERVATION_RESOLUTION_SCHEMA_V2.to_owned()),
             key,
             observation: self
                 .substitute_observation
                 .clone()
                 .unwrap_or_else(|| request.observation.clone()),
             currentness: ObservationCurrentnessRefV1::from_digest(digest("observation-current")),
-            normalized_preconditions: self.preconditions.clone(),
+            normalized_preconditions: self.substitute_preconditions.clone().unwrap_or_else(|| {
+                PreconditionBasisRefV1::from_digest(self.basis.decision_basis_digest().unwrap())
+            }),
+            basis: self.basis.clone(),
+            resolver_id: self
+                .substitute_resolver_id
+                .clone()
+                .unwrap_or_else(|| OBSERVATION_RESOLVER_ID.to_owned()),
             subject: self
                 .substitute_subject
                 .clone()
@@ -100,16 +144,24 @@ impl ObservationResolverV1 for ObservationBoundary {
 #[derive(Clone)]
 struct StandingBoundary {
     status: StandingStatusV1,
+    mandate: MandateRefV1,
+    window_ms: u64,
     substitute_proposal: Option<ProposalRefV1>,
     substitute_occurrence: Option<OccurrenceId>,
+    substitute_resolver_id: Option<String>,
+    substitute_expires_unix_ms: Option<u64>,
 }
 
 impl StandingBoundary {
     fn current() -> Self {
         Self {
             status: StandingStatusV1::Current,
+            mandate: MandateRefV1::from_digest(digest("mandate")),
+            window_ms: 1_000,
             substitute_proposal: None,
             substitute_occurrence: None,
+            substitute_resolver_id: None,
+            substitute_expires_unix_ms: None,
         }
     }
 }
@@ -118,16 +170,19 @@ impl StandingResolverV1 for StandingBoundary {
     fn resolve_standing(
         &mut self,
         request: &StandingResolutionRequestV1<'_>,
-    ) -> Result<CurrentStandingResolutionV1, ExternalBoundaryErrorV1> {
+    ) -> Result<CurrentStandingResolutionV2, ExternalBoundaryErrorV1> {
         let mut key = request.key.clone();
         if let Some(occurrence) = self.substitute_occurrence {
             key.occurrence = occurrence;
         }
-        Ok(CurrentStandingResolutionV1 {
-            schema: STANDING_RESOLUTION_SCHEMA_V1.to_owned(),
-            resolution: StandingResolutionRefV1::from_digest(digest("standing-resolution")),
+        Ok(CurrentStandingResolutionV2 {
+            schema: STANDING_RESOLUTION_SCHEMA_V2.to_owned(),
+            resolution: StandingResolutionRefV1::from_digest(digest(&format!(
+                "standing-resolution-{}",
+                self.mandate.as_str()
+            ))),
             currentness: StandingCurrentnessRefV1::from_digest(digest("standing-current")),
-            mandate: MandateRefV1::from_digest(digest("mandate")),
+            mandate: self.mandate.clone(),
             key,
             observation: request.observation.clone(),
             proposal: self
@@ -136,9 +191,15 @@ impl StandingResolverV1 for StandingBoundary {
                 .unwrap_or_else(|| request.proposal.clone()),
             subject: request.subject.clone(),
             scope: request.scope.clone(),
+            resolver_id: self
+                .substitute_resolver_id
+                .clone()
+                .unwrap_or_else(|| STANDING_RESOLVER_ID.to_owned()),
             status: self.status,
             resolved_at_unix_ms: request.now_unix_ms,
-            expires_at_unix_ms: request.now_unix_ms + 1_000,
+            expires_at_unix_ms: self
+                .substitute_expires_unix_ms
+                .unwrap_or(request.now_unix_ms + self.window_ms),
         })
     }
 }
@@ -147,6 +208,7 @@ impl StandingResolverV1 for StandingBoundary {
 struct Decider {
     disposition: AdmissionDispositionV1,
     substitute_proposal: Option<ProposalRefV1>,
+    calls: usize,
 }
 
 impl Decider {
@@ -154,6 +216,7 @@ impl Decider {
         Self {
             disposition: AdmissionDispositionV1::Admitted,
             substitute_proposal: None,
+            calls: 0,
         }
     }
 }
@@ -163,6 +226,7 @@ impl AdmissibilityDeciderV1 for Decider {
         &mut self,
         request: &AdmissibilityRequestV1<'_>,
     ) -> Result<AdmissionDecisionV1, ExternalBoundaryErrorV1> {
+        self.calls += 1;
         Ok(AdmissionDecisionV1 {
             decision: AdmissionDecisionRefV1::from_digest(digest("decision")),
             key: request.standing.key.clone(),
@@ -222,6 +286,7 @@ fn advance_to_spent(
             ProposalClassV1::Initial
         },
         observation,
+        OBSERVATION_RESOLVER_ID,
         NOW,
     )
     .unwrap();
@@ -234,6 +299,9 @@ fn advance_to_spent(
         &mut standing,
         &mut decider,
         None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
         NOW,
     )
     .unwrap();
@@ -243,6 +311,9 @@ fn advance_to_spent(
         &mut standing,
         &mut decider,
         None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
         NOW,
     )
     .unwrap()
@@ -282,7 +353,7 @@ fn settlement(dispatched: &OccurrenceSnapshotV1, outcome: KnownOutcomeV1) -> Doc
 fn settled() -> (OccurrenceSnapshotV1, ExactWorkProposalV1) {
     let initial = initial();
     let proposal = proposal(&campaign(), "work");
-    let mut observation = ObservationBoundary::current("preconditions");
+    let mut observation = ObservationBoundary::current(clean_basis());
     let spent = advance_to_spent(
         &initial,
         proposal.clone(),
@@ -306,7 +377,7 @@ fn normal_path_is_closed_and_one_shot() {
         ProgramCounterV1::ObservationRequired
     );
     let exact_proposal = proposal(&campaign(), "work");
-    let mut observation = ObservationBoundary::current("preconditions");
+    let mut observation = ObservationBoundary::current(clean_basis());
     let spent = advance_to_spent(
         &initial,
         exact_proposal,
@@ -325,6 +396,9 @@ fn normal_path_is_closed_and_one_shot() {
             &mut StandingBoundary::current(),
             &mut Decider::admit(),
             None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
             NOW,
         )
         .is_err()
@@ -373,13 +447,14 @@ fn normal_path_is_closed_and_one_shot() {
 #[test]
 fn proposal_review_receipt_and_executor_output_have_no_transition_projection() {
     let initial = initial();
-    let mut observation = ObservationBoundary::current("preconditions");
+    let mut observation = ObservationBoundary::current(clean_basis());
     let proposed = GovernedLoopKernelV1::record_proposal(
         &initial,
         ObservationRefV1::from_digest(digest("observation-1")),
         proposal(&campaign(), "work"),
         ProposalClassV1::Initial,
         &mut observation,
+        OBSERVATION_RESOLVER_ID,
         NOW,
     )
     .unwrap();
@@ -411,13 +486,14 @@ fn proposal_review_receipt_and_executor_output_have_no_transition_projection() {
 #[test]
 fn currentness_and_exact_binding_are_rechecked_before_spend() {
     let start = initial();
-    let mut observation = ObservationBoundary::current("preconditions");
+    let mut observation = ObservationBoundary::current(clean_basis());
     let proposed = GovernedLoopKernelV1::record_proposal(
         &start,
         ObservationRefV1::from_digest(digest("observation-1")),
         proposal(&campaign(), "work"),
         ProposalClassV1::Initial,
         &mut observation,
+        OBSERVATION_RESOLVER_ID,
         NOW,
     )
     .unwrap();
@@ -430,6 +506,9 @@ fn currentness_and_exact_binding_are_rechecked_before_spend() {
         &mut standing,
         &mut decider,
         None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
         NOW,
     )
     .unwrap();
@@ -442,6 +521,9 @@ fn currentness_and_exact_binding_are_rechecked_before_spend() {
             &mut standing,
             &mut decider,
             None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
             NOW,
         ),
         Err(KernelErrorV1::StandingNotCurrent)
@@ -455,6 +537,9 @@ fn currentness_and_exact_binding_are_rechecked_before_spend() {
             &mut standing,
             &mut decider,
             None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
             NOW,
         ),
         Err(KernelErrorV1::ObservationNotCurrent)
@@ -470,20 +555,21 @@ fn retry_is_a_distinct_occurrence_with_fresh_unchanged_preconditions() {
         retry.program_counter(),
         ProgramCounterV1::ObservationRequired
     );
-    let mut fresh = ObservationBoundary::current("preconditions");
+    let mut fresh = ObservationBoundary::current(clean_basis());
     let proposed = GovernedLoopKernelV1::record_proposal(
         &retry,
         ObservationRefV1::from_digest(digest("observation-2")),
         exact_proposal.clone(),
         ProposalClassV1::Retry,
         &mut fresh,
+        OBSERVATION_RESOLVER_ID,
         NOW,
     )
     .unwrap();
     assert_eq!(proposed.state().meta().budget().retries_used, 1);
 
     let retry_changed = GovernedLoopKernelV1::open_continuation(&settled, occurrence(3)).unwrap();
-    let mut changed = ObservationBoundary::current("changed-preconditions");
+    let mut changed = ObservationBoundary::current(changed_basis());
     assert!(matches!(
         GovernedLoopKernelV1::record_proposal(
             &retry_changed,
@@ -491,11 +577,12 @@ fn retry_is_a_distinct_occurrence_with_fresh_unchanged_preconditions() {
             exact_proposal.clone(),
             ProposalClassV1::Retry,
             &mut changed,
+            OBSERVATION_RESOLVER_ID,
             NOW,
         ),
         Err(KernelErrorV1::RetryPreconditionsChanged)
     ));
-    let mut unchanged = ObservationBoundary::current("preconditions");
+    let mut unchanged = ObservationBoundary::current(clean_basis());
     assert!(matches!(
         GovernedLoopKernelV1::record_proposal(
             &retry_changed,
@@ -503,6 +590,7 @@ fn retry_is_a_distinct_occurrence_with_fresh_unchanged_preconditions() {
             exact_proposal,
             ProposalClassV1::Successor,
             &mut unchanged,
+            OBSERVATION_RESOLVER_ID,
             NOW,
         ),
         Err(KernelErrorV1::SuccessorProposalReused)
@@ -542,7 +630,7 @@ fn exact_c1_repair_rejects_subset_extra_duplicate_and_substitution() {
 #[test]
 fn unknown_outcome_can_only_reconcile_or_halt_and_never_repeat() {
     let start = initial();
-    let mut observation = ObservationBoundary::current("preconditions");
+    let mut observation = ObservationBoundary::current(clean_basis());
     let spent = advance_to_spent(
         &start,
         proposal(&campaign(), "work"),
@@ -582,7 +670,7 @@ fn restart_mapping_erases_authority_and_ambiguous_dispatch_reconciles() {
         GovernedLoopKernelV1::recovery_requirement(&start),
         RecoveryRequirementV1::FreshObservation
     );
-    let mut observation = ObservationBoundary::current("preconditions");
+    let mut observation = ObservationBoundary::current(clean_basis());
     let spent = advance_to_spent(
         &start,
         proposal(&campaign(), "work"),
@@ -624,7 +712,8 @@ fn residuals_are_exact_and_human_dispositions_never_dispatch() {
             ObservationRefV1::from_digest(digest("terminal-observation")),
             &digest("subject"),
             TerminalWitnessRefV1::from_digest(digest("terminal")),
-            &mut ObservationBoundary::current("terminal-preconditions"),
+            &mut ObservationBoundary::current(clean_basis()),
+            OBSERVATION_RESOLVER_ID,
             NOW,
         )
         .is_err()
@@ -669,7 +758,8 @@ fn residuals_are_exact_and_human_dispositions_never_dispatch() {
         artifact.clone(),
         &scope,
         None,
-        &mut ObservationBoundary::current("unused"),
+        &mut ObservationBoundary::current(clean_basis()),
+        OBSERVATION_RESOLVER_ID,
         &mut HumanVerifier,
         NOW,
     )
@@ -688,7 +778,8 @@ fn residuals_are_exact_and_human_dispositions_never_dispatch() {
             },
             &scope,
             None,
-            &mut ObservationBoundary::current("unused"),
+            &mut ObservationBoundary::current(clean_basis()),
+            OBSERVATION_RESOLVER_ID,
             &mut HumanVerifier,
             NOW,
         )
@@ -712,7 +803,8 @@ fn residuals_are_exact_and_human_dispositions_never_dispatch() {
         },
         &scope,
         Some(occurrence(2)),
-        &mut ObservationBoundary::current("unused"),
+        &mut ObservationBoundary::current(clean_basis()),
+        OBSERVATION_RESOLVER_ID,
         &mut HumanVerifier,
         NOW,
     )
@@ -730,13 +822,14 @@ fn residuals_are_exact_and_human_dispositions_never_dispatch() {
 #[test]
 fn completed_is_terminal_and_halted_is_effect_free() {
     let start = initial();
-    let mut terminal = ObservationBoundary::current("terminal-preconditions");
+    let mut terminal = ObservationBoundary::current(clean_basis());
     let completed = GovernedLoopKernelV1::complete_from_observation(
         &start,
         ObservationRefV1::from_digest(digest("terminal-observation")),
         &digest("terminal-subject"),
         TerminalWitnessRefV1::from_digest(digest("terminal-witness")),
         &mut terminal,
+        OBSERVATION_RESOLVER_ID,
         NOW,
     )
     .unwrap();
@@ -756,10 +849,13 @@ fn completed_is_terminal_and_halted_is_effect_free() {
     assert!(
         GovernedLoopKernelV1::consume_authorization(
             &halted,
-            &mut ObservationBoundary::current("preconditions"),
+            &mut ObservationBoundary::current(clean_basis()),
             &mut StandingBoundary::current(),
             &mut Decider::admit(),
             None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
             NOW,
         )
         .is_err()
@@ -851,7 +947,8 @@ fn residual_disposition_refuses_wrong_basis_and_partial_accounting() {
                 artifact,
                 &scope,
                 None,
-                &mut ObservationBoundary::current("unused"),
+                &mut ObservationBoundary::current(clean_basis()),
+                OBSERVATION_RESOLVER_ID,
                 &mut HumanVerifier,
                 NOW,
             ),
@@ -895,7 +992,8 @@ fn program_replacement_is_authority_empty_and_unresolved_attempt_blocks_resume_o
             replacement,
             &scope,
             Some(occurrence(2)),
-            &mut ObservationBoundary::current("unused"),
+            &mut ObservationBoundary::current(clean_basis()),
+            OBSERVATION_RESOLVER_ID,
             &mut HumanVerifier,
             NOW,
         )
@@ -912,7 +1010,7 @@ fn program_replacement_is_authority_empty_and_unresolved_attempt_blocks_resume_o
     assert!(successor.ag_spend().is_none());
     assert!(successor.docket_custody().is_none());
 
-    let mut observation = ObservationBoundary::current("preconditions");
+    let mut observation = ObservationBoundary::current(clean_basis());
     let spent = advance_to_spent(
         &start,
         proposal(&campaign(), "work"),
@@ -974,11 +1072,570 @@ fn program_replacement_is_authority_empty_and_unresolved_attempt_blocks_resume_o
                 } else {
                     None
                 },
-                &mut ObservationBoundary::current("terminal"),
+                &mut ObservationBoundary::current(clean_basis()),
+                OBSERVATION_RESOLVER_ID,
                 &mut HumanVerifier,
                 NOW,
             ),
             Err(KernelErrorV1::UnresolvedAttempt)
         ));
     }
+}
+
+#[test]
+fn v2_resolution_requires_the_basis_digest_to_match_the_pinned_ref() {
+    // The structured basis is the semantics; `normalized_preconditions` is its
+    // canonical digest. A resolver that returns a valid basis whose digest
+    // does not equal the pinned ref must fail closed before any status is
+    // consumed.
+    let start = initial();
+    let mut mismatched = ObservationBoundary::current(clean_basis());
+    mismatched.substitute_preconditions =
+        Some(PreconditionBasisRefV1::from_digest(digest("foreign-basis")));
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &start,
+            ObservationRefV1::from_digest(digest("observation-1")),
+            proposal(&campaign(), "work"),
+            ProposalClassV1::Initial,
+            &mut mismatched,
+            OBSERVATION_RESOLVER_ID,
+            NOW,
+        ),
+        Err(KernelErrorV1::BindingMismatch("precondition basis"))
+    ));
+    assert_eq!(
+        start.program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+}
+
+#[test]
+fn v2_resolution_rejects_a_malformed_or_foreign_rule_basis() {
+    // In-process resolvers can construct a basis without going through the
+    // validating wire parser, so the kernel re-validates the semantic content
+    // itself.
+    let start = initial();
+    let mut unknown_atom = ObservationBoundary::current(DecisionBasisV1 {
+        atoms: BTreeSet::from(["condition.clean".to_owned(), "delivery.unknown".to_owned()]),
+        ..clean_basis()
+    });
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &start,
+            ObservationRefV1::from_digest(digest("observation-1")),
+            proposal(&campaign(), "work"),
+            ProposalClassV1::Initial,
+            &mut unknown_atom,
+            OBSERVATION_RESOLVER_ID,
+            NOW,
+        ),
+        Err(KernelErrorV1::ForeignSchema("decision basis"))
+    ));
+
+    let mut wrong_rule = ObservationBoundary::current(DecisionBasisV1 {
+        rule: DecisionBasisRuleV1 {
+            version: "2".to_owned(),
+            ..clean_basis().rule
+        },
+        ..clean_basis()
+    });
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &start,
+            ObservationRefV1::from_digest(digest("observation-1")),
+            proposal(&campaign(), "work"),
+            ProposalClassV1::Initial,
+            &mut wrong_rule,
+            OBSERVATION_RESOLVER_ID,
+            NOW,
+        ),
+        Err(KernelErrorV1::ForeignSchema("decision basis"))
+    ));
+}
+
+#[test]
+fn v2_resolution_rejects_a_foreign_or_unconfigured_resolver_identity() {
+    let start = initial();
+    let mut foreign = ObservationBoundary::current(clean_basis());
+    foreign.substitute_resolver_id = Some("test.other-resolver/v9".to_owned());
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &start,
+            ObservationRefV1::from_digest(digest("observation-1")),
+            proposal(&campaign(), "work"),
+            ProposalClassV1::Initial,
+            &mut foreign,
+            OBSERVATION_RESOLVER_ID,
+            NOW,
+        ),
+        Err(KernelErrorV1::BindingMismatch(
+            "observation resolver identity"
+        ))
+    ));
+
+    // An empty configured expectation is a configuration failure, not an
+    // identity match.
+    let mut honest = ObservationBoundary::current(clean_basis());
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &start,
+            ObservationRefV1::from_digest(digest("observation-1")),
+            proposal(&campaign(), "work"),
+            ProposalClassV1::Initial,
+            &mut honest,
+            "",
+            NOW,
+        ),
+        Err(KernelErrorV1::BindingMismatch(
+            "observation resolver identity"
+        ))
+    ));
+}
+
+#[test]
+fn legacy_v1_resolution_is_not_accepted_as_v2() {
+    // A response naming the retired v1 schema is refused at the kernel.
+    let start = initial();
+    let mut legacy = ObservationBoundary::current(clean_basis());
+    legacy.substitute_schema = Some("ag.governed-loop.observation-resolution/v1".to_owned());
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &start,
+            ObservationRefV1::from_digest(digest("observation-1")),
+            proposal(&campaign(), "work"),
+            ProposalClassV1::Initial,
+            &mut legacy,
+            OBSERVATION_RESOLVER_ID,
+            NOW,
+        ),
+        Err(KernelErrorV1::ForeignSchema("observation resolution"))
+    ));
+
+    // A v1-shaped wire document (no `basis`, no `resolver_id`) cannot even
+    // parse as a v2 resolution.
+    let mut resolver = ObservationBoundary::current(clean_basis());
+    let request = ObservationResolutionRequestV1 {
+        key: start.key(),
+        observation: &ObservationRefV1::from_digest(digest("observation-1")),
+        subject: &digest("subject"),
+        now_unix_ms: NOW,
+    };
+    let resolution = resolver.resolve_observation(&request).unwrap();
+    let mut wire = serde_json::to_value(&resolution).unwrap();
+    let object = wire.as_object_mut().unwrap();
+    object.remove("basis");
+    object.remove("resolver_id");
+    object.insert(
+        "schema".to_owned(),
+        serde_json::Value::String("ag.governed-loop.observation-resolution/v1".to_owned()),
+    );
+    assert!(serde_json::from_value::<ObservationResolutionV2>(wire).is_err());
+}
+
+#[test]
+fn a_changed_basis_between_record_and_decide_keeps_the_proposal_unjudged() {
+    // The proposal pins exactly one basis digest at record time. A later
+    // resolution carrying different semantic content (and therefore a
+    // different digest) cannot refresh it; the existing currentness refusal
+    // applies and no state advances.
+    let start = initial();
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &start,
+        ObservationRefV1::from_digest(digest("observation-1")),
+        proposal(&campaign(), "work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
+    let required = GovernedLoopKernelV1::require_standing(&proposed).unwrap();
+
+    observation.basis = changed_basis();
+    assert!(matches!(
+        GovernedLoopKernelV1::record_admissible(
+            &required,
+            &mut observation,
+            &mut StandingBoundary::current(),
+            &mut Decider::admit(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::ObservationNotCurrent)
+    ));
+    assert_eq!(
+        required.program_counter(),
+        ProgramCounterV1::StandingRequired
+    );
+}
+
+#[test]
+fn a_negative_observation_status_never_reaches_the_admissibility_decider() {
+    // The v2 wire requires every resolution to carry a syntactically valid
+    // basis, so a negative resolver answer still contains atoms. Those atoms
+    // are wire filler: evidence health must fail before the catalog decider
+    // is consulted, and the decider must never see them.
+    let start = initial();
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &start,
+        ObservationRefV1::from_digest(digest("observation-1")),
+        proposal(&campaign(), "work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
+    let required = GovernedLoopKernelV1::require_standing(&proposed).unwrap();
+
+    for status in [
+        ObservationStatusV1::Stale,
+        ObservationStatusV1::Superseded,
+        ObservationStatusV1::Absent,
+    ] {
+        observation.status = status;
+        let mut decider = Decider::admit();
+        assert!(matches!(
+            GovernedLoopKernelV1::record_admissible(
+                &required,
+                &mut observation,
+                &mut StandingBoundary::current(),
+                &mut decider,
+                None,
+                OBSERVATION_RESOLVER_ID,
+                STANDING_RESOLVER_ID,
+                MAX_STANDING_TTL_MS,
+                NOW,
+            ),
+            Err(KernelErrorV1::ObservationNotCurrent)
+        ));
+        assert_eq!(
+            decider.calls, 0,
+            "decider must not run for {status:?} observations"
+        );
+    }
+    observation.status = ObservationStatusV1::Contradictory;
+    let mut decider = Decider::admit();
+    assert!(matches!(
+        GovernedLoopKernelV1::record_admissible(
+            &required,
+            &mut observation,
+            &mut StandingBoundary::current(),
+            &mut decider,
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::ObservationContradiction)
+    ));
+    assert_eq!(decider.calls, 0);
+    assert_eq!(
+        required.program_counter(),
+        ProgramCounterV1::StandingRequired
+    );
+}
+
+/// One occurrence holding a recorded proposal at the standing-required
+/// boundary, plus its observation boundary fixture.
+fn standing_required() -> (OccurrenceSnapshotV1, ObservationBoundary) {
+    let start = initial();
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &start,
+        ObservationRefV1::from_digest(digest("observation-1")),
+        proposal(&campaign(), "work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
+    let required = GovernedLoopKernelV1::require_standing(&proposed).unwrap();
+    (required, observation)
+}
+
+#[test]
+fn standing_resolver_identity_is_checked_and_never_wildcard() {
+    let (required, mut observation) = standing_required();
+    let mut foreign = StandingBoundary::current();
+    foreign.substitute_resolver_id = Some("test.other-standing-resolver/v9".to_owned());
+    assert!(matches!(
+        GovernedLoopKernelV1::record_admissible(
+            &required,
+            &mut observation,
+            &mut foreign,
+            &mut Decider::admit(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::BindingMismatch("standing resolver identity"))
+    ));
+
+    // An empty configured expectation is a configuration failure, never a
+    // wildcard match.
+    let mut honest = StandingBoundary::current();
+    assert!(matches!(
+        GovernedLoopKernelV1::record_admissible(
+            &required,
+            &mut observation,
+            &mut honest,
+            &mut Decider::admit(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            "",
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::BindingMismatch("standing resolver identity"))
+    ));
+    assert_eq!(
+        required.program_counter(),
+        ProgramCounterV1::StandingRequired
+    );
+}
+
+#[test]
+fn standing_answer_window_is_capped_by_the_configured_maximum() {
+    // The fixture answers with a 1000 ms window. The cap is inclusive:
+    // window == max is accepted, max - 1 refuses, and a reversed window
+    // cannot wrap through checked subtraction.
+    let (required, mut observation) = standing_required();
+    let mut standing = StandingBoundary::current();
+    GovernedLoopKernelV1::record_admissible(
+        &required,
+        &mut observation,
+        &mut standing,
+        &mut Decider::admit(),
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        1_000,
+        NOW,
+    )
+    .unwrap();
+
+    let mut standing = StandingBoundary::current();
+    assert!(matches!(
+        GovernedLoopKernelV1::record_admissible(
+            &required,
+            &mut observation,
+            &mut standing,
+            &mut Decider::admit(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            999,
+            NOW,
+        ),
+        Err(KernelErrorV1::StandingNotCurrent)
+    ));
+
+    let mut reversed = StandingBoundary::current();
+    reversed.substitute_expires_unix_ms = Some(NOW - 1);
+    assert!(matches!(
+        GovernedLoopKernelV1::record_admissible(
+            &required,
+            &mut observation,
+            &mut reversed,
+            &mut Decider::admit(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::StandingNotCurrent)
+    ));
+    assert_eq!(
+        required.program_counter(),
+        ProgramCounterV1::StandingRequired
+    );
+}
+
+#[test]
+fn standing_is_present_tense_and_may_recover_for_the_same_proposal() {
+    // T25: standing is present-tense governance state, not proposal-pinned
+    // evidence. Absent standing blocks admission; a later Current answer
+    // admits the same unchanged proposal and the spend then succeeds.
+    let (required, mut observation) = standing_required();
+    let mut standing = StandingBoundary::current();
+    standing.status = StandingStatusV1::Absent;
+    assert!(matches!(
+        GovernedLoopKernelV1::record_admissible(
+            &required,
+            &mut observation,
+            &mut standing,
+            &mut Decider::admit(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::StandingAbsent)
+    ));
+    assert_eq!(
+        required.program_counter(),
+        ProgramCounterV1::StandingRequired
+    );
+
+    standing.status = StandingStatusV1::Current;
+    let admissible = GovernedLoopKernelV1::record_admissible(
+        &required,
+        &mut observation,
+        &mut standing,
+        &mut Decider::admit(),
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap();
+    let spent = GovernedLoopKernelV1::consume_authorization(
+        &admissible,
+        &mut observation,
+        &mut standing,
+        &mut Decider::admit(),
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap();
+    assert!(spent.ag_spend().is_some());
+}
+
+#[test]
+fn mandate_supersession_blocks_spend_and_a_new_mandate_spends_with_its_own_provenance() {
+    // T26: a superseded mandate cannot spend; a fresh Current answer under a
+    // new mandate spends with provenance naming the new standing resolution
+    // and mandate.
+    let (required, mut observation) = standing_required();
+    let mut standing = StandingBoundary::current();
+    let admissible = GovernedLoopKernelV1::record_admissible(
+        &required,
+        &mut observation,
+        &mut standing,
+        &mut Decider::admit(),
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap();
+
+    standing.status = StandingStatusV1::Superseded;
+    assert!(matches!(
+        GovernedLoopKernelV1::consume_authorization(
+            &admissible,
+            &mut observation,
+            &mut standing,
+            &mut Decider::admit(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::StandingNotCurrent)
+    ));
+    assert_eq!(
+        admissible.program_counter(),
+        ProgramCounterV1::AdmissiblePendingAuthorization
+    );
+
+    standing.status = StandingStatusV1::Current;
+    standing.mandate = MandateRefV1::from_digest(digest("mandate-m2"));
+    let spent = GovernedLoopKernelV1::consume_authorization(
+        &admissible,
+        &mut observation,
+        &mut standing,
+        &mut Decider::admit(),
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap();
+    let expected_resolution = StandingResolutionRefV1::from_digest(digest(&format!(
+        "standing-resolution-{}",
+        digest("mandate-m2").as_str()
+    )));
+    assert_eq!(
+        spent.admission_decision().unwrap().standing_resolution,
+        expected_resolution
+    );
+    assert_eq!(
+        *spent.issuance().unwrap().mandate.as_digest(),
+        digest("mandate-m2")
+    );
+}
+
+#[test]
+fn the_designated_standing_resolver_remains_a_trusted_authority_boundary() {
+    // ENVIRONMENTAL TRUST BOUNDARY, pinned deliberately: a well-formed
+    // answer from the configured resolver — correct identity, echoes, and
+    // window, Current status, arbitrary opaque mandate/currentness content —
+    // is accepted. Kernel binding proves the answer's shape and provenance;
+    // it cannot prove the external governance claim true.
+    let (required, mut observation) = standing_required();
+    let mut standing = StandingBoundary::current();
+    standing.mandate = MandateRefV1::from_digest(digest("arbitrary-opaque-mandate"));
+    GovernedLoopKernelV1::record_admissible(
+        &required,
+        &mut observation,
+        &mut standing,
+        &mut Decider::admit(),
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap();
+}
+
+#[test]
+fn standing_alone_cannot_mint_authority() {
+    // A Current standing answer is a revocable prerequisite, not authority:
+    // with no proposal path there is nothing to spend, and no issuance can
+    // exist.
+    let start = initial();
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    assert!(matches!(
+        GovernedLoopKernelV1::require_standing(&start),
+        Err(KernelErrorV1::IllegalTransition { .. })
+    ));
+    assert!(matches!(
+        GovernedLoopKernelV1::consume_authorization(
+            &start,
+            &mut observation,
+            &mut standing,
+            &mut Decider::admit(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::IllegalTransition { .. })
+    ));
+    assert!(start.ag_spend().is_none());
+    assert!(start.issuance().is_none());
 }
