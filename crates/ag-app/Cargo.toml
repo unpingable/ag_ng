@@ -35,6 +35,10 @@ required-features = ["worker-fixture"]
 name = "ag-loopctl"
 path = "src/bin/ag-loopctl.rs"
 
+[[bin]]
+name = "ag-standing-resolver"
+path = "src/bin/ag_standing_resolver.rs"
+
 [dependencies]
 ag-campaign = { path = "../ag-campaign" }
 ag-effect = { path = "../ag-effect" }

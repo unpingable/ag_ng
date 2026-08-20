@@ -19,6 +19,7 @@ pub mod peer;
 pub mod rpc_auth;
 pub mod runtime;
 pub mod signed_transport;
+pub mod standing_authority;
 pub mod transport;
 pub mod worker;
 pub mod worker_protocol;
