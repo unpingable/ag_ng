@@ -71,11 +71,15 @@ fn budget() -> LoopBudgetV1 {
 }
 
 fn proposal(label: &str) -> ExactWorkProposalV1 {
+    proposal_with_schema("test.engine-work/v1", label)
+}
+
+fn proposal_with_schema(work_schema: &str, label: &str) -> ExactWorkProposalV1 {
     ExactWorkProposalV1::new(
         campaign(),
         digest("subject"),
         digest("scope"),
-        "test.engine-work/v1".to_owned(),
+        work_schema.to_owned(),
         digest(label),
         None,
     )
@@ -421,6 +425,7 @@ fn create_engine(directory: &TempDir, residuals: ResidualSetV1) -> CampaignEngin
         campaign(),
         occurrence(1),
         ProgramBasisRefV1::from_digest(digest("program")),
+        digest("work-1"),
         residuals,
         budget(),
         NOW,
@@ -593,7 +598,9 @@ fn production_path_spends_once_settles_and_requires_a_new_occurrence() {
             .is_err()
     );
 
-    let next = engine.open_continuation(occurrence(2), NOW + 9).unwrap();
+    let next = engine
+        .open_continuation(occurrence(2), digest("work-1"), NOW + 9)
+        .unwrap();
     assert_eq!(
         next.program_counter(),
         ProgramCounterV1::ObservationRequired
@@ -839,7 +846,9 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
     drop(engine);
 
     engine = CampaignEngineV1::open(&database).unwrap();
-    let next = engine.open_continuation(occurrence(2), NOW + 9).unwrap();
+    let next = engine
+        .open_continuation(occurrence(2), digest("work-1"), NOW + 9)
+        .unwrap();
     assert_eq!(
         next.program_counter(),
         ProgramCounterV1::ObservationRequired
@@ -863,7 +872,9 @@ fn changed_preconditions_cannot_be_laundered_as_retry() {
         KnownOutcomeV1::Failure,
     );
     let _ = engine.poll_docket(&mut docket, NOW + 6).unwrap();
-    engine.open_continuation(occurrence(2), NOW + 7).unwrap();
+    engine
+        .open_continuation(occurrence(2), digest("work-1"), NOW + 7)
+        .unwrap();
 
     observation.basis = changed_basis();
     let error = engine
@@ -888,7 +899,7 @@ fn changed_preconditions_cannot_be_laundered_as_retry() {
     let successor = engine
         .record_proposal(
             ObservationRefV1::from_digest(digest("observation-2")),
-            proposal("work-2"),
+            proposal_with_schema("test.successor-work/v1", "work-1"),
             ProposalClassV1::Successor,
             &mut observation,
             OBSERVATION_RESOLVER_ID,
@@ -923,7 +934,11 @@ fn indeterminate_attempt_blocks_repeat_until_exact_settlement() {
         ProgramCounterV1::ReconciliationRequired
     );
     assert!(engine.dispatch(&mut docket, NOW + 7).is_err());
-    assert!(engine.open_continuation(occurrence(2), NOW + 8).is_err());
+    assert!(
+        engine
+            .open_continuation(occurrence(2), digest("work-1"), NOW + 8)
+            .is_err()
+    );
     assert_eq!(docket.accept_calls(), 1);
 
     docket.settle(&issuance, KnownOutcomeV1::Success);
@@ -1967,4 +1982,93 @@ fn revoked_standing_after_restart_still_blocks_spend() {
         ProgramCounterV1::AdmissiblePendingAuthorization
     );
     assert_eq!(engine.replay().unwrap().ag_spends, 0);
+}
+
+#[test]
+fn record_proposal_rejects_unbound_work_before_any_resolution() {
+    // The occurrence was opened to govern digest("work-1"). An otherwise
+    // valid proposal naming work-2 fails the exact-work binding before the
+    // observation resolver is consulted, with no state change and no spend.
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    // `record_proposal` has no standing or catalog parameter at all: neither
+    // can be consulted at record time.
+    let before = engine.current().unwrap();
+    let error = engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("observation-1")),
+            proposal("work-2"),
+            ProposalClassV1::Initial,
+            &mut observation,
+            OBSERVATION_RESOLVER_ID,
+            NOW + 1,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CampaignEngineErrorV1::Kernel(KernelErrorV1::BindingMismatch("prepared exact work"))
+    ));
+    assert_eq!(observation.calls, 0, "no observation resolution consulted");
+    assert_eq!(engine.current().unwrap(), before);
+    assert_eq!(engine.replay().unwrap().ag_spends, 0);
+}
+
+#[test]
+fn each_occurrence_binds_its_own_expected_work() {
+    // A continuation opened with a new expected-work binding refuses the
+    // predecessor's exact work and records the newly bound work.
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    docket.settle(
+        &dispatched.issuance().unwrap().issuance,
+        KnownOutcomeV1::Success,
+    );
+    let _ = engine.poll_docket(&mut docket, NOW + 6).unwrap();
+    engine
+        .open_continuation(occurrence(2), digest("work-2"), NOW + 7)
+        .unwrap();
+
+    // The predecessor's bound work is foreign to this occurrence.
+    let error = engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("observation-2")),
+            proposal("work-1"),
+            ProposalClassV1::Successor,
+            &mut observation,
+            OBSERVATION_RESOLVER_ID,
+            NOW + 8,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CampaignEngineErrorV1::Kernel(KernelErrorV1::BindingMismatch("prepared exact work"))
+    ));
+    assert_eq!(
+        engine.current().unwrap().program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+
+    // The newly bound work records (as a successor, since its identity
+    // differs from the predecessor's proposal).
+    let recorded = engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("observation-2")),
+            proposal("work-2"),
+            ProposalClassV1::Successor,
+            &mut observation,
+            OBSERVATION_RESOLVER_ID,
+            NOW + 9,
+        )
+        .unwrap();
+    assert_eq!(
+        recorded.program_counter(),
+        ProgramCounterV1::ProposalRecorded
+    );
+    assert_eq!(engine.replay().unwrap().ag_spends, 1);
 }

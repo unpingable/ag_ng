@@ -280,19 +280,27 @@ pub struct CampaignEngineV1 {
 }
 
 impl CampaignEngineV1 {
-    /// Creates one campaign with one authority-empty occurrence.
+    /// Creates one campaign with one authority-empty occurrence bound to one
+    /// exact expected executable-work identity.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         database: &Path,
         campaign: CampaignId,
         occurrence: OccurrenceId,
         program: ProgramBasisRefV1,
+        expected_work: Digest,
         residuals: ResidualSetV1,
         budget: LoopBudgetV1,
         now_unix_ms: u64,
     ) -> Result<Self, CampaignEngineErrorV1> {
-        let initial =
-            GovernedLoopKernelV1::create_initial(campaign, occurrence, program, residuals, budget)?;
+        let initial = GovernedLoopKernelV1::create_initial(
+            campaign,
+            occurrence,
+            program,
+            expected_work,
+            residuals,
+            budget,
+        )?;
         let store = CampaignStoreV1::create(database, &initial, now_unix_ms)?;
         Ok(Self { store })
     }
@@ -488,14 +496,17 @@ impl CampaignEngineV1 {
         self.apply_docket_progress(&current, response, now_unix_ms)
     }
 
-    /// Opens a distinct authority-empty continuation after settlement.
+    /// Opens a distinct authority-empty continuation after settlement,
+    /// binding the new occurrence to its own exact expected work.
     pub fn open_continuation(
         &mut self,
         occurrence: OccurrenceId,
+        expected_work: Digest,
         now_unix_ms: u64,
     ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
         let current = self.store.current()?;
-        let successor = GovernedLoopKernelV1::open_continuation(&current, occurrence)?;
+        let successor =
+            GovernedLoopKernelV1::open_continuation(&current, occurrence, expected_work)?;
         self.store.commit(
             &current,
             &successor,

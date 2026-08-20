@@ -831,6 +831,11 @@ pub enum OccurrenceLinkV1 {
 pub struct OccurrenceMetaV1 {
     key: OccurrenceKeyV1,
     program: ProgramBasisRefV1,
+    /// The exact executable-work identity this occurrence was opened to
+    /// govern, bound at occurrence creation. `record_proposal` refuses any
+    /// proposal naming different work; this is an integrity binding, not a
+    /// policy judgment.
+    expected_work: Digest,
     residuals: ResidualSetV1,
     budget: LoopBudgetV1,
     used_human_decisions: Vec<HumanDecisionIdV1>,
@@ -847,6 +852,13 @@ impl OccurrenceMetaV1 {
     #[must_use]
     pub const fn program(&self) -> &ProgramBasisRefV1 {
         &self.program
+    }
+
+    /// Returns the exact executable-work identity this occurrence was opened
+    /// to govern.
+    #[must_use]
+    pub const fn expected_work(&self) -> &Digest {
+        &self.expected_work
     }
 
     /// Returns all open residuals.
@@ -1738,6 +1750,7 @@ impl GovernedLoopKernelV1 {
         campaign: CampaignId,
         occurrence: OccurrenceId,
         program: ProgramBasisRefV1,
+        expected_work: Digest,
         residuals: ResidualSetV1,
         budget: LoopBudgetV1,
     ) -> Result<OccurrenceSnapshotV1, KernelErrorV1> {
@@ -1750,18 +1763,21 @@ impl GovernedLoopKernelV1 {
         struct Genesis<'a> {
             key: &'a OccurrenceKeyV1,
             program: &'a ProgramBasisRefV1,
+            expected_work: &'a Digest,
         }
         let prior_state_digest = digest_value(
             GENESIS_DIGEST_DOMAIN_V1,
             &Genesis {
                 key: &key,
                 program: &program,
+                expected_work: &expected_work,
             },
         );
         let state = OccurrenceStateV1::ObservationRequired(ObservationRequiredV1 {
             meta: OccurrenceMetaV1 {
                 key,
                 program,
+                expected_work,
                 residuals,
                 budget,
                 used_human_decisions: Vec::new(),
@@ -1936,6 +1952,14 @@ impl GovernedLoopKernelV1 {
         proposal.validate()?;
         if proposal.campaign() != &pending.meta.key().campaign {
             return Err(KernelErrorV1::OccurrenceMismatch);
+        }
+        // Exact-work binding: this occurrence was opened to govern one exact
+        // executable-work identity (bound at occurrence creation from the
+        // Nightshift-prepared mapping). A proposal naming different work is
+        // an integrity failure, not a policy refusal, and fails before any
+        // external resolution is consulted.
+        if proposal.work() != pending.meta.expected_work() {
+            return Err(KernelErrorV1::BindingMismatch("prepared exact work"));
         }
         let resolved = resolve_observation(
             resolver,
@@ -2232,6 +2256,7 @@ impl GovernedLoopKernelV1 {
     pub fn open_continuation(
         current: &OccurrenceSnapshotV1,
         occurrence: OccurrenceId,
+        expected_work: Digest,
     ) -> Result<OccurrenceSnapshotV1, KernelErrorV1> {
         current.validate_integrity()?;
         let OccurrenceStateV1::SettledObservationRequired(settled) = current.state() else {
@@ -2271,6 +2296,7 @@ impl GovernedLoopKernelV1 {
                     occurrence,
                 },
                 program: old_meta.program,
+                expected_work,
                 residuals: old_meta.residuals,
                 budget: old_meta.budget,
                 used_human_decisions: old_meta.used_human_decisions,
@@ -3083,6 +3109,10 @@ fn open_from_halt(
                 occurrence,
             },
             program,
+            // The disposition-opened occurrence continues the halted
+            // occurrence's exact-work lineage: a different executable work
+            // requires a new campaign, not a disposition.
+            expected_work: consumed_halt.meta.expected_work.clone(),
             residuals: consumed_halt.meta.residuals.clone(),
             budget: consumed_halt.meta.budget,
             used_human_decisions: consumed_halt.meta.used_human_decisions.clone(),

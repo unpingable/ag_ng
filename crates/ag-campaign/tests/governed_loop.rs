@@ -260,6 +260,7 @@ fn initial_with(occurrence: OccurrenceId, residuals: ResidualSetV1) -> Occurrenc
         campaign(),
         occurrence,
         ProgramBasisRefV1::from_digest(digest("program")),
+        digest("work"),
         residuals,
         budget(),
     )
@@ -549,7 +550,8 @@ fn currentness_and_exact_binding_are_rechecked_before_spend() {
 #[test]
 fn retry_is_a_distinct_occurrence_with_fresh_unchanged_preconditions() {
     let (settled, exact_proposal) = settled();
-    let retry = GovernedLoopKernelV1::open_continuation(&settled, occurrence(2)).unwrap();
+    let retry =
+        GovernedLoopKernelV1::open_continuation(&settled, occurrence(2), digest("work")).unwrap();
     assert_ne!(retry.key(), settled.key());
     assert_eq!(
         retry.program_counter(),
@@ -568,7 +570,8 @@ fn retry_is_a_distinct_occurrence_with_fresh_unchanged_preconditions() {
     .unwrap();
     assert_eq!(proposed.state().meta().budget().retries_used, 1);
 
-    let retry_changed = GovernedLoopKernelV1::open_continuation(&settled, occurrence(3)).unwrap();
+    let retry_changed =
+        GovernedLoopKernelV1::open_continuation(&settled, occurrence(3), digest("work")).unwrap();
     let mut changed = ObservationBoundary::current(changed_basis());
     assert!(matches!(
         GovernedLoopKernelV1::record_proposal(
@@ -651,7 +654,10 @@ fn unknown_outcome_can_only_reconcile_or_halt_and_never_repeat() {
         ProgramCounterV1::ReconciliationRequired
     );
     assert!(GovernedLoopKernelV1::accept_docket_custody(&reconciling, custody(&spent)).is_err());
-    assert!(GovernedLoopKernelV1::open_continuation(&reconciling, occurrence(2)).is_err());
+    assert!(
+        GovernedLoopKernelV1::open_continuation(&reconciling, occurrence(2), digest("work"))
+            .is_err()
+    );
     let settled = GovernedLoopKernelV1::record_reconciled_settlement(
         &reconciling,
         settlement(&dispatched, KnownOutcomeV1::Failure),
@@ -834,7 +840,9 @@ fn completed_is_terminal_and_halted_is_effect_free() {
     )
     .unwrap();
     assert_eq!(completed.program_counter(), ProgramCounterV1::Completed);
-    assert!(GovernedLoopKernelV1::open_continuation(&completed, occurrence(2)).is_err());
+    assert!(
+        GovernedLoopKernelV1::open_continuation(&completed, occurrence(2), digest("work")).is_err()
+    );
     assert!(
         GovernedLoopKernelV1::halt(
             &completed,
@@ -1638,4 +1646,64 @@ fn standing_alone_cannot_mint_authority() {
     ));
     assert!(start.ag_spend().is_none());
     assert!(start.issuance().is_none());
+}
+
+#[test]
+fn record_proposal_rejects_work_other_than_the_bound_expected_work() {
+    // The occurrence was opened to govern digest("work"); an otherwise valid
+    // proposal naming different executable work is an integrity failure, not
+    // a policy refusal.
+    let initial = initial();
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let error = GovernedLoopKernelV1::record_proposal(
+        &initial,
+        ObservationRefV1::from_digest(digest("observation-1")),
+        proposal(&campaign(), "substituted-work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        KernelErrorV1::BindingMismatch("prepared exact work")
+    ));
+    assert_eq!(
+        initial.program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+}
+
+#[test]
+fn work_binding_fails_before_any_observation_resolution() {
+    // A resolver that can never answer proves the binding check precedes any
+    // external consultation: the failure is the binding error, not the
+    // resolver's unavailability.
+    struct UnavailableObservation;
+    impl ObservationResolverV1 for UnavailableObservation {
+        fn resolve_observation(
+            &mut self,
+            _: &ObservationResolutionRequestV1<'_>,
+        ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+            Err(ExternalBoundaryErrorV1::Unavailable {
+                code: "observation-resolver-unavailable".to_owned(),
+            })
+        }
+    }
+    let initial = initial();
+    let error = GovernedLoopKernelV1::record_proposal(
+        &initial,
+        ObservationRefV1::from_digest(digest("observation-1")),
+        proposal(&campaign(), "substituted-work"),
+        ProposalClassV1::Initial,
+        &mut UnavailableObservation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        KernelErrorV1::BindingMismatch("prepared exact work")
+    ));
 }

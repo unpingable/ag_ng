@@ -55,6 +55,7 @@ fn initial() -> OccurrenceSnapshotV1 {
         campaign(),
         OccurrenceId::allocate(),
         ProgramBasisRefV1::from_digest(digest("program")),
+        digest("work"),
         ResidualSetV1::default(),
         budget(),
     )

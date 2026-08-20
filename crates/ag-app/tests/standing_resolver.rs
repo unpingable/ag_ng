@@ -676,6 +676,7 @@ fn create_engine(directory: &TempDir) -> CampaignEngineV1 {
         campaign(),
         occurrence(1),
         ProgramBasisRefV1::from_digest(digest("program")),
+        digest("work-1"),
         ResidualSetV1::default(),
         budget(),
         NOW,

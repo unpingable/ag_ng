@@ -217,6 +217,9 @@ struct GenesisInputV1 {
     campaign: CampaignId,
     occurrence: OccurrenceId,
     program: ProgramBasisRefV1,
+    /// The exact executable-work identity this occurrence is opened to
+    /// govern, taken from the Nightshift-prepared binding.
+    expected_ag_work: Digest,
     residuals: ResidualSetV1,
     budget: LoopBudgetV1,
 }
@@ -233,6 +236,9 @@ struct ProposalInputV1 {
 #[serde(deny_unknown_fields)]
 struct ContinuationInputV1 {
     occurrence: OccurrenceId,
+    /// The exact executable-work identity the continuation occurrence is
+    /// opened to govern.
+    expected_ag_work: Digest,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -276,6 +282,7 @@ fn main() -> anyhow::Result<()> {
                 input.campaign,
                 input.occurrence,
                 input.program,
+                input.expected_ag_work,
                 input.residuals,
                 input.budget,
                 now,
@@ -368,7 +375,7 @@ fn main() -> anyhow::Result<()> {
         Command::Continue { database, input } => {
             let input: ContinuationInputV1 = read_exact_record(&input)?;
             let mut engine = CampaignEngineV1::open(&database)?;
-            write_exact(&engine.open_continuation(input.occurrence, now)?)
+            write_exact(&engine.open_continuation(input.occurrence, input.expected_ag_work, now)?)
         }
         Command::NoteProbe { database } => {
             let mut engine = CampaignEngineV1::open(&database)?;

@@ -1010,4 +1010,45 @@ mod tests {
             "effect-executor-typed-receipt-binding"
         );
     }
+
+    #[test]
+    fn plan_identity_matches_the_pinned_cross_repo_vector() {
+        // The identical plan document and expected digest are pinned in
+        // nightshift against its independent mirror of the AG digest
+        // construction: both repositories derive the same executable-work
+        // identity from the same semantic plan.
+        let document = serde_json::json!({
+            "schema": "ag-effectd.docket-executor-plan/v1",
+            "attempt_store": "/tmp/wo9-1-vector/effect-attempts.sqlite",
+            "subject": format!("sha256:{}", "62".repeat(32)),
+            "scope": format!("sha256:{}", "31".repeat(32)),
+            "effect_index": 0,
+            "effect": {
+                "kind": "managed_file_put",
+                "target": "wo9-1-vector",
+                "path": "/tmp/wo9-1-vector/target",
+                "expected_content": null,
+                "content": format!("sha256:{}", "35".repeat(32)),
+                "mode": 384,
+                "uid": 1000,
+                "gid": 1000
+            },
+            "artifacts": [{
+                "digest": format!("sha256:{}", "35".repeat(32)),
+                "path": "/tmp/wo9-1-vector/artifact"
+            }],
+            "file_policy": {
+                "max_content_bytes": 1024,
+                "trusted_ancestor_uid": 0,
+                "trusted_parent_uid": 1000,
+                "require_private_parent_writes": true
+            },
+            "preparation_checkpoint": null
+        });
+        let plan: EffectExecutorPlanV1 = serde_json::from_value(document).unwrap();
+        assert_eq!(
+            plan.identity().unwrap().as_str(),
+            "sha256:c938048c15ac6ebe40053d6137924cd60e75c649e4239b318901a5be77517ca6"
+        );
+    }
 }

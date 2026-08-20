@@ -168,6 +168,7 @@ fn signed_issuance_crosses_docket_and_effectd_once_then_settles() {
         campaign.clone(),
         occurrence,
         ProgramBasisRefV1::from_digest(digest("program")),
+        work.clone(),
         ResidualSetV1::default(),
         LoopBudgetV1 {
             retry_limit: 1,
