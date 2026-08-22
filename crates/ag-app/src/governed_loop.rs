@@ -42,11 +42,15 @@ use thiserror::Error;
 
 /// Root-owned exact-work catalog schema.
 pub const EXACT_WORK_CATALOG_SCHEMA_V1: &str = "ag.governed-loop.exact-work-catalog/v1";
+/// Root-owned exact-work catalog schema with an explicit closed observation-
+/// basis requirement per work item.
+pub const EXACT_WORK_CATALOG_SCHEMA_V2: &str = "ag.governed-loop.exact-work-catalog/v2";
 
-/// Finite per-workflow precondition over `DecisionBasisV1` atoms.
+/// Finite per-workflow precondition over Nightshift `DecisionBasisV1` atoms.
 ///
 /// The judgment is exactly `required ⊆ basis.atoms` and
-/// `forbidden ∩ basis.atoms = ∅`. An omitted precondition is unconditional.
+/// `forbidden ∩ basis.atoms = ∅`. An omitted precondition is unconditional
+/// only within the frozen Nightshift basis type.
 /// This is catalog policy, not evidence health: it is evaluated only over a
 /// validated `Current` observation basis, never over the sentinel basis a
 /// negative resolution carries for wire completeness.
@@ -78,9 +82,48 @@ impl WorkPreconditionV1 {
         Ok(())
     }
 
-    /// The exact predicate over one validated observation basis.
-    fn holds_over(&self, basis: &DecisionBasisV1) -> bool {
-        self.required.is_subset(&basis.atoms) && self.forbidden.is_disjoint(&basis.atoms)
+    /// The exact predicate over one validated Nightshift observation basis.
+    /// Opaque typed bases are never interpreted as an empty atom set and must
+    /// use the explicit v2 catalog contract instead.
+    fn holds_over(&self, observation: &VersionedObservationResolutionV1) -> bool {
+        match observation.nightshift_basis() {
+            Some(basis) => {
+                self.required.is_subset(&basis.atoms) && self.forbidden.is_disjoint(&basis.atoms)
+            }
+            None => false,
+        }
+    }
+}
+
+/// Closed exact observation-basis requirement for one v2 catalog entry.
+///
+/// Nightshift retains its atom predicate. An application-owned typed basis is
+/// admitted only when its complete opaque envelope (type and identity) is an
+/// exact match; AG never interprets that identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "requirement", rename_all = "snake_case")]
+pub enum ExactObservationBasisRequirementV1 {
+    /// Frozen Nightshift atom predicate.
+    NightshiftAtoms(WorkPreconditionV1),
+    /// Exact application-owned type and opaque identity.
+    TypedBasis(TypedOpaqueObservationBasisV1),
+}
+
+impl ExactObservationBasisRequirementV1 {
+    fn validate(&self) -> Result<(), CampaignEngineErrorV1> {
+        match self {
+            Self::NightshiftAtoms(precondition) => precondition.validate(),
+            Self::TypedBasis(basis) => basis
+                .validate()
+                .map_err(|_| CampaignEngineErrorV1::InvalidCatalog),
+        }
+    }
+
+    fn holds_over(&self, observation: &VersionedObservationResolutionV1) -> bool {
+        match self {
+            Self::NightshiftAtoms(precondition) => precondition.holds_over(observation),
+            Self::TypedBasis(expected) => observation.typed_basis() == Some(expected),
+        }
     }
 }
 
@@ -94,9 +137,24 @@ pub struct ExactWorkCatalogEntryV1 {
     pub subject: Digest,
     /// Exact governed scope.
     pub scope: Digest,
-    /// Finite workflow precondition; absent means unconditional.
+    /// Finite Nightshift workflow precondition; absent means unconditional
+    /// within Nightshift only.
     #[serde(default)]
     pub precondition: WorkPreconditionV1,
+}
+
+/// One exact v2 catalog entry with an explicit observation-basis requirement.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactWorkCatalogEntryV2 {
+    /// Exact typed work schema.
+    pub work_schema: String,
+    /// Exact governed subject.
+    pub subject: Digest,
+    /// Exact governed scope.
+    pub scope: Digest,
+    /// Closed exact observation-basis requirement.
+    pub observation_basis: ExactObservationBasisRequirementV1,
 }
 
 /// Root-owned exact admissibility policy basis.
@@ -113,6 +171,66 @@ pub struct ExactWorkCatalogV1 {
     pub schema: String,
     /// Entries keyed by typed work schema.
     pub entries: BTreeMap<String, ExactWorkCatalogEntryV1>,
+}
+
+/// Root-owned exact admissibility catalog whose entries bind the observation
+/// basis class and, for typed evidence, its complete opaque identity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExactWorkCatalogV2 {
+    /// Exact schema.
+    pub schema: String,
+    /// Entries keyed by typed work schema.
+    pub entries: BTreeMap<String, ExactWorkCatalogEntryV2>,
+}
+
+/// Closed catalog generations accepted by the production governed loop.
+/// Untagged encoding preserves the historical v1 document exactly.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum VersionedExactWorkCatalogV1 {
+    /// Frozen Nightshift catalog.
+    NightshiftV1(ExactWorkCatalogV1),
+    /// Explicit exact observation-basis catalog.
+    ExactBasisV2(ExactWorkCatalogV2),
+}
+
+impl VersionedExactWorkCatalogV1 {
+    /// Validates the selected closed catalog generation.
+    pub fn validate(&self) -> Result<(), CampaignEngineErrorV1> {
+        match self {
+            Self::NightshiftV1(catalog) => catalog.validate(),
+            Self::ExactBasisV2(catalog) => catalog.validate(),
+        }
+    }
+}
+
+impl ExactWorkCatalogV2 {
+    /// Validates exact key/entry agreement and every closed basis requirement.
+    pub fn validate(&self) -> Result<(), CampaignEngineErrorV1> {
+        if self.schema != EXACT_WORK_CATALOG_SCHEMA_V2 || self.entries.is_empty() {
+            return Err(CampaignEngineErrorV1::InvalidCatalog);
+        }
+        if self.entries.iter().any(|(key, entry)| {
+            key != &entry.work_schema
+                || key.is_empty()
+                || entry.observation_basis.validate().is_err()
+        }) {
+            return Err(CampaignEngineErrorV1::InvalidCatalog);
+        }
+        Ok(())
+    }
+
+    /// Returns the canonical identity of the complete v2 catalog.
+    pub fn policy_basis(&self) -> Result<Digest, CampaignEngineErrorV1> {
+        self.validate()?;
+        let bytes = JcsDocument::canonicalize(self)
+            .map_err(|error| CampaignEngineErrorV1::Canonical(error.to_string()))?;
+        Ok(Digest::hash_domain(
+            EXACT_WORK_CATALOG_SCHEMA_V2,
+            bytes.as_bytes(),
+        ))
+    }
 }
 
 impl ExactWorkCatalogV1 {
@@ -185,7 +303,7 @@ impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV1<'_> {
             .is_some_and(|entry| {
                 entry.subject == *request.proposal.subject()
                     && entry.scope == *request.proposal.scope()
-                    && entry.precondition.holds_over(&request.observation.basis)
+                    && entry.precondition.holds_over(request.observation)
             });
         #[derive(Serialize)]
         struct DecisionBasis<'a> {
@@ -198,7 +316,7 @@ impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV1<'_> {
         }
         let basis = DecisionBasis {
             key: &request.standing.key,
-            observation: &request.observation.observation,
+            observation: request.observation.observation(),
             proposal: &request.standing.proposal,
             standing: &request.standing.resolution,
             policy: &self.policy_basis,
@@ -215,7 +333,79 @@ impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV1<'_> {
                 bytes.as_bytes(),
             )),
             key: request.standing.key.clone(),
-            observation: request.observation.observation.clone(),
+            observation: request.observation.observation().clone(),
+            proposal: request.standing.proposal.clone(),
+            standing_resolution: request.standing.resolution.clone(),
+            disposition: if admitted {
+                AdmissionDispositionV1::Admitted
+            } else {
+                AdmissionDispositionV1::Refused
+            },
+            policy_basis: self.policy_basis.clone(),
+        })
+    }
+}
+
+/// AG-owned v2 exact catalog admission policy.
+pub struct CatalogAdmissibilityDeciderV2<'a> {
+    catalog: &'a ExactWorkCatalogV2,
+    policy_basis: Digest,
+}
+
+impl<'a> CatalogAdmissibilityDeciderV2<'a> {
+    /// Binds one consequence-time decision pass to an exact v2 catalog.
+    pub fn new(catalog: &'a ExactWorkCatalogV2) -> Result<Self, CampaignEngineErrorV1> {
+        let policy_basis = catalog.policy_basis()?;
+        Ok(Self {
+            catalog,
+            policy_basis,
+        })
+    }
+}
+
+impl AdmissibilityDeciderV1 for CatalogAdmissibilityDeciderV2<'_> {
+    fn decide_admissibility(
+        &mut self,
+        request: &AdmissibilityRequestV1<'_>,
+    ) -> Result<AdmissionDecisionV1, ExternalBoundaryErrorV1> {
+        let admitted = self
+            .catalog
+            .entries
+            .get(request.proposal.work_schema())
+            .is_some_and(|entry| {
+                entry.subject == *request.proposal.subject()
+                    && entry.scope == *request.proposal.scope()
+                    && entry.observation_basis.holds_over(request.observation)
+            });
+        #[derive(Serialize)]
+        struct DecisionBasis<'a> {
+            key: &'a OccurrenceKeyV1,
+            observation: &'a ObservationRefV1,
+            proposal: &'a ProposalRefV1,
+            standing: &'a StandingResolutionRefV1,
+            policy: &'a Digest,
+            admitted: bool,
+        }
+        let basis = DecisionBasis {
+            key: &request.standing.key,
+            observation: request.observation.observation(),
+            proposal: &request.standing.proposal,
+            standing: &request.standing.resolution,
+            policy: &self.policy_basis,
+            admitted,
+        };
+        let bytes = JcsDocument::canonicalize(&basis).map_err(|error| {
+            ExternalBoundaryErrorV1::Unavailable {
+                code: format!("admission-canonicalization:{error}"),
+            }
+        })?;
+        Ok(AdmissionDecisionV1 {
+            decision: AdmissionDecisionRefV1::from_digest(Digest::hash_domain(
+                "ag.governed-loop.catalog-admission/v2",
+                bytes.as_bytes(),
+            )),
+            key: request.standing.key.clone(),
+            observation: request.observation.observation().clone(),
             proposal: request.standing.proposal.clone(),
             standing_resolution: request.standing.resolution.clone(),
             disposition: if admitted {
@@ -464,6 +654,88 @@ impl CampaignEngineV1 {
         Ok(successor)
     }
 
+    /// Resolves observation/current standing and records a positive AG
+    /// decision under an explicit exact-basis v2 catalog.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_with_catalog_v2<O, S>(
+        &mut self,
+        observation: &mut O,
+        standing: &mut S,
+        catalog: &ExactWorkCatalogV2,
+        controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
+    where
+        O: ObservationResolverV1,
+        S: StandingResolverV1,
+    {
+        let current = self.store.current()?;
+        let mut decider = CatalogAdmissibilityDeciderV2::new(catalog)?;
+        let successor = GovernedLoopKernelV1::record_admissible(
+            &current,
+            observation,
+            standing,
+            &mut decider,
+            controlling_review,
+            expected_observation_resolver,
+            expected_standing_resolver,
+            max_standing_ttl_ms,
+            now_unix_ms,
+        )?;
+        self.store.commit(
+            &current,
+            &successor,
+            CampaignTransitionKindV1::Admissible,
+            now_unix_ms,
+        )?;
+        Ok(successor)
+    }
+
+    /// Dispatches decision evaluation to the exact catalog generation named
+    /// by the pinned deployment artifact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_versioned<O, S>(
+        &mut self,
+        observation: &mut O,
+        standing: &mut S,
+        catalog: &VersionedExactWorkCatalogV1,
+        controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
+    where
+        O: ObservationResolverV1,
+        S: StandingResolverV1,
+    {
+        match catalog {
+            VersionedExactWorkCatalogV1::NightshiftV1(catalog) => self.decide(
+                observation,
+                standing,
+                catalog,
+                controlling_review,
+                expected_observation_resolver,
+                expected_standing_resolver,
+                max_standing_ttl_ms,
+                now_unix_ms,
+            ),
+            VersionedExactWorkCatalogV1::ExactBasisV2(catalog) => self.decide_with_catalog_v2(
+                observation,
+                standing,
+                catalog,
+                controlling_review,
+                expected_observation_resolver,
+                expected_standing_resolver,
+                max_standing_ttl_ms,
+                now_unix_ms,
+            ),
+        }
+    }
+
     /// Re-resolves all current premises and durably spends the one AG authorization.
     #[allow(clippy::too_many_arguments)]
     pub fn authorize<O, S>(
@@ -501,6 +773,87 @@ impl CampaignEngineV1 {
             now_unix_ms,
         )?;
         Ok(successor)
+    }
+
+    /// Re-resolves and spends under an explicit exact-basis v2 catalog.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_with_catalog_v2<O, S>(
+        &mut self,
+        observation: &mut O,
+        standing: &mut S,
+        catalog: &ExactWorkCatalogV2,
+        controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
+    where
+        O: ObservationResolverV1,
+        S: StandingResolverV1,
+    {
+        let current = self.store.current()?;
+        let mut decider = CatalogAdmissibilityDeciderV2::new(catalog)?;
+        let successor = GovernedLoopKernelV1::consume_authorization(
+            &current,
+            observation,
+            standing,
+            &mut decider,
+            controlling_review,
+            expected_observation_resolver,
+            expected_standing_resolver,
+            max_standing_ttl_ms,
+            now_unix_ms,
+        )?;
+        self.store.commit(
+            &current,
+            &successor,
+            CampaignTransitionKindV1::AuthorizationConsumed,
+            now_unix_ms,
+        )?;
+        Ok(successor)
+    }
+
+    /// Dispatches one-use spend evaluation to the exact catalog generation
+    /// named by the pinned deployment artifact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_versioned<O, S>(
+        &mut self,
+        observation: &mut O,
+        standing: &mut S,
+        catalog: &VersionedExactWorkCatalogV1,
+        controlling_review: Option<&C1RejectedReviewBasisV1>,
+        expected_observation_resolver: &str,
+        expected_standing_resolver: &str,
+        max_standing_ttl_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1>
+    where
+        O: ObservationResolverV1,
+        S: StandingResolverV1,
+    {
+        match catalog {
+            VersionedExactWorkCatalogV1::NightshiftV1(catalog) => self.authorize(
+                observation,
+                standing,
+                catalog,
+                controlling_review,
+                expected_observation_resolver,
+                expected_standing_resolver,
+                max_standing_ttl_ms,
+                now_unix_ms,
+            ),
+            VersionedExactWorkCatalogV1::ExactBasisV2(catalog) => self.authorize_with_catalog_v2(
+                observation,
+                standing,
+                catalog,
+                controlling_review,
+                expected_observation_resolver,
+                expected_standing_resolver,
+                max_standing_ttl_ms,
+                now_unix_ms,
+            ),
+        }
     }
 
     /// Delegates the exact durable issuance to Docket and records its custody.

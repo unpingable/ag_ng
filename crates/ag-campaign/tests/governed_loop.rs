@@ -125,7 +125,7 @@ impl ObservationResolverV1 for ObservationBoundary {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+    ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
         let mut key = request.key.clone();
         if let Some(occurrence) = self.substitute_occurrence {
             key.occurrence = occurrence;
@@ -156,7 +156,64 @@ impl ObservationResolverV1 for ObservationBoundary {
             status: self.status,
             resolved_at_unix_ms: request.now_unix_ms,
             fresh_until_unix_ms: request.now_unix_ms + 1_000,
-        })
+        }
+        .into())
+    }
+}
+
+#[derive(Clone)]
+struct TypedObservationBoundary {
+    basis: TypedOpaqueObservationBasisV1,
+    status: TypedObservationStatusV1,
+    substitute_occurrence: Option<OccurrenceId>,
+    substitute_preconditions: Option<PreconditionBasisRefV1>,
+    substitute_resolver_id: Option<String>,
+}
+
+impl TypedObservationBoundary {
+    fn current(label: &str) -> Self {
+        Self {
+            basis: TypedOpaqueObservationBasisV1::new(
+                "civil.managed-file.ag-observation-basis/v1".to_owned(),
+                digest(label),
+            )
+            .unwrap(),
+            status: TypedObservationStatusV1::Current,
+            substitute_occurrence: None,
+            substitute_preconditions: None,
+            substitute_resolver_id: None,
+        }
+    }
+}
+
+impl ObservationResolverV1 for TypedObservationBoundary {
+    fn resolve_observation(
+        &mut self,
+        request: &ObservationResolutionRequestV1<'_>,
+    ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
+        let mut key = request.key.clone();
+        if let Some(occurrence) = self.substitute_occurrence {
+            key.occurrence = occurrence;
+        }
+        Ok(ObservationResolutionV3 {
+            schema: OBSERVATION_RESOLUTION_SCHEMA_V3.to_owned(),
+            key,
+            observation: request.observation.clone(),
+            currentness: ObservationCurrentnessRefV1::from_digest(digest("typed-currentness")),
+            normalized_preconditions: self.substitute_preconditions.clone().unwrap_or_else(|| {
+                PreconditionBasisRefV1::from_digest(self.basis.binding_digest().unwrap())
+            }),
+            basis: self.basis.clone(),
+            resolver_id: self
+                .substitute_resolver_id
+                .clone()
+                .unwrap_or_else(|| OBSERVATION_RESOLVER_ID.to_owned()),
+            subject: request.subject.clone(),
+            status: self.status,
+            resolved_at_unix_ms: request.now_unix_ms,
+            fresh_until_unix_ms: request.now_unix_ms + 1_000,
+        }
+        .into())
     }
 }
 
@@ -249,7 +306,7 @@ impl AdmissibilityDeciderV1 for Decider {
         Ok(AdmissionDecisionV1 {
             decision: AdmissionDecisionRefV1::from_digest(digest("decision")),
             key: request.standing.key.clone(),
-            observation: request.observation.observation.clone(),
+            observation: request.observation.observation().clone(),
             proposal: self
                 .substitute_proposal
                 .clone()
@@ -1180,6 +1237,286 @@ fn v2_resolution_requires_the_basis_digest_to_match_the_pinned_ref() {
 }
 
 #[test]
+fn frozen_nightshift_v2_wire_and_state_round_trip_unchanged() {
+    let start = initial();
+    let mut resolver = ObservationBoundary::current(clean_basis());
+    let observation_ref = ObservationRefV1::from_digest(digest("observation-1"));
+    let request = ObservationResolutionRequestV1 {
+        key: start.key(),
+        observation: &observation_ref,
+        subject: &digest("subject"),
+        now_unix_ms: NOW,
+    };
+    let versioned = resolver.resolve_observation(&request).unwrap();
+    let VersionedObservationResolutionV1::NightshiftV2(direct) = &versioned else {
+        panic!("Nightshift fixture must remain v2");
+    };
+    assert_eq!(
+        serde_json::to_vec(&versioned).unwrap(),
+        serde_json::to_vec(direct).unwrap(),
+        "the untagged versioned carrier must add no wire bytes"
+    );
+    assert_eq!(
+        direct.normalized_preconditions.as_digest(),
+        &direct.basis.decision_basis_digest().unwrap()
+    );
+
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &start,
+        observation_ref,
+        proposal(&campaign(), "work"),
+        ProposalClassV1::Initial,
+        &mut resolver,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&proposed).unwrap();
+    let digest = proposed.state_digest().clone();
+    let decoded: OccurrenceSnapshotV1 = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
+    assert_eq!(decoded.state_digest(), &digest);
+}
+
+#[test]
+fn typed_v3_basis_is_accepted_without_nightshift_atoms_and_bound_exactly() {
+    let start = initial();
+    let mut observation = TypedObservationBoundary::current("civil-basis-a");
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &start,
+        ObservationRefV1::from_digest(digest("typed-observation")),
+        proposal(&campaign(), "work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
+    let resolution = proposed.observation().unwrap();
+    assert!(resolution.nightshift_basis().is_none());
+    assert_eq!(resolution.typed_basis(), Some(&observation.basis));
+    assert_eq!(
+        resolution.normalized_preconditions().as_digest(),
+        &observation.basis.binding_digest().unwrap()
+    );
+}
+
+#[test]
+fn typed_basis_cross_repository_digest_vector_is_frozen() {
+    let basis = TypedOpaqueObservationBasisV1::new(
+        "civil.managed-file.ag-observation-basis/v1".to_owned(),
+        Digest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(
+            ag_primitives::JcsDocument::canonicalize(&basis)
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        )
+        .unwrap(),
+        format!(
+            "{{\"basis_identity\":\"sha256:{}\",\"basis_type\":\"civil.managed-file.ag-observation-basis/v1\",\"schema\":\"ag.governed-loop.typed-observation-basis/v1\"}}",
+            "a".repeat(64)
+        )
+    );
+    assert_eq!(
+        basis.binding_digest().unwrap().as_str(),
+        "sha256:9e777af149b14dda50ac651af7031cb734cb40b94452099fd7bf3b7f43f7915f"
+    );
+}
+
+#[test]
+fn typed_v3_negative_support_statuses_stop_before_standing_or_policy() {
+    let start = initial();
+    let mut observation = TypedObservationBoundary::current("civil-basis-a");
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &start,
+        ObservationRefV1::from_digest(digest("typed-observation")),
+        proposal(&campaign(), "work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
+    let required = GovernedLoopKernelV1::require_standing(&proposed).unwrap();
+    for status in [
+        TypedObservationStatusV1::Stale,
+        TypedObservationStatusV1::Unsupported,
+        TypedObservationStatusV1::Refused,
+    ] {
+        observation.status = status;
+        let mut standing = StandingBoundary::current();
+        let mut decider = Decider::admit();
+        assert!(matches!(
+            GovernedLoopKernelV1::record_admissible(
+                &required,
+                &mut observation,
+                &mut standing,
+                &mut decider,
+                None,
+                OBSERVATION_RESOLVER_ID,
+                STANDING_RESOLVER_ID,
+                MAX_STANDING_TTL_MS,
+                NOW,
+            ),
+            Err(KernelErrorV1::ObservationNotCurrent)
+        ));
+        assert_eq!(decider.calls, 0, "policy ran for {status:?}");
+    }
+}
+
+#[test]
+fn typed_v3_basis_type_identity_and_resolver_substitution_fail_closed() {
+    let start = initial();
+    let observation_ref = ObservationRefV1::from_digest(digest("typed-observation"));
+
+    let mut bad_digest = TypedObservationBoundary::current("civil-basis-a");
+    bad_digest.substitute_preconditions = Some(PreconditionBasisRefV1::from_digest(digest(
+        "foreign-binding",
+    )));
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &start,
+            observation_ref.clone(),
+            proposal(&campaign(), "work"),
+            ProposalClassV1::Initial,
+            &mut bad_digest,
+            OBSERVATION_RESOLVER_ID,
+            NOW,
+        ),
+        Err(KernelErrorV1::BindingMismatch("precondition basis"))
+    ));
+
+    let mut wrong_occurrence = TypedObservationBoundary::current("civil-basis-a");
+    wrong_occurrence.substitute_occurrence = Some(occurrence(99));
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &start,
+            observation_ref.clone(),
+            proposal(&campaign(), "work"),
+            ProposalClassV1::Initial,
+            &mut wrong_occurrence,
+            OBSERVATION_RESOLVER_ID,
+            NOW,
+        ),
+        Err(KernelErrorV1::OccurrenceMismatch)
+    ));
+
+    let mut foreign_resolver = TypedObservationBoundary::current("civil-basis-a");
+    foreign_resolver.substitute_resolver_id = Some("foreign.resolver/v1".to_owned());
+    assert!(matches!(
+        GovernedLoopKernelV1::record_proposal(
+            &start,
+            observation_ref.clone(),
+            proposal(&campaign(), "work"),
+            ProposalClassV1::Initial,
+            &mut foreign_resolver,
+            OBSERVATION_RESOLVER_ID,
+            NOW,
+        ),
+        Err(KernelErrorV1::BindingMismatch(
+            "observation resolver identity"
+        ))
+    ));
+
+    let mut observation = TypedObservationBoundary::current("civil-basis-a");
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &start,
+        observation_ref,
+        proposal(&campaign(), "work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
+    let required = GovernedLoopKernelV1::require_standing(&proposed).unwrap();
+    observation.basis = TypedOpaqueObservationBasisV1::new(
+        "foreign.observation-basis/v1".to_owned(),
+        digest("foreign-basis"),
+    )
+    .unwrap();
+    assert!(matches!(
+        GovernedLoopKernelV1::record_admissible(
+            &required,
+            &mut observation,
+            &mut StandingBoundary::current(),
+            &mut Decider::admit(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::ObservationNotCurrent)
+    ));
+}
+
+#[test]
+fn typed_v3_authorization_is_one_use_for_one_occurrence() {
+    let start = initial();
+    let mut observation = TypedObservationBoundary::current("civil-basis-a");
+    let proposed = GovernedLoopKernelV1::record_proposal(
+        &start,
+        ObservationRefV1::from_digest(digest("typed-observation")),
+        proposal(&campaign(), "work"),
+        ProposalClassV1::Initial,
+        &mut observation,
+        OBSERVATION_RESOLVER_ID,
+        NOW,
+    )
+    .unwrap();
+    let required = GovernedLoopKernelV1::require_standing(&proposed).unwrap();
+    let mut standing = StandingBoundary::current();
+    let mut decider = Decider::admit();
+    let admissible = GovernedLoopKernelV1::record_admissible(
+        &required,
+        &mut observation,
+        &mut standing,
+        &mut decider,
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap();
+    let spent = GovernedLoopKernelV1::consume_authorization(
+        &admissible,
+        &mut observation,
+        &mut standing,
+        &mut decider,
+        None,
+        OBSERVATION_RESOLVER_ID,
+        STANDING_RESOLVER_ID,
+        MAX_STANDING_TTL_MS,
+        NOW,
+    )
+    .unwrap();
+    let spend = spent.ag_spend().unwrap().clone();
+    let issuance = spent.issuance().unwrap().clone();
+    assert!(matches!(
+        GovernedLoopKernelV1::consume_authorization(
+            &spent,
+            &mut observation,
+            &mut standing,
+            &mut decider,
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW,
+        ),
+        Err(KernelErrorV1::IllegalTransition { .. })
+    ));
+    assert_eq!(spent.ag_spend(), Some(&spend));
+    assert_eq!(spent.issuance(), Some(&issuance));
+}
+
+#[test]
 fn v2_resolution_rejects_a_malformed_or_foreign_rule_basis() {
     // In-process resolvers can construct a basis without going through the
     // validating wire parser, so the kernel re-validates the semantic content
@@ -1746,7 +2083,7 @@ fn work_binding_fails_before_any_observation_resolution() {
         fn resolve_observation(
             &mut self,
             _: &ObservationResolutionRequestV1<'_>,
-        ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+        ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
             Err(ExternalBoundaryErrorV1::Unavailable {
                 code: "observation-resolver-unavailable".to_owned(),
             })

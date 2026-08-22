@@ -265,7 +265,7 @@ impl GovernedRuntimeProfileV1 {
         let document =
             JcsDocument::from_canonical_bytes(catalog.strip_suffix(b"\n").unwrap_or(&catalog))
                 .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
-        let catalog: crate::governed_loop::ExactWorkCatalogV1 =
+        let catalog: crate::governed_loop::VersionedExactWorkCatalogV1 =
             serde_json::from_slice(document.as_bytes())
                 .map_err(|error| GovernedPortErrorV1::Canonical(error.to_string()))?;
         catalog
@@ -640,7 +640,7 @@ impl ObservationResolverV1 for CommandObservationResolverV1 {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+    ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
         run_json_program(
             &self.program,
             &[],

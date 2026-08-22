@@ -742,32 +742,40 @@ fn evidence(
             .map(ag_campaign::governed::CompletedV1::terminal_observation)
     });
     if let Some(observation) = observation {
+        let basis_rows = if let Some(basis) = observation.nightshift_basis() {
+            kv(
+                "basis atoms",
+                &basis.atoms.iter().cloned().collect::<Vec<_>>().join(", "),
+            )
+        } else if let Some(basis) = observation.typed_basis() {
+            format!(
+                "{}{}",
+                kv("basis type", &basis.basis_type),
+                kv("basis identity", basis.basis_identity.as_str())
+            )
+        } else {
+            String::new()
+        };
         let _ = write!(
             body,
             "<h3>Observation <span class=fact>canonical projection</span></h3><div class=kv>{}{}{}{}{}{}{}{}</div>",
-            kv("identity", observation.observation.as_str()),
-            kv("status", &format!("{:?}", observation.status)),
-            kv("currentness", observation.currentness.as_str()),
-            kv("resolver", &observation.resolver_id),
-            kv("resolved at", &observation.resolved_at_unix_ms.to_string()),
+            kv("identity", observation.observation().as_str()),
+            kv("status", observation.status_label()),
+            kv("currentness", observation.currentness().as_str()),
+            kv("resolver", observation.resolver_id()),
+            kv(
+                "resolved at",
+                &observation.resolved_at_unix_ms().to_string()
+            ),
             kv(
                 "fresh until (exclusive)",
-                &observation.fresh_until_unix_ms.to_string()
+                &observation.fresh_until_unix_ms().to_string()
             ),
             kv(
                 "basis digest",
-                observation.normalized_preconditions.as_str()
+                observation.normalized_preconditions().as_str()
             ),
-            kv(
-                "basis atoms",
-                &observation
-                    .basis
-                    .atoms
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
+            basis_rows
         );
     } else {
         body.push_str("<p><span class=unknown>unknown</span> No observation basis exists in this program-counter state.</p>");

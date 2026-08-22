@@ -60,7 +60,7 @@ impl ObservationResolverV1 for Observation {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+    ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
         let basis = clean_basis();
         Ok(ObservationResolutionV2 {
             schema: OBSERVATION_RESOLUTION_SCHEMA_V2.to_owned(),
@@ -76,7 +76,8 @@ impl ObservationResolverV1 for Observation {
             status: ObservationStatusV1::Current,
             resolved_at_unix_ms: request.now_unix_ms,
             fresh_until_unix_ms: request.now_unix_ms + 60_000,
-        })
+        }
+        .into())
     }
 }
 

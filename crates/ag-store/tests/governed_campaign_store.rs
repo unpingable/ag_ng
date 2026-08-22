@@ -94,7 +94,7 @@ impl ObservationResolverV1 for Observation {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+    ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
         Ok(ObservationResolutionV2 {
             schema: OBSERVATION_RESOLUTION_SCHEMA_V2.to_owned(),
             key: request.key.clone(),
@@ -109,7 +109,8 @@ impl ObservationResolverV1 for Observation {
             status: ObservationStatusV1::Current,
             resolved_at_unix_ms: request.now_unix_ms,
             fresh_until_unix_ms: request.now_unix_ms + 1_000,
-        })
+        }
+        .into())
     }
 }
 
@@ -148,7 +149,7 @@ impl AdmissibilityDeciderV1 for Decider {
         Ok(AdmissionDecisionV1 {
             decision: AdmissionDecisionRefV1::from_digest(digest("admission")),
             key: request.standing.key.clone(),
-            observation: request.observation.observation.clone(),
+            observation: request.observation.observation().clone(),
             proposal: request.standing.proposal.clone(),
             standing_resolution: request.standing.resolution.clone(),
             disposition: AdmissionDispositionV1::Admitted,

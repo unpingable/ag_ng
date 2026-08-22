@@ -2,8 +2,9 @@
 
 Status: canonical AG-NG campaign-transition contract. The production path is
 `ag-loopctl` → `CampaignEngineV1` → `GovernedLoopKernelV1` →
-`CampaignStoreV1`. It composes the existing Nightshift observation resolver
-and Docket governed-loop custody interface; it does not replace either office.
+`CampaignStoreV1`. It composes a pinned observation resolver (the historical
+Nightshift resolver or a closed typed opaque resolver) and Docket governed-loop
+custody interface; it does not replace either office.
 
 ## One transition owner
 
@@ -30,7 +31,7 @@ consume authority.
 The normative sequence is:
 
 ```text
-fresh Nightshift observation
+fresh qualified observation
 → typed exact-work proposal
 → fresh observation and standing resolution
 → catalog admissibility decision
@@ -39,7 +40,7 @@ fresh Nightshift observation
 → Docket custody and dispatch
 → settlement or exact reconciliation
 → observation required
-→ fresh Nightshift observation
+→ fresh qualified observation
 → successor occurrence, refusal, human disposition, halt, or completion
 ```
 
@@ -60,6 +61,46 @@ standing, catalog, subject/scope, occurrence, and work bindings are rechecked
 at the consequence boundary. `authorize` atomically commits the one-use spend
 and exact Docket issuance before any dispatch. A spend cannot return to an
 unconsumed state and no recovery API constructs one.
+
+## Versioned observation-basis boundary
+
+Nightshift's historical `ag.governed-loop.observation-resolution/v2` wire and
+its embedded `nightshift.decision-basis.v1` remain frozen. The governed state
+stores that v2 record through an untagged version carrier, so canonical v2
+bytes, basis digests, and state digests do not gain a wrapper or discriminator.
+The v1 exact-work catalog remains Nightshift-only; even an empty Nightshift
+atom predicate does not treat an opaque basis as an empty atom set.
+
+Other observation owners use
+`ag.governed-loop.observation-resolution/v3`. Its basis is the closed envelope
+`ag.governed-loop.typed-observation-basis/v1`:
+
+```text
+basis_type       exact application-owned versioned type
+basis_identity   opaque exact application-owned identity
+```
+
+`normalized_preconditions` is AG's domain-separated JCS digest of that
+complete envelope, binding both fields without interpreting either. The v3
+resolution also binds the exact occurrence key, requested observation,
+subject, resolver/authority identity, support/currentness witness, resolution
+window, and one of the closed statuses `current`, `stale`, `superseded`,
+`contradictory`, `absent`, `unsupported`, or `refused`. Only `current` may
+proceed. Support and currentness are upstream judgments made by the pinned
+resolver; AG does not reproduce their evidence logic.
+
+Typed evidence requires the explicit
+`ag.governed-loop.exact-work-catalog/v2` catalog. Each entry selects either a
+Nightshift atom predicate or one exact typed envelope. For typed evidence,
+both `basis_type` and `basis_identity` must equal the root-owned catalog entry.
+The catalog is not a registry or plugin interface. A consistently substituted
+foreign basis therefore refuses admission even if its resolver repeats that
+basis at every consequence boundary.
+
+Neither observation generation grants standing. Proposal/work, subject,
+scope, occurrence, current standing, current catalog, and one-use spend remain
+independent gates. A typed basis has no atoms, and AG does not import civild
+claims, platform semantics, or policy evaluation.
 
 Campaign genesis atomically persists a canonical
 `ag.governed-loop.runtime-profile/v1`. It byte-pins the observation resolver,
@@ -108,7 +149,7 @@ authority or a transition by itself.
 | `AuthorizationConsumed` before custody | spend is historical; outcome not inferred | present the same issuance to Docket or reconcile it |
 | `Dispatched` without settlement | effect may have occurred | reconcile the exact issuance/attempt; never repeat mechanics |
 | `ReconciliationRequired` | consumed but outcome unknown | exact read-only attempt reconciliation request, typed human disposition after safe halt, or safe halt; never repeat dispatch |
-| `SettledObservationRequired` | receipt is durable, posture is not inferred | obtain a fresh Nightshift observation |
+| `SettledObservationRequired` | receipt is durable, posture is not inferred | obtain a fresh qualified observation |
 
 Attempted dispatch is neither success nor proof of non-execution. Docket's
 settlement/reconciliation identifies the exact attempt. Duplicate exact facts
@@ -119,7 +160,7 @@ sidecar, receipt, or caller assertion.
 ## Retry, successor, and terminal law
 
 A retry is a new occurrence, not another dispatch. An indeterminate consumed
-attempt must first reconcile. After settlement, a fresh Nightshift observation
+attempt must first reconcile. After settlement, a fresh qualified observation
 is mandatory. If the decision-relative preconditions are unchanged, AG may
 open a bounded `Retry` successor occurrence; changed preconditions require a
 new proposal and basis. Residual work is exact and monotone: no completion or
@@ -164,6 +205,9 @@ timing assumptions.
 | 21 | residual prevents completion | `residual_disposition_refuses_wrong_basis_and_partial_accounting`; `program_replacement_is_authority_empty_and_unresolved_attempt_blocks_resume_or_termination` |
 | 22 | refusal retains provenance, mints nothing | Nightshift `ag_refusal_cannot_be_resurrected_by_docket`; AG policy/standing refusal witnesses |
 | 23 | result requires fresh observation | Nightshift healthy chain reaches `SettledObservationRequired`, then only an independently sealed fresh cycle opens the distinct successor occurrence at `ProposalRecorded`; AG `production_path_spends_once_settles_and_requires_a_new_occurrence` |
+| 24 | typed basis/type/resolver substitution | `typed_v3_basis_type_identity_and_resolver_substitution_fail_closed`; `exact_typed_catalog_rejects_consistent_type_or_identity_substitution` |
+| 25 | typed unsupported/refused/stale evidence | `typed_v3_negative_support_statuses_stop_before_standing_or_policy` |
+| 26 | typed occurrence/work/replay | `typed_basis_cannot_bypass_the_occurrence_work_binding`; `typed_v3_authorization_is_one_use_for_one_occurrence`; `exact_typed_basis_catalog_admits_and_spends_once_without_atoms` |
 
 The mechanical gate `scripts/check-governed-loop-authority-surface.sh` also
 fails if spend construction leaves the pure kernel, CampaignDriverNG enters
@@ -177,5 +221,9 @@ This loop does not prove source or resolver honesty, external-world truth,
 timely revocation, clock adequacy, filesystem/power-loss behavior on an
 unqualified host, cryptographic collision impossibility, Docket/executor host
 integrity, or successful execution absent a receipt. NQ admission,
-observation currentness, catalog admissibility, standing, AG authorization,
+observation currentness/support, catalog admissibility, standing, AG authorization,
 Docket custody, execution, and later observation remain distinct predicates.
+An opaque typed basis identity is not host truth, authorization, standing, a
+civild claim, or proof that its resolver is honest. Later civild observation is
+independent evidence and does not establish that an AG issuance or writer
+caused the observed state.

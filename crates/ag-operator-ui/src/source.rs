@@ -1211,13 +1211,13 @@ fn collect_related(
     issuances: &mut BTreeSet<String>,
 ) {
     if let Some(observation) = snapshot.observation() {
-        observations.insert(observation.observation.as_str().to_owned());
+        observations.insert(observation.observation().as_str().to_owned());
     }
     if let Some(completed) = snapshot.completed() {
         observations.insert(
             completed
                 .terminal_observation()
-                .observation
+                .observation()
                 .as_str()
                 .to_owned(),
         );

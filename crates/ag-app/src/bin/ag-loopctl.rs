@@ -19,7 +19,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ag_app::governed_loop::{CampaignEngineErrorV1, CampaignEngineV1, ExactWorkCatalogV1};
+use ag_app::governed_loop::{CampaignEngineErrorV1, CampaignEngineV1, VersionedExactWorkCatalogV1};
 use ag_app::governed_ports::{
     AgIssuanceSignerV1, CommandDocketCustodyPortV1, CommandDocketReconciliationPortV1,
     CommandGovernedInterventionVerifierV1, CommandHumanDispositionVerifierV1,
@@ -555,7 +555,7 @@ fn main() -> anyhow::Result<()> {
             let (mut engine, profile) = open_bound(&database)?;
             let (mut observation, mut standing, catalog, review) =
                 gate_components(&profile, &gate)?;
-            write_exact(&engine.decide(
+            write_exact(&engine.decide_versioned(
                 &mut observation,
                 &mut standing,
                 &catalog,
@@ -570,7 +570,7 @@ fn main() -> anyhow::Result<()> {
             let (mut engine, profile) = open_bound(&database)?;
             let (mut observation, mut standing, catalog, review) =
                 gate_components(&profile, &gate)?;
-            write_exact(&engine.authorize(
+            write_exact(&engine.authorize_versioned(
                 &mut observation,
                 &mut standing,
                 &catalog,
@@ -951,7 +951,7 @@ fn gate_components(
 ) -> anyhow::Result<(
     CommandObservationResolverV1,
     CommandStandingResolverV1,
-    ExactWorkCatalogV1,
+    VersionedExactWorkCatalogV1,
     Option<C1RejectedReviewBasisV1>,
 )> {
     let _ = profile
@@ -976,7 +976,7 @@ fn gate_components(
         }
         _ => bail!("caller substituted the genesis-pinned controlling review"),
     }
-    let catalog: ExactWorkCatalogV1 = read_exact_record(&profile.exact_work_catalog.path)?;
+    let catalog: VersionedExactWorkCatalogV1 = read_exact_record(&profile.exact_work_catalog.path)?;
     let review = profile
         .controlling_review
         .as_ref()

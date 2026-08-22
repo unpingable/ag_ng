@@ -7,7 +7,9 @@ use std::sync::{Arc, Barrier, Mutex};
 
 use ag_app::governed_loop::{
     CampaignEngineErrorV1, CampaignEngineV1, CampaignRecoveryV1, DocketProgressV1,
-    EXACT_WORK_CATALOG_SCHEMA_V1, ExactWorkCatalogEntryV1, ExactWorkCatalogV1, WorkPreconditionV1,
+    EXACT_WORK_CATALOG_SCHEMA_V1, EXACT_WORK_CATALOG_SCHEMA_V2, ExactObservationBasisRequirementV1,
+    ExactWorkCatalogEntryV1, ExactWorkCatalogEntryV2, ExactWorkCatalogV1, ExactWorkCatalogV2,
+    WorkPreconditionV1,
 };
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
@@ -70,6 +72,14 @@ fn changed_basis() -> DecisionBasisV1 {
 
 fn failed_delivery_basis() -> DecisionBasisV1 {
     decision_basis("condition.clean", "delivery.failed")
+}
+
+fn typed_basis(label: &str) -> TypedOpaqueObservationBasisV1 {
+    TypedOpaqueObservationBasisV1::new(
+        "civil.managed-file.ag-observation-basis/v1".to_owned(),
+        digest(label),
+    )
+    .unwrap()
 }
 
 fn campaign() -> CampaignId {
@@ -154,6 +164,21 @@ fn refusing_catalog() -> ExactWorkCatalogV1 {
     }
 }
 
+fn typed_catalog(basis: TypedOpaqueObservationBasisV1) -> ExactWorkCatalogV2 {
+    ExactWorkCatalogV2 {
+        schema: EXACT_WORK_CATALOG_SCHEMA_V2.to_owned(),
+        entries: BTreeMap::from([(
+            "test.engine-work/v1".to_owned(),
+            ExactWorkCatalogEntryV2 {
+                work_schema: "test.engine-work/v1".to_owned(),
+                subject: digest("subject"),
+                scope: digest("scope"),
+                observation_basis: ExactObservationBasisRequirementV1::TypedBasis(basis),
+            },
+        )]),
+    }
+}
+
 #[derive(Clone)]
 struct ObservationBoundary {
     basis: DecisionBasisV1,
@@ -175,7 +200,7 @@ impl ObservationResolverV1 for ObservationBoundary {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+    ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
         self.calls += 1;
         Ok(ObservationResolutionV2 {
             schema: OBSERVATION_RESOLUTION_SCHEMA_V2.to_owned(),
@@ -194,7 +219,57 @@ impl ObservationResolverV1 for ObservationBoundary {
             status: self.status,
             resolved_at_unix_ms: request.now_unix_ms,
             fresh_until_unix_ms: request.now_unix_ms + 1_000,
-        })
+        }
+        .into())
+    }
+}
+
+#[derive(Clone)]
+struct TypedObservationBoundary {
+    basis: TypedOpaqueObservationBasisV1,
+    calls: usize,
+    substitute_occurrence: Option<OccurrenceId>,
+}
+
+impl TypedObservationBoundary {
+    fn current(basis: TypedOpaqueObservationBasisV1) -> Self {
+        Self {
+            basis,
+            calls: 0,
+            substitute_occurrence: None,
+        }
+    }
+}
+
+impl ObservationResolverV1 for TypedObservationBoundary {
+    fn resolve_observation(
+        &mut self,
+        request: &ObservationResolutionRequestV1<'_>,
+    ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
+        self.calls += 1;
+        let mut key = request.key.clone();
+        if let Some(occurrence) = self.substitute_occurrence {
+            key.occurrence = occurrence;
+        }
+        Ok(ObservationResolutionV3 {
+            schema: OBSERVATION_RESOLUTION_SCHEMA_V3.to_owned(),
+            key,
+            observation: request.observation.clone(),
+            currentness: ObservationCurrentnessRefV1::from_digest(digest(&format!(
+                "typed-currentness-{}",
+                self.calls
+            ))),
+            normalized_preconditions: PreconditionBasisRefV1::from_digest(
+                self.basis.binding_digest().unwrap(),
+            ),
+            basis: self.basis.clone(),
+            resolver_id: OBSERVATION_RESOLVER_ID.to_owned(),
+            subject: request.subject.clone(),
+            status: TypedObservationStatusV1::Current,
+            resolved_at_unix_ms: request.now_unix_ms,
+            fresh_until_unix_ms: request.now_unix_ms + 1_000,
+        }
+        .into())
     }
 }
 
@@ -679,7 +754,7 @@ fn attach_demo_owner_sources(detail: &mut CampaignDetailV1) {
         };
         let export = NightshiftObservationExportV1 {
             schema: NIGHTSHIFT_OBSERVATION_EXPORT_SCHEMA_V1.to_owned(),
-            observation_id: observation.observation.as_str().to_owned(),
+            observation_id: observation.observation().as_str().to_owned(),
             matches: vec![NightshiftObservationMatchV1 {
                 cycle_id: digest("demo-nightshift-cycle").as_str().to_owned(),
                 slot_id: order.slot_id.clone(),
@@ -695,7 +770,7 @@ fn attach_demo_owner_sources(detail: &mut CampaignDetailV1) {
                 family_latest_order_key: Some(order),
                 observation: serde_json::json!({
                     "schema": "nightshift.observation_record.v2",
-                    "observation_id": observation.observation.as_str(),
+                    "observation_id": observation.observation().as_str(),
                     "source_admissions": [{
                         "schema": "nq.diagnostic_admission_provenance.v1",
                         "provenance_id": digest("demo-nq-provenance").as_str(),
@@ -711,7 +786,7 @@ fn attach_demo_owner_sources(detail: &mut CampaignDetailV1) {
             }],
         };
         detail.nightshift.push(RelatedSourceV1 {
-            identity: observation.observation.as_str().to_owned(),
+            identity: observation.observation().as_str().to_owned(),
             result: available_from(
                 "Nightshift",
                 ReadCommandNameV1::NightshiftExportObservation,
@@ -1637,7 +1712,7 @@ fn operator_views_render_every_canonical_counter_from_real_persisted_history() {
                             .completed()
                             .unwrap()
                             .terminal_observation()
-                            .observation
+                            .observation()
                             .as_str()
                     )
                 );
@@ -2545,7 +2620,7 @@ fn concurrent_authorization_consumes_exactly_one_ag_spend() {
         fn resolve_observation(
             &mut self,
             request: &ObservationResolutionRequestV1<'_>,
-        ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1> {
+        ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
             self.barrier.wait();
             self.inner.resolve_observation(request)
         }
@@ -2696,9 +2771,9 @@ fn concurrent_human_resume_consumes_one_disposition_and_opens_one_occurrence() {
 
 /// Records a proposal and advances to the standing-required boundary with
 /// the given observation basis.
-fn advance_to_standing_required(
+fn advance_to_standing_required<O: ObservationResolverV1>(
     engine: &mut CampaignEngineV1,
-    observation: &mut ObservationBoundary,
+    observation: &mut O,
 ) {
     engine
         .record_proposal(
@@ -2711,6 +2786,202 @@ fn advance_to_standing_required(
         )
         .unwrap();
     engine.require_standing(NOW + 2).unwrap();
+}
+
+#[test]
+fn typed_basis_requires_the_explicit_exact_catalog_generation() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = TypedObservationBoundary::current(typed_basis("civil-basis-a"));
+    let mut standing = StandingBoundary::current();
+    advance_to_standing_required(&mut engine, &mut observation);
+    let before = engine.current().unwrap();
+
+    let error = engine
+        .decide(
+            &mut observation,
+            &mut standing,
+            &catalog(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 3,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CampaignEngineErrorV1::Kernel(KernelErrorV1::Inadmissible)
+    ));
+    assert_eq!(engine.current().unwrap(), before);
+    assert_eq!(engine.replay().unwrap().ag_spends, 0);
+}
+
+#[test]
+fn typed_basis_cannot_bypass_the_occurrence_work_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = TypedObservationBoundary::current(typed_basis("civil-basis-a"));
+    let error = engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("typed-observation")),
+            proposal("substituted-work"),
+            ProposalClassV1::Initial,
+            &mut observation,
+            OBSERVATION_RESOLVER_ID,
+            NOW + 1,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CampaignEngineErrorV1::Kernel(KernelErrorV1::BindingMismatch("prepared exact work"))
+    ));
+    assert_eq!(observation.calls, 0);
+    assert_eq!(engine.replay().unwrap().transitions, 1);
+}
+
+#[test]
+fn exact_typed_basis_catalog_admits_and_spends_once_without_atoms() {
+    let expected = typed_basis("civil-basis-a");
+    let catalog = typed_catalog(expected.clone());
+    catalog.validate().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = TypedObservationBoundary::current(expected);
+    let mut standing = StandingBoundary::current();
+    advance_to_standing_required(&mut engine, &mut observation);
+
+    let admitted = engine
+        .decide_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 3,
+        )
+        .unwrap();
+    assert_eq!(
+        admitted.program_counter(),
+        ProgramCounterV1::AdmissiblePendingAuthorization
+    );
+    assert_eq!(
+        admitted.admission_decision().unwrap().policy_basis,
+        catalog.policy_basis().unwrap()
+    );
+    observation.substitute_occurrence = Some(occurrence(99));
+    let before = engine.current().unwrap();
+    let error = engine
+        .authorize_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 4,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        CampaignEngineErrorV1::Kernel(KernelErrorV1::OccurrenceMismatch)
+    ));
+    assert_eq!(engine.current().unwrap(), before);
+    assert_eq!(engine.replay().unwrap().ag_spends, 0);
+    observation.substitute_occurrence = None;
+    let spent = engine
+        .authorize_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        spent.program_counter(),
+        ProgramCounterV1::AuthorizationConsumed
+    );
+    assert_eq!(engine.replay().unwrap().ag_spends, 1);
+    assert!(
+        engine
+            .authorize_with_catalog_v2(
+                &mut observation,
+                &mut standing,
+                &catalog,
+                None,
+                OBSERVATION_RESOLVER_ID,
+                STANDING_RESOLVER_ID,
+                MAX_STANDING_TTL_MS,
+                NOW + 5,
+            )
+            .is_err()
+    );
+    assert_eq!(engine.replay().unwrap().ag_spends, 1);
+}
+
+#[test]
+fn exact_typed_catalog_rejects_consistent_type_or_identity_substitution() {
+    let expected = typed_basis("civil-basis-a");
+    let catalog = typed_catalog(expected);
+    let substitutions = [
+        typed_basis("civil-basis-b"),
+        TypedOpaqueObservationBasisV1::new(
+            "foreign.managed-file-basis/v1".to_owned(),
+            digest("civil-basis-a"),
+        )
+        .unwrap(),
+    ];
+
+    for substituted in substitutions {
+        let directory = tempfile::tempdir().unwrap();
+        let mut engine = create_engine(&directory, ResidualSetV1::default());
+        let mut observation = TypedObservationBoundary::current(substituted);
+        let mut standing = StandingBoundary::current();
+        advance_to_standing_required(&mut engine, &mut observation);
+        let before = engine.current().unwrap();
+        let error = engine
+            .decide_with_catalog_v2(
+                &mut observation,
+                &mut standing,
+                &catalog,
+                None,
+                OBSERVATION_RESOLVER_ID,
+                STANDING_RESOLVER_ID,
+                MAX_STANDING_TTL_MS,
+                NOW + 3,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CampaignEngineErrorV1::Kernel(KernelErrorV1::Inadmissible)
+        ));
+        assert_eq!(engine.current().unwrap(), before);
+        assert_eq!(engine.replay().unwrap().ag_spends, 0);
+    }
+}
+
+#[test]
+fn v2_catalog_schema_is_closed_and_v1_serialization_is_unchanged() {
+    let v1 = catalog();
+    let versioned = ag_app::governed_loop::VersionedExactWorkCatalogV1::NightshiftV1(v1.clone());
+    assert_eq!(
+        serde_json::to_vec(&versioned).unwrap(),
+        serde_json::to_vec(&v1).unwrap()
+    );
+
+    let mut v2 = typed_catalog(typed_basis("civil-basis-a"));
+    v2.schema = EXACT_WORK_CATALOG_SCHEMA_V1.to_owned();
+    assert!(matches!(
+        v2.validate(),
+        Err(CampaignEngineErrorV1::InvalidCatalog)
+    ));
 }
 
 #[test]
@@ -2834,7 +3105,8 @@ fn catalog_precondition_validation_rejects_overlap_and_unknown_atoms() {
 #[test]
 fn omitted_precondition_is_unconditional_and_old_style_entries_parse() {
     // T11: an old-style three-field entry without `precondition` parses with
-    // the defaulted unconditional precondition and admits any Current basis.
+    // the defaulted unconditional Nightshift predicate. Typed opaque evidence
+    // still requires an explicit v2 catalog entry.
     let document = format!(
         "{{\"schema\":\"ag.governed-loop.exact-work-catalog/v1\",\"entries\":{{\"test.engine-work/v1\":{{\"work_schema\":\"test.engine-work/v1\",\"subject\":\"{}\",\"scope\":\"{}\"}}}}}}",
         digest("subject"),

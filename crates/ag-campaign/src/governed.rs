@@ -43,6 +43,10 @@ use crate::transcript::validate_label;
 pub const EXACT_WORK_PROPOSAL_SCHEMA_V1: &str = "ag.governed-loop.exact-work-proposal/v1";
 /// Wire schema for fresh observation records.
 pub const OBSERVATION_RESOLUTION_SCHEMA_V2: &str = "ag.governed-loop.observation-resolution/v2";
+/// Wire schema for typed opaque observation records.
+pub const OBSERVATION_RESOLUTION_SCHEMA_V3: &str = "ag.governed-loop.observation-resolution/v3";
+/// Wire schema for one application-owned opaque observation basis.
+pub const TYPED_OBSERVATION_BASIS_SCHEMA_V1: &str = "ag.governed-loop.typed-observation-basis/v1";
 /// Wire schema for current standing resolutions.
 pub const STANDING_RESOLUTION_SCHEMA_V2: &str = "ag.governed-loop.standing-resolution/v2";
 /// Wire schema for AG issuances.
@@ -598,11 +602,10 @@ pub enum ObservationStatusV1 {
 
 /// Exact observation/currentness record returned by an external resolver.
 ///
-/// Version 2 carries the semantic `DecisionBasisV1` whose canonical digest
-/// must equal `normalized_preconditions`, plus the explicit identity of the
-/// resolver that produced the record.  The digest remains the kernel
-/// equality/pinning token; the structured basis makes the pinned content
-/// inspectable.  Neither field authorizes anything.
+/// Version 2 carries the frozen semantic `DecisionBasisV1` whose canonical
+/// digest must equal `normalized_preconditions`, plus the explicit identity
+/// of the resolver that produced the record. This historical Nightshift wire
+/// remains closed and byte-compatible. Neither field authorizes anything.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationResolutionV2 {
@@ -616,7 +619,7 @@ pub struct ObservationResolutionV2 {
     pub currentness: ObservationCurrentnessRefV1,
     /// Canonical digest of `basis`; the exact pinned precondition basis.
     pub normalized_preconditions: PreconditionBasisRefV1,
-    /// Semantic decision basis produced by the resolver's normalization rule.
+    /// Semantic Nightshift decision basis produced by its normalization rule.
     pub basis: DecisionBasisV1,
     /// Exact identity of the resolver that produced this record.
     pub resolver_id: String,
@@ -628,6 +631,73 @@ pub struct ObservationResolutionV2 {
     pub resolved_at_unix_ms: u64,
     /// Exclusive freshness deadline.
     pub fresh_until_unix_ms: u64,
+}
+
+/// Closed status vocabulary for a typed opaque observation resolution.
+/// Support and currentness meanings remain owned by the pinned resolver; AG
+/// only permits consequence-bearing progress for `Current`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TypedObservationStatusV1 {
+    /// The exact typed basis is supported, current, and fresh.
+    Current,
+    /// The supporting evidence is too old for consequence.
+    Stale,
+    /// A newer basis superseded the requested basis.
+    Superseded,
+    /// The current evidence contradicts the requested exact basis.
+    Contradictory,
+    /// No supporting observation exists.
+    Absent,
+    /// The resolver cannot support consequence-bearing use of this basis.
+    Unsupported,
+    /// The resolver explicitly refuses consequence-bearing use of this basis.
+    Refused,
+}
+
+/// Version 3 typed opaque observation/currentness record.
+///
+/// The application-owned basis remains opaque to AG. The outer record binds
+/// its type and identity to exact occurrence, subject, resolver authority,
+/// currentness witness, and exclusive time window. It carries no atoms and
+/// grants no authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationResolutionV3 {
+    /// Exact schema.
+    pub schema: String,
+    /// Occurrence being observed.
+    pub key: OccurrenceKeyV1,
+    /// Exact requested observation identity.
+    pub observation: ObservationRefV1,
+    /// Exact application-owned support/currentness witness.
+    pub currentness: ObservationCurrentnessRefV1,
+    /// Binding digest of the complete typed basis envelope.
+    pub normalized_preconditions: PreconditionBasisRefV1,
+    /// Exact application-owned basis type and opaque identity.
+    pub basis: TypedOpaqueObservationBasisV1,
+    /// Exact identity of the qualifying resolver/authority.
+    pub resolver_id: String,
+    /// Exact observed subject.
+    pub subject: Digest,
+    /// Resolver-owned support/currentness status.
+    pub status: TypedObservationStatusV1,
+    /// Resolver clock lower bound.
+    pub resolved_at_unix_ms: u64,
+    /// Exclusive freshness deadline.
+    pub fresh_until_unix_ms: u64,
+}
+
+/// Closed versioned observation-resolution set stored by the governed loop.
+/// Untagged encoding preserves historical v2 Nightshift documents and state
+/// digests exactly; the outer schema unambiguously selects v2 or v3.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum VersionedObservationResolutionV1 {
+    /// Frozen Nightshift resolution.
+    NightshiftV2(ObservationResolutionV2),
+    /// Typed opaque application resolution.
+    TypedV3(ObservationResolutionV3),
 }
 
 /// Exact request made to the external observation resolver.
@@ -649,7 +719,7 @@ pub trait ObservationResolverV1 {
     fn resolve_observation(
         &mut self,
         request: &ObservationResolutionRequestV1<'_>,
-    ) -> Result<ObservationResolutionV2, ExternalBoundaryErrorV1>;
+    ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1>;
 }
 
 /// Standing status returned by the authoritative Standing/Docket resolver.
@@ -769,7 +839,7 @@ pub struct AdmissibilityRequestV1<'a> {
     /// Exact proposal.
     pub proposal: &'a ExactWorkProposalV1,
     /// Fresh observation resolution.
-    pub observation: &'a ObservationResolutionV2,
+    pub observation: &'a VersionedObservationResolutionV1,
     /// Current standing resolution.
     pub standing: &'a CurrentStandingResolutionV2,
     /// Optional controlling rejected-review basis for C1 repair.
@@ -908,7 +978,7 @@ pub struct ObservationRequiredV1 {
 #[serde(deny_unknown_fields)]
 pub struct ProposalBasisV1 {
     meta: OccurrenceMetaV1,
-    observation: ObservationResolutionV2,
+    observation: VersionedObservationResolutionV1,
     proposal: ExactWorkProposalV1,
     proposal_ref: ProposalRefV1,
     link: OccurrenceLinkV1,
@@ -1129,7 +1199,7 @@ pub struct HaltedV1 {
 #[serde(deny_unknown_fields)]
 pub struct CompletedV1 {
     meta: OccurrenceMetaV1,
-    terminal_observation: ObservationResolutionV2,
+    terminal_observation: VersionedObservationResolutionV1,
     terminal_witness: TerminalWitnessRefV1,
     history: AuthorityHistoryV1,
 }
@@ -2123,13 +2193,12 @@ impl GovernedLoopKernelV1 {
                 source,
                 Some(&from.dispatch.authorized.admitted.proposal.proposal_ref),
                 Some(
-                    &from
-                        .dispatch
+                    from.dispatch
                         .authorized
                         .admitted
                         .proposal
                         .observation
-                        .normalized_preconditions,
+                        .normalized_preconditions(),
                 ),
                 to,
                 false,
@@ -2230,7 +2299,7 @@ impl GovernedLoopKernelV1 {
                     return Err(KernelErrorV1::RetryProposalChanged);
                 }
                 if prior.normalized_preconditions.as_ref()
-                    != Some(&resolved.normalized_preconditions)
+                    != Some(resolved.normalized_preconditions())
                 {
                     return Err(KernelErrorV1::RetryPreconditionsChanged);
                 }
@@ -2368,7 +2437,7 @@ impl GovernedLoopKernelV1 {
         };
         let authorization = AgAuthorizationRefV1::for_basis(
             admitted.proposal.meta.key(),
-            &admitted.proposal.observation.observation,
+            admitted.proposal.observation.observation(),
             &admitted.proposal.proposal_ref,
             &admitted.standing.resolution,
         );
@@ -2377,7 +2446,7 @@ impl GovernedLoopKernelV1 {
             authorization,
             spend: spend_ref.clone(),
             key: admitted.proposal.meta.key.clone(),
-            observation: admitted.proposal.observation.observation.clone(),
+            observation: admitted.proposal.observation.observation().clone(),
             proposal: admitted.proposal.proposal_ref.clone(),
             standing_resolution: admitted.standing.resolution.clone(),
             admission_decision: admitted.decision.decision.clone(),
@@ -2525,7 +2594,7 @@ impl GovernedLoopKernelV1 {
                     .admitted
                     .proposal
                     .observation
-                    .normalized_preconditions
+                    .normalized_preconditions()
                     .clone(),
             ),
             state_digest: current.state_digest.clone(),
@@ -2917,7 +2986,7 @@ impl OccurrenceSnapshotV1 {
 
     /// Returns the exact historical observation basis, when any.
     #[must_use]
-    pub fn observation(&self) -> Option<&ObservationResolutionV2> {
+    pub fn observation(&self) -> Option<&VersionedObservationResolutionV1> {
         self.state.proposal_basis().map(|basis| &basis.observation)
     }
 
@@ -3069,7 +3138,7 @@ impl HaltedV1 {
 impl CompletedV1 {
     /// Returns the fresh terminal observation recorded at completion.
     #[must_use]
-    pub const fn terminal_observation(&self) -> &ObservationResolutionV2 {
+    pub const fn terminal_observation(&self) -> &VersionedObservationResolutionV1 {
         &self.terminal_observation
     }
 
@@ -3105,66 +3174,76 @@ fn resolve_observation<O: ObservationResolverV1>(
     subject: &Digest,
     expected_resolver_id: &str,
     now_unix_ms: u64,
-) -> Result<ObservationResolutionV2, KernelErrorV1> {
+) -> Result<VersionedObservationResolutionV1, KernelErrorV1> {
     let resolved = resolver.resolve_observation(&ObservationResolutionRequestV1 {
         key,
         observation,
         subject,
         now_unix_ms,
     })?;
-    if resolved.schema != OBSERVATION_RESOLUTION_SCHEMA_V2 {
+    if !matches!(
+        &resolved,
+        VersionedObservationResolutionV1::NightshiftV2(value)
+            if value.schema == OBSERVATION_RESOLUTION_SCHEMA_V2
+    ) && !matches!(
+        &resolved,
+        VersionedObservationResolutionV1::TypedV3(value)
+            if value.schema == OBSERVATION_RESOLUTION_SCHEMA_V3
+    ) {
         return Err(KernelErrorV1::ForeignSchema("observation resolution"));
     }
-    if expected_resolver_id.is_empty() || resolved.resolver_id != expected_resolver_id {
+    if expected_resolver_id.is_empty() || resolved.resolver_id() != expected_resolver_id {
         return Err(KernelErrorV1::BindingMismatch(
             "observation resolver identity",
         ));
     }
-    if &resolved.key != key {
+    if resolved.key() != key {
         return Err(KernelErrorV1::OccurrenceMismatch);
     }
-    if &resolved.observation != observation {
+    if resolved.observation() != observation {
         return Err(KernelErrorV1::BindingMismatch("observation"));
     }
-    if &resolved.subject != subject {
+    if resolved.subject() != subject {
         return Err(KernelErrorV1::BindingMismatch("observation subject"));
     }
     // In-process resolvers can construct a basis without going through the
     // validating wire parser, so the kernel re-validates the semantic content
     // itself before trusting the pinned digest.
-    if resolved.basis.validate().is_err() {
-        return Err(KernelErrorV1::ForeignSchema("decision basis"));
+    if resolved.validate_basis().is_err() {
+        return Err(KernelErrorV1::ForeignSchema(
+            resolved.invalid_schema_label(),
+        ));
     }
     let basis_digest = resolved
-        .basis
-        .decision_basis_digest()
-        .map_err(|_| KernelErrorV1::ForeignSchema("decision basis"))?;
-    if resolved.normalized_preconditions.as_digest() != &basis_digest {
+        .basis_binding_digest()
+        .map_err(|_| KernelErrorV1::ForeignSchema(resolved.invalid_schema_label()))?;
+    if resolved.normalized_preconditions().as_digest() != &basis_digest {
         return Err(KernelErrorV1::BindingMismatch("precondition basis"));
     }
-    if resolved.resolved_at_unix_ms > now_unix_ms || now_unix_ms >= resolved.fresh_until_unix_ms {
+    if resolved.resolved_at_unix_ms() > now_unix_ms || now_unix_ms >= resolved.fresh_until_unix_ms()
+    {
         return Err(KernelErrorV1::ObservationNotCurrent);
     }
-    match resolved.status {
-        ObservationStatusV1::Current => Ok(resolved),
-        ObservationStatusV1::Contradictory => Err(KernelErrorV1::ObservationContradiction),
-        ObservationStatusV1::Stale
-        | ObservationStatusV1::Superseded
-        | ObservationStatusV1::Absent => Err(KernelErrorV1::ObservationNotCurrent),
+    if resolved.is_current() {
+        Ok(resolved)
+    } else if resolved.is_contradictory() {
+        Err(KernelErrorV1::ObservationContradiction)
+    } else {
+        Err(KernelErrorV1::ObservationNotCurrent)
     }
 }
 
 fn resolve_standing<S: StandingResolverV1>(
     resolver: &mut S,
     basis: &ProposalBasisV1,
-    observation: &ObservationResolutionV2,
+    observation: &VersionedObservationResolutionV1,
     expected_resolver_id: &str,
     max_standing_ttl_ms: u64,
     now_unix_ms: u64,
 ) -> Result<CurrentStandingResolutionV2, KernelErrorV1> {
     let resolved = resolver.resolve_standing(&StandingResolutionRequestV1 {
         key: basis.meta.key(),
-        observation: &observation.observation,
+        observation: observation.observation(),
         proposal: &basis.proposal_ref,
         subject: basis.proposal.subject(),
         scope: basis.proposal.scope(),
@@ -3179,7 +3258,7 @@ fn resolve_standing<S: StandingResolverV1>(
     if resolved.key != basis.meta.key {
         return Err(KernelErrorV1::OccurrenceMismatch);
     }
-    if resolved.observation != observation.observation {
+    if &resolved.observation != observation.observation() {
         return Err(KernelErrorV1::BindingMismatch("standing observation"));
     }
     if resolved.proposal != basis.proposal_ref {
@@ -3231,7 +3310,7 @@ fn resolve_admissibility<O, S, A>(
     now_unix_ms: u64,
 ) -> Result<
     (
-        ObservationResolutionV2,
+        VersionedObservationResolutionV1,
         CurrentStandingResolutionV2,
         AdmissionDecisionV1,
     ),
@@ -3245,12 +3324,12 @@ where
     let observation = resolve_observation(
         observation_resolver,
         basis.meta.key(),
-        &basis.observation.observation,
+        basis.observation.observation(),
         basis.proposal.subject(),
         expected_observation_resolver,
         now_unix_ms,
     )?;
-    if observation.normalized_preconditions != basis.observation.normalized_preconditions {
+    if observation.normalized_preconditions() != basis.observation.normalized_preconditions() {
         return Err(KernelErrorV1::ObservationNotCurrent);
     }
     let standing = resolve_standing(
@@ -3273,7 +3352,7 @@ where
         controlling_rejected_review,
     })?;
     if decision.key != basis.meta.key
-        || decision.observation != observation.observation
+        || &decision.observation != observation.observation()
         || decision.proposal != basis.proposal_ref
         || decision.standing_resolution != standing.resolution
     {
@@ -3309,7 +3388,7 @@ fn build_issuance(admitted: &AdmissibleBasisV1, spend: &AgSpendRefV1) -> AgIssua
         work: admitted.proposal.proposal.work(),
         subject: admitted.proposal.proposal.subject(),
         scope: admitted.proposal.proposal.scope(),
-        observation: &admitted.proposal.observation.observation,
+        observation: admitted.proposal.observation.observation(),
         standing_resolution: &admitted.standing.resolution,
         mandate: &admitted.standing.mandate,
         spend,
@@ -3409,7 +3488,7 @@ fn current_prior_basis(current: &OccurrenceSnapshotV1) -> PriorOccurrenceBasisV1
         normalized_preconditions: current
             .state
             .proposal_basis()
-            .map(|basis| basis.observation.normalized_preconditions.clone()),
+            .map(|basis| basis.observation.normalized_preconditions().clone()),
         state_digest: current.state_digest.clone(),
     }
 }
@@ -3563,7 +3642,7 @@ fn validate_recorded_proposal(
                 && prior.key != from.meta.key
                 && prior.proposal.as_ref() == Some(&to.proposal_ref)
                 && prior.normalized_preconditions.as_ref()
-                    == Some(&to.observation.normalized_preconditions)
+                    == Some(to.observation.normalized_preconditions())
                 && to.meta.budget.retries_used
                     == from.meta.budget.retries_used.saturating_add(1)
                 && to.meta.budget.retry_limit == from.meta.budget.retry_limit
@@ -3593,12 +3672,13 @@ fn same_proposal_basis(left: &ProposalBasisV1, right: &ProposalBasisV1) -> bool 
         && left.proposal == right.proposal
         && left.proposal_ref == right.proposal_ref
         && left.link == right.link
-        && left.observation.schema == right.observation.schema
-        && left.observation.key == right.observation.key
-        && left.observation.observation == right.observation.observation
-        && left.observation.normalized_preconditions == right.observation.normalized_preconditions
-        && left.observation.subject == right.observation.subject
-        && right.observation.status == ObservationStatusV1::Current
+        && left.observation.schema() == right.observation.schema()
+        && left.observation.key() == right.observation.key()
+        && left.observation.observation() == right.observation.observation()
+        && left.observation.normalized_preconditions()
+            == right.observation.normalized_preconditions()
+        && left.observation.subject() == right.observation.subject()
+        && right.observation.is_current()
 }
 
 fn validate_continuation(
@@ -3754,11 +3834,12 @@ fn validate_state(state: &OccurrenceStateV1) -> Result<(), KernelErrorV1> {
     }
     if let Some(basis) = state.proposal_basis() {
         basis.proposal.validate()?;
+        validate_observation_resolution_integrity(&basis.observation)?;
         if basis.proposal.campaign() != &meta.key.campaign
-            || basis.observation.key != meta.key
+            || basis.observation.key() != &meta.key
             || basis.proposal_ref != basis.proposal.reference()
-            || basis.observation.subject != *basis.proposal.subject()
-            || basis.observation.status != ObservationStatusV1::Current
+            || basis.observation.subject() != basis.proposal.subject()
+            || !basis.observation.is_current()
         {
             return Err(KernelErrorV1::StateInvariant("proposal basis"));
         }
@@ -3811,8 +3892,8 @@ fn validate_state(state: &OccurrenceStateV1) -> Result<(), KernelErrorV1> {
         }
         OccurrenceStateV1::Completed(value) => {
             if !value.meta.residuals.is_empty()
-                || value.terminal_observation.key != value.meta.key
-                || value.terminal_observation.status != ObservationStatusV1::Current
+                || value.terminal_observation.key() != &value.meta.key
+                || !value.terminal_observation.is_current()
             {
                 return Err(KernelErrorV1::StateInvariant("completion clearance"));
             }
@@ -3822,16 +3903,49 @@ fn validate_state(state: &OccurrenceStateV1) -> Result<(), KernelErrorV1> {
     Ok(())
 }
 
+fn validate_observation_resolution_integrity(
+    observation: &VersionedObservationResolutionV1,
+) -> Result<(), KernelErrorV1> {
+    if !matches!(
+        observation,
+        VersionedObservationResolutionV1::NightshiftV2(value)
+            if value.schema == OBSERVATION_RESOLUTION_SCHEMA_V2
+    ) && !matches!(
+        observation,
+        VersionedObservationResolutionV1::TypedV3(value)
+            if value.schema == OBSERVATION_RESOLUTION_SCHEMA_V3
+    ) {
+        return Err(KernelErrorV1::ForeignSchema("observation resolution"));
+    }
+    observation
+        .validate_basis()
+        .map_err(|_| KernelErrorV1::ForeignSchema(observation.invalid_schema_label()))?;
+    let expected = observation
+        .basis_binding_digest()
+        .map_err(|_| KernelErrorV1::ForeignSchema(observation.invalid_schema_label()))?;
+    if observation.normalized_preconditions().as_digest() != &expected {
+        return Err(KernelErrorV1::StateInvariant(
+            "observation precondition basis",
+        ));
+    }
+    if observation.resolver_id().is_empty()
+        || observation.resolved_at_unix_ms() >= observation.fresh_until_unix_ms()
+    {
+        return Err(KernelErrorV1::StateInvariant("observation resolution"));
+    }
+    Ok(())
+}
+
 fn validate_admissible_basis(value: &AdmissibleBasisV1) -> Result<(), KernelErrorV1> {
     if value.standing.schema != STANDING_RESOLUTION_SCHEMA_V2
         || value.standing.key != value.proposal.meta.key
-        || value.standing.observation != value.proposal.observation.observation
+        || &value.standing.observation != value.proposal.observation.observation()
         || value.standing.proposal != value.proposal.proposal_ref
         || value.standing.subject != *value.proposal.proposal.subject()
         || value.standing.scope != *value.proposal.proposal.scope()
         || value.standing.status != StandingStatusV1::Current
         || value.decision.key != value.proposal.meta.key
-        || value.decision.observation != value.proposal.observation.observation
+        || &value.decision.observation != value.proposal.observation.observation()
         || value.decision.proposal != value.proposal.proposal_ref
         || value.decision.standing_resolution != value.standing.resolution
         || value.decision.disposition != AdmissionDispositionV1::Admitted
@@ -3845,14 +3959,14 @@ fn validate_authorized(value: &AuthorizationConsumedV1) -> Result<(), KernelErro
     validate_admissible_basis(&value.admitted)?;
     let expected_authorization = AgAuthorizationRefV1::for_basis(
         value.admitted.proposal.meta.key(),
-        &value.admitted.proposal.observation.observation,
+        value.admitted.proposal.observation.observation(),
         &value.admitted.proposal.proposal_ref,
         &value.admitted.standing.resolution,
     );
     if value.spend.authorization != expected_authorization
         || value.spend.spend != AgSpendRefV1::for_authorization(&expected_authorization)
         || value.spend.key != value.admitted.proposal.meta.key
-        || value.spend.observation != value.admitted.proposal.observation.observation
+        || &value.spend.observation != value.admitted.proposal.observation.observation()
         || value.spend.proposal != value.admitted.proposal.proposal_ref
         || value.spend.standing_resolution != value.admitted.standing.resolution
         || value.spend.admission_decision != value.admitted.decision.decision
@@ -3864,6 +3978,238 @@ fn validate_authorized(value: &AuthorizationConsumedV1) -> Result<(), KernelErro
         return Err(KernelErrorV1::StateInvariant("AG issuance"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Closed typed observation basis
+//
+// `ObservationResolutionV2` remains the frozen Nightshift record. The
+// distinct v3 outer schema and the inner typed-basis schema give other
+// resolvers one narrow, inspectable type-and-identity envelope. AG never
+// interprets the opaque identity or manufactures support/currentness
+// semantics from it.
+
+/// One application-owned observation basis represented only by exact type and
+/// identity. The outer observation resolution separately binds occurrence,
+/// subject, resolver, currentness witness, and validity window.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedOpaqueObservationBasisV1 {
+    /// Exact envelope schema.
+    pub schema: String,
+    /// Bounded application-owned basis type.
+    pub basis_type: String,
+    /// Opaque exact identity whose semantics remain owned by the resolver.
+    pub basis_identity: Digest,
+}
+
+impl TypedOpaqueObservationBasisV1 {
+    /// Constructs and validates one typed opaque basis.
+    pub fn new(basis_type: String, basis_identity: Digest) -> Result<Self, String> {
+        let basis = Self {
+            schema: TYPED_OBSERVATION_BASIS_SCHEMA_V1.to_owned(),
+            basis_type,
+            basis_identity,
+        };
+        basis.validate()?;
+        Ok(basis)
+    }
+
+    /// Validates only the closed envelope. AG does not interpret the opaque
+    /// basis identity.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != TYPED_OBSERVATION_BASIS_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported typed observation-basis schema {}",
+                self.schema
+            ));
+        }
+        validate_label("typed observation-basis type", &self.basis_type)
+            .map_err(|error| error.to_string())?;
+        if self.basis_type == DECISION_BASIS_SCHEMA_V1 {
+            return Err("Nightshift decision basis must use its frozen typed variant".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Exact binding token over both application type and opaque identity.
+    pub fn binding_digest(&self) -> Result<Digest, String> {
+        self.validate()?;
+        Ok(digest_value(TYPED_OBSERVATION_BASIS_SCHEMA_V1, self))
+    }
+}
+
+impl VersionedObservationResolutionV1 {
+    fn validate_basis(&self) -> Result<(), String> {
+        match self {
+            Self::NightshiftV2(resolution) => resolution.basis.validate(),
+            Self::TypedV3(resolution) => resolution.basis.validate(),
+        }
+    }
+
+    fn basis_binding_digest(&self) -> Result<Digest, String> {
+        match self {
+            Self::NightshiftV2(resolution) => resolution.basis.decision_basis_digest(),
+            Self::TypedV3(resolution) => resolution.basis.binding_digest(),
+        }
+    }
+
+    /// Returns the frozen Nightshift basis only for a historical v2
+    /// resolution. Typed opaque v3 evidence is never projected into atoms.
+    #[must_use]
+    pub const fn nightshift_basis(&self) -> Option<&DecisionBasisV1> {
+        match self {
+            Self::NightshiftV2(resolution) => Some(&resolution.basis),
+            Self::TypedV3(_) => None,
+        }
+    }
+
+    const fn invalid_schema_label(&self) -> &'static str {
+        match self {
+            Self::NightshiftV2(_) => "decision basis",
+            Self::TypedV3(_) => "typed observation basis",
+        }
+    }
+
+    fn schema(&self) -> &str {
+        match self {
+            Self::NightshiftV2(value) => &value.schema,
+            Self::TypedV3(value) => &value.schema,
+        }
+    }
+
+    const fn key(&self) -> &OccurrenceKeyV1 {
+        match self {
+            Self::NightshiftV2(value) => &value.key,
+            Self::TypedV3(value) => &value.key,
+        }
+    }
+
+    /// Returns the exact observation requested from either closed resolution
+    /// generation.
+    #[must_use]
+    pub const fn observation(&self) -> &ObservationRefV1 {
+        match self {
+            Self::NightshiftV2(value) => &value.observation,
+            Self::TypedV3(value) => &value.observation,
+        }
+    }
+
+    /// Returns the exact currentness/support witness supplied by the pinned
+    /// resolver.
+    #[must_use]
+    pub const fn currentness(&self) -> &ObservationCurrentnessRefV1 {
+        match self {
+            Self::NightshiftV2(value) => &value.currentness,
+            Self::TypedV3(value) => &value.currentness,
+        }
+    }
+
+    /// Returns the exact binding digest for the closed basis representation.
+    #[must_use]
+    pub const fn normalized_preconditions(&self) -> &PreconditionBasisRefV1 {
+        match self {
+            Self::NightshiftV2(value) => &value.normalized_preconditions,
+            Self::TypedV3(value) => &value.normalized_preconditions,
+        }
+    }
+
+    /// Returns the exact pinned resolver/authority identity.
+    #[must_use]
+    pub fn resolver_id(&self) -> &str {
+        match self {
+            Self::NightshiftV2(value) => &value.resolver_id,
+            Self::TypedV3(value) => &value.resolver_id,
+        }
+    }
+
+    /// Returns the typed opaque basis only for a v3 resolution.
+    #[must_use]
+    pub const fn typed_basis(&self) -> Option<&TypedOpaqueObservationBasisV1> {
+        match self {
+            Self::NightshiftV2(_) => None,
+            Self::TypedV3(resolution) => Some(&resolution.basis),
+        }
+    }
+
+    const fn subject(&self) -> &Digest {
+        match self {
+            Self::NightshiftV2(value) => &value.subject,
+            Self::TypedV3(value) => &value.subject,
+        }
+    }
+
+    /// Returns the resolver clock lower bound.
+    #[must_use]
+    pub const fn resolved_at_unix_ms(&self) -> u64 {
+        match self {
+            Self::NightshiftV2(value) => value.resolved_at_unix_ms,
+            Self::TypedV3(value) => value.resolved_at_unix_ms,
+        }
+    }
+
+    /// Returns the exclusive resolver freshness deadline.
+    #[must_use]
+    pub const fn fresh_until_unix_ms(&self) -> u64 {
+        match self {
+            Self::NightshiftV2(value) => value.fresh_until_unix_ms,
+            Self::TypedV3(value) => value.fresh_until_unix_ms,
+        }
+    }
+
+    /// Returns the closed status label without interpreting its
+    /// application-owned support semantics.
+    #[must_use]
+    pub const fn status_label(&self) -> &'static str {
+        match self {
+            Self::NightshiftV2(value) => match value.status {
+                ObservationStatusV1::Current => "Current",
+                ObservationStatusV1::Stale => "Stale",
+                ObservationStatusV1::Superseded => "Superseded",
+                ObservationStatusV1::Contradictory => "Contradictory",
+                ObservationStatusV1::Absent => "Absent",
+            },
+            Self::TypedV3(value) => match value.status {
+                TypedObservationStatusV1::Current => "Current",
+                TypedObservationStatusV1::Stale => "Stale",
+                TypedObservationStatusV1::Superseded => "Superseded",
+                TypedObservationStatusV1::Contradictory => "Contradictory",
+                TypedObservationStatusV1::Absent => "Absent",
+                TypedObservationStatusV1::Unsupported => "Unsupported",
+                TypedObservationStatusV1::Refused => "Refused",
+            },
+        }
+    }
+
+    const fn is_current(&self) -> bool {
+        match self {
+            Self::NightshiftV2(value) => matches!(value.status, ObservationStatusV1::Current),
+            Self::TypedV3(value) => matches!(value.status, TypedObservationStatusV1::Current),
+        }
+    }
+
+    const fn is_contradictory(&self) -> bool {
+        match self {
+            Self::NightshiftV2(value) => {
+                matches!(value.status, ObservationStatusV1::Contradictory)
+            }
+            Self::TypedV3(value) => {
+                matches!(value.status, TypedObservationStatusV1::Contradictory)
+            }
+        }
+    }
+}
+
+impl From<ObservationResolutionV2> for VersionedObservationResolutionV1 {
+    fn from(value: ObservationResolutionV2) -> Self {
+        Self::NightshiftV2(value)
+    }
+}
+
+impl From<ObservationResolutionV3> for VersionedObservationResolutionV1 {
+    fn from(value: ObservationResolutionV3) -> Self {
+        Self::TypedV3(value)
+    }
 }
 
 // ---------------------------------------------------------------------------
