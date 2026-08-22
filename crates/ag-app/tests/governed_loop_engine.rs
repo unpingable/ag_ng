@@ -620,6 +620,7 @@ fn operator_detail(
         nightshift: Vec::new(),
         authoring_contexts: Vec::new(),
         authoring_custody: Vec::new(),
+        external_observations: Vec::new(),
         docket: Vec::new(),
     }
 }

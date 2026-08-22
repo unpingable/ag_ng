@@ -24,10 +24,11 @@ use crate::model::{
     AG_INTERVENTION_SUBMISSION_HISTORY_SCHEMA_V1, AgInspectV1, CAMPAIGN_DETAIL_SCHEMA_V1,
     CAMPAIGN_INDEX_SCHEMA_V1, CampaignDetailV1, CampaignIndexEntryV1, CampaignIndexV1,
     DEMO_CORPUS_SCHEMA_V1, DOCKET_INSPECTION_SCHEMA_V1, DemoCorpusV1, DocketInspectionV1,
-    InterventionSubmissionHistoryProjectionV1, NightshiftAuthoringContextExportV1,
-    NightshiftAuthoringContextQueryV1, NightshiftAuthoringCustodyExportV1,
-    NightshiftObservationExportV1, ProjectionCheckV1, ProjectionCorrespondenceV1,
-    ReadCommandNameV1, RelatedSourceV1, SourceErrorKindV1, SourceResultV1,
+    ExternalObservationExportV1, InterventionSubmissionHistoryProjectionV1,
+    NightshiftAuthoringContextExportV1, NightshiftAuthoringContextQueryV1,
+    NightshiftAuthoringCustodyExportV1, NightshiftObservationExportV1, ProjectionCheckV1,
+    ProjectionCorrespondenceV1, ReadCommandNameV1, RelatedSourceV1, SourceErrorKindV1,
+    SourceResultV1,
 };
 
 const MAX_STDOUT_BYTES: u64 = 16 * 1024 * 1024;
@@ -36,6 +37,9 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const RELATED_SOURCE_PROCESS_LIMIT: usize = 128;
 const MAX_DEMO_CORPUS_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEMO_CAMPAIGNS: usize = 512;
+/// Presentation-only evidence-age window passed transparently to Nightshift.
+/// It is never used as canonical cycle currentness or AG authority.
+const EXTERNAL_OBSERVATION_DISPLAY_TTL_MS: u64 = 5 * 60 * 1_000;
 
 /// Optional Nightshift read-source coordinates.
 #[derive(Clone, Debug)]
@@ -113,6 +117,12 @@ enum CanonicalReadRequestV1 {
         campaign: String,
         occurrence: String,
     },
+    NightshiftExportExternalObservation {
+        campaign: String,
+        occurrence: String,
+        evaluated_at_unix_ms: i64,
+        evidence_ttl_ms: u64,
+    },
     DocketInspect(String),
 }
 
@@ -131,6 +141,9 @@ impl CanonicalReadRequestV1 {
             }
             Self::NightshiftExportAuthoringCustody { .. } => {
                 ReadCommandNameV1::NightshiftExportAuthoringCustody
+            }
+            Self::NightshiftExportExternalObservation { .. } => {
+                ReadCommandNameV1::NightshiftExportExternalObservation
             }
             Self::DocketInspect(_) => ReadCommandNameV1::DocketGovernedLoopInspect,
         }
@@ -312,7 +325,8 @@ impl OperatorReaderV1 {
 
         let nightshift = self.collect_nightshift_sources(observations);
         let authoring_contexts = self.collect_authoring_sources(occurrences.clone());
-        let authoring_custody = self.collect_authoring_custody_sources(occurrences);
+        let authoring_custody = self.collect_authoring_custody_sources(occurrences.clone());
+        let external_observations = self.collect_external_observations(occurrences);
         let docket = self.collect_docket_sources(issuances);
 
         Ok(CampaignDetailV1 {
@@ -329,6 +343,7 @@ impl OperatorReaderV1 {
             nightshift,
             authoring_contexts,
             authoring_custody,
+            external_observations,
             docket,
         })
     }
@@ -420,6 +435,30 @@ impl OperatorReaderV1 {
                     unavailable(
                         "Nightshift",
                         ReadCommandNameV1::NightshiftExportAuthoringCustody,
+                        SourceErrorKindV1::Unavailable,
+                        "related-source process limit exceeded; fact not queried".to_owned(),
+                        None,
+                    )
+                },
+            })
+            .collect()
+    }
+
+    fn collect_external_observations(
+        &self,
+        occurrences: BTreeSet<(String, String)>,
+    ) -> Vec<RelatedSourceV1<ExternalObservationExportV1>> {
+        occurrences
+            .into_iter()
+            .enumerate()
+            .map(|(index, (campaign, occurrence))| RelatedSourceV1 {
+                identity: format!("{campaign}/{occurrence}"),
+                result: if index < RELATED_SOURCE_PROCESS_LIMIT {
+                    self.nightshift_external_observation_export(&campaign, &occurrence)
+                } else {
+                    unavailable(
+                        "Nightshift",
+                        ReadCommandNameV1::NightshiftExportExternalObservation,
                         SourceErrorKindV1::Unavailable,
                         "related-source process limit exceeded; fact not queried".to_owned(),
                         None,
@@ -694,6 +733,39 @@ impl OperatorReaderV1 {
         )
     }
 
+    fn nightshift_external_observation_export(
+        &self,
+        campaign: &str,
+        occurrence: &str,
+    ) -> SourceResultV1<ExternalObservationExportV1> {
+        let Some(_) = &self
+            .canonical_config()
+            .ok()
+            .and_then(|value| value.nightshift.as_ref())
+        else {
+            return unavailable(
+                "Nightshift",
+                ReadCommandNameV1::NightshiftExportExternalObservation,
+                SourceErrorKindV1::NotConfigured,
+                "Nightshift source is not configured".to_owned(),
+                None,
+            );
+        };
+        let evaluated_at_unix_ms = i64::try_from(capture_time()).unwrap_or(i64::MAX);
+        self.capture_typed(
+            "Nightshift",
+            &CanonicalReadRequestV1::NightshiftExportExternalObservation {
+                campaign: campaign.to_owned(),
+                occurrence: occurrence.to_owned(),
+                evaluated_at_unix_ms,
+                evidence_ttl_ms: EXTERNAL_OBSERVATION_DISPLAY_TTL_MS,
+            },
+            |value: &ExternalObservationExportV1| {
+                value.validate_for_occurrence(campaign, occurrence)
+            },
+        )
+    }
+
     fn capture_typed<T>(
         &self,
         source: &str,
@@ -841,6 +913,30 @@ fn canonical_command(
                 campaign,
                 "--occurrence-id",
                 occurrence,
+            ]);
+            command
+        }
+        CanonicalReadRequestV1::NightshiftExportExternalObservation {
+            campaign,
+            occurrence,
+            evaluated_at_unix_ms,
+            evidence_ttl_ms,
+        } => {
+            let source = require_nightshift_source(config)?;
+            let mut command = Command::new(&source.program);
+            let evaluated_at_unix_ms = evaluated_at_unix_ms.to_string();
+            let evidence_ttl_ms = evidence_ttl_ms.to_string();
+            command.args(["--store"]).arg(&source.store).args([
+                "external-observation",
+                "export",
+                "--campaign-id",
+                campaign,
+                "--occurrence-id",
+                occurrence,
+                "--evaluated-at-unix-ms",
+                &evaluated_at_unix_ms,
+                "--evidence-ttl-ms",
+                &evidence_ttl_ms,
             ]);
             command
         }
@@ -1044,6 +1140,22 @@ fn validate_demo_detail(detail: &CampaignDetailV1) -> Result<(), String> {
             value.validate_for_occurrence(campaign_id, occurrence_id)?;
             if related.identity != format!("{campaign_id}/{occurrence_id}") {
                 return Err("demo authoring-custody related identity drift".to_owned());
+            }
+        }
+    }
+    for related in &detail.external_observations {
+        validate_source_raw(&related.result)?;
+        if let Some(value) = related.result.value() {
+            let crate::model::ExternalObservationQueryV1::GovernedOccurrence {
+                campaign_id,
+                occurrence_id,
+            } = &value.query
+            else {
+                return Err("demo external-observation query is not occurrence-scoped".to_owned());
+            };
+            value.validate_for_occurrence(campaign_id, occurrence_id)?;
+            if related.identity != format!("{campaign_id}/{occurrence_id}") {
+                return Err("demo external-observation related identity drift".to_owned());
             }
         }
     }
@@ -1590,6 +1702,66 @@ mod tests {
                 occurrence,
             )
         );
+    }
+
+    #[test]
+    fn external_observation_uses_only_occurrence_scoped_read_verb() {
+        let root = tempfile::tempdir().unwrap();
+        let ag = root.path().join("ag-loopctl");
+        std::fs::write(&ag, b"#!/bin/sh\nexit 1\n").unwrap();
+        let nightshift = root.path().join("nightshift");
+        let arguments = root.path().join("nightshift-arguments");
+        let campaign = ag_primitives::Digest::hash_bytes(b"campaign").to_string();
+        let occurrence = "00000000-0000-0000-0000-000000000001";
+        let payload = serde_json::json!({
+            "schema": crate::model::NIGHTSHIFT_EXTERNAL_OBSERVATION_EXPORT_SCHEMA_V1,
+            "query": {
+                "kind": "governed_occurrence",
+                "campaign_id": campaign,
+                "occurrence_id": occurrence,
+            },
+            "matches": [],
+        });
+        std::fs::write(
+            &nightshift,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\n",
+                arguments.display(),
+                payload
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ag, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&nightshift, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reader = OperatorReaderV1::new(OperatorSourceConfigV1 {
+            campaign_root: root.path().to_owned(),
+            ag_loopctl: ag,
+            nightshift: Some(NightshiftReadSourceV1 {
+                program: nightshift,
+                store: root.path().join("nightshift.sqlite"),
+            }),
+            docket: None,
+        })
+        .unwrap();
+        let result = reader.nightshift_external_observation_export(&campaign, occurrence);
+        assert!(matches!(
+            result,
+            SourceResultV1::Available {
+                command: ReadCommandNameV1::NightshiftExportExternalObservation,
+                value: ExternalObservationExportV1 { matches, .. },
+                ..
+            } if matches.is_empty()
+        ));
+        let arguments = std::fs::read_to_string(arguments).unwrap();
+        assert!(arguments.contains("\nexternal-observation\nexport\n"));
+        assert!(arguments.contains(&format!(
+            "--campaign-id\n{campaign}\n--occurrence-id\n{occurrence}\n"
+        )));
+        assert!(arguments.contains(&format!(
+            "--evidence-ttl-ms\n{EXTERNAL_OBSERVATION_DISPLAY_TTL_MS}\n"
+        )));
+        assert!(!arguments.contains("cycle\nrun"));
     }
 
     #[test]

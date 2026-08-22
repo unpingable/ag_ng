@@ -50,6 +50,9 @@ The UI invokes only these owner commands:
 ```text
 ag-loopctl inspect|status|replay|history|refusals|intervention-submissions --database DB
 nightshift --store STORE cycle export-observation --observation-id ID
+nightshift --store STORE external-observation export --campaign-id ID \
+  --occurrence-id UUID --evaluated-at-unix-ms DISPLAY_TIME \
+  --evidence-ttl-ms DISPLAY_WINDOW
 docket governed-loop inspect --state STATE --issuance ID
 ```
 
@@ -219,3 +222,11 @@ Maude session issuer and delivery producer, session/handoff receipts, target
 runtime, and caller-sealed cycle time only after the custody record agrees with the exact
 lineage and AG proposal/work. `custody not recorded` remains valid historical
 absence. Producer authentication is never presented as standing or authority.
+
+For occurrences with workflow-specific application/world evidence,
+Phosphor-ng also reads Nightshift's exact `external-observation export`
+projection. It shows authenticated producer custody, candidate/source
+identities, exact PlanNode claims, and whether the source time falls inside an
+explicit five-minute display window. That arithmetic age label is not
+Nightshift currentness. Docket settlement remains an attempt outcome rather
+than proof of present health; absent candidates remain honestly unrecorded.

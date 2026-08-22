@@ -51,12 +51,17 @@ if ! rg -q 'campaign: Digest' "$ui/src/links.rs" \
   exit 1
 fi
 
-for verb in inspect status replay history refusals intervention-submissions export-observation export-authoring-context export-authoring-custody; do
+for verb in inspect status replay history refusals intervention-submissions export-observation export-authoring-context export-authoring-custody external-observation; do
   if ! rg -q "$verb" "$ui/src/source.rs"; then
     echo "operator UI closed read-command surface lost $verb" >&2
     exit 1
   fi
 done
+
+if rg -n 'ExternalObservation(Custody|Claim|Export).*::(new|mint|seal)' "$ui/src"; then
+  echo "operator UI can construct owner-side external observation/custody" >&2
+  exit 1
+fi
 
 if rg -n 'AuthoringContextProvenanceV1::(new|mint|seal)|AuthoringContextCustodyProvenanceV1::(new|mint|seal)|MaudeAuthoringContext(Input|Handoff)V1|HmacAuthenticationV1' "$ui/src"; then
   echo "operator UI can construct owner-side authoring provenance" >&2

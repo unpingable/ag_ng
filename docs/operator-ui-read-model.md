@@ -29,6 +29,7 @@ proposal identities.
 | Nightshift lineage and NQ admission provenance | optional Nightshift `cycle export-observation` for the AG-bound observation | display propagated provenance verbatim; AG/UI do not reinterpret NQ admission |
 | Maude authoring-context lineage | optional Nightshift `cycle export-authoring-context` for exact campaign + occurrence | require owner self-digest plus exact proposal/work agreement; show lineage, never authority |
 | Maude handoff custody | optional Nightshift `cycle export-authoring-custody` for exact campaign + occurrence | require owner self-digest, exact lineage/proposal/work join, and retain distinct session-issuer/producer identities; show authentication at ingress, never authority |
+| workflow-specific application/world evidence | optional Nightshift `external-observation export` for exact campaign + occurrence | show authenticated candidate, PlanNode claims, source receipt, and caller-supplied age projection; never call it Nightshift currentness or infer health from settlement |
 | halt/completion/human disposition/intervention history | AG snapshot and transition evidence | show exact halt reason, terminal witness, authenticated request, or human artifact when present; request evidence is not authority |
 
 The supported source schemas are:
@@ -42,6 +43,9 @@ The supported source schemas are:
   `nightshift.authoring_context_provenance.v1`;
 - `nightshift.authoring_context_custody_export.v1` and
   `nightshift.authoring_context_custody_provenance.v1`;
+- `nightshift.external_observation_export.v1`,
+  `maude.local-compose-world-observation/v1`, and
+  `nightshift.external_observation_custody_provenance.v1`;
 - `docket.governed-loop.inspection/v1`.
 
 An unknown schema is an incompatible source, not a best-effort input.
@@ -104,6 +108,9 @@ ag-loopctl refusals --database DB
 ag-loopctl intervention-submissions --database DB
 nightshift --store STORE cycle export-observation --observation-id ID
 nightshift --store STORE cycle export-authoring-context --campaign-id ID --occurrence-id UUID
+nightshift --store STORE cycle export-authoring-custody --campaign-id ID --occurrence-id UUID
+nightshift --store STORE external-observation export --campaign-id ID --occurrence-id UUID \
+  --evaluated-at-unix-ms DISPLAY_TIME --evidence-ttl-ms 300000
 docket governed-loop inspect --state STATE --issuance ID
 ```
 

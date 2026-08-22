@@ -35,6 +35,18 @@ pub const NIGHTSHIFT_AUTHORING_CUSTODY_EXPORT_SCHEMA_V1: &str =
 /// Exact Nightshift-minted custody provenance schema.
 pub const NIGHTSHIFT_AUTHORING_CUSTODY_PROVENANCE_SCHEMA_V1: &str =
     "nightshift.authoring_context_custody_provenance.v1";
+/// Exact supported Nightshift application/world-evidence export schema.
+pub const NIGHTSHIFT_EXTERNAL_OBSERVATION_EXPORT_SCHEMA_V1: &str =
+    "nightshift.external_observation_export.v1";
+/// Exact owner-validated workflow-specific observation-candidate schema.
+pub const NIGHTSHIFT_EXTERNAL_OBSERVATION_SCHEMA_V1: &str =
+    "maude.local-compose-world-observation/v1";
+/// Exact owner-minted custody record for one authenticated candidate.
+pub const NIGHTSHIFT_EXTERNAL_OBSERVATION_CUSTODY_SCHEMA_V1: &str =
+    "nightshift.external_observation_custody_provenance.v1";
+/// Exact workflow-specific `PlanNode` claim schema.
+pub const NIGHTSHIFT_EXTERNAL_OBSERVATION_CLAIM_SCHEMA_V1: &str =
+    "maude.local-compose-world-claim/v1";
 /// Exact supported Docket inspection schema.
 pub const DOCKET_INSPECTION_SCHEMA_V1: &str = "docket.governed-loop.inspection/v1";
 /// Exact schema for a deterministic, read-only presentation corpus.
@@ -297,6 +309,228 @@ pub struct NightshiftAuthoringCustodyExportV1 {
     pub matches: Vec<NightshiftAuthoringCustodyProvenanceV1>,
 }
 
+/// Closed local-Compose action whose evidence was retained by Nightshift.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalObservationActionV1 {
+    /// Observe the qualified cache-platform acceptance contract.
+    Qualify,
+    /// Observe campaign resource absence after teardown.
+    Teardown,
+}
+
+/// Closed executor outcome. A settled success still does not establish
+/// present-world truth or Nightshift currentness.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalObservationOutcomeV1 {
+    /// Executor produced the workflow's closed successful evidence shape.
+    Success,
+    /// Executor produced a known failure result.
+    Failure,
+    /// Executor outcome remained indeterminate.
+    Indeterminate,
+}
+
+/// Closed workflow-specific claim kind. These are evidence projections, not
+/// AG/Nightshift authority or currentness facts.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalObservationClaimKindV1 {
+    /// Front door returned the workflow's qualified response.
+    FrontDoorReachable,
+    /// Exact observed sequence was MISS/MISS/HIT/HIT.
+    CacheMissThenHit,
+    /// Requests remained served during one-cache failure.
+    SingleCacheFailureSurvived,
+    /// Both cache nodes were observed after restoration.
+    CacheTopologyRestored,
+    /// Recorded campaign resources were absent after teardown.
+    CampaignResourcesAbsent,
+}
+
+/// Evidence claim status. Non-success outcomes may only project unknown.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalObservationClaimStatusV1 {
+    /// Closed source evidence satisfied this workflow-specific claim.
+    Satisfied,
+    /// Source evidence did not establish this claim.
+    Unknown,
+}
+
+/// Exact PlanNode-addressed claim from the workflow adapter.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalObservationClaimV1 {
+    /// Claim schema.
+    pub schema: String,
+    /// Content-derived claim identity.
+    pub claim_id: String,
+    /// Closed workflow-specific meaning.
+    pub kind: ExternalObservationClaimKindV1,
+    /// Satisfied or honestly unknown.
+    pub status: ExternalObservationClaimStatusV1,
+    /// Stable originating `PlanNode` identity.
+    pub plan_node_id: String,
+    /// Exact compiler output bound to that `PlanNode`.
+    pub compiled_output_identity: String,
+    /// Exact JSON pointers into retained source evidence.
+    pub evidence_paths: Vec<String>,
+}
+
+/// Workflow-specific application/world observation candidate retained by
+/// Nightshift. It is deliberately distinct from canonical observation cycles.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalObservationV1 {
+    /// Observation-candidate schema.
+    pub schema: String,
+    /// Content-derived candidate identity.
+    pub observation_id: String,
+    /// Workflow adapter identity.
+    pub adapter_id: String,
+    /// Workflow adapter version.
+    pub adapter_version: String,
+    /// Closed workflow action.
+    pub action: ExternalObservationActionV1,
+    /// Exact locked `PlanDocument` digest.
+    pub plan_document_digest: String,
+    /// Exact workflow compilation receipt.
+    pub compilation_id: String,
+    /// Exact governed coordinates.
+    pub campaign_id: String,
+    /// Exact governed occurrence.
+    pub occurrence_id: String,
+    /// Exact AG proposal.
+    pub proposal_id: String,
+    /// Exact compiled work.
+    pub exact_work_id: String,
+    /// Exact AG issuance.
+    pub issuance_id: String,
+    /// Exact Docket attempt.
+    pub attempt_id: String,
+    /// Exact Docket settlement.
+    pub settlement_id: String,
+    /// Exact governed subject.
+    pub subject_digest: String,
+    /// Exact governed scope.
+    pub scope_digest: String,
+    /// Exact retained executor evidence receipt.
+    pub executor_evidence_receipt: String,
+    /// Exact canonical executor evidence byte length.
+    pub executor_evidence_bytes: u64,
+    /// Source observation time; evidence only.
+    pub observed_at_unix_ms: i64,
+    /// Closed executor outcome.
+    pub outcome: ExternalObservationOutcomeV1,
+    /// Complete owner-validated source record, not reinterpreted by AG/UI.
+    pub source_evidence: Value,
+    /// Stable PlanNode-addressed workflow claims.
+    pub claims: Vec<ExternalObservationClaimV1>,
+    /// Exact authority/currentness nonclaims retained with the candidate.
+    pub nonclaims: Vec<String>,
+}
+
+/// Authenticated delivery evidence for one exact external observation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalObservationCustodyV1 {
+    /// Custody schema.
+    pub schema: String,
+    /// Content-derived custody identity.
+    pub custody_id: String,
+    /// Exact authenticated handoff.
+    pub handoff_id: String,
+    /// Exact candidate.
+    pub observation_id: String,
+    /// Authenticated producer identity.
+    pub producer_principal_id: String,
+    /// Pinned producer credential identity.
+    pub producer_key_id: String,
+    /// Intended Nightshift runtime.
+    pub target_runtime_id: String,
+    /// Exact governed and evidence coordinates.
+    pub campaign_id: String,
+    /// Exact governed occurrence.
+    pub occurrence_id: String,
+    /// Exact compiled work.
+    pub exact_work_id: String,
+    /// Exact Docket attempt.
+    pub attempt_id: String,
+    /// Exact Docket settlement.
+    pub settlement_id: String,
+    /// Exact executor evidence receipt.
+    pub executor_evidence_receipt: String,
+    /// First durable Nightshift receipt time.
+    pub received_at: String,
+}
+
+/// Display-only arithmetic relation between source time and the exact
+/// caller-supplied evaluation window. This is explicitly not currentness.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalObservationEvidenceAgeV1 {
+    /// Source time falls inside the caller's display window.
+    FreshAtEvaluation,
+    /// Source time predates the caller's display window.
+    StaleAtEvaluation,
+    /// Evaluation time precedes source time.
+    NotYetObserved,
+}
+
+/// Exact occurrence-scoped owner query used by Phosphor-ng.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExternalObservationQueryV1 {
+    /// Exact governed campaign/occurrence lookup.
+    GovernedOccurrence {
+        /// AG campaign identity.
+        campaign_id: String,
+        /// AG occurrence identity.
+        occurrence_id: String,
+    },
+    /// Other owner queries are retained in raw output but not accepted by
+    /// this occurrence-scoped UI projection.
+    Observation {
+        /// Exact observation-candidate identity.
+        observation_id: String,
+    },
+    /// Exact Docket-attempt lookup.
+    Attempt {
+        /// Exact Docket attempt identity.
+        attempt_id: String,
+    },
+}
+
+/// One candidate plus custody and transparent evidence-age projection.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalObservationExportMatchV1 {
+    /// Exact workflow candidate.
+    pub observation: ExternalObservationV1,
+    /// Exact authenticated delivery receipt.
+    pub custody: ExternalObservationCustodyV1,
+    /// Caller-supplied evaluation time.
+    pub evaluated_at_unix_ms: i64,
+    /// Caller-supplied display age window.
+    pub evidence_ttl_ms: u64,
+    /// Arithmetic age class, never currentness.
+    pub evidence_age: ExternalObservationEvidenceAgeV1,
+}
+
+/// Read-only Nightshift owner projection for external observation candidates.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalObservationExportV1 {
+    /// Export schema.
+    pub schema: String,
+    /// Exact owner-echoed lookup.
+    pub query: ExternalObservationQueryV1,
+    /// Zero or one candidate under current v1 persistence law.
+    pub matches: Vec<ExternalObservationExportMatchV1>,
+}
+
 /// Authentication retained by Docket with the exact AG issuance.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -381,6 +615,8 @@ pub enum ReadCommandNameV1 {
     NightshiftExportAuthoringContext,
     /// Nightshift authenticated authoring delivery evidence.
     NightshiftExportAuthoringCustody,
+    /// Nightshift authenticated workflow-specific external observation.
+    NightshiftExportExternalObservation,
     /// Docket exact persisted governed-loop record.
     DocketGovernedLoopInspect,
 }
@@ -555,6 +791,10 @@ pub struct CampaignDetailV1 {
     /// lineage may legitimately have no custody match.
     #[serde(default)]
     pub authoring_custody: Vec<RelatedSourceV1<NightshiftAuthoringCustodyExportV1>>,
+    /// Workflow-specific application/world evidence retained by Nightshift,
+    /// keyed by exact governed occurrence. It is not cycle currentness.
+    #[serde(default)]
+    pub external_observations: Vec<RelatedSourceV1<ExternalObservationExportV1>>,
     /// Docket records keyed by exact AG issuance identity.
     pub docket: Vec<RelatedSourceV1<DocketInspectionV1>>,
 }
@@ -862,6 +1102,232 @@ impl NightshiftAuthoringCustodyProvenanceV1 {
     }
 }
 
+impl ExternalObservationExportV1 {
+    /// Validates the exact occurrence-scoped owner projection and every
+    /// candidate/custody relationship without treating evidence age as
+    /// Nightshift currentness.
+    ///
+    /// # Errors
+    ///
+    /// Refuses unsupported schemas, substituted lookup coordinates,
+    /// malformed self-identities, and contradictory custody records.
+    pub fn validate_for_occurrence(&self, campaign: &str, occurrence: &str) -> Result<(), String> {
+        if self.schema != NIGHTSHIFT_EXTERNAL_OBSERVATION_EXPORT_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported Nightshift external-observation export schema {}",
+                self.schema
+            ));
+        }
+        let ExternalObservationQueryV1::GovernedOccurrence {
+            campaign_id,
+            occurrence_id,
+        } = &self.query
+        else {
+            return Err("Nightshift external observation echoed the wrong query kind".into());
+        };
+        if campaign_id != campaign || occurrence_id != occurrence {
+            return Err("Nightshift external observation substituted lookup identity".into());
+        }
+        if self.matches.len() > 1 {
+            return Err(
+                "Nightshift returned ambiguous external observations for one occurrence".into(),
+            );
+        }
+        for item in &self.matches {
+            item.validate_for_occurrence(campaign, occurrence)?;
+        }
+        Ok(())
+    }
+}
+
+impl ExternalObservationExportMatchV1 {
+    fn validate_for_occurrence(&self, campaign: &str, occurrence: &str) -> Result<(), String> {
+        self.observation.validate()?;
+        self.custody.validate()?;
+        if self.observation.campaign_id != campaign
+            || self.observation.occurrence_id != occurrence
+            || self.custody.campaign_id != campaign
+            || self.custody.occurrence_id != occurrence
+            || self.custody.observation_id != self.observation.observation_id
+            || self.custody.exact_work_id != self.observation.exact_work_id
+            || self.custody.attempt_id != self.observation.attempt_id
+            || self.custody.settlement_id != self.observation.settlement_id
+            || self.custody.executor_evidence_receipt != self.observation.executor_evidence_receipt
+        {
+            return Err("external observation custody disagrees with exact candidate".into());
+        }
+        if self.evaluated_at_unix_ms < 0
+            || self.evidence_age
+                != external_evidence_age(
+                    self.observation.observed_at_unix_ms,
+                    self.evaluated_at_unix_ms,
+                    self.evidence_ttl_ms,
+                )
+        {
+            return Err("external observation evidence-age projection mismatch".into());
+        }
+        Ok(())
+    }
+}
+
+impl ExternalObservationV1 {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != NIGHTSHIFT_EXTERNAL_OBSERVATION_SCHEMA_V1
+            || self.adapter_id != "maude.local-compose-observation-adapter"
+            || self.adapter_version != "1"
+            || self.executor_evidence_bytes == 0
+            || self.observed_at_unix_ms < 0
+        {
+            return Err("external observation schema, adapter, size, or time is invalid".into());
+        }
+        for (name, value) in [
+            ("observation_id", &self.observation_id),
+            ("plan_document_digest", &self.plan_document_digest),
+            ("compilation_id", &self.compilation_id),
+            ("campaign_id", &self.campaign_id),
+            ("proposal_id", &self.proposal_id),
+            ("exact_work_id", &self.exact_work_id),
+            ("issuance_id", &self.issuance_id),
+            ("attempt_id", &self.attempt_id),
+            ("settlement_id", &self.settlement_id),
+            ("subject_digest", &self.subject_digest),
+            ("scope_digest", &self.scope_digest),
+            ("executor_evidence_receipt", &self.executor_evidence_receipt),
+        ] {
+            Digest::parse(value).map_err(|error| format!("invalid {name}: {error}"))?;
+        }
+        if serde_json::from_value::<OccurrenceId>(Value::String(self.occurrence_id.clone()))
+            .is_err()
+        {
+            return Err("external observation occurrence is malformed".into());
+        }
+        let required_nonclaims = [
+            "candidate is not Nightshift currentness",
+            "Docket settlement is not world-state freshness",
+            "producer authentication is not standing or authorization",
+            "observation candidate cannot authorize or execute work",
+        ];
+        if self
+            .nonclaims
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != required_nonclaims
+        {
+            return Err("external observation authority nonclaims drifted".into());
+        }
+        for claim in &self.claims {
+            claim.validate()?;
+            if self.outcome != ExternalObservationOutcomeV1::Success
+                && claim.status != ExternalObservationClaimStatusV1::Unknown
+            {
+                return Err("non-success external observation projected a satisfied claim".into());
+            }
+        }
+        let mut value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        value
+            .as_object_mut()
+            .expect("external observation is an object")
+            .remove("observation_id");
+        let expected = Digest::from_serializable(&value).map_err(|error| error.to_string())?;
+        if expected.as_str() != self.observation_id {
+            return Err("external observation self-digest mismatch".into());
+        }
+        Ok(())
+    }
+}
+
+impl ExternalObservationClaimV1 {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != NIGHTSHIFT_EXTERNAL_OBSERVATION_CLAIM_SCHEMA_V1
+            || self.plan_node_id.trim().is_empty()
+            || self.plan_node_id.chars().any(char::is_whitespace)
+            || self.evidence_paths.is_empty()
+            || self
+                .evidence_paths
+                .iter()
+                .any(|path| !path.starts_with('/'))
+        {
+            return Err("external observation claim shape is invalid".into());
+        }
+        Digest::parse(&self.claim_id).map_err(|error| format!("invalid claim_id: {error}"))?;
+        Digest::parse(&self.compiled_output_identity)
+            .map_err(|error| format!("invalid compiled output identity: {error}"))?;
+        let mut value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        value
+            .as_object_mut()
+            .expect("external observation claim is an object")
+            .remove("claim_id");
+        let expected = Digest::from_serializable(&value).map_err(|error| error.to_string())?;
+        if expected.as_str() != self.claim_id {
+            return Err("external observation claim self-digest mismatch".into());
+        }
+        Ok(())
+    }
+}
+
+impl ExternalObservationCustodyV1 {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != NIGHTSHIFT_EXTERNAL_OBSERVATION_CUSTODY_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported external observation custody schema {}",
+                self.schema
+            ));
+        }
+        for (name, value) in [
+            ("custody_id", &self.custody_id),
+            ("handoff_id", &self.handoff_id),
+            ("observation_id", &self.observation_id),
+            ("campaign_id", &self.campaign_id),
+            ("exact_work_id", &self.exact_work_id),
+            ("attempt_id", &self.attempt_id),
+            ("settlement_id", &self.settlement_id),
+            ("executor_evidence_receipt", &self.executor_evidence_receipt),
+        ] {
+            Digest::parse(value).map_err(|error| format!("invalid {name}: {error}"))?;
+        }
+        for value in [
+            &self.producer_principal_id,
+            &self.producer_key_id,
+            &self.target_runtime_id,
+        ] {
+            if value.trim().is_empty() || value.chars().any(char::is_whitespace) {
+                return Err("external observation custody contains a malformed token".into());
+            }
+        }
+        if serde_json::from_value::<OccurrenceId>(Value::String(self.occurrence_id.clone()))
+            .is_err()
+            || self.received_at.trim().is_empty()
+        {
+            return Err("external observation custody occurrence or time is malformed".into());
+        }
+        let mut value = serde_json::to_value(self).map_err(|error| error.to_string())?;
+        value
+            .as_object_mut()
+            .expect("external observation custody is an object")
+            .remove("custody_id");
+        let expected = Digest::from_serializable(&value).map_err(|error| error.to_string())?;
+        if expected.as_str() != self.custody_id {
+            return Err("external observation custody self-digest mismatch".into());
+        }
+        Ok(())
+    }
+}
+
+fn external_evidence_age(
+    observed_at: i64,
+    evaluated_at: i64,
+    ttl_ms: u64,
+) -> ExternalObservationEvidenceAgeV1 {
+    if evaluated_at < observed_at {
+        ExternalObservationEvidenceAgeV1::NotYetObserved
+    } else if u64::try_from(evaluated_at - observed_at).is_ok_and(|age| age <= ttl_ms) {
+        ExternalObservationEvidenceAgeV1::FreshAtEvaluation
+    } else {
+        ExternalObservationEvidenceAgeV1::StaleAtEvaluation
+    }
+}
+
 /// Returns the campaign identity from an available AG inspection.
 #[must_use]
 pub fn inspected_campaign(source: &SourceResultV1<AgInspectV1>) -> Option<&CampaignId> {
@@ -925,6 +1391,101 @@ mod authoring_context_tests {
         preimage.as_object_mut().unwrap().remove("custody_id");
         value.custody_id = Digest::from_serializable(&preimage).unwrap().to_string();
         value
+    }
+
+    fn external_observation_export() -> ExternalObservationExportV1 {
+        let campaign = digest("campaign");
+        let occurrence = "00000000-0000-0000-0000-000000000001".to_owned();
+        let mut claim = ExternalObservationClaimV1 {
+            schema: NIGHTSHIFT_EXTERNAL_OBSERVATION_CLAIM_SCHEMA_V1.to_owned(),
+            claim_id: String::new(),
+            kind: ExternalObservationClaimKindV1::FrontDoorReachable,
+            status: ExternalObservationClaimStatusV1::Satisfied,
+            plan_node_id: "pn_health".to_owned(),
+            compiled_output_identity: digest("compiled node"),
+            evidence_paths: vec!["/evidence/health".to_owned()],
+        };
+        let mut claim_preimage = serde_json::to_value(&claim).unwrap();
+        claim_preimage.as_object_mut().unwrap().remove("claim_id");
+        claim.claim_id = Digest::from_serializable(&claim_preimage)
+            .unwrap()
+            .to_string();
+        let mut observation = ExternalObservationV1 {
+            schema: NIGHTSHIFT_EXTERNAL_OBSERVATION_SCHEMA_V1.to_owned(),
+            observation_id: String::new(),
+            adapter_id: "maude.local-compose-observation-adapter".to_owned(),
+            adapter_version: "1".to_owned(),
+            action: ExternalObservationActionV1::Qualify,
+            plan_document_digest: digest("plan"),
+            compilation_id: digest("compilation"),
+            campaign_id: campaign.clone(),
+            occurrence_id: occurrence.clone(),
+            proposal_id: digest("proposal"),
+            exact_work_id: digest("work"),
+            issuance_id: digest("issuance"),
+            attempt_id: digest("attempt"),
+            settlement_id: digest("settlement"),
+            subject_digest: digest("subject"),
+            scope_digest: digest("scope"),
+            executor_evidence_receipt: digest("evidence"),
+            executor_evidence_bytes: 2,
+            observed_at_unix_ms: 1_000,
+            outcome: ExternalObservationOutcomeV1::Success,
+            source_evidence: serde_json::json!({}),
+            claims: vec![claim],
+            nonclaims: vec![
+                "candidate is not Nightshift currentness".to_owned(),
+                "Docket settlement is not world-state freshness".to_owned(),
+                "producer authentication is not standing or authorization".to_owned(),
+                "observation candidate cannot authorize or execute work".to_owned(),
+            ],
+        };
+        let mut observation_preimage = serde_json::to_value(&observation).unwrap();
+        observation_preimage
+            .as_object_mut()
+            .unwrap()
+            .remove("observation_id");
+        observation.observation_id = Digest::from_serializable(&observation_preimage)
+            .unwrap()
+            .to_string();
+        let mut custody = ExternalObservationCustodyV1 {
+            schema: NIGHTSHIFT_EXTERNAL_OBSERVATION_CUSTODY_SCHEMA_V1.to_owned(),
+            custody_id: String::new(),
+            handoff_id: digest("handoff"),
+            observation_id: observation.observation_id.clone(),
+            producer_principal_id: "maude-observer:local".to_owned(),
+            producer_key_id: "maude-observer-key:one".to_owned(),
+            target_runtime_id: "nightshift:local".to_owned(),
+            campaign_id: campaign.clone(),
+            occurrence_id: occurrence.clone(),
+            exact_work_id: observation.exact_work_id.clone(),
+            attempt_id: observation.attempt_id.clone(),
+            settlement_id: observation.settlement_id.clone(),
+            executor_evidence_receipt: observation.executor_evidence_receipt.clone(),
+            received_at: "2026-08-22T18:00:00Z".to_owned(),
+        };
+        let mut custody_preimage = serde_json::to_value(&custody).unwrap();
+        custody_preimage
+            .as_object_mut()
+            .unwrap()
+            .remove("custody_id");
+        custody.custody_id = Digest::from_serializable(&custody_preimage)
+            .unwrap()
+            .to_string();
+        ExternalObservationExportV1 {
+            schema: NIGHTSHIFT_EXTERNAL_OBSERVATION_EXPORT_SCHEMA_V1.to_owned(),
+            query: ExternalObservationQueryV1::GovernedOccurrence {
+                campaign_id: campaign,
+                occurrence_id: occurrence,
+            },
+            matches: vec![ExternalObservationExportMatchV1 {
+                observation,
+                custody,
+                evaluated_at_unix_ms: 1_000,
+                evidence_ttl_ms: 0,
+                evidence_age: ExternalObservationEvidenceAgeV1::FreshAtEvaluation,
+            }],
+        }
     }
 
     #[test]
@@ -1014,5 +1575,36 @@ mod authoring_context_tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn external_observation_is_exact_custody_not_currentness() {
+        let export = external_observation_export();
+        let ExternalObservationQueryV1::GovernedOccurrence {
+            campaign_id,
+            occurrence_id,
+        } = &export.query
+        else {
+            unreachable!()
+        };
+        assert!(
+            export
+                .validate_for_occurrence(campaign_id, occurrence_id)
+                .is_ok()
+        );
+        let mut substituted = export.clone();
+        substituted.matches[0].custody.attempt_id = digest("other attempt");
+        let mut preimage = serde_json::to_value(&substituted.matches[0].custody).unwrap();
+        preimage.as_object_mut().unwrap().remove("custody_id");
+        substituted.matches[0].custody.custody_id =
+            Digest::from_serializable(&preimage).unwrap().to_string();
+        assert!(
+            substituted
+                .validate_for_occurrence(campaign_id, occurrence_id)
+                .is_err()
+        );
+        let serialized = serde_json::to_string(&export).unwrap();
+        assert!(!serialized.contains("\"currentness\":"));
+        assert!(!serialized.contains("authorization\":"));
     }
 }
