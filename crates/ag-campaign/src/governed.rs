@@ -53,6 +53,8 @@ pub const DOCKET_CUSTODY_SCHEMA_V1: &str = "ag.governed-loop.docket-custody/v1";
 pub const DOCKET_SETTLEMENT_SCHEMA_V1: &str = "ag.governed-loop.docket-settlement/v1";
 /// Wire schema for external human dispositions.
 pub const HUMAN_DISPOSITION_SCHEMA_V1: &str = "ag.governed-loop.human-disposition/v1";
+/// Wire schema for authenticated, authority-neutral governed intervention requests.
+pub const GOVERNED_INTERVENTION_SCHEMA_V1: &str = "ag.governed-loop.intervention-request/v1";
 
 const STATE_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.state/v1";
 const GENESIS_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.genesis/v1";
@@ -60,6 +62,7 @@ const PROPOSAL_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.proposal/v1";
 const AG_AUTHORIZATION_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.authorization/v1";
 const AG_SPEND_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.spend/v1";
 const AG_ISSUANCE_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.issuance/v1";
+const GOVERNED_INTERVENTION_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.intervention-request/v1";
 
 fn digest_value<T: Serialize + ?Sized>(domain: &str, value: &T) -> Digest {
     let document = JcsDocument::canonicalize(value)
@@ -205,6 +208,18 @@ exact_digest_ref!(
 exact_digest_ref!(
     /// Exact external verification record for a human disposition.
     HumanVerificationRefV1
+);
+exact_digest_ref!(
+    /// Content-derived identity of one exact governed intervention request.
+    GovernedInterventionRequestIdV1
+);
+exact_digest_ref!(
+    /// Exact replay nonce of one governed intervention request.
+    GovernedInterventionNonceRefV1
+);
+exact_digest_ref!(
+    /// Exact external authentication/mandate verification record.
+    GovernedInterventionVerificationRefV1
 );
 
 /// Independently allocated identity of one governed occurrence.
@@ -1366,6 +1381,12 @@ pub enum RefusalCodeV1 {
     ProfileLawViolation,
     /// Recovery found an ambiguous or inconsistent state.
     RecoveryRequired,
+    /// An authenticated intervention targeted stale or foreign exact state.
+    InterventionBindingMismatch,
+    /// An authenticated intervention class is illegal at the exact target PC.
+    InterventionNotApplicable,
+    /// Exact reconciliation was evaluated but the outcome remains unknown.
+    InterventionOutcomeUnknown,
 }
 
 /// Durable non-authorizing refusal outcome.
@@ -1380,6 +1401,11 @@ pub struct RefusalOutcomeV1 {
     pub code: RefusalCodeV1,
     /// Optional exact evidence identity.
     pub evidence: Option<Digest>,
+    /// Exact authenticated intent when the refusal occurred after successful
+    /// principal/mandate verification. Unauthenticated bytes are never
+    /// promoted into trusted durable provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governed_intervention: Option<VerifiedGovernedInterventionV1>,
 }
 
 /// Canonical recovery requirement derived solely from durable state.
@@ -1479,6 +1505,9 @@ pub enum KernelErrorV1 {
     /// Human disposition failed exact binding/currentness/replay checks.
     #[error("human disposition is not applicable ({0})")]
     HumanDisposition(&'static str),
+    /// Governed intervention failed integrity, exact targeting, or applicability.
+    #[error("governed intervention is not applicable ({0})")]
+    Intervention(&'static str),
     /// State digest is not exact.
     #[error("state digest mismatch")]
     StateDigestMismatch,
@@ -1685,6 +1714,218 @@ pub struct HumanAuthorityScopeV1 {
     pub principal: HumanPrincipalRefV1,
     /// Expected mandate.
     pub mandate: MandateRefV1,
+}
+
+/// Closed intervention vocabulary.  There is deliberately no generic retry:
+/// reconciliation, read-only evidence acquisition, authority-empty successor
+/// creation, and safe continuation halt have different legal effects.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "class", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GovernedInterventionClassV1 {
+    /// Ask Docket read-only for the outcome of one exact indeterminate attempt.
+    ReconcileAttempt {
+        /// Exact consumed AG issuance.
+        issuance: AgIssuanceRefV1,
+        /// Exact Docket attempt.
+        attempt: DocketAttemptRefV1,
+        /// Sorted, duplicate-free exact reconciliation evidence references.
+        evidence: Vec<Digest>,
+    },
+    /// Record one bounded request for read-only evidence acquisition.
+    ///
+    /// This does not execute the probe.  Any effectful mechanics remain exact
+    /// work that must enter the ordinary proposal/standing/spend path.
+    RequestProbe {
+        /// Exact read-only probe work identity.
+        exact_probe_work: Digest,
+        /// Sorted, duplicate-free evidence references motivating the probe.
+        evidence: Vec<Digest>,
+    },
+    /// Open one distinct authority-empty occurrence after exact settlement.
+    OpenSuccessor {
+        /// Independently allocated successor occurrence.
+        successor_occurrence: OccurrenceId,
+        /// Exact work expected in that successor's fresh proposal.
+        exact_work: Digest,
+    },
+    /// Halt future continuation at an authority-safe boundary.
+    ///
+    /// This is not effectful containment.  Physical containment must be
+    /// proposed and authorized as its own exact work.
+    HaltContinuation {
+        /// Exact durable halt reason.
+        reason: HaltReasonRefV1,
+    },
+}
+
+/// Versioned, content-bound operator intent.  Presence of this record is not
+/// currentness, standing, AG authorization, or Docket execution authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernedInterventionRequestV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Content-derived request identity.
+    pub request: GovernedInterventionRequestIdV1,
+    /// Authenticated requesting principal.
+    pub principal: HumanPrincipalRefV1,
+    /// Exact external mandate to be verified at consequence time.
+    pub mandate: MandateRefV1,
+    /// Exact replay nonce.
+    pub nonce: GovernedInterventionNonceRefV1,
+    /// Exact target campaign.
+    pub campaign: CampaignId,
+    /// Exact target occurrence; historical targets never retarget implicitly.
+    pub occurrence: OccurrenceId,
+    /// Exact target state digest.
+    pub target_state_digest: Digest,
+    /// Closed requested intervention.
+    pub intervention: GovernedInterventionClassV1,
+    /// Creation time retained in the exact record, never target selection or freshness truth.
+    pub created_at_unix_ms: u64,
+    /// Exclusive request/mandate evaluation expiry.
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Serialize)]
+struct GovernedInterventionDigestInputV1<'a> {
+    schema: &'a str,
+    principal: &'a HumanPrincipalRefV1,
+    mandate: &'a MandateRefV1,
+    nonce: &'a GovernedInterventionNonceRefV1,
+    campaign: &'a CampaignId,
+    occurrence: OccurrenceId,
+    target_state_digest: &'a Digest,
+    intervention: &'a GovernedInterventionClassV1,
+    created_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+}
+
+impl GovernedInterventionRequestV1 {
+    /// Constructs and content-binds one exact request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        principal: HumanPrincipalRefV1,
+        mandate: MandateRefV1,
+        nonce: GovernedInterventionNonceRefV1,
+        campaign: CampaignId,
+        occurrence: OccurrenceId,
+        target_state_digest: Digest,
+        intervention: GovernedInterventionClassV1,
+        created_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+    ) -> Result<Self, KernelErrorV1> {
+        let mut value = Self {
+            schema: GOVERNED_INTERVENTION_SCHEMA_V1.to_owned(),
+            request: GovernedInterventionRequestIdV1::from_digest(Digest::hash_bytes(b"pending")),
+            principal,
+            mandate,
+            nonce,
+            campaign,
+            occurrence,
+            target_state_digest,
+            intervention,
+            created_at_unix_ms,
+            expires_at_unix_ms,
+        };
+        value.request = value.derived_request_id();
+        value.validate_integrity()?;
+        Ok(value)
+    }
+
+    /// Recomputes the domain-separated identity over every semantic field.
+    #[must_use]
+    pub fn derived_request_id(&self) -> GovernedInterventionRequestIdV1 {
+        GovernedInterventionRequestIdV1::from_digest(digest_value(
+            GOVERNED_INTERVENTION_DIGEST_DOMAIN_V1,
+            &GovernedInterventionDigestInputV1 {
+                schema: &self.schema,
+                principal: &self.principal,
+                mandate: &self.mandate,
+                nonce: &self.nonce,
+                campaign: &self.campaign,
+                occurrence: self.occurrence,
+                target_state_digest: &self.target_state_digest,
+                intervention: &self.intervention,
+                created_at_unix_ms: self.created_at_unix_ms,
+                expires_at_unix_ms: self.expires_at_unix_ms,
+            },
+        ))
+    }
+
+    /// Validates schema, self-digest, time shape, and bounded exact evidence.
+    pub fn validate_integrity(&self) -> Result<(), KernelErrorV1> {
+        if self.schema != GOVERNED_INTERVENTION_SCHEMA_V1 {
+            return Err(KernelErrorV1::ForeignSchema("governed intervention"));
+        }
+        if self.request != self.derived_request_id() {
+            return Err(KernelErrorV1::Intervention("request digest mismatch"));
+        }
+        if self.created_at_unix_ms >= self.expires_at_unix_ms {
+            return Err(KernelErrorV1::Intervention("invalid request window"));
+        }
+        let evidence = match &self.intervention {
+            GovernedInterventionClassV1::ReconcileAttempt { evidence, .. }
+            | GovernedInterventionClassV1::RequestProbe { evidence, .. } => Some(evidence),
+            GovernedInterventionClassV1::OpenSuccessor { .. }
+            | GovernedInterventionClassV1::HaltContinuation { .. } => None,
+        };
+        if let Some(evidence) = evidence
+            && (evidence.len() > 64 || evidence.windows(2).any(|pair| pair[0] >= pair[1]))
+        {
+            return Err(KernelErrorV1::Intervention(
+                "evidence must be bounded, sorted, and unique",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Deployment-owned expected principal and mandate for one request ingress.
+pub type GovernedInterventionAuthorityScopeV1 = HumanAuthorityScopeV1;
+
+/// Exact request presented to the external principal/mandate verifier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GovernedInterventionVerificationRequestV1<'a> {
+    /// Exact content-bound operator request.
+    pub request: &'a GovernedInterventionRequestV1,
+    /// Deployment-owned expected principal/mandate.
+    pub expected_scope: &'a GovernedInterventionAuthorityScopeV1,
+    /// Consequence-time clock reading.
+    pub now_unix_ms: u64,
+}
+
+/// External authentication and current-mandate boundary for interventions.
+pub trait GovernedInterventionVerifierV1 {
+    /// Authenticates the exact bytes and checks the exact mandate now.
+    fn verify_governed_intervention(
+        &mut self,
+        request: &GovernedInterventionVerificationRequestV1<'_>,
+    ) -> Result<GovernedInterventionVerificationRefV1, ExternalBoundaryErrorV1>;
+}
+
+/// Authenticated intent retained as evidence, not a reusable AG capability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedGovernedInterventionV1 {
+    /// Exact request.
+    pub request: GovernedInterventionRequestV1,
+    /// Exact external verification receipt.
+    pub verification: GovernedInterventionVerificationRefV1,
+}
+
+/// Pure result of applying one authenticated request to one exact state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GovernedInterventionEffectV1 {
+    /// Read-only reconciliation may now query only the bound attempt.
+    Reconcile(VerifiedGovernedInterventionV1),
+    /// An existing authority-safe kernel transition was selected.
+    Transition {
+        /// Exact successor with no newly minted AG authority.
+        successor: OccurrenceSnapshotV1,
+        /// Authenticated intent retained as transition evidence.
+        verified: VerifiedGovernedInterventionV1,
+    },
 }
 
 /// Request to the external human-disposition verifier.
@@ -2445,6 +2686,92 @@ impl GovernedLoopKernelV1 {
         Ok(next)
     }
 
+    /// Authenticates one exact intervention request without granting AG authority.
+    ///
+    /// Authentication answers who requested the intervention and whether the
+    /// deployment-owned verifier recognizes the mandate.  Applicability to a
+    /// campaign state remains a separate kernel check.
+    pub fn verify_governed_intervention<V: GovernedInterventionVerifierV1>(
+        request: GovernedInterventionRequestV1,
+        expected_scope: &GovernedInterventionAuthorityScopeV1,
+        verifier: &mut V,
+        now_unix_ms: u64,
+    ) -> Result<VerifiedGovernedInterventionV1, KernelErrorV1> {
+        request.validate_integrity()?;
+        if request.principal != expected_scope.principal {
+            return Err(KernelErrorV1::Intervention("wrong principal"));
+        }
+        if request.mandate != expected_scope.mandate {
+            return Err(KernelErrorV1::Intervention("wrong mandate"));
+        }
+        if now_unix_ms >= request.expires_at_unix_ms {
+            return Err(KernelErrorV1::Intervention("expired"));
+        }
+        let verification =
+            verifier.verify_governed_intervention(&GovernedInterventionVerificationRequestV1 {
+                request: &request,
+                expected_scope,
+                now_unix_ms,
+            })?;
+        Ok(VerifiedGovernedInterventionV1 {
+            request,
+            verification,
+        })
+    }
+
+    /// Applies authenticated intent only through an existing, closed kernel law.
+    ///
+    /// This function cannot mint standing, an AG authorization, a spend, an
+    /// issuance, Docket custody, or a dispatch.  Reconciliation returns only a
+    /// bound read permission for the engine's read-only Docket port.
+    pub fn apply_verified_governed_intervention(
+        current: &OccurrenceSnapshotV1,
+        verified: VerifiedGovernedInterventionV1,
+    ) -> Result<GovernedInterventionEffectV1, KernelErrorV1> {
+        current.validate_integrity()?;
+        let request = &verified.request;
+        if request.campaign != current.key().campaign {
+            return Err(KernelErrorV1::Intervention("wrong campaign"));
+        }
+        if request.occurrence != current.key().occurrence {
+            return Err(KernelErrorV1::Intervention("wrong occurrence"));
+        }
+        if request.target_state_digest != *current.state_digest() {
+            return Err(KernelErrorV1::Intervention("stale target state"));
+        }
+
+        let successor = match &request.intervention {
+            GovernedInterventionClassV1::ReconcileAttempt {
+                issuance, attempt, ..
+            } => {
+                let OccurrenceStateV1::ReconciliationRequired(state) = current.state() else {
+                    return Err(KernelErrorV1::Intervention(
+                        "reconciliation is not required",
+                    ));
+                };
+                if issuance != &state.dispatch.authorized.issuance.issuance {
+                    return Err(KernelErrorV1::Intervention("wrong issuance"));
+                }
+                if attempt != &state.dispatch.custody.attempt {
+                    return Err(KernelErrorV1::Intervention("wrong attempt"));
+                }
+                return Ok(GovernedInterventionEffectV1::Reconcile(verified));
+            }
+            GovernedInterventionClassV1::RequestProbe { .. } => Self::note_probe(current)?,
+            GovernedInterventionClassV1::OpenSuccessor {
+                successor_occurrence,
+                exact_work,
+            } => Self::open_continuation(current, *successor_occurrence, exact_work.clone())?,
+            GovernedInterventionClassV1::HaltContinuation { reason } => {
+                Self::halt(current, reason.clone())?
+            }
+        };
+        Ok(GovernedInterventionEffectV1::Transition {
+            successor,
+            verified,
+        })
+    }
+
     /// Applies an exactly bound, externally verified, one-use human disposition.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_human_disposition<O, H>(
@@ -2581,6 +2908,13 @@ impl OccurrenceSnapshotV1 {
         self.state.proposal_basis().map(|basis| &basis.proposal)
     }
 
+    /// Returns the proposal's exact occurrence link, when a proposal exists.
+    /// This is provenance only and cannot transfer predecessor authority.
+    #[must_use]
+    pub fn occurrence_link(&self) -> Option<&OccurrenceLinkV1> {
+        self.state.proposal_basis().map(|basis| &basis.link)
+    }
+
     /// Returns the exact historical observation basis, when any.
     #[must_use]
     pub fn observation(&self) -> Option<&ObservationResolutionV2> {
@@ -2657,6 +2991,24 @@ impl OccurrenceSnapshotV1 {
         }
     }
 
+    /// Returns the exact historical standing resolution retained with a
+    /// positive admissibility decision, when one exists.
+    #[must_use]
+    pub fn standing_resolution(&self) -> Option<&CurrentStandingResolutionV2> {
+        match &self.state {
+            OccurrenceStateV1::AdmissiblePendingAuthorization(value) => Some(&value.0.standing),
+            OccurrenceStateV1::AuthorizationConsumed(value) => Some(&value.admitted.standing),
+            OccurrenceStateV1::Dispatched(value) => Some(&value.0.authorized.admitted.standing),
+            OccurrenceStateV1::ReconciliationRequired(value) => {
+                Some(&value.dispatch.authorized.admitted.standing)
+            }
+            OccurrenceStateV1::SettledObservationRequired(value) => {
+                Some(&value.dispatch.authorized.admitted.standing)
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the exact indeterminate record, when reconciliation is required.
     #[must_use]
     pub fn indeterminate(&self) -> Option<&IndeterminateOutcomeV1> {
@@ -2683,6 +3035,15 @@ impl OccurrenceSnapshotV1 {
             _ => None,
         }
     }
+
+    /// Returns terminal completion details, when completed.
+    #[must_use]
+    pub fn completed(&self) -> Option<&CompletedV1> {
+        match &self.state {
+            OccurrenceStateV1::Completed(value) => Some(value),
+            _ => None,
+        }
+    }
 }
 
 impl HaltedV1 {
@@ -2702,6 +3063,20 @@ impl HaltedV1 {
     #[must_use]
     pub const fn unresolved_attempt(&self) -> Option<&DocketAttemptRefV1> {
         self.unresolved_attempt.as_ref()
+    }
+}
+
+impl CompletedV1 {
+    /// Returns the fresh terminal observation recorded at completion.
+    #[must_use]
+    pub const fn terminal_observation(&self) -> &ObservationResolutionV2 {
+        &self.terminal_observation
+    }
+
+    /// Returns the exact external terminal witness.
+    #[must_use]
+    pub const fn terminal_witness(&self) -> &TerminalWitnessRefV1 {
+        &self.terminal_witness
     }
 }
 

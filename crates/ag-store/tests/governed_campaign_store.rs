@@ -6,7 +6,10 @@ use std::sync::{Arc, Barrier};
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::Digest;
-use ag_store::campaign::{CampaignStoreErrorV1, CampaignStoreV1, CampaignTransitionKindV1};
+use ag_store::campaign::{
+    CampaignStoreErrorV1, CampaignStoreV1, CampaignTransitionEvidenceV1, CampaignTransitionKindV1,
+    RUNTIME_PROFILE_DIGEST_DOMAIN_V1,
+};
 
 const NOW: u64 = 20_000;
 /// The resolver identity these tests configure the kernel to expect.
@@ -303,6 +306,43 @@ fn one_transactional_path_replays_and_reconstructs_issuance() {
 }
 
 #[test]
+fn runtime_profile_is_genesis_atomic_and_revalidated_on_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let profile = br#"{"profile_label":"fixture","schema":"ag.governed-loop.runtime-profile/v1"}"#;
+    let store = CampaignStoreV1::create_with_runtime_profile(
+        &database,
+        &start,
+        Some((RUNTIME_PROFILE_DIGEST_DOMAIN_V1, profile)),
+        NOW,
+    )
+    .unwrap();
+    let stored = store.runtime_profile().unwrap().unwrap();
+    assert_eq!(stored.canonical_bytes, profile);
+    drop(store);
+
+    let reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(
+        reopened.runtime_profile().unwrap().unwrap().canonical_bytes,
+        profile
+    );
+    drop(reopened);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let forged = br#"{"profile_label":"forged","schema":"ag.governed-loop.runtime-profile/v1"}"#;
+    let forged_digest = Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, forged).to_string();
+    connection
+        .execute(
+            "UPDATE runtime_profile SET profile_digest=?1, profile_jcs=?2",
+            rusqlite::params![forged_digest, forged],
+        )
+        .unwrap();
+    drop(connection);
+    assert!(CampaignStoreV1::open(&database).is_err());
+}
+
+#[test]
 fn stale_writer_and_duplicate_successor_refuse_without_partial_accounting() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("campaign.sqlite");
@@ -466,4 +506,72 @@ fn restart_refuses_symlink_substitution_for_authoritative_store() {
     drop(CampaignStoreV1::create(&database, &start, NOW).unwrap());
     symlink(&database, &alias).unwrap();
     assert!(CampaignStoreV1::open(&alias).is_err());
+}
+
+fn verified_probe(current: &OccurrenceSnapshotV1, nonce: &str) -> VerifiedGovernedInterventionV1 {
+    VerifiedGovernedInterventionV1 {
+        request: GovernedInterventionRequestV1::new(
+            HumanPrincipalRefV1::from_digest(digest("operator")),
+            MandateRefV1::from_digest(digest("operator-mandate")),
+            GovernedInterventionNonceRefV1::from_digest(digest(nonce)),
+            current.key().campaign.clone(),
+            current.key().occurrence,
+            current.state_digest().clone(),
+            GovernedInterventionClassV1::RequestProbe {
+                exact_probe_work: digest("probe-work"),
+                evidence: vec![],
+            },
+            NOW - 1,
+            NOW + 1_000,
+        )
+        .unwrap(),
+        verification: GovernedInterventionVerificationRefV1::from_digest(digest(
+            "intervention-verification",
+        )),
+    }
+}
+
+#[test]
+fn governed_intervention_evidence_survives_restart_and_conflicting_replay_loses() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let start = initial();
+    let mut store = CampaignStoreV1::create(&database, &start, NOW).unwrap();
+    let successor = GovernedLoopKernelV1::note_probe(&start).unwrap();
+    let accepted = verified_probe(&start, "accepted-nonce");
+    store
+        .commit_governed_intervention(
+            &start,
+            &successor,
+            CampaignTransitionKindV1::ProbeNoted,
+            &accepted,
+            NOW,
+        )
+        .unwrap();
+    drop(store);
+
+    let mut reopened = CampaignStoreV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap(), successor);
+    let history = reopened.history().unwrap();
+    assert!(matches!(
+        &history.transitions[1].evidence,
+        CampaignTransitionEvidenceV1::GovernedIntervention { verified }
+            if verified == &accepted
+    ));
+    assert_eq!(reopened.replay().unwrap().transitions, 2);
+
+    // A second authenticated assertion targeting the same predecessor cannot
+    // consume another probe or replace the canonical relationship after reopen.
+    let conflicting = verified_probe(&start, "conflicting-nonce");
+    assert!(matches!(
+        reopened.commit_governed_intervention(
+            &start,
+            &successor,
+            CampaignTransitionKindV1::ProbeNoted,
+            &conflicting,
+            NOW + 1,
+        ),
+        Err(CampaignStoreErrorV1::StalePredecessor { .. } | CampaignStoreErrorV1::BindingMismatch)
+    ));
+    assert_eq!(reopened.replay().unwrap().transitions, 2);
 }

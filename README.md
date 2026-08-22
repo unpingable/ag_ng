@@ -49,6 +49,31 @@ escalation facts, reconciliation, and authority-safe halt/resume are part of
 that path. The former fixed-stage campaign office is retired; its disposition
 record is retained only as history in
 [`docs/campaign-orchestration-office.md`](docs/campaign-orchestration-office.md).
+The single current ownership, crash, retry, deployment-root, and qualification
+law is [`docs/governed-loop-c1.md`](docs/governed-loop-c1.md).
+Its minimal one-shot-process provisioning, restart matrix, custody assumptions,
+structured inspection surface, and honest physical-environment limits are in
+[`docs/governed-loop-deployment-qualification.md`](docs/governed-loop-deployment-qualification.md).
+The loopback-only read interface is presented as **Phosphor-ng**, with the
+qualified Rust package/binary name `ag-operator-ui`. Its campaign/occurrence
+contract is in [`docs/operator-ui.md`](docs/operator-ui.md); it is a
+canonical-fact projection with no runtime mutation surface. Maude/Phosphor-ng
+roles, vocabulary, semantic deep links, and legacy Phosphor disposition are in
+[`docs/operator-surface-convergence.md`](docs/operator-surface-convergence.md).
+Authenticated operator intent is represented by several exact, narrow request
+classes—never a generic retry—and is specified in
+[`docs/governed-intervention-contract.md`](docs/governed-intervention-contract.md).
+Those records select only existing authority-safe laws and do not themselves
+mint standing or authorization. No browser write surface exists.
+The production loading dock for those records is the authenticated one-shot
+ingress in
+[`docs/governed-intervention-ingress.md`](docs/governed-intervention-ingress.md).
+It preserves exact inspected bytes, binds the configured submitting service
+and target runtime, and returns immutable custody/evaluation receipts.
+Submission is delivery of intent, not authorization.
+For newly authenticated Maude handoffs it also displays Nightshift's separate
+session-issuer/producer custody projection; that ingress fact is explicitly
+not standing or authorization.
 
 This repository does not preserve the classic command, API, database, or
 authority-token surfaces. The Rust-only frozen archive verifier treats classic

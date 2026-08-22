@@ -1,0 +1,1527 @@
+//! Dense server-rendered views over the typed canonical read model.
+
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+use std::path::Path;
+
+use ag_campaign::governed::{OccurrenceSnapshotV1, ProgramCounterV1};
+use ag_primitives::Digest;
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::links::GovernedRuntimeLinkV1;
+use crate::model::{
+    AgInspectV1, CampaignDetailV1, CampaignIndexEntryV1, CampaignIndexV1, DocketInspectionV1,
+    DocketRecordStatusV1, ProjectionCorrespondenceV1, RelatedSourceV1, SourceResultV1,
+};
+use crate::source::selected_snapshot;
+
+const MAX_RENDERED_TRANSITIONS: usize = 500;
+
+/// Shared stylesheet for the local operator console.
+pub const STYLE: &str = r#"
+.campaign>div{min-width:0;overflow-wrap:anywhere}.campaign .k,.campaign .pc{max-width:100%;overflow-wrap:anywhere;word-break:break-word}.campaign .identity a{display:block;overflow-wrap:anywhere;text-decoration:none}.campaign-source{display:block;font:650 .88rem/1.35 ui-sans-serif,system-ui;text-decoration:underline;text-underline-offset:.18em}.campaign-digest{display:block;margin-top:.16rem;color:var(--muted);font-size:.72rem;font-weight:500}.projection-findings{padding:.6rem .7rem}.projection-findings:empty{display:none}
+:root{color-scheme:dark;--bg:#090d12;--surface:#0e141b;--panel:#121a23;--raised:#18222d;--line:#2a3745;--text:#e7edf4;--muted:#95a5b6;--fact:#86d4c8;--projection:#9abdf5;--unknown:#f1c76f;--bad:#ff9b9b;--accent:#c8a7f6;--focus:#72b7ff;--spent:#ff8c79}*{box-sizing:border-box}html{scroll-padding-top:5.5rem}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.48 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}a{color:#9dccff;text-underline-offset:.18em}a:hover{color:#c8e2ff}a:focus-visible,summary:focus-visible{outline:2px solid var(--focus);outline-offset:3px;border-radius:2px}.skip{position:absolute;left:-10000px}.skip:focus{left:.8rem;top:.7rem;z-index:20;background:var(--raised);padding:.5rem}.topbar{position:sticky;top:0;z-index:10;display:flex;gap:1rem;align-items:center;padding:.72rem 1.15rem;background:#0b1017f2;border-bottom:1px solid var(--line);backdrop-filter:blur(8px)}.topbar a{color:var(--text);text-decoration:none}.topbar .mode{margin-left:auto;color:var(--muted);font-size:.78rem}main{max-width:1520px;margin:auto;padding:1.1rem 1.25rem 5rem}h1,h2,h3{font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif}h1{font-size:1.42rem;line-height:1.25;margin:.2rem 0 .35rem;overflow-wrap:anywhere}h2{font-size:1rem;line-height:1.3;margin:0 0 .72rem;color:#f4f7fa}h3{font-size:.88rem;line-height:1.3;margin:1rem 0 .48rem}.lede{max-width:85rem;color:var(--muted);margin:.25rem 0 1rem}.eyebrow{font:700 .7rem/1.2 ui-monospace,SFMono-Regular,monospace;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:.75rem;margin:.75rem 0}.panel{grid-column:span 6;background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:.9rem;min-width:0}.panel.wide,.wide{grid-column:1/-1}.panel.third{grid-column:span 4}.panel.attention{border-color:#795c2d;background:#201a11}.panel.danger{border-color:#804542;background:#231414;box-shadow:inset 3px 0 0 var(--spent)}.panel.unknown-outcome{border-color:#8d6632;background:#241b10;box-shadow:inset 3px 0 0 var(--unknown)}.panel.terminal{border-color:#495766;background:#111820}.summary-strip{display:grid;grid-template-columns:minmax(16rem,1.5fr) minmax(12rem,1fr) minmax(17rem,1.5fr);gap:.7rem;margin:.85rem 0}.summary-cell{background:var(--panel);border:1px solid var(--line);border-radius:7px;padding:.85rem;min-width:0}.summary-cell strong{display:block;font:650 1.02rem/1.35 ui-sans-serif,system-ui;overflow-wrap:anywhere}.summary-cell .k{display:block;overflow-wrap:anywhere}.summary-cell.emphasis{border-color:#775a2b;background:#1e1810}.summary-cell.danger{border-color:#88443e;background:#241313}.kv{display:grid;grid-template-columns:minmax(9.5rem,13rem) minmax(0,1fr);gap:.34rem .8rem}.k{color:var(--muted)}.v{overflow-wrap:anywhere}.fact,.projection,.unknown,.error,.spent,.terminal-badge{display:inline-block;border-radius:999px;padding:.11rem .48rem;font-size:.68rem;font-weight:750;text-transform:uppercase;letter-spacing:.055em;vertical-align:middle}.fact{color:var(--fact);border:1px solid #356b64}.projection{color:var(--projection);border:1px solid #3b587b}.unknown{color:var(--unknown);border:1px solid #715d31}.error{color:var(--bad);border:1px solid #804949}.spent{color:#ffb2a6;border:1px solid #934c43;background:#321815}.terminal-badge{color:#c0cad5;border:1px solid #526172}.pc{font:650 1rem/1.3 ui-sans-serif,system-ui;color:var(--accent);overflow-wrap:anywhere}.localnav,.filters,.occurrence-jumps{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin:.75rem 0}.localnav a,.filters a,.occurrence-jumps a{display:inline-block;padding:.3rem .55rem;border:1px solid var(--line);border-radius:5px;background:var(--surface);text-decoration:none;font-size:.78rem}.filters a[aria-current=true]{border-color:var(--accent);color:var(--text);background:#241b32}.index-head{display:grid;grid-template-columns:minmax(20rem,2fr) minmax(13rem,1.05fr) minmax(16rem,1.25fr) minmax(14rem,1.1fr);gap:.85rem;padding:.55rem .72rem;color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid var(--line)}.campaign-list{background:var(--panel);border:1px solid var(--line);border-radius:7px;overflow:hidden}.campaign{display:grid;grid-template-columns:minmax(20rem,2fr) minmax(13rem,1.05fr) minmax(16rem,1.25fr) minmax(14rem,1.1fr);gap:.85rem;padding:.72rem;border-top:1px solid var(--line);min-width:0}.campaign:first-of-type{border-top:0}.campaign:hover{background:var(--raised)}.campaign .identity{min-width:0}.campaign .identity a{font-family:ui-sans-serif,system-ui;font-weight:650}.campaign .identity .v{font-size:.78rem;color:#bac6d2}.attention-line{margin-top:.35rem}.timeline{list-style:none;padding:0;margin:.2rem 0 0}.occurrence-boundary{display:flex;align-items:center;gap:.65rem;margin:1.15rem 0 .8rem;color:var(--text);font:700 .78rem/1.2 ui-sans-serif,system-ui;text-transform:uppercase;letter-spacing:.06em}.occurrence-boundary:after{content:"";height:1px;background:var(--line);flex:1}.event{position:relative;margin-left:.65rem;padding:0 0 1.05rem 1.55rem;border-left:2px solid #344554;min-width:0}.event:before{content:"";position:absolute;left:-6px;top:.25rem;width:10px;height:10px;border-radius:50%;background:#73869a}.event.current{border-left-color:var(--accent)}.event.current:before{background:var(--accent);box-shadow:0 0 0 4px #c8a7f624}.event.unknown-step:before{background:var(--unknown)}.event.danger-step:before{background:var(--spent)}.event.terminal-step:before{background:#9ba9b7}.event-title{display:flex;gap:.58rem;align-items:baseline;flex-wrap:wrap}.event-title strong{font-family:ui-sans-serif,system-ui}.seq{color:var(--muted)}details{margin-top:.55rem;border-radius:4px}summary{cursor:pointer;color:#b5d4f7;width:fit-content}.raw{margin-top:.6rem;border:1px solid #26313c;background:#090c10;border-radius:6px;overflow:hidden}.raw summary{width:auto;padding:.55rem .7rem;background:#101720}.raw-meta{color:var(--muted);font-size:.75rem}.schema{color:var(--projection)}pre{white-space:pre;overflow:auto;max-height:36rem;margin:0;padding:.75rem;background:#080b0f;color:#d0dae4;font:12px/1.48 ui-monospace,SFMono-Regular,Menlo,monospace;tab-size:2}.source-error{border:1px solid #754043;border-left:4px solid var(--bad);border-radius:5px;padding:.65rem;margin:.6rem 0;background:#211214}.source-error pre{white-space:pre-wrap}.finding{color:var(--muted);margin:.25rem 0;overflow-wrap:anywhere}.residual{padding:.48rem 0;border-top:1px dotted var(--line)}.empty{color:var(--muted);font-style:italic}.mono{font-family:ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere}.note{padding:.55rem .68rem;border-left:3px solid var(--projection);background:#111a24;color:#cbd5df}.count{color:var(--muted);font-size:.78rem}.visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}@media(max-width:1050px){.index-head{display:none}.campaign{grid-template-columns:minmax(17rem,1.4fr) minmax(12rem,1fr)}.panel.third{grid-column:span 6}.summary-strip{grid-template-columns:1fr 1fr}.summary-cell:last-child{grid-column:1/-1}}@media(max-width:920px){.panel,.panel.third{grid-column:1/-1}}@media(max-width:720px){html{scroll-padding-top:1rem}.topbar{position:static;align-items:flex-start;flex-wrap:wrap}.topbar .mode{width:100%;margin:0}.campaign,.summary-strip,.kv{grid-template-columns:1fr}main{padding:.85rem .75rem 4rem}.campaign{gap:.55rem}.event{margin-left:.35rem;padding-left:1.2rem}.localnav{position:static}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}@media print{.topbar,.filters,.localnav{display:none}body{background:#fff;color:#111}.panel,.campaign-list{border-color:#bbb;background:#fff}pre{color:#111;background:#f6f6f6}.fact,.projection,.unknown,.error,.spent{color:#111;border-color:#777}}
+"#;
+
+/// Renders the campaign index from independently captured canonical facts.
+#[must_use]
+pub fn campaign_index(model: &CampaignIndexV1) -> String {
+    campaign_index_with_context(model, "canonical source", "")
+}
+
+/// Renders a filterable index while retaining exact canonical classifications.
+#[must_use]
+pub fn campaign_index_with_context(
+    model: &CampaignIndexV1,
+    source_mode: &str,
+    query: &str,
+) -> String {
+    let view = IndexViewV1::parse(query);
+    let sort = IndexSortV1::parse(query);
+    let mut entries = model
+        .campaigns
+        .iter()
+        .filter(|entry| view.includes(entry))
+        .collect::<Vec<_>>();
+    match sort {
+        IndexSortV1::Recent => entries.sort_by_key(|entry| std::cmp::Reverse(last_sequence(entry))),
+        IndexSortV1::Campaign => entries.sort_by_key(|entry| campaign_sort_key(entry)),
+        IndexSortV1::ProgramCounter => entries.sort_by_key(|entry| {
+            entry.inspect.value().map_or_else(
+                || "unknown".to_owned(),
+                |value| format!("{:?}", value.current.program_counter()),
+            )
+        }),
+    }
+    let mut body = String::new();
+    let _ = write!(
+        body,
+        "<div class=eyebrow>Phosphor-ng / governed-runtime inspector</div><h1>Governed campaigns</h1><p class=lede><span class=projection>projection</span> {}. Canonical states and source problems are shown directly; no aggregate health judgment is computed.</p>",
+        escape(source_mode)
+    );
+    index_controls(&mut body, view, sort, model.campaigns.len(), entries.len());
+    body.push_str("<section class=campaign-list aria-label=\"Campaign projections\"><div class=index-head><span>Campaign store / identity / occurrence</span><span>Current program counter</span><span>Immediate condition</span><span>Last durable fact</span></div>");
+    if entries.is_empty() {
+        body.push_str("<p class=empty>No campaign stores were found in the configured root.</p>");
+    }
+    for entry in entries {
+        body.push_str("<article class=campaign>");
+        if let Some(inspect) = entry.inspect.value() {
+            let link = if source_mode == "deterministic demo corpus" {
+                format!("/campaign/{}", entry.locator_token)
+            } else {
+                snapshot_link(&inspect.current, false).relative_path()
+            };
+            let campaign = inspect.current.key().campaign.as_str();
+            let source_label = campaign_source_label(&entry.locator);
+            let _ = write!(
+                body,
+                "<div class=identity><a href=\"{}\" title=\"Campaign {} · store {}\" aria-label=\"Campaign {}; store {}\"><span class=campaign-source>{}</span><code class=campaign-digest aria-hidden=true>{}</code></a><div class=k>occurrence {}</div></div><div><span class=pc>{}</span><div class=k>{}</div></div><div>{}</div>",
+                escape(&link),
+                escape(campaign),
+                escape(&entry.locator),
+                escape(campaign),
+                escape(&entry.locator),
+                escape(source_label),
+                escape(&compact_campaign_identity(campaign)),
+                escape(&inspect.current.key().occurrence.to_string()),
+                pc(inspect.current.program_counter()),
+                terminal_label(&inspect.current),
+                immediate_condition(&inspect.current)
+            );
+        } else {
+            let _ = write!(
+                body,
+                "<div class=identity><a href=\"/campaign/{}\">{}</a><div class=unknown>unknown</div></div><div>AG inspect unavailable</div><div><span class=unknown>unavailable</span> authoritative occurrence cannot be displayed</div>",
+                escape(&entry.locator_token),
+                escape(&entry.locator)
+            );
+        }
+        let last = entry
+            .history
+            .value()
+            .and_then(|value| value.transitions.last());
+        if let Some(last) = last {
+            let _ = write!(
+                body,
+                "<div><span class=fact>persisted fact</span><div>{:?}</div><div class=k>sequence {} · recorded {}</div>",
+                last.kind, last.sequence, last.recorded_at_unix_ms
+            );
+            if let Some(refusal) = entry
+                .refusals
+                .value()
+                .and_then(|value| value.refusals.last())
+            {
+                let _ = write!(
+                    body,
+                    "<div><span class=error>refusal</span> {:?}</div>",
+                    refusal.outcome.code
+                );
+            }
+            body.push_str("</div>");
+        } else {
+            body.push_str("<div><span class=unknown>unknown</span><div>last durable transition unavailable</div></div>");
+        }
+        body.push_str("</article>");
+    }
+    body.push_str("</section>");
+    page_with_mode("Campaign index", &body, source_mode)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum IndexViewV1 {
+    All,
+    Active,
+    Reconciliation,
+    Human,
+    Terminal,
+    SourceProblem,
+}
+
+impl IndexViewV1 {
+    fn parse(query: &str) -> Self {
+        match query_value(query, "view") {
+            Some("active") => Self::Active,
+            Some("reconciliation") => Self::Reconciliation,
+            Some("human") => Self::Human,
+            Some("terminal") => Self::Terminal,
+            Some("source-problem") => Self::SourceProblem,
+            _ => Self::All,
+        }
+    }
+
+    fn includes(self, entry: &CampaignIndexEntryV1) -> bool {
+        let current = entry.inspect.value().map(|value| &value.current);
+        match self {
+            Self::All => true,
+            Self::Active => current.is_some_and(|value| {
+                !matches!(
+                    value.program_counter(),
+                    ProgramCounterV1::Halted | ProgramCounterV1::Completed
+                )
+            }),
+            Self::Reconciliation => current.is_some_and(|value| {
+                value.program_counter() == ProgramCounterV1::ReconciliationRequired
+            }),
+            Self::Human => {
+                current.is_some_and(|value| value.halted().is_some())
+                    && entry.refusals.value().is_some_and(|value| {
+                        value.refusals.iter().any(|refusal| {
+                            refusal.outcome.code
+                                == ag_campaign::governed::RefusalCodeV1::HumanDecisionRequired
+                        })
+                    })
+            }
+            Self::Terminal => current.is_some_and(|value| {
+                matches!(
+                    value.program_counter(),
+                    ProgramCounterV1::Halted | ProgramCounterV1::Completed
+                )
+            }),
+            Self::SourceProblem => {
+                entry.projection.correspondence != ProjectionCorrespondenceV1::Exact
+            }
+        }
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Reconciliation => "reconciliation",
+            Self::Human => "human",
+            Self::Terminal => "terminal",
+            Self::SourceProblem => "source-problem",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum IndexSortV1 {
+    Recent,
+    Campaign,
+    ProgramCounter,
+}
+
+impl IndexSortV1 {
+    fn parse(query: &str) -> Self {
+        match query_value(query, "sort") {
+            Some("campaign") => Self::Campaign,
+            Some("state") => Self::ProgramCounter,
+            _ => Self::Recent,
+        }
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Campaign => "campaign",
+            Self::ProgramCounter => "state",
+        }
+    }
+}
+
+fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|part| {
+        let (candidate, value) = part.split_once('=')?;
+        (candidate == key).then_some(value)
+    })
+}
+
+fn index_controls(
+    body: &mut String,
+    view: IndexViewV1,
+    sort: IndexSortV1,
+    total: usize,
+    shown: usize,
+) {
+    let mut views = String::new();
+    for (candidate, label) in [
+        (IndexViewV1::All, "all"),
+        (IndexViewV1::Active, "nonterminal"),
+        (IndexViewV1::Reconciliation, "reconciliation"),
+        (IndexViewV1::Human, "human required"),
+        (IndexViewV1::Terminal, "terminal"),
+        (IndexViewV1::SourceProblem, "source problem"),
+    ] {
+        let current = if candidate == view {
+            " aria-current=true"
+        } else {
+            ""
+        };
+        let _ = write!(
+            views,
+            "<a href=\"/?view={}&amp;sort={}\"{current}>{label}</a>",
+            candidate.key(),
+            sort.key()
+        );
+    }
+    let mut sorts = String::new();
+    for (candidate, label) in [
+        (IndexSortV1::Recent, "recent transition"),
+        (IndexSortV1::Campaign, "campaign identity"),
+        (IndexSortV1::ProgramCounter, "program counter"),
+    ] {
+        let current = if candidate == sort {
+            " aria-current=true"
+        } else {
+            ""
+        };
+        let _ = write!(
+            sorts,
+            "<a href=\"/?view={}&amp;sort={}\"{current}>{label}</a>",
+            view.key(),
+            candidate.key()
+        );
+    }
+    let _ = write!(
+        body,
+        "<nav class=filters aria-label=\"Campaign filters\"><span class=eyebrow>Show</span>{views}</nav><nav class=filters aria-label=\"Campaign ordering\"><span class=eyebrow>Order</span>{sorts}<span class=count>showing {shown} of {total}</span></nav>"
+    );
+}
+
+fn last_sequence(entry: &CampaignIndexEntryV1) -> u64 {
+    entry
+        .history
+        .value()
+        .and_then(|value| value.transitions.last())
+        .map_or(0, |transition| transition.recorded_at_unix_ms)
+}
+
+fn campaign_sort_key(entry: &CampaignIndexEntryV1) -> String {
+    entry.inspect.value().map_or_else(
+        || entry.locator.clone(),
+        |value| value.current.key().campaign.as_str().to_owned(),
+    )
+}
+
+/// Renders one end-to-end campaign/occurrence inspection.
+#[must_use]
+pub fn campaign_detail(model: &CampaignDetailV1) -> String {
+    campaign_detail_with_context(model, "canonical source")
+}
+
+/// Renders one campaign with a visible source-mode boundary.
+#[must_use]
+pub fn campaign_detail_with_context(model: &CampaignDetailV1, source_mode: &str) -> String {
+    campaign_detail_selection(model, source_mode, None)
+}
+
+/// Renders the exact historical or current occurrence selected by a semantic
+/// Phosphor-ng link.
+#[must_use]
+pub fn campaign_detail_for_link_with_context(
+    model: &CampaignDetailV1,
+    source_mode: &str,
+    link: &GovernedRuntimeLinkV1,
+) -> String {
+    campaign_detail_selection(model, source_mode, Some(link))
+}
+
+fn campaign_detail_selection(
+    model: &CampaignDetailV1,
+    source_mode: &str,
+    link: Option<&GovernedRuntimeLinkV1>,
+) -> String {
+    let mut body = String::new();
+    let canonical_title = model.inspect.value().map_or_else(
+        || model.locator.clone(),
+        |value| value.current.key().campaign.to_string(),
+    );
+    let title = campaign_source_label(&model.locator);
+    let _ = write!(
+        body,
+        "<div class=eyebrow>Phosphor-ng / governed runtime / selected case</div><h1>{}</h1><p class=lede><span class=projection>projection</span> Campaign <code title=\"{}\">{}</code> · source {}. Independently captured owner sources remain separate; semantic links carry identities, never authority.</p>",
+        escape(title),
+        escape(&canonical_title),
+        escape(&compact_campaign_identity(&canonical_title)),
+        escape(&model.locator)
+    );
+    if let Some(inspect) = model.inspect.value() {
+        let selected = link
+            .and_then(|value| selected_snapshot(model, value))
+            .unwrap_or(&inspect.current);
+        let selected_is_current = selected.state_digest() == inspect.current.state_digest();
+        if link.is_some() && !selected_is_current {
+            let current_link = snapshot_link(&inspect.current, false).relative_path();
+            let _ = write!(
+                body,
+                "<p class=note><span class=fact>historical occurrence</span> This view is pinned to occurrence {} from the verified journal. The campaign's <a href=\"{}\">authoritative current occurrence</a> is {}.</p>",
+                escape(&selected.key().occurrence.to_string()),
+                escape(&current_link),
+                escape(&inspect.current.key().occurrence.to_string())
+            );
+        }
+        quick_orientation(&mut body, selected, selected_is_current);
+        local_navigation(&mut body);
+        projection_panel(&mut body, model);
+        overview(&mut body, inspect, selected, selected_is_current);
+        authority(&mut body, selected);
+        execution(&mut body, selected, &model.docket);
+        timeline(&mut body, model, &inspect.current, selected);
+        evidence(
+            &mut body,
+            selected,
+            &model.nightshift,
+            &model.authoring_contexts,
+            &model.authoring_custody,
+        );
+        refusals(&mut body, &model.refusals);
+        intervention_submissions(&mut body, model.intervention_submissions.as_ref());
+    } else {
+        body.push_str("<section class=panel critical><h2>AG campaign unavailable</h2><p>The authoritative campaign view cannot be rendered. Other source diagnostics and raw captures remain below.</p></section>");
+    }
+    raw_sources(&mut body, model);
+    page_with_mode(&format!("{title} · governed case"), &body, source_mode)
+}
+
+fn quick_orientation(body: &mut String, current: &OccurrenceSnapshotV1, selected_is_current: bool) {
+    let meta = current.state().meta();
+    let class = match current.program_counter() {
+        ProgramCounterV1::AuthorizationConsumed => " danger",
+        ProgramCounterV1::Dispatched | ProgramCounterV1::ReconciliationRequired => " emphasis",
+        _ => "",
+    };
+    let _ = write!(
+        body,
+        "<section class=summary-strip aria-label=\"Selected occurrence summary\"><div class=summary-cell><span class=eyebrow>{}</span><strong>{}</strong><span class=k>{}</span></div><div class=summary-cell><span class=eyebrow>Program counter</span><strong class=pc>{}</strong><span class=k>{}</span></div><div class=\"summary-cell{}\"><span class=eyebrow>Immediate condition</span><strong>{}</strong></div></section>",
+        if selected_is_current {
+            "Authoritative current occurrence"
+        } else {
+            "Selected historical occurrence"
+        },
+        escape(&current.key().occurrence.to_string()),
+        escape(current.key().campaign.as_str()),
+        pc(current.program_counter()),
+        escape(meta.expected_work().as_str()),
+        class,
+        immediate_condition(current)
+    );
+}
+
+fn local_navigation(body: &mut String) {
+    body.push_str("<nav class=localnav aria-label=\"Available read-only inspections\"><span class=eyebrow>Available inspections</span><a href=#overview>orient this occurrence</a><a href=#authority>inspect authority</a><a href=#execution>inspect execution</a><a href=#timeline>trace history</a><a href=#evidence>inspect evidence</a><a href=#refusals>inspect refusals</a><a href=#intervention-submissions>inspect submitted intent</a><a href=#raw>verify raw owner facts</a></nav>");
+}
+
+fn refusals(
+    body: &mut String,
+    source: &SourceResultV1<ag_store::campaign::CampaignRefusalHistoryV1>,
+) {
+    body.push_str("<section id=refusals class=\"panel wide\"><h2>Durable refusals <span class=fact>non-authorizing facts</span></h2>");
+    match source {
+        SourceResultV1::Available { value, .. } if value.refusals.is_empty() => {
+            body.push_str("<p class=empty>No durable refusal is recorded.</p>");
+        }
+        SourceResultV1::Available { value, .. } => {
+            for refusal in &value.refusals {
+                let _ = write!(
+                    body,
+                    "<article class=residual><div class=kv>{}{}{}{}{}{}</div>{}",
+                    kv("refusal", refusal.refusal.as_str()),
+                    kv("code", &format!("{:?}", refusal.outcome.code)),
+                    kv("campaign", refusal.outcome.key.campaign.as_str()),
+                    kv("occurrence", &refusal.outcome.key.occurrence.to_string()),
+                    kv("at state", refusal.outcome.at_state_digest.as_str()),
+                    kv("recorded at", &refusal.recorded_at_unix_ms.to_string()),
+                    raw_details("canonical refusal", refusal)
+                );
+                if let Some(verified) = &refusal.outcome.governed_intervention {
+                    let _ = write!(
+                        body,
+                        "<p class=attention-line><span class=error>intervention refused</span> {} — authenticated intent created no transition or authority</p>",
+                        intervention_summary(verified)
+                    );
+                }
+                body.push_str("</article>");
+            }
+        }
+        SourceResultV1::Unavailable { .. } => source_summary(body, source),
+    }
+    body.push_str("<p class=k>A refusal records why authority was not created; it is never an authorization.</p></section>");
+}
+
+fn intervention_submissions(
+    body: &mut String,
+    source: Option<&SourceResultV1<crate::model::InterventionSubmissionHistoryProjectionV1>>,
+) {
+    body.push_str("<section id=intervention-submissions class=\"panel wide\"><h2>Intervention submission custody <span class=projection>delivery is not authorization</span></h2>");
+    match source {
+        None => body.push_str("<p class=unknown>not recorded</p><p class=k>This campaign projection predates the canonical ingress receipt source.</p>"),
+        Some(SourceResultV1::Available { value, .. }) if value.receipts.is_empty() => {
+            body.push_str("<p class=empty>No authenticated intervention submission receipt is recorded.</p>");
+        }
+        Some(SourceResultV1::Available { value, .. }) => {
+            for receipt in &value.receipts {
+                let status = receipt.result.get("status").and_then(Value::as_str).unwrap_or("unknown");
+                let _ = write!(
+                    body,
+                    "<article class=receipt><h3>{}</h3><div class=kv>{}{}{}{}{}{}</div>{}</article>",
+                    escape(status),
+                    kv("receipt", receipt.receipt.as_str()),
+                    kv("submission", receipt.submission.as_ref().map_or("unknown", Digest::as_str)),
+                    kv("request", receipt.request.as_ref().map_or("unknown", Digest::as_str)),
+                    kv("submitter", receipt.submitting_principal.as_deref().unwrap_or("unknown")),
+                    kv("target runtime", receipt.target_runtime_profile.as_ref().map_or("unknown", Digest::as_str)),
+                    kv("recorded at", &receipt.recorded_at_unix_ms.to_string()),
+                    raw_details("canonical ingress receipt", receipt),
+                );
+            }
+        }
+        Some(unavailable @ SourceResultV1::Unavailable { .. }) => {
+            source_summary(body, unavailable);
+        }
+    }
+    body.push_str("<p class=k>Received, governed accepted/refused, and outcome unknown are distinct owner facts. None is an AG authorization or execution receipt.</p></section>");
+}
+
+fn projection_panel(body: &mut String, model: &CampaignDetailV1) {
+    projection_panel_for(
+        body,
+        model.projection.correspondence,
+        &model.projection.findings,
+    );
+}
+
+fn projection_panel_for(
+    body: &mut String,
+    correspondence: ProjectionCorrespondenceV1,
+    findings: &[String],
+) {
+    let class = match correspondence {
+        ProjectionCorrespondenceV1::Exact => "projection",
+        ProjectionCorrespondenceV1::Partial => "unknown",
+        ProjectionCorrespondenceV1::Disagreement => "error",
+    };
+    let _ = write!(
+        body,
+        "<details class=\"raw projection-evidence\"{}><summary>Projection correspondence <span class={class}>{:?}</span> <span class=raw-meta>exact owner-source comparison</span></summary><div class=projection-findings>",
+        if correspondence == ProjectionCorrespondenceV1::Exact {
+            ""
+        } else {
+            " open"
+        },
+        correspondence
+    );
+    for finding in findings {
+        let _ = write!(body, "<p class=finding>{}</p>", escape(finding));
+    }
+    body.push_str("</div></details>");
+}
+
+fn overview(
+    body: &mut String,
+    inspect: &AgInspectV1,
+    current: &OccurrenceSnapshotV1,
+    selected_is_current: bool,
+) {
+    let meta = current.state().meta();
+    let _ = write!(
+        body,
+        "<div id=overview class=grid><section class=panel><h2>{}</h2><div class=kv>{}{}{}{}{}</div></section><section class=panel><h2>Runtime and exact work</h2><div class=kv>{}{}{}{}{}</div></section><section class=panel><h2>Bounded continuation</h2><div class=kv>{}</div></section><section class=panel><h2>Residual work</h2>",
+        if selected_is_current {
+            "Authoritative coordinates"
+        } else {
+            "Selected historical coordinates"
+        },
+        kv("campaign", current.key().campaign.as_str()),
+        kv("occurrence", &current.key().occurrence.to_string()),
+        kv(
+            "program counter",
+            &format!("{:?}", current.program_counter())
+        ),
+        kv("state digest", current.state_digest().as_str()),
+        kv("terminal disposition", &terminal_label(current)),
+        kv("profile schema", &inspect.runtime_profile.schema),
+        kv("profile digest", inspect.runtime_profile.digest.as_str()),
+        kv("program", meta.program().as_str()),
+        kv("expected exact work", meta.expected_work().as_str()),
+        kv(
+            "consumed human decisions",
+            &meta
+                .used_human_decisions()
+                .iter()
+                .map(ag_campaign::governed::HumanDecisionIdV1::as_str)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        budget_html(meta.budget())
+    );
+    if meta.residuals().is_empty() {
+        body.push_str("<p class=empty>Canonical residual set is empty.</p>");
+    } else {
+        for residual in meta.residuals().as_slice() {
+            let _ = write!(
+                body,
+                "<div class=residual>{}{}{}</div>",
+                kv("residual", residual.residual.as_str()),
+                kv("owner", residual.owner.as_str()),
+                kv("statement", residual.statement.as_str())
+            );
+        }
+    }
+    if let Some(prior) = current.prior_occurrence() {
+        let _ = write!(
+            body,
+            "<h3>Predecessor occurrence</h3><div class=kv>{}{}{}</div>",
+            kv("occurrence", &prior.key.occurrence.to_string()),
+            kv("state digest", prior.state_digest.as_str()),
+            kv(
+                "prior proposal",
+                prior
+                    .proposal
+                    .as_ref()
+                    .map_or("unknown", |value| value.as_str())
+            )
+        );
+    }
+    body.push_str("</section></div>");
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear verified-journal rendering keeps occurrence boundaries and refusal adjacency visible"
+)]
+fn timeline(
+    body: &mut String,
+    model: &CampaignDetailV1,
+    current: &OccurrenceSnapshotV1,
+    selected: &OccurrenceSnapshotV1,
+) {
+    body.push_str(
+        "<section id=timeline class=\"panel wide\"><h2>Governed transition timeline</h2>",
+    );
+    if let Some(history) = model.history.value() {
+        let first_rendered = history
+            .transitions
+            .len()
+            .saturating_sub(MAX_RENDERED_TRANSITIONS);
+        let rendered = &history.transitions[first_rendered..];
+        if first_rendered > 0 {
+            let _ = write!(
+                body,
+                "<p class=note><span class=projection>bounded view</span> showing the most recent {} of {} verified transitions. The complete owner response remains under raw sources.</p>",
+                rendered.len(),
+                history.transitions.len()
+            );
+        }
+        let occurrences = rendered
+            .iter()
+            .map(|transition| transition.successor.key().occurrence.to_string())
+            .collect::<BTreeSet<_>>();
+        body.push_str("<nav class=occurrence-jumps aria-label=\"Occurrence jumps\"><span class=eyebrow>Occurrences</span>");
+        for occurrence in &occurrences {
+            let _ = write!(
+                body,
+                "<a href=\"#occurrence-{}\">{}</a>",
+                escape(occurrence),
+                escape(occurrence)
+            );
+        }
+        body.push_str("</nav><p class=lede>Journal order is authoritative. Missing transitions are not inferred. Occurrence boundaries mark fresh governed continuation.</p><ol class=timeline>");
+        let mut prior_occurrence: Option<String> = None;
+        for transition in rendered {
+            let is_current = transition.successor_state_digest == *current.state_digest();
+            let is_selected = transition.successor_state_digest == *selected.state_digest();
+            let occurrence = transition.successor.key().occurrence.to_string();
+            if prior_occurrence.as_deref() != Some(occurrence.as_str()) {
+                let predecessor = transition.successor.prior_occurrence();
+                let occurrence_link = snapshot_link(&transition.successor, false).relative_path();
+                let _ = write!(
+                    body,
+                    "<li id=\"occurrence-{}\" class=occurrence-boundary>Occurrence {}{} <a href=\"{}\">open exact occurrence</a></li>",
+                    escape(&occurrence),
+                    escape(&occurrence),
+                    predecessor.map_or_else(String::new, |prior| format!(
+                        " <span class=k>successor of {}</span>",
+                        escape(&prior.key.occurrence.to_string())
+                    )),
+                    escape(&occurrence_link)
+                );
+                prior_occurrence = Some(occurrence.clone());
+            }
+            let counter = transition.successor.program_counter();
+            let current_attr = if is_current { " aria-current=step" } else { "" };
+            let _ = write!(
+                body,
+                "<li id=transition-{} class=\"event{} {}\"{}><div class=event-title><a class=seq href=\"#transition-{}\">#{}</a><strong>{:?}</strong><span class=pc>{:?}</span><span class=fact>persisted fact</span>{}{}</div><div class=k>occurrence {} · recorded {} · state {}</div>{}",
+                transition.sequence,
+                if is_current { " current" } else { "" },
+                state_tone_class(counter),
+                current_attr,
+                transition.sequence,
+                transition.sequence,
+                transition.kind,
+                counter,
+                if is_current {
+                    "<span class=projection>authoritative now</span>"
+                } else {
+                    ""
+                },
+                if is_selected && !is_current {
+                    "<span class=fact>selected historical state</span>"
+                } else {
+                    ""
+                },
+                escape(&occurrence),
+                transition.recorded_at_unix_ms,
+                escape(transition.successor_state_digest.as_str()),
+                raw_details("canonical transition", transition)
+            );
+            if let ag_store::campaign::CampaignTransitionEvidenceV1::GovernedIntervention {
+                verified,
+            } = &transition.evidence
+            {
+                let _ = write!(
+                    body,
+                    "<div class=attention-line><span class=projection>operator intent</span> {} — authenticated request evidence, not authorization</div>",
+                    intervention_summary(verified)
+                );
+            }
+            if let Some(refusals) = model.refusals.value() {
+                for refusal in refusals.refusals.iter().filter(|refusal| {
+                    refusal.outcome.at_state_digest == transition.successor_state_digest
+                }) {
+                    let _ = write!(
+                        body,
+                        "<div class=attention-line><span class=error>refusal</span> {:?} — no transition or authority was created</div>",
+                        refusal.outcome.code
+                    );
+                }
+            }
+            body.push_str("</li>");
+        }
+        body.push_str("</ol>");
+    } else {
+        body.push_str("<p><span class=unknown>unknown</span> AG history unavailable; no timeline was reconstructed from current fields.</p>");
+    }
+    body.push_str("</section>");
+}
+
+fn intervention_summary(
+    verified: &ag_campaign::governed::VerifiedGovernedInterventionV1,
+) -> String {
+    use ag_campaign::governed::GovernedInterventionClassV1 as I;
+    let target = match &verified.request.intervention {
+        I::ReconcileAttempt {
+            issuance, attempt, ..
+        } => format!("reconcile issuance {issuance} / attempt {attempt}"),
+        I::RequestProbe {
+            exact_probe_work, ..
+        } => format!("request bounded read-only probe {exact_probe_work}"),
+        I::OpenSuccessor {
+            successor_occurrence,
+            exact_work,
+        } => format!("open successor {successor_occurrence} for exact work {exact_work}"),
+        I::HaltContinuation { reason } => format!("halt continuation: {reason}"),
+    };
+    format!(
+        "{} · request {} · principal {} · target occurrence {}",
+        escape(&target),
+        escape(verified.request.request.as_str()),
+        escape(verified.request.principal.as_str()),
+        escape(&verified.request.occurrence.to_string())
+    )
+}
+
+fn evidence(
+    body: &mut String,
+    current: &OccurrenceSnapshotV1,
+    nightshift: &[RelatedSourceV1<crate::model::NightshiftObservationExportV1>],
+    authoring_contexts: &[RelatedSourceV1<crate::model::NightshiftAuthoringContextExportV1>],
+    authoring_custody: &[RelatedSourceV1<crate::model::NightshiftAuthoringCustodyExportV1>],
+) {
+    body.push_str(
+        "<div id=evidence class=grid><section class=panel><h2>Evidence and proposal</h2>",
+    );
+    let observation = current.observation().or_else(|| {
+        current
+            .completed()
+            .map(ag_campaign::governed::CompletedV1::terminal_observation)
+    });
+    if let Some(observation) = observation {
+        let _ = write!(
+            body,
+            "<h3>Observation <span class=fact>canonical projection</span></h3><div class=kv>{}{}{}{}{}{}{}{}</div>",
+            kv("identity", observation.observation.as_str()),
+            kv("status", &format!("{:?}", observation.status)),
+            kv("currentness", observation.currentness.as_str()),
+            kv("resolver", &observation.resolver_id),
+            kv("resolved at", &observation.resolved_at_unix_ms.to_string()),
+            kv(
+                "fresh until (exclusive)",
+                &observation.fresh_until_unix_ms.to_string()
+            ),
+            kv(
+                "basis digest",
+                observation.normalized_preconditions.as_str()
+            ),
+            kv(
+                "basis atoms",
+                &observation
+                    .basis
+                    .atoms
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        );
+    } else {
+        body.push_str("<p><span class=unknown>unknown</span> No observation basis exists in this program-counter state.</p>");
+    }
+    if let Some(proposal) = current.proposal() {
+        let permalink = snapshot_link(current, true).relative_path();
+        let permalink_row = format!(
+            "<div class=k>semantic permalink</div><div class=v><a href=\"{}\">campaign + occurrence + proposal</a></div>",
+            escape(&permalink)
+        );
+        let _ = write!(
+            body,
+            "<h3>Exact-work proposal <span class=fact>canonical persisted fact</span></h3><div class=kv>{}{}{}{}{}{}{}{}</div>",
+            kv("proposal", proposal.reference().as_str()),
+            kv(
+                "occurrence link",
+                &current
+                    .occurrence_link()
+                    .map_or_else(|| "unknown".to_owned(), |value| format!("{value:?}")),
+            ),
+            kv("work schema", proposal.work_schema()),
+            kv("work", proposal.work().as_str()),
+            kv(
+                "expected work",
+                current.state().meta().expected_work().as_str()
+            ),
+            kv("subject", proposal.subject().as_str()),
+            kv("scope", proposal.scope().as_str()),
+            permalink_row
+        );
+        authoring_context(
+            body,
+            current,
+            proposal.reference().as_str(),
+            authoring_contexts,
+            authoring_custody,
+        );
+    } else {
+        body.push_str("<p class=empty>No proposal has been recorded for the selected state. No Maude authoring link can be constructed.</p>");
+    }
+    body.push_str("</section><section class=panel><h2>Nightshift provenance</h2>");
+    if nightshift.is_empty() {
+        body.push_str("<p><span class=unknown>unknown</span> No observation lookup identity is available.</p>");
+    }
+    for related in nightshift {
+        let _ = write!(body, "<h3>{}</h3>", escape(&related.identity));
+        source_summary(body, &related.result);
+    }
+    body.push_str("<p class=k>Propagated NQ admission fields are displayed only inside Nightshift’s canonical raw record; this UI does not reinterpret admission.</p></section></div>");
+}
+
+fn authoring_context(
+    body: &mut String,
+    current: &OccurrenceSnapshotV1,
+    proposal_id: &str,
+    related: &[RelatedSourceV1<crate::model::NightshiftAuthoringContextExportV1>],
+    custody_related: &[RelatedSourceV1<crate::model::NightshiftAuthoringCustodyExportV1>],
+) {
+    use crate::model::NightshiftAuthoringContextQueryV1;
+
+    let campaign = current.key().campaign.as_str();
+    let occurrence = current.key().occurrence.to_string();
+    let identity = format!("{campaign}/{occurrence}");
+    let source = related.iter().find(|source| {
+        source.result.value().is_some_and(|export| {
+            matches!(
+                &export.query,
+                NightshiftAuthoringContextQueryV1::GovernedOccurrence {
+                    campaign_id,
+                    occurrence_id,
+                } if campaign_id == campaign && occurrence_id == &occurrence
+            )
+        }) || source.identity == identity
+    });
+    let Some(source) = source else {
+        body.push_str("<p class=k><span class=unknown>authoring context unavailable</span> No owner-side lookup was captured for this exact occurrence. No Maude relation is inferred.</p>");
+        return;
+    };
+    let SourceResultV1::Available { value, .. } = &source.result else {
+        body.push_str("<p class=k><span class=unknown>authoring context unavailable</span> The canonical Nightshift lookup failed; source diagnostics remain in raw data.</p>");
+        return;
+    };
+    match value.matches.as_slice() {
+        [] => body.push_str("<p class=k><span class=unknown>authoring context not recorded</span> This occurrence is honestly unlinked; Phosphor-ng does not inherit or infer a predecessor context.</p>"),
+        [record]
+            if record
+                .validate_for_governed_relationship(
+                    campaign,
+                    &occurrence,
+                    proposal_id,
+                    current.state().meta().expected_work().as_str(),
+                )
+                .is_ok() =>
+        {
+            let _ = write!(
+                body,
+                "<h3>Authoring context <span class=fact>canonical Nightshift lineage</span></h3><div class=kv>{}{}{}{}{}{}</div><p class=k>Lineage, not permission. No stable Maude browser address is recorded, so this inspector shows exact context rather than fabricating a backlink.</p>",
+                kv("provenance", &record.provenance_id),
+                kv("Maude plan", &record.maude_plan_ref),
+                kv("Maude session", &record.maude_session_id),
+                kv("proposal binding", &record.proposal_id),
+                kv("exact work binding", &record.exact_work_id),
+                kv("handoff recorded", &record.recorded_at),
+            );
+            authoring_custody(
+                body,
+                record,
+                campaign,
+                &occurrence,
+                proposal_id,
+                current.state().meta().expected_work().as_str(),
+                custody_related,
+            );
+        }
+        [_] => body.push_str("<p class=source-error><span class=error>projection disagreement</span> Nightshift returned an authoring relation for this occurrence, but its proposal/work binding does not match the selected canonical AG state. No backlink was emitted.</p>"),
+        records => {
+            let _ = write!(
+                body,
+                "<p class=source-error><span class=error>ambiguous owner relation</span> Nightshift returned {} authoring records for one governed occurrence. No backlink was emitted.</p>",
+                records.len()
+            );
+        }
+    }
+}
+
+fn authoring_custody(
+    body: &mut String,
+    authoring: &crate::model::NightshiftAuthoringContextProvenanceV1,
+    campaign: &str,
+    occurrence: &str,
+    proposal: &str,
+    exact_work: &str,
+    related: &[RelatedSourceV1<crate::model::NightshiftAuthoringCustodyExportV1>],
+) {
+    let identity = format!("{campaign}/{occurrence}");
+    let Some(source) = related.iter().find(|source| source.identity == identity) else {
+        body.push_str("<p class=k><span class=unknown>producer custody unavailable</span> No custody lookup was captured. Lineage remains visible, but producer authentication is unknown.</p>");
+        return;
+    };
+    let SourceResultV1::Available { value, .. } = &source.result else {
+        body.push_str("<p class=k><span class=unknown>producer custody unavailable</span> The canonical Nightshift custody lookup failed; diagnostics remain in raw data.</p>");
+        return;
+    };
+    match value.matches.as_slice() {
+        [] => body.push_str("<p class=k><span class=unknown>custody not recorded</span> This is historical/unlinked custody state. Authentication is not inferred and lineage does not become authority.</p>"),
+        [custody]
+            if custody
+                .validate_for_relationship(
+                    authoring,
+                    campaign,
+                    occurrence,
+                    proposal,
+                    exact_work,
+                )
+                .is_ok() =>
+        {
+            let _ = write!(
+                body,
+                "<h3>Handoff custody <span class=fact>authenticated at ingress</span></h3><div class=kv>{}{}{}{}{}{}{}{}{}{}</div><p class=k>The session issuer binds the supervised session to exact plan bytes; the distinct handoff producer binds that receipt to the exact Nightshift request. Authentication establishes custody, not permission.</p>",
+                kv("custody record", &custody.custody_id),
+                kv("handoff", &custody.handoff_id),
+                kv("session receipt", &custody.session_record_id),
+                kv("session issuer", &custody.session_issuer_principal_id),
+                kv("session issuer key", &custody.session_issuer_key_id),
+                kv("producer principal", &custody.producer_principal_id),
+                kv("producer key", &custody.producer_key_id),
+                kv("target Nightshift", &custody.target_runtime_id),
+                kv("authentication", &custody.authentication_method),
+                kv("recorded at (cycle time)", &custody.recorded_at),
+            );
+        }
+        [_] => body.push_str("<p class=source-error><span class=error>custody disagreement</span> Nightshift returned custody that does not bind the selected lineage/proposal/work. It is not presented as authenticated.</p>"),
+        records => {
+            let _ = write!(
+                body,
+                "<p class=source-error><span class=error>ambiguous custody</span> Nightshift returned {} custody records for one occurrence.</p>",
+                records.len()
+            );
+        }
+    }
+}
+
+fn authority(body: &mut String, current: &OccurrenceSnapshotV1) {
+    body.push_str(
+        "<div id=authority class=grid><section class=panel><h2>Standing and admissibility</h2>",
+    );
+    if let Some(standing) = current.standing_resolution() {
+        let _ = write!(
+            body,
+            "<div class=kv>{}{}{}{}{}{}{}</div>",
+            kv("standing status", &format!("{:?}", standing.status)),
+            kv("resolution", standing.resolution.as_str()),
+            kv("currentness", standing.currentness.as_str()),
+            kv("mandate", standing.mandate.as_str()),
+            kv("resolver", &standing.resolver_id),
+            kv("resolved at", &standing.resolved_at_unix_ms.to_string()),
+            kv(
+                "expires at (exclusive)",
+                &standing.expires_at_unix_ms.to_string()
+            )
+        );
+    } else {
+        body.push_str("<p><span class=unknown>unknown</span> No standing resolution is retained in this state.</p>");
+    }
+    if let Some(decision) = current.admission_decision() {
+        let _ = write!(
+            body,
+            "<h3>Admissibility</h3><div class=kv>{}{}{}{}</div>",
+            kv("disposition", &format!("{:?}", decision.disposition)),
+            kv("decision", decision.decision.as_str()),
+            kv("policy basis", decision.policy_basis.as_str()),
+            kv("proposal", decision.proposal.as_str())
+        );
+    } else {
+        body.push_str("<p class=empty>No admissibility decision exists in this state.</p>");
+    }
+    authority_lifecycle(body, current);
+    body.push_str("</section></div>");
+}
+
+fn authority_lifecycle(body: &mut String, current: &OccurrenceSnapshotV1) {
+    let authority_tone =
+        if current.ag_spend().is_some() || current.state().authority_history().ag_spend.is_some() {
+            " danger"
+        } else {
+            ""
+        };
+    let _ = write!(
+        body,
+        "</section><section class=\"panel{authority_tone}\"><h2>AG authority lifecycle</h2>"
+    );
+    let retained = current.state().authority_history();
+    match current.program_counter() {
+        ProgramCounterV1::AdmissiblePendingAuthorization => body.push_str("<p><span class=projection>pending</span> Exact work is admissible, but no AG authorization has been spent.</p>"),
+        ProgramCounterV1::AuthorizationConsumed => body.push_str("<p class=note><span class=spent>consumed</span> Authorization is spent and cannot be reused. Issuance is durable. AG does not report Docket custody or dispatch yet.</p>"),
+        ProgramCounterV1::Dispatched | ProgramCounterV1::ReconciliationRequired | ProgramCounterV1::SettledObservationRequired => body.push_str("<p><span class=spent>consumed</span> Authorization is historical evidence only; it is not available.</p>"),
+        ProgramCounterV1::Halted | ProgramCounterV1::Completed if retained.ag_spend.is_some() => body.push_str("<p><span class=spent>consumed</span> Terminal state retains historical authority identities only; none is available.</p>"),
+        _ if current.ag_spend().is_none() => body.push_str("<p><span class=unknown>none</span> No AG authorization spend exists in this state.</p>"),
+        _ => body.push_str("<p><span class=spent>consumed</span> Retained authority history is not reusable.</p>"),
+    }
+    if let Some(spend) = current.ag_spend() {
+        let _ = write!(
+            body,
+            "<div class=kv>{}{}{}{}{}{}</div>",
+            kv("authorization", spend.authorization.as_str()),
+            kv("spend", spend.spend.as_str()),
+            kv("occurrence", &spend.key.occurrence.to_string()),
+            kv("proposal", spend.proposal.as_str()),
+            kv("observation", spend.observation.as_str()),
+            kv("consumed at", &spend.consumed_at_unix_ms.to_string())
+        );
+    }
+    if let Some(issuance) = current.issuance() {
+        let _ = write!(
+            body,
+            "<h3>Durable issuance</h3><div class=kv>{}{}{}{}{}</div>",
+            kv("issuance", issuance.issuance.as_str()),
+            kv("work", issuance.work.as_str()),
+            kv("work schema", &issuance.work_schema),
+            kv("subject", issuance.subject.as_str()),
+            kv("scope", issuance.scope.as_str())
+        );
+    }
+    if current.ag_spend().is_none() && retained.ag_spend.is_some() {
+        let _ = write!(
+            body,
+            "<h3>Terminal authority history</h3><div class=kv>{}{}{}{}{}</div>",
+            kv(
+                "AG spend",
+                retained
+                    .ag_spend
+                    .as_ref()
+                    .map_or("unknown", |value| value.as_str())
+            ),
+            kv(
+                "Docket attempt",
+                retained
+                    .docket_attempt
+                    .as_ref()
+                    .map_or("unknown", |value| value.as_str())
+            ),
+            kv(
+                "settlement",
+                retained
+                    .settlement
+                    .as_ref()
+                    .map_or("unknown", |value| value.as_str())
+            ),
+            kv(
+                "receipt",
+                retained
+                    .receipt
+                    .as_ref()
+                    .map_or("unknown", |value| value.as_str())
+            ),
+            kv("authority availability", "consumed / not available")
+        );
+    }
+}
+
+fn execution(
+    body: &mut String,
+    current: &OccurrenceSnapshotV1,
+    docket: &[RelatedSourceV1<DocketInspectionV1>],
+) {
+    let tone = match current.program_counter() {
+        ProgramCounterV1::Dispatched => " unknown-outcome",
+        ProgramCounterV1::ReconciliationRequired => " danger",
+        _ => "",
+    };
+    let _ = write!(
+        body,
+        "<section id=execution class=\"panel wide{tone}\"><h2>Docket custody and outcome</h2>"
+    );
+    if let Some(custody) = current.docket_custody() {
+        let _ = write!(
+            body,
+            "<p><span class=fact>custody accepted</span> Docket owns the one attempt.</p><div class=kv>{}{}{}{}{}{}</div>",
+            kv("issuance", custody.issuance.as_str()),
+            kv("attempt", custody.attempt.as_str()),
+            kv("executor marker", custody.executor_marker.as_str()),
+            kv("execution standing", custody.execution_standing.as_str()),
+            kv(
+                "standing currentness",
+                custody.standing_currentness.as_str()
+            ),
+            kv("accepted at", &custody.accepted_at_unix_ms.to_string())
+        );
+    } else {
+        body.push_str("<p><span class=unknown>unknown/not present</span> No Docket custody fact exists in AG’s current snapshot.</p>");
+    }
+    match current.program_counter() {
+        ProgramCounterV1::Dispatched => body.push_str("<p class=note><span class=unknown>outcome unknown</span> Docket custody exists and mechanics may have occurred. AG has no settlement. Absence of a receipt is not failure, and repeat dispatch is not available.</p>"),
+        ProgramCounterV1::ReconciliationRequired => body.push_str("<p class=note><span class=error>reconciliation required</span> Effect outcome is indeterminate. Repeat dispatch is not authorized. Exact issuance, attempt, and evidence appear below.</p>"),
+        ProgramCounterV1::SettledObservationRequired => body.push_str("<p class=note><span class=fact>settled</span> The prior occurrence outcome is known. Settlement does not authorize continuation; a fresh independent observation is required.</p>"),
+        _ => {}
+    }
+    if let Some(indeterminate) = current.indeterminate() {
+        let _ = write!(
+            body,
+            "<div class=kv>{}{}{}</div>",
+            kv("reconciliation", indeterminate.reconciliation.as_str()),
+            kv("attempt", indeterminate.attempt.as_str()),
+            kv("evidence", indeterminate.evidence.as_str())
+        );
+    }
+    if let Some(settlement) = current.settlement() {
+        let _ = write!(
+            body,
+            "<div class=kv>{}{}{}{}{}</div>",
+            kv("settlement", settlement.settlement.as_str()),
+            kv("outcome", &format!("{:?}", settlement.outcome)),
+            kv("receipt", settlement.receipt.as_str()),
+            kv("attempt", settlement.attempt.as_str()),
+            kv("settled at", &settlement.settled_at_unix_ms.to_string())
+        );
+    }
+    for related in docket {
+        let _ = write!(
+            body,
+            "<h3>Docket source: {}</h3>",
+            escape(&related.identity)
+        );
+        match &related.result {
+            SourceResultV1::Available { value, .. } => {
+                if let Some(record) = &value.record {
+                    let status = match record.status {
+                        DocketRecordStatusV1::Accepted => "accepted — outcome unknown",
+                        DocketRecordStatusV1::Settled => "settled — known outcome",
+                        DocketRecordStatusV1::Indeterminate => {
+                            "indeterminate — reconciliation required"
+                        }
+                    };
+                    let _ = write!(
+                        body,
+                        "<div class=kv>{}{}{}{}{}</div>",
+                        kv("Docket record", status),
+                        kv("issuer principal", &record.authentication.issuer_principal),
+                        kv("signer key", &record.authentication.signer_key_id),
+                        kv("executor binding", &record.executor_binding),
+                        kv("executor program", &record.executor_program_digest)
+                    );
+                } else {
+                    body.push_str("<p><span class=fact>canonical fact</span> Docket reports no accepted custody for this issuance.</p>");
+                }
+            }
+            SourceResultV1::Unavailable { .. } => source_summary(body, &related.result),
+        }
+    }
+    body.push_str("</section>");
+}
+
+fn raw_sources(body: &mut String, model: &CampaignDetailV1) {
+    body.push_str("<section id=raw class=\"panel wide\"><h2>Raw canonical data and source diagnostics</h2><p class=note>These are the complete bounded owner responses used above. Expand a source to verify what the owner actually said.</p>");
+    source_summary(body, &model.inspect);
+    source_summary(body, &model.status);
+    source_summary(body, &model.replay);
+    source_summary(body, &model.history);
+    source_summary(body, &model.refusals);
+    if let Some(source) = &model.intervention_submissions {
+        source_summary(body, source);
+    }
+    for source in &model.nightshift {
+        source_summary(body, &source.result);
+    }
+    for source in &model.authoring_contexts {
+        source_summary(body, &source.result);
+    }
+    for source in &model.authoring_custody {
+        source_summary(body, &source.result);
+    }
+    for source in &model.docket {
+        source_summary(body, &source.result);
+    }
+    body.push_str("</section>");
+}
+
+fn source_summary<T: Serialize>(body: &mut String, source: &SourceResultV1<T>) {
+    match source {
+        SourceResultV1::Available {
+            source,
+            command,
+            captured_at_unix_ms,
+            raw,
+            ..
+        } => {
+            let schema = raw
+                .get("schema")
+                .and_then(Value::as_str)
+                .unwrap_or("schema not present");
+            let _ = write!(
+                body,
+                "<details class=raw><summary><span class=fact>available</span> {} / {:?} <span class=schema>{}</span> <span class=raw-meta>captured {}</span></summary><pre tabindex=0 aria-label=\"Raw canonical JSON\">{}</pre></details>",
+                escape(source),
+                command,
+                escape(schema),
+                captured_at_unix_ms,
+                escape(&pretty(raw))
+            );
+        }
+        SourceResultV1::Unavailable {
+            source,
+            command,
+            captured_at_unix_ms,
+            error_kind,
+            detail,
+            exit_status,
+        } => {
+            let _ = write!(
+                body,
+                "<div class=source-error><p><span class=error>unavailable</span> {} / {:?} · {:?} · captured {} · exit {}</p><pre>{}</pre></div>",
+                escape(source),
+                command,
+                error_kind,
+                captured_at_unix_ms,
+                exit_status.map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+                escape(detail)
+            );
+        }
+    }
+}
+
+fn terminal_label(snapshot: &OccurrenceSnapshotV1) -> String {
+    if let Some(halted) = snapshot.halted() {
+        format!("halted: {}", halted.reason())
+    } else if let Some(completed) = snapshot.completed() {
+        format!("completed: {}", completed.terminal_witness())
+    } else {
+        "nonterminal".to_owned()
+    }
+}
+
+fn budget_html(budget: ag_campaign::governed::LoopBudgetV1) -> String {
+    format!(
+        "{}{}{}",
+        kv(
+            "retry occurrences",
+            &format!("{} / {}", budget.retries_used, budget.retry_limit)
+        ),
+        kv(
+            "read-only probes",
+            &format!("{} / {}", budget.probes_used, budget.probe_limit)
+        ),
+        kv(
+            "escalations",
+            &format!("{} / {}", budget.escalations_used, budget.escalation_limit)
+        )
+    )
+}
+
+fn pc(value: ProgramCounterV1) -> String {
+    escape(&format!("{value:?}"))
+}
+
+fn snapshot_link(snapshot: &OccurrenceSnapshotV1, include_proposal: bool) -> GovernedRuntimeLinkV1 {
+    GovernedRuntimeLinkV1 {
+        campaign: snapshot.key().campaign.as_digest().clone(),
+        occurrence: snapshot.key().occurrence,
+        proposal: include_proposal
+            .then(|| {
+                snapshot
+                    .proposal()
+                    .map(|proposal| proposal.reference().as_digest().clone())
+            })
+            .flatten(),
+    }
+}
+
+fn immediate_condition(snapshot: &OccurrenceSnapshotV1) -> &'static str {
+    immediate_condition_for(snapshot.program_counter())
+}
+
+fn immediate_condition_for(counter: ProgramCounterV1) -> &'static str {
+    match counter {
+        ProgramCounterV1::ObservationRequired => {
+            "<span class=projection>fresh observation required</span> no proposal or authority exists"
+        }
+        ProgramCounterV1::ProposalRecorded => {
+            "<span class=projection>proposal recorded</span> standing has not yet been established"
+        }
+        ProgramCounterV1::StandingRequired => {
+            "<span class=projection>standing required</span> no authorization exists"
+        }
+        ProgramCounterV1::AdmissiblePendingAuthorization => {
+            "<span class=projection>authorization pending</span> admissibility is not a spend"
+        }
+        ProgramCounterV1::AuthorizationConsumed => {
+            "<span class=spent>authority consumed</span> issuance exists; dispatch is not established"
+        }
+        ProgramCounterV1::Dispatched => {
+            "<span class=unknown>outcome unknown</span> custody exists; absence of settlement is not failure"
+        }
+        ProgramCounterV1::ReconciliationRequired => {
+            "<span class=error>reconciliation required</span> effect may have occurred; no repeat dispatch"
+        }
+        ProgramCounterV1::SettledObservationRequired => {
+            "<span class=fact>settled</span> fresh independent observation is required before continuation"
+        }
+        ProgramCounterV1::Halted => {
+            "<span class=error>halted</span> inspect the durable reason and refusal provenance"
+        }
+        ProgramCounterV1::Completed => {
+            "<span class=terminal-badge>completed</span> terminal witness is retained"
+        }
+    }
+}
+
+fn state_tone_class(value: ProgramCounterV1) -> &'static str {
+    match value {
+        ProgramCounterV1::AuthorizationConsumed | ProgramCounterV1::ReconciliationRequired => {
+            "danger-step"
+        }
+        ProgramCounterV1::Dispatched => "unknown-step",
+        ProgramCounterV1::Halted | ProgramCounterV1::Completed => "terminal-step",
+        _ => "",
+    }
+}
+
+fn kv(key: &str, value: &str) -> String {
+    format!(
+        "<div class=k>{}</div><div class=v>{}</div>",
+        escape(key),
+        escape(value)
+    )
+}
+
+fn raw_details(label: &str, value: &impl Serialize) -> String {
+    let raw = serde_json::to_value(value).unwrap_or(Value::Null);
+    format!(
+        "<details class=raw><summary>{}</summary><pre tabindex=0 aria-label=\"Raw canonical JSON\">{}</pre></details>",
+        escape(label),
+        escape(&pretty(&raw))
+    )
+}
+
+fn pretty(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "<serialization unavailable>".to_owned())
+}
+
+fn page_with_mode(title: &str, body: &str, source_mode: &str) -> String {
+    format!(
+        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=stylesheet href=/style.css></head><body><a class=skip href=#main>Skip to content</a><header class=topbar><a href=/phosphor-ng><strong>Phosphor-ng</strong></a><span class=k>governed-runtime inspector</span><span class=projection>read only</span><span class=k>canonical facts, visible uncertainty</span><span class=mode>{}</span></header><main id=main>{}</main></body></html>",
+        escape(title),
+        escape(source_mode),
+        body
+    )
+}
+
+fn escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#39;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn campaign_source_label(locator: &str) -> &str {
+    Path::new(locator)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(locator)
+}
+
+fn compact_campaign_identity(identity: &str) -> String {
+    let Some(digest) = identity.strip_prefix("sha256:") else {
+        return identity.to_owned();
+    };
+    if digest.len() != 64 || !digest.bytes().all(|value| value.is_ascii_hexdigit()) {
+        return identity.to_owned();
+    }
+    format!("sha256:{}…{}", &digest[..8], &digest[digest.len() - 8..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_and_consumed_vocabulary_remain_distinct() {
+        assert!(STYLE.contains("--unknown"));
+        assert_ne!(
+            pc(ProgramCounterV1::AuthorizationConsumed),
+            pc(ProgramCounterV1::Dispatched)
+        );
+    }
+
+    #[test]
+    fn campaign_columns_wrap_long_terminal_identifiers() {
+        assert!(STYLE.contains(".campaign>div{min-width:0;overflow-wrap:anywhere}"));
+        assert!(STYLE.contains(".campaign .k,.campaign .pc"));
+        assert!(STYLE.contains("word-break:break-word"));
+    }
+
+    #[test]
+    fn escaping_prevents_canonical_data_from_becoming_markup() {
+        assert_eq!(escape("<widget>&\"'"), "&lt;widget&gt;&amp;&quot;&#39;");
+    }
+
+    #[test]
+    fn campaign_index_compacts_only_canonical_digest_typography() {
+        let identity = format!("sha256:{}", "0123456789abcdef".repeat(4));
+        assert_eq!(
+            compact_campaign_identity(&identity),
+            "sha256:01234567…89abcdef"
+        );
+        assert_eq!(
+            compact_campaign_identity("campaign-alpha"),
+            "campaign-alpha"
+        );
+        assert_eq!(
+            campaign_source_label("/tmp/corpus/reconciliation-exact-attempt.sqlite"),
+            "reconciliation-exact-attempt.sqlite"
+        );
+    }
+
+    #[test]
+    fn index_controls_accept_only_closed_presentation_values() {
+        assert!(matches!(
+            IndexViewV1::parse("view=reconciliation&sort=state"),
+            IndexViewV1::Reconciliation
+        ));
+        assert!(matches!(
+            IndexSortV1::parse("view=reconciliation&sort=state"),
+            IndexSortV1::ProgramCounter
+        ));
+        assert!(matches!(
+            IndexViewV1::parse("view=healthy"),
+            IndexViewV1::All
+        ));
+    }
+
+    #[test]
+    fn critical_counter_copy_never_collapses_consumed_and_unknown() {
+        assert!(
+            immediate_condition_for(ProgramCounterV1::AuthorizationConsumed)
+                .contains("authority consumed")
+        );
+        assert!(immediate_condition_for(ProgramCounterV1::Dispatched).contains("outcome unknown"));
+        assert!(
+            immediate_condition_for(ProgramCounterV1::ReconciliationRequired)
+                .contains("reconciliation required")
+        );
+    }
+
+    #[test]
+    fn contextual_occurrence_moves_are_navigation_only() {
+        let mut body = String::new();
+        local_navigation(&mut body);
+        assert!(body.contains("Available inspections"));
+        assert!(body.contains("inspect evidence"));
+        assert!(body.contains("verify raw owner facts"));
+        assert!(!body.contains("retry"));
+    }
+
+    #[test]
+    fn exact_projection_correspondence_is_progressively_disclosed() {
+        let mut exact = String::new();
+        projection_panel_for(
+            &mut exact,
+            ProjectionCorrespondenceV1::Exact,
+            &["all canonical coordinates agree".to_owned()],
+        );
+        assert!(exact.starts_with("<details class=\"raw projection-evidence\">"));
+        assert!(!exact.starts_with("<details class=\"raw projection-evidence\" open>"));
+        assert!(exact.contains("all canonical coordinates agree"));
+
+        let mut disagreement = String::new();
+        projection_panel_for(
+            &mut disagreement,
+            ProjectionCorrespondenceV1::Disagreement,
+            &["canonical sources disagree".to_owned()],
+        );
+        assert!(disagreement.starts_with("<details class=\"raw projection-evidence\" open>"));
+        assert!(disagreement.contains("canonical sources disagree"));
+    }
+
+    #[test]
+    fn ingress_receipts_distinguish_delivery_from_governed_acceptance() {
+        let target = Digest::hash_bytes(b"runtime");
+        let submission = Digest::hash_bytes(b"submission");
+        let received = crate::model::InterventionSubmissionReceiptProjectionV1 {
+            schema: "ag.governed-loop.intervention-submission-receipt/v1".to_owned(),
+            receipt: Digest::hash_bytes(b"receipt"),
+            submission: Some(submission.clone()),
+            presentation_digest: Digest::hash_bytes(b"presentation"),
+            request: Some(Digest::hash_bytes(b"request")),
+            target_runtime_profile: Some(target.clone()),
+            submitting_principal: Some("maude-submitter".to_owned()),
+            result: serde_json::json!({"status": "received", "custody_verification": Digest::hash_bytes(b"custody")}),
+            previous_receipt: None,
+            recorded_at_unix_ms: 1,
+        };
+        let source = SourceResultV1::Available {
+            source: "AG intervention ingress".to_owned(),
+            command: crate::model::ReadCommandNameV1::AgInterventionSubmissions,
+            captured_at_unix_ms: 2,
+            raw: serde_json::json!({}),
+            value: crate::model::InterventionSubmissionHistoryProjectionV1 {
+                schema: crate::model::AG_INTERVENTION_SUBMISSION_HISTORY_SCHEMA_V1.to_owned(),
+                target_runtime_profile: target,
+                submission: Some(submission),
+                receipts: vec![received],
+            },
+        };
+        let mut body = String::new();
+        intervention_submissions(&mut body, Some(&source));
+        assert!(body.contains("received"));
+        assert!(body.contains("delivery is not authorization"));
+        assert!(!body.contains("approved"));
+    }
+}

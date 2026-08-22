@@ -9,6 +9,7 @@ dependencies = [
  "ag-campaign",
  "ag-effect",
  "ag-kernel",
+ "ag-operator-ui",
  "ag-primitives",
  "ag-protocol",
  "ag-session",
@@ -80,6 +81,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "ag-operator-ui"
+version = "0.1.0"
+dependencies = [
+ "ag-campaign",
+ "ag-primitives",
+ "ag-store",
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

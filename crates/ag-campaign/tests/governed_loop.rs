@@ -1,6 +1,7 @@
 //! Hostile development tests for the frozen canonical governed-loop kernel.
 
 #![allow(
+    clippy::similar_names,
     clippy::too_many_lines,
     reason = "hostile scenarios keep full setup and assertion chains visible"
 )]
@@ -73,6 +74,24 @@ fn proposal(campaign: &CampaignId, work: &str) -> ExactWorkProposalV1 {
         None,
     )
     .unwrap()
+}
+
+/// Pinned byte-for-byte in Nightshift's authoring-context provenance module.
+#[test]
+fn proposal_reference_matches_nightshift_handoff_vector() {
+    let exact = ExactWorkProposalV1::new(
+        CampaignId::from_digest(Digest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap()),
+        Digest::parse(&format!("sha256:{}", "b".repeat(64))).unwrap(),
+        Digest::parse(&format!("sha256:{}", "c".repeat(64))).unwrap(),
+        "test.exact-work/v1".to_owned(),
+        Digest::parse(&format!("sha256:{}", "d".repeat(64))).unwrap(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        exact.reference().as_str(),
+        "sha256:101445d903d1c43207f5ab6bc44bd1b2b74c05d738d7afe464d22eff00704fe7"
+    );
 }
 
 #[derive(Clone)]
@@ -253,6 +272,48 @@ impl HumanDispositionVerifierV1 for HumanVerifier {
             "human-verification",
         )))
     }
+}
+
+struct InterventionVerifier {
+    calls: usize,
+}
+
+impl GovernedInterventionVerifierV1 for InterventionVerifier {
+    fn verify_governed_intervention(
+        &mut self,
+        _request: &GovernedInterventionVerificationRequestV1<'_>,
+    ) -> Result<GovernedInterventionVerificationRefV1, ExternalBoundaryErrorV1> {
+        self.calls += 1;
+        Ok(GovernedInterventionVerificationRefV1::from_digest(digest(
+            "intervention-verification",
+        )))
+    }
+}
+
+fn intervention_scope() -> GovernedInterventionAuthorityScopeV1 {
+    HumanAuthorityScopeV1 {
+        principal: HumanPrincipalRefV1::from_digest(digest("operator-principal")),
+        mandate: MandateRefV1::from_digest(digest("operator-mandate")),
+    }
+}
+
+fn intervention_request(
+    current: &OccurrenceSnapshotV1,
+    intervention: GovernedInterventionClassV1,
+) -> GovernedInterventionRequestV1 {
+    let scope = intervention_scope();
+    GovernedInterventionRequestV1::new(
+        scope.principal,
+        scope.mandate,
+        GovernedInterventionNonceRefV1::from_digest(digest("intervention-nonce")),
+        current.key().campaign.clone(),
+        current.key().occurrence,
+        current.state_digest().clone(),
+        intervention,
+        NOW - 1,
+        NOW + 1_000,
+    )
+    .unwrap()
 }
 
 fn initial_with(occurrence: OccurrenceId, residuals: ResidualSetV1) -> OccurrenceSnapshotV1 {
@@ -1706,4 +1767,385 @@ fn work_binding_fails_before_any_observation_resolution() {
         error,
         KernelErrorV1::BindingMismatch("prepared exact work")
     ));
+}
+
+#[test]
+fn intervention_request_is_content_bound_and_authentication_is_not_authority() {
+    let current = initial();
+    let request = intervention_request(
+        &current,
+        GovernedInterventionClassV1::RequestProbe {
+            exact_probe_work: digest("read-only-probe"),
+            evidence: vec![digest("probe-evidence")],
+        },
+    );
+    let mut substituted = request.clone();
+    substituted.occurrence = occurrence(99);
+    assert!(matches!(
+        substituted.validate_integrity(),
+        Err(KernelErrorV1::Intervention("request digest mismatch"))
+    ));
+    // Recomputing the outer request identity cannot hide the changed target:
+    // the exact current occurrence/state applicability check still refuses.
+    substituted.request = substituted.derived_request_id();
+    let mut verifier = InterventionVerifier { calls: 0 };
+    let verified = GovernedLoopKernelV1::verify_governed_intervention(
+        substituted,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(verifier.calls, 1);
+    assert!(matches!(
+        GovernedLoopKernelV1::apply_verified_governed_intervention(&current, verified),
+        Err(KernelErrorV1::Intervention("wrong occurrence"))
+    ));
+    assert!(current.ag_spend().is_none());
+    assert!(current.issuance().is_none());
+    assert!(current.docket_custody().is_none());
+}
+
+#[test]
+fn probe_halt_and_successor_requests_use_only_existing_authority_empty_laws() {
+    let start = initial();
+    let mut verifier = InterventionVerifier { calls: 0 };
+    let probe = intervention_request(
+        &start,
+        GovernedInterventionClassV1::RequestProbe {
+            exact_probe_work: digest("probe-work"),
+            evidence: vec![],
+        },
+    );
+    let verified = GovernedLoopKernelV1::verify_governed_intervention(
+        probe,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    let GovernedInterventionEffectV1::Transition { successor, .. } =
+        GovernedLoopKernelV1::apply_verified_governed_intervention(&start, verified).unwrap()
+    else {
+        panic!("probe cannot become reconciliation");
+    };
+    assert_eq!(
+        successor.program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+    assert_eq!(successor.state().meta().budget().probes_used, 1);
+    assert!(successor.ag_spend().is_none());
+
+    // Exact replay targets the predecessor state and cannot consume budget twice.
+    let replay = intervention_request(
+        &start,
+        GovernedInterventionClassV1::RequestProbe {
+            exact_probe_work: digest("probe-work-2"),
+            evidence: vec![],
+        },
+    );
+    let replay = GovernedLoopKernelV1::verify_governed_intervention(
+        replay,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(
+        GovernedLoopKernelV1::apply_verified_governed_intervention(&successor, replay),
+        Err(KernelErrorV1::Intervention("stale target state"))
+    ));
+
+    let halt = intervention_request(
+        &successor,
+        GovernedInterventionClassV1::HaltContinuation {
+            reason: HaltReasonRefV1::from_digest(digest("operator-halt")),
+        },
+    );
+    let halt = GovernedLoopKernelV1::verify_governed_intervention(
+        halt,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    let GovernedInterventionEffectV1::Transition {
+        successor: halted, ..
+    } = GovernedLoopKernelV1::apply_verified_governed_intervention(&successor, halt).unwrap()
+    else {
+        panic!("halt cannot become reconciliation");
+    };
+    assert_eq!(halted.program_counter(), ProgramCounterV1::Halted);
+    assert!(halted.ag_spend().is_none());
+
+    let (settled, _) = settled();
+    let open = intervention_request(
+        &settled,
+        GovernedInterventionClassV1::OpenSuccessor {
+            successor_occurrence: occurrence(20),
+            exact_work: digest("successor-work"),
+        },
+    );
+    let open = GovernedLoopKernelV1::verify_governed_intervention(
+        open,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    let GovernedInterventionEffectV1::Transition { successor, .. } =
+        GovernedLoopKernelV1::apply_verified_governed_intervention(&settled, open).unwrap()
+    else {
+        panic!("successor cannot become reconciliation");
+    };
+    assert_eq!(successor.key().occurrence, occurrence(20));
+    assert_eq!(
+        successor.program_counter(),
+        ProgramCounterV1::ObservationRequired
+    );
+    assert!(successor.proposal().is_none());
+    assert!(successor.ag_spend().is_none());
+}
+
+#[test]
+fn reconciliation_intervention_is_exact_read_only_and_never_dispatches() {
+    let start = initial();
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let spent = advance_to_spent(
+        &start,
+        proposal(&campaign(), "work"),
+        ObservationRefV1::from_digest(digest("observation-1")),
+        &mut observation,
+    );
+    let dispatched = GovernedLoopKernelV1::accept_docket_custody(&spent, custody(&spent)).unwrap();
+    let custody = dispatched.docket_custody().unwrap().clone();
+    let reconciling = GovernedLoopKernelV1::require_reconciliation(
+        &dispatched,
+        IndeterminateOutcomeV1 {
+            issuance: custody.issuance.clone(),
+            attempt: custody.attempt.clone(),
+            reconciliation: ReconciliationRefV1::from_digest(digest("reconcile")),
+            evidence: digest("unknown"),
+        },
+    )
+    .unwrap();
+    let request = intervention_request(
+        &reconciling,
+        GovernedInterventionClassV1::ReconcileAttempt {
+            issuance: custody.issuance.clone(),
+            attempt: custody.attempt.clone(),
+            evidence: vec![digest("manual-observation")],
+        },
+    );
+    let mut verifier = InterventionVerifier { calls: 0 };
+    let verified = GovernedLoopKernelV1::verify_governed_intervention(
+        request,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(
+        GovernedLoopKernelV1::apply_verified_governed_intervention(&reconciling, verified),
+        Ok(GovernedInterventionEffectV1::Reconcile(_))
+    ));
+    assert_eq!(
+        reconciling.program_counter(),
+        ProgramCounterV1::ReconciliationRequired
+    );
+
+    let wrong = intervention_request(
+        &reconciling,
+        GovernedInterventionClassV1::ReconcileAttempt {
+            issuance: custody.issuance,
+            attempt: DocketAttemptRefV1::from_digest(digest("substituted-attempt")),
+            evidence: vec![],
+        },
+    );
+    let wrong = GovernedLoopKernelV1::verify_governed_intervention(
+        wrong,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(
+        GovernedLoopKernelV1::apply_verified_governed_intervention(&reconciling, wrong),
+        Err(KernelErrorV1::Intervention("wrong attempt"))
+    ));
+}
+
+#[test]
+fn authentication_alone_never_satisfies_standing_or_authorization() {
+    let start = initial();
+    let request = intervention_request(
+        &start,
+        GovernedInterventionClassV1::RequestProbe {
+            exact_probe_work: digest("probe"),
+            evidence: vec![],
+        },
+    );
+    let mut verifier = InterventionVerifier { calls: 0 };
+    let verified = GovernedLoopKernelV1::verify_governed_intervention(
+        request,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    let GovernedInterventionEffectV1::Transition { successor, .. } =
+        GovernedLoopKernelV1::apply_verified_governed_intervention(&start, verified).unwrap()
+    else {
+        panic!("wrong effect");
+    };
+    assert!(successor.proposal().is_none());
+    assert!(successor.standing_resolution().is_none());
+    assert!(successor.ag_spend().is_none());
+}
+
+#[test]
+fn malformed_expired_and_wrong_scope_interventions_fail_before_applicability() {
+    let current = initial();
+    let mut unsorted = intervention_request(
+        &current,
+        GovernedInterventionClassV1::RequestProbe {
+            exact_probe_work: digest("probe"),
+            evidence: vec![],
+        },
+    );
+    // The helper's constructor correctly rejects noncanonical evidence; build
+    // the attack from a valid record and then rebind its outer identity.
+    let mut noncanonical_evidence = vec![digest("z-evidence"), digest("a-evidence")];
+    noncanonical_evidence.sort();
+    noncanonical_evidence.reverse();
+    unsorted.intervention = GovernedInterventionClassV1::RequestProbe {
+        exact_probe_work: digest("probe"),
+        evidence: noncanonical_evidence,
+    };
+    unsorted.request = unsorted.derived_request_id();
+    assert!(matches!(
+        unsorted.validate_integrity(),
+        Err(KernelErrorV1::Intervention(
+            "evidence must be bounded, sorted, and unique"
+        ))
+    ));
+
+    let valid = intervention_request(
+        &current,
+        GovernedInterventionClassV1::RequestProbe {
+            exact_probe_work: digest("probe"),
+            evidence: vec![],
+        },
+    );
+    let wrong_scope = HumanAuthorityScopeV1 {
+        principal: HumanPrincipalRefV1::from_digest(digest("wrong-principal")),
+        mandate: intervention_scope().mandate,
+    };
+    let mut verifier = InterventionVerifier { calls: 0 };
+    assert!(matches!(
+        GovernedLoopKernelV1::verify_governed_intervention(
+            valid.clone(),
+            &wrong_scope,
+            &mut verifier,
+            NOW,
+        ),
+        Err(KernelErrorV1::Intervention("wrong principal"))
+    ));
+    assert_eq!(verifier.calls, 0);
+    assert!(matches!(
+        GovernedLoopKernelV1::verify_governed_intervention(
+            valid,
+            &intervention_scope(),
+            &mut verifier,
+            NOW + 1_000,
+        ),
+        Err(KernelErrorV1::Intervention("expired"))
+    ));
+    assert_eq!(verifier.calls, 0);
+}
+
+#[test]
+fn consumed_effectful_authority_cannot_be_recast_as_a_probe_intervention() {
+    let start = initial();
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let spent = advance_to_spent(
+        &start,
+        proposal(&campaign(), "work"),
+        ObservationRefV1::from_digest(digest("observation-1")),
+        &mut observation,
+    );
+    let request = intervention_request(
+        &spent,
+        GovernedInterventionClassV1::RequestProbe {
+            exact_probe_work: digest("read-only-probe"),
+            evidence: vec![],
+        },
+    );
+    let mut verifier = InterventionVerifier { calls: 0 };
+    let verified = GovernedLoopKernelV1::verify_governed_intervention(
+        request,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(
+        GovernedLoopKernelV1::apply_verified_governed_intervention(&spent, verified),
+        Err(KernelErrorV1::IllegalTransition { .. })
+    ));
+    assert_eq!(
+        spent.program_counter(),
+        ProgramCounterV1::AuthorizationConsumed
+    );
+    assert!(spent.ag_spend().is_some());
+    assert!(spent.docket_custody().is_none());
+}
+
+#[test]
+fn intervention_presence_does_not_change_ag_authorization_or_issuance_material() {
+    let plain = initial();
+    let with_intent = initial();
+    let request = intervention_request(
+        &with_intent,
+        GovernedInterventionClassV1::RequestProbe {
+            exact_probe_work: digest("read-only-probe"),
+            evidence: vec![],
+        },
+    );
+    let mut verifier = InterventionVerifier { calls: 0 };
+    let authenticated = GovernedLoopKernelV1::verify_governed_intervention(
+        request,
+        &intervention_scope(),
+        &mut verifier,
+        NOW,
+    )
+    .unwrap();
+    let GovernedInterventionEffectV1::Transition {
+        successor: with_intent,
+        ..
+    } = GovernedLoopKernelV1::apply_verified_governed_intervention(&with_intent, authenticated)
+        .unwrap()
+    else {
+        panic!("probe intent must use the probe law");
+    };
+
+    let exact = proposal(&campaign(), "work");
+    let observation_ref = ObservationRefV1::from_digest(digest("observation-1"));
+    let plain_spent = advance_to_spent(
+        &plain,
+        exact.clone(),
+        observation_ref.clone(),
+        &mut ObservationBoundary::current(clean_basis()),
+    );
+    let intent_spent = advance_to_spent(
+        &with_intent,
+        exact,
+        observation_ref,
+        &mut ObservationBoundary::current(clean_basis()),
+    );
+    assert_eq!(plain_spent.proposal(), intent_spent.proposal());
+    assert_eq!(plain_spent.ag_spend(), intent_spent.ag_spend());
+    assert_eq!(plain_spent.issuance(), intent_spent.issuance());
+    assert_eq!(with_intent.state().meta().budget().probes_used, 1);
+    assert_eq!(plain.state().meta().budget().probes_used, 0);
 }

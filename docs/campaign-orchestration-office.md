@@ -111,16 +111,13 @@ campaign office. This repository does not own that document and does not modify 
 repository. Nothing here pre-empts the map; the ownership list above is this office's
 own statement of its boundary, consistent with the four-office posture in the README.
 
-## Sidecar sunset condition
+## Historical sidecar note
 
-The authority-neutral sidecar (`campaign-driver`, Python, separate repository, read-only
-to this one) exists to execute stage mechanics against an exact runtime envelope. Its
-sunset condition: it is retired when an AG-native admitted execution path — broker-owned
-compilation, ratification, and burn-before-effect execution through `ag-effectd` under a
-qualified worker/containment surface — can carry campaign stages end to end with the
-same exact-envelope guarantees. Until then the sidecar executes mechanics only, carries
-no authority, and every dispatch requires a consumed-standing digest recorded before the
-envelope is rendered.
+This sidecar description is not a live ownership rule. Canonical continuation
+now belongs to AG's governed-loop C1 path. CampaignDriverNG may appear only as
+an authority-neutral executor adapter selected inside the genesis-pinned
+Docket root; Docket, not the driver, owns attempt custody and dispatch. See
+`docs/governed-loop-c1.md` for the current contract.
 
 ## Digest domains
 

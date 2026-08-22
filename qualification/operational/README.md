@@ -11,8 +11,10 @@ environment. It does not alter the governed-loop law or any production path.
 
 | Gate | Required environment | Safe local evidence available here |
 | --- | --- | --- |
+| local process provisioning/reopen | runnable locally now | create-once profile seal, genesis binding, independent-process inspect/replay, coherent closed-copy restore, partial-copy and missing-custody refusal |
 | SQLite/WAL crash and power-loss recovery | fault-injection environment | transactional replay, logical crash cuts, reopen tests |
 | multi-process contention | runnable locally now | independent `ag-loopctl` writers contend for one predecessor |
+| authenticated intervention ingress | runnable locally now | exact signed bytes, runtime targeting, receipt durability, timeout resend, owner read projection, and structural read-only checks |
 | service-currentness behavior | deployed service | deterministic current/stale/mismatch contract tests |
 | clock/expiry behavior | deployed service | exact boundary and noninheritance tests |
 | process isolation | trusted host | release-binary structural isolation scan |
@@ -36,10 +38,13 @@ The runner refuses a dirty source tree by default. During development of the
 harness itself, `--allow-dirty-development` permits the run while recording the
 exact dirty-status digest and marking the bundle as development evidence.
 
-The local runner executes focused kernel/store/engine tests, a real
-multi-process SQLite contention scenario, executor-adapter tests, and the
-existing release-binary isolation scan. Its result is always
-`qualification_status: not_assessed`.
+The local runner executes focused kernel/store/engine tests, the production
+profile provisioning/reopen test, the authenticated intervention ingress and
+operator read projection, a real multi-process SQLite contention scenario,
+executor-adapter tests, both authority/read-only structural checks, and the
+existing release-binary isolation scan. Its aggregate result remains
+`qualification_status: not_assessed`: it closes only the explicitly local
+development gate and does not turn proxies into host or physical qualification.
 
 ## Environment preflight
 

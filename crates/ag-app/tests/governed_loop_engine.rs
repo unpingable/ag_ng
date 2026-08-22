@@ -11,7 +11,28 @@ use ag_app::governed_loop::{
 };
 use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
+use ag_operator_ui::links::GovernedRuntimeLinkV1;
+use ag_operator_ui::model::{
+    AgInspectV1, CAMPAIGN_DETAIL_SCHEMA_V1, CAMPAIGN_INDEX_SCHEMA_V1, CampaignDetailV1,
+    CampaignIndexEntryV1, CampaignIndexV1, DEMO_CORPUS_SCHEMA_V1, DOCKET_INSPECTION_SCHEMA_V1,
+    DemoCorpusV1, DemoSemanticLinkTargetV1, DocketAuthenticationV1, DocketInspectionV1,
+    DocketRecordInspectionV1, DocketRecordStatusV1, NIGHTSHIFT_AUTHORING_CONTEXT_EXPORT_SCHEMA_V1,
+    NIGHTSHIFT_AUTHORING_CONTEXT_PROVENANCE_SCHEMA_V1, NIGHTSHIFT_OBSERVATION_EXPORT_SCHEMA_V1,
+    NightshiftAuthoringContextExportV1, NightshiftAuthoringContextProvenanceV1,
+    NightshiftAuthoringContextQueryV1, NightshiftFamilyV1, NightshiftObservationExportV1,
+    NightshiftObservationMatchV1, NightshiftOrderKeyV1, ProjectionCheckV1,
+    ProjectionCorrespondenceV1, ReadCommandNameV1, RelatedSourceV1, RuntimeProfileBindingV1,
+    SourceErrorKindV1, SourceResultV1,
+};
+use ag_operator_ui::render;
+use ag_operator_ui::source::{OperatorReaderV1, hex_encode, selected_snapshot};
 use ag_primitives::Digest;
+use ag_store::campaign::{
+    CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1, CAMPAIGN_TRANSITION_HISTORY_SCHEMA_V1,
+    CampaignRefusalHistoryV1, CampaignReplayReportV1, CampaignTransitionEvidenceV1,
+    CampaignTransitionHistoryV1,
+};
+use serde::Serialize;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -419,6 +440,53 @@ impl HumanDispositionVerifierV1 for HumanVerifier {
     }
 }
 
+#[derive(Default)]
+struct InterventionVerifier {
+    calls: usize,
+}
+
+impl GovernedInterventionVerifierV1 for InterventionVerifier {
+    fn verify_governed_intervention(
+        &mut self,
+        request: &GovernedInterventionVerificationRequestV1<'_>,
+    ) -> Result<GovernedInterventionVerificationRefV1, ExternalBoundaryErrorV1> {
+        self.calls += 1;
+        Ok(GovernedInterventionVerificationRefV1::from_digest(
+            Digest::hash_domain(
+                "ag-governed-engine-test/intervention-verification/v1",
+                request.request.request.as_str().as_bytes(),
+            ),
+        ))
+    }
+}
+
+fn intervention_scope() -> GovernedInterventionAuthorityScopeV1 {
+    HumanAuthorityScopeV1 {
+        principal: HumanPrincipalRefV1::from_digest(digest("operator-principal")),
+        mandate: MandateRefV1::from_digest(digest("operator-mandate")),
+    }
+}
+
+fn intervention_request(
+    current: &OccurrenceSnapshotV1,
+    class: GovernedInterventionClassV1,
+    nonce: &str,
+) -> GovernedInterventionRequestV1 {
+    let scope = intervention_scope();
+    GovernedInterventionRequestV1::new(
+        scope.principal,
+        scope.mandate,
+        GovernedInterventionNonceRefV1::from_digest(digest(nonce)),
+        current.key().campaign.clone(),
+        current.key().occurrence,
+        current.state_digest().clone(),
+        class,
+        NOW,
+        NOW + 10_000,
+    )
+    .unwrap()
+}
+
 fn create_engine(directory: &TempDir, residuals: ResidualSetV1) -> CampaignEngineV1 {
     CampaignEngineV1::create(
         &directory.path().join("campaign.sqlite"),
@@ -431,6 +499,875 @@ fn create_engine(directory: &TempDir, residuals: ResidualSetV1) -> CampaignEngin
         NOW,
     )
     .unwrap()
+}
+
+#[test]
+fn authenticated_probe_request_is_durable_authority_neutral_and_one_use_by_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let current = engine.current().unwrap();
+    let request = intervention_request(
+        &current,
+        GovernedInterventionClassV1::RequestProbe {
+            exact_probe_work: digest("read-only-probe"),
+            evidence: vec![],
+        },
+        "probe-nonce",
+    );
+    let mut verifier = InterventionVerifier::default();
+    let successor = engine
+        .apply_governed_intervention(
+            request.clone(),
+            &intervention_scope(),
+            &mut verifier,
+            NOW + 1,
+        )
+        .unwrap();
+    assert_eq!(verifier.calls, 1);
+    assert_eq!(successor.state().meta().budget().probes_used, 1);
+    assert!(successor.proposal().is_none());
+    assert!(successor.ag_spend().is_none());
+    assert!(successor.issuance().is_none());
+
+    drop(engine);
+    let mut reopened = CampaignEngineV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap(), successor);
+    assert!(matches!(
+        &reopened.history().unwrap().transitions[1].evidence,
+        CampaignTransitionEvidenceV1::GovernedIntervention { verified }
+            if verified.request == request
+    ));
+    let accepted_detail = operator_detail(
+        successor.clone(),
+        reopened.history().unwrap(),
+        reopened.refusal_history().unwrap(),
+    );
+    let accepted_html = render::campaign_detail(&accepted_detail);
+    assert!(accepted_html.contains("operator intent"));
+    assert!(accepted_html.contains("authenticated request evidence, not authorization"));
+    // Exact replay is stale because the request binds its predecessor digest.
+    assert!(
+        reopened
+            .apply_governed_intervention(request, &intervention_scope(), &mut verifier, NOW + 2,)
+            .is_err()
+    );
+    assert_eq!(reopened.current().unwrap(), successor);
+    let refusals = reopened.refusal_history().unwrap();
+    assert_eq!(refusals.refusals.len(), 1);
+    assert_eq!(
+        refusals.refusals[0].outcome.code,
+        RefusalCodeV1::InterventionBindingMismatch
+    );
+    assert!(refusals.refusals[0].outcome.governed_intervention.is_some());
+    let detail = operator_detail(successor, reopened.history().unwrap(), refusals);
+    let html = render::campaign_detail(&detail);
+    assert!(html.contains("intervention refused"));
+    assert!(html.contains("authenticated intent created no transition or authority"));
+}
+
+fn available<T: Serialize>(command: ReadCommandNameV1, value: T) -> SourceResultV1<T> {
+    let raw = serde_json::to_value(&value).unwrap();
+    SourceResultV1::Available {
+        source: "AG".to_owned(),
+        command,
+        captured_at_unix_ms: NOW,
+        value,
+        raw,
+    }
+}
+
+fn operator_detail(
+    current: OccurrenceSnapshotV1,
+    history: CampaignTransitionHistoryV1,
+    refusals: CampaignRefusalHistoryV1,
+) -> CampaignDetailV1 {
+    let ag_spends = u64::from(current.ag_spend().is_some());
+    let docket_attempts = u64::from(current.docket_custody().is_some());
+    let settlements = u64::from(current.settlement().is_some());
+    let replay = CampaignReplayReportV1 {
+        campaign: current.key().campaign.clone(),
+        transitions: u64::try_from(history.transitions.len()).unwrap(),
+        ag_spends,
+        docket_attempts,
+        settlements,
+        human_dispositions: 0,
+        current_state_digest: current.state_digest().clone(),
+    };
+    let inspect = AgInspectV1 {
+        schema: "ag.governed-loop.operational-snapshot/v1".to_owned(),
+        current: current.clone(),
+        replay: replay.clone(),
+        runtime_profile: RuntimeProfileBindingV1 {
+            schema: "ag.governed-loop.runtime-profile/v1".to_owned(),
+            digest: digest("operator-profile"),
+        },
+    };
+    CampaignDetailV1 {
+        schema: CAMPAIGN_DETAIL_SCHEMA_V1.to_owned(),
+        locator_token: "63616d706169676e2e73716c697465".to_owned(),
+        locator: "campaign.sqlite".to_owned(),
+        inspect: available(ReadCommandNameV1::AgInspect, inspect),
+        status: available(ReadCommandNameV1::AgStatus, current),
+        replay: available(ReadCommandNameV1::AgReplay, replay),
+        history: available(ReadCommandNameV1::AgHistory, history),
+        refusals: available(ReadCommandNameV1::AgRefusals, refusals),
+        intervention_submissions: None,
+        projection: ProjectionCheckV1 {
+            correspondence: ProjectionCorrespondenceV1::Exact,
+            findings: vec!["fixture projections share exact canonical coordinates".to_owned()],
+        },
+        nightshift: Vec::new(),
+        authoring_contexts: Vec::new(),
+        authoring_custody: Vec::new(),
+        docket: Vec::new(),
+    }
+}
+
+fn available_from<T: Serialize>(
+    source: &str,
+    command: ReadCommandNameV1,
+    value: T,
+) -> SourceResultV1<T> {
+    let raw = serde_json::to_value(&value).unwrap();
+    SourceResultV1::Available {
+        source: source.to_owned(),
+        command,
+        captured_at_unix_ms: NOW,
+        value,
+        raw,
+    }
+}
+
+fn unavailable_fixture<T>(
+    source: &str,
+    command: ReadCommandNameV1,
+    kind: SourceErrorKindV1,
+    detail: &str,
+) -> SourceResultV1<T> {
+    SourceResultV1::Unavailable {
+        source: source.to_owned(),
+        command,
+        captured_at_unix_ms: NOW,
+        error_kind: kind,
+        detail: detail.to_owned(),
+        exit_status: None,
+    }
+}
+
+fn demo_locator(detail: &mut CampaignDetailV1, name: &str) {
+    detail.locator = format!("{name}.sqlite");
+    detail.locator_token = hex_encode(detail.locator.as_bytes());
+}
+
+fn attach_demo_owner_sources(detail: &mut CampaignDetailV1) {
+    let Some(current) = detail.inspect.value().map(|value| value.current.clone()) else {
+        return;
+    };
+    let observation = current.observation().or_else(|| {
+        current
+            .completed()
+            .map(ag_campaign::governed::CompletedV1::terminal_observation)
+    });
+    if let Some(observation) = observation {
+        let order = NightshiftOrderKeyV1 {
+            occurrence: u64::try_from(current.key().occurrence.as_uuid().as_u128())
+                .expect("demo occurrence identity fits the Nightshift fixture order"),
+            nominal_due_at: "2026-08-20T12:00:00Z".to_owned(),
+            slot_id: format!("slot:{}", current.key().occurrence),
+        };
+        let export = NightshiftObservationExportV1 {
+            schema: NIGHTSHIFT_OBSERVATION_EXPORT_SCHEMA_V1.to_owned(),
+            observation_id: observation.observation.as_str().to_owned(),
+            matches: vec![NightshiftObservationMatchV1 {
+                cycle_id: digest("demo-nightshift-cycle").as_str().to_owned(),
+                slot_id: order.slot_id.clone(),
+                family: NightshiftFamilyV1 {
+                    policy_id: "policy:operator-demo".to_owned(),
+                    configuration_version: "configuration:operator-demo/v1".to_owned(),
+                    subject_id: digest("subject").as_str().to_owned(),
+                    scope_id: digest("scope").as_str().to_owned(),
+                    scheduler_clock_id: "clock:operator-demo".to_owned(),
+                },
+                order_key: order.clone(),
+                family_latest_cycle_id: Some(digest("demo-nightshift-cycle").as_str().to_owned()),
+                family_latest_order_key: Some(order),
+                observation: serde_json::json!({
+                    "schema": "nightshift.observation_record.v2",
+                    "observation_id": observation.observation.as_str(),
+                    "source_admissions": [{
+                        "schema": "nq.diagnostic_admission_provenance.v1",
+                        "provenance_id": digest("demo-nq-provenance").as_str(),
+                        "disposition": "admitted_report",
+                        "nonclaims": [
+                            "admission establishes evidence eligibility only",
+                            "admission does not authorize work"
+                        ]
+                    }],
+                    "support": {"standing": "current"},
+                    "posture": {"current": true}
+                }),
+            }],
+        };
+        detail.nightshift.push(RelatedSourceV1 {
+            identity: observation.observation.as_str().to_owned(),
+            result: available_from(
+                "Nightshift",
+                ReadCommandNameV1::NightshiftExportObservation,
+                export,
+            ),
+        });
+    }
+    attach_demo_authoring_contexts(detail, &current);
+    if let Some(issuance) = current.issuance() {
+        let record = current.docket_custody().map(|custody| {
+            let status = match current.program_counter() {
+                ProgramCounterV1::ReconciliationRequired => DocketRecordStatusV1::Indeterminate,
+                ProgramCounterV1::SettledObservationRequired => DocketRecordStatusV1::Settled,
+                _ => DocketRecordStatusV1::Accepted,
+            };
+            DocketRecordInspectionV1 {
+                issuance: issuance.clone(),
+                authentication: DocketAuthenticationV1 {
+                    issuer_principal: "principal:ag-ng-demo".to_owned(),
+                    signer_key_id: "key:ag-ng-demo".to_owned(),
+                    signer_public_key: "ed25519:demo-public-key".to_owned(),
+                    signature: "ed25519:demo-signature".to_owned(),
+                },
+                custody: custody.clone(),
+                status,
+                settlement: current.settlement().cloned(),
+                indeterminate: current.indeterminate().cloned(),
+                executor_binding: digest("demo-executor-binding").as_str().to_owned(),
+                executor_program_digest: digest("demo-executor-program").as_str().to_owned(),
+                executor_plan: digest("demo-executor-plan").as_str().to_owned(),
+            }
+        });
+        let inspection = DocketInspectionV1 {
+            schema: DOCKET_INSPECTION_SCHEMA_V1.to_owned(),
+            requested_issuance: issuance.issuance.as_str().to_owned(),
+            record,
+        };
+        detail.docket.push(RelatedSourceV1 {
+            identity: issuance.issuance.as_str().to_owned(),
+            result: available_from(
+                "Docket",
+                ReadCommandNameV1::DocketGovernedLoopInspect,
+                inspection,
+            ),
+        });
+    }
+}
+
+fn attach_demo_authoring_contexts(detail: &mut CampaignDetailV1, current: &OccurrenceSnapshotV1) {
+    // Fixture-only exact relations for presentation qualification. Historical
+    // occurrences retain their own owner record. Occurrence 2 is deliberately
+    // left unlinked to pin that a successor never inherits a predecessor's
+    // Maude context by convenience.
+    let mut governed_occurrences = BTreeMap::new();
+    if let Some(history) = detail.history.value() {
+        for transition in &history.transitions {
+            let snapshot = &transition.successor;
+            if snapshot.proposal().is_some() {
+                governed_occurrences
+                    .entry(snapshot.key().occurrence)
+                    .or_insert_with(|| snapshot.clone());
+            }
+        }
+    }
+    if current.proposal().is_some() {
+        governed_occurrences.insert(current.key().occurrence, current.clone());
+    }
+    for governed in governed_occurrences.values() {
+        let proposal = governed
+            .proposal()
+            .expect("governed authoring fixture has an exact proposal");
+        let matches = if governed.key().occurrence.as_uuid().as_u128() == 2 {
+            Vec::new()
+        } else {
+            let mut provenance = NightshiftAuthoringContextProvenanceV1 {
+                schema: NIGHTSHIFT_AUTHORING_CONTEXT_PROVENANCE_SCHEMA_V1.to_owned(),
+                provenance_id: String::new(),
+                producer_component: "nightshift.canonical_runtime".to_owned(),
+                maude_plan_ref: Digest::hash_bytes(b"operator-demo exact Maude plan").to_string(),
+                maude_session_id: "sess_0123456789ab".to_owned(),
+                source_plan_bytes: 30,
+                campaign_id: governed.key().campaign.to_string(),
+                occurrence_id: governed.key().occurrence.to_string(),
+                proposal_id: proposal.reference().to_string(),
+                exact_work_id: governed.state().meta().expected_work().to_string(),
+                source_intent_id: digest("demo-nightshift-intent").to_string(),
+                recorded_at: "2026-08-21T12:00:00Z".to_owned(),
+            };
+            let mut preimage = serde_json::to_value(&provenance).unwrap();
+            preimage.as_object_mut().unwrap().remove("provenance_id");
+            provenance.provenance_id = Digest::from_serializable(&preimage).unwrap().to_string();
+            vec![provenance]
+        };
+        let export = NightshiftAuthoringContextExportV1 {
+            schema: NIGHTSHIFT_AUTHORING_CONTEXT_EXPORT_SCHEMA_V1.to_owned(),
+            query: NightshiftAuthoringContextQueryV1::GovernedOccurrence {
+                campaign_id: governed.key().campaign.to_string(),
+                occurrence_id: governed.key().occurrence.to_string(),
+            },
+            matches,
+        };
+        detail.authoring_contexts.push(RelatedSourceV1 {
+            identity: format!("{}/{}", governed.key().campaign, governed.key().occurrence),
+            result: available_from(
+                "Nightshift",
+                ReadCommandNameV1::NightshiftExportAuthoringContext,
+                export,
+            ),
+        });
+    }
+}
+
+fn detail_at_transition(
+    complete_history: &CampaignTransitionHistoryV1,
+    index: usize,
+    name: &str,
+) -> CampaignDetailV1 {
+    let current = complete_history.transitions[index].successor.clone();
+    let mut history = complete_history.clone();
+    history.transitions.truncate(index + 1);
+    history.current_state_digest = current.state_digest().clone();
+    let refusals = CampaignRefusalHistoryV1 {
+        schema: CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1.to_owned(),
+        campaign: current.key().campaign.clone(),
+        verified_at_state_digest: current.state_digest().clone(),
+        refusals: Vec::new(),
+    };
+    let mut detail = operator_detail(current, history, refusals);
+    demo_locator(&mut detail, name);
+    attach_demo_owner_sources(&mut detail);
+    detail
+}
+
+fn demo_index_entry(detail: &CampaignDetailV1) -> CampaignIndexEntryV1 {
+    CampaignIndexEntryV1 {
+        locator_token: detail.locator_token.clone(),
+        locator: detail.locator.clone(),
+        inspect: detail.inspect.clone(),
+        history: detail.history.clone(),
+        refusals: detail.refusals.clone(),
+        projection: detail.projection.clone(),
+    }
+}
+
+fn canonical_demo_details() -> Vec<CampaignDetailV1> {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let issuance = dispatched.issuance().unwrap().issuance.clone();
+    docket.make_indeterminate(&issuance);
+    let _ = engine.poll_docket(&mut docket, NOW + 6).unwrap();
+    docket.settle(&issuance, KnownOutcomeV1::Success);
+    let _ = engine.poll_docket(&mut docket, NOW + 7).unwrap();
+    let _ = engine
+        .open_continuation(occurrence(2), digest("work-2"), NOW + 8)
+        .unwrap();
+    let _ = engine
+        .complete(
+            ObservationRefV1::from_digest(digest("terminal-observation")),
+            &digest("subject"),
+            TerminalWitnessRefV1::from_digest(digest("terminal-witness")),
+            &mut observation,
+            OBSERVATION_RESOLVER_ID,
+            NOW + 9,
+        )
+        .unwrap();
+    let history = engine.history().unwrap();
+    history
+        .transitions
+        .iter()
+        .enumerate()
+        .map(|(index, transition)| {
+            detail_at_transition(
+                &history,
+                index,
+                &format!(
+                    "lifecycle-{index:02}-{:?}",
+                    transition.successor.program_counter()
+                )
+                .to_ascii_lowercase(),
+            )
+        })
+        .collect()
+}
+
+fn successor_proposal_demo_detail() -> CampaignDetailV1 {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let issuance = dispatched.issuance().unwrap().issuance.clone();
+    docket.settle(&issuance, KnownOutcomeV1::Success);
+    let _ = engine.poll_docket(&mut docket, NOW + 6).unwrap();
+    let _ = engine
+        .open_continuation(occurrence(2), digest("work-2"), NOW + 7)
+        .unwrap();
+    let _ = engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("observation-2")),
+            proposal("work-2"),
+            ProposalClassV1::Successor,
+            &mut observation,
+            OBSERVATION_RESOLVER_ID,
+            NOW + 8,
+        )
+        .unwrap();
+    let mut detail = operator_detail(
+        engine.current().unwrap(),
+        engine.history().unwrap(),
+        engine.refusal_history().unwrap(),
+    );
+    demo_locator(&mut detail, "successor-own-proposal");
+    attach_demo_owner_sources(&mut detail);
+    detail
+}
+
+fn human_required_demo_detail() -> CampaignDetailV1 {
+    let human_directory = tempfile::tempdir().unwrap();
+    let mut human = create_engine(&human_directory, ResidualSetV1::default());
+    human
+        .record_refusal(
+            RefusalCodeV1::HumanDecisionRequired,
+            Some(digest("operator-escalation-evidence")),
+            NOW + 1,
+        )
+        .unwrap();
+    human
+        .record_refusal(
+            RefusalCodeV1::AbsentStanding,
+            Some(digest("standing-source-unavailable")),
+            NOW + 2,
+        )
+        .unwrap();
+    human
+        .halt(
+            HaltReasonRefV1::from_digest(digest("human-required")),
+            NOW + 3,
+        )
+        .unwrap();
+    let mut human_detail = operator_detail(
+        human.current().unwrap(),
+        human.history().unwrap(),
+        human.refusal_history().unwrap(),
+    );
+    demo_locator(&mut human_detail, "human-required-multiple-refusals");
+    human_detail
+}
+
+fn budget_exhaustion_demo_detail() -> CampaignDetailV1 {
+    let budget_directory = tempfile::tempdir().unwrap();
+    let mut budget_engine = create_engine(&budget_directory, ResidualSetV1::default());
+    budget_engine.note_probe(NOW + 1).unwrap();
+    budget_engine.note_probe(NOW + 2).unwrap();
+    let mut budget_detail = operator_detail(
+        budget_engine.current().unwrap(),
+        budget_engine.history().unwrap(),
+        budget_engine.refusal_history().unwrap(),
+    );
+    demo_locator(&mut budget_detail, "budget-probe-exhaustion");
+    budget_detail
+}
+
+fn add_source_problem_demo_variants(campaigns: &mut Vec<CampaignDetailV1>) {
+    let dispatched_index = campaigns
+        .iter()
+        .position(|detail| {
+            detail.inspect.value().is_some_and(|value| {
+                value.current.program_counter() == ProgramCounterV1::Dispatched
+            })
+        })
+        .unwrap();
+    let reconciliation_index = campaigns
+        .iter()
+        .position(|detail| {
+            detail.inspect.value().is_some_and(|value| {
+                value.current.program_counter() == ProgramCounterV1::ReconciliationRequired
+            })
+        })
+        .unwrap();
+    let settled_index = campaigns
+        .iter()
+        .position(|detail| {
+            detail.inspect.value().is_some_and(|value| {
+                value.current.program_counter() == ProgramCounterV1::SettledObservationRequired
+            })
+        })
+        .unwrap();
+
+    let mut partial = campaigns[dispatched_index].clone();
+    demo_locator(&mut partial, "partial-ag-history-unavailable");
+    partial.history = unavailable_fixture(
+        "AG",
+        ReadCommandNameV1::AgHistory,
+        SourceErrorKindV1::Unavailable,
+        "fixture: verified journal source temporarily unavailable",
+    );
+    partial.projection = ProjectionCheckV1 {
+        correspondence: ProjectionCorrespondenceV1::Partial,
+        findings: vec!["AG history unavailable; no timeline was inferred".to_owned()],
+    };
+    campaigns.push(partial);
+
+    let mut disagreement = campaigns[1].clone();
+    demo_locator(&mut disagreement, "projection-disagreement-refused");
+    disagreement.status = campaigns[2].status.clone();
+    disagreement.history = campaigns[2].history.clone();
+    disagreement.projection = ProjectionCheckV1 {
+        correspondence: ProjectionCorrespondenceV1::Disagreement,
+        findings: vec![
+            "inspect and status/history name different current-state digests".to_owned(),
+            "canonical AG projections disagree; no value was reconciled".to_owned(),
+        ],
+    };
+    campaigns.push(disagreement);
+
+    let mut docket_unavailable = campaigns[dispatched_index].clone();
+    demo_locator(&mut docket_unavailable, "dispatched-docket-unavailable");
+    docket_unavailable.docket.iter_mut().for_each(|related| {
+        related.result = unavailable_fixture(
+            "Docket",
+            ReadCommandNameV1::DocketGovernedLoopInspect,
+            SourceErrorKindV1::Unavailable,
+            "fixture: Docket owner command unavailable; AG custody fact remains visible",
+        );
+    });
+    campaigns.push(docket_unavailable);
+
+    let mut malformed = campaigns[reconciliation_index].clone();
+    demo_locator(&mut malformed, "reconciliation-docket-malformed");
+    malformed.docket.iter_mut().for_each(|related| {
+        related.result = unavailable_fixture(
+            "Docket",
+            ReadCommandNameV1::DocketGovernedLoopInspect,
+            SourceErrorKindV1::MalformedOutput,
+            "fixture: owner output was not one supported structured value",
+        );
+    });
+    campaigns.push(malformed);
+
+    let mut nightshift_unavailable = campaigns[settled_index].clone();
+    demo_locator(
+        &mut nightshift_unavailable,
+        "settled-nightshift-unavailable",
+    );
+    nightshift_unavailable
+        .nightshift
+        .iter_mut()
+        .for_each(|related| {
+            related.result = unavailable_fixture(
+                "Nightshift",
+                ReadCommandNameV1::NightshiftExportObservation,
+                SourceErrorKindV1::CommandRefused,
+                "fixture: Nightshift refused the read projection",
+            );
+        });
+    campaigns.push(nightshift_unavailable);
+}
+
+fn add_named_lifecycle_demo_variants(campaigns: &mut Vec<CampaignDetailV1>) {
+    for (source_index, label) in [
+        (0, "new-empty-campaign"),
+        (4, "authority-consumed-before-dispatch"),
+        (5, "outcome-unknown-no-settlement"),
+        (6, "reconciliation-exact-attempt"),
+        (7, "settled-fresh-observation-block"),
+        (8, "successor-after-fresh-observation"),
+        (9, "multi-occurrence-complete-history"),
+    ] {
+        let mut copy = campaigns[source_index].clone();
+        demo_locator(&mut copy, label);
+        campaigns.push(copy);
+    }
+}
+
+fn demo_semantic_link_targets(campaigns: &[CampaignDetailV1]) -> Vec<DemoSemanticLinkTargetV1> {
+    let target = campaigns
+        .iter()
+        .find(|detail| detail.locator == "multi-occurrence-complete-history.sqlite")
+        .expect("complete-history demo capture exists");
+    let history = target.history.value().expect("demo history is available");
+    let mut latest_by_occurrence = BTreeMap::new();
+    for transition in &history.transitions {
+        latest_by_occurrence.insert(transition.successor.key().occurrence, &transition.successor);
+    }
+    let mut links = Vec::new();
+    for (occurrence, snapshot) in latest_by_occurrence {
+        links.push(DemoSemanticLinkTargetV1 {
+            campaign: snapshot.key().campaign.clone(),
+            occurrence,
+            proposal: None,
+            locator_token: target.locator_token.clone(),
+        });
+        if let Some(proposal) = snapshot.proposal() {
+            links.push(DemoSemanticLinkTargetV1 {
+                campaign: snapshot.key().campaign.clone(),
+                occurrence,
+                proposal: Some(proposal.reference()),
+                locator_token: target.locator_token.clone(),
+            });
+        }
+    }
+    let successor = campaigns
+        .iter()
+        .find(|detail| detail.locator == "successor-own-proposal.sqlite")
+        .expect("successor proposal demo capture exists");
+    let successor_snapshot = &successor
+        .inspect
+        .value()
+        .expect("successor proposal inspect is available")
+        .current;
+    links.push(DemoSemanticLinkTargetV1 {
+        campaign: successor_snapshot.key().campaign.clone(),
+        occurrence: successor_snapshot.key().occurrence,
+        proposal: Some(
+            successor_snapshot
+                .proposal()
+                .expect("successor proposal is recorded")
+                .reference(),
+        ),
+        locator_token: successor.locator_token.clone(),
+    });
+    links
+}
+
+fn build_operator_demo_corpus() -> DemoCorpusV1 {
+    let mut campaigns = canonical_demo_details();
+    campaigns.push(successor_proposal_demo_detail());
+    campaigns.push(human_required_demo_detail());
+    campaigns.push(budget_exhaustion_demo_detail());
+    add_source_problem_demo_variants(&mut campaigns);
+    add_named_lifecycle_demo_variants(&mut campaigns);
+    let semantic_link_targets = demo_semantic_link_targets(&campaigns);
+
+    let index = CampaignIndexV1 {
+        schema: CAMPAIGN_INDEX_SCHEMA_V1.to_owned(),
+        campaigns: campaigns.iter().map(demo_index_entry).collect(),
+    };
+    DemoCorpusV1 {
+        schema: DEMO_CORPUS_SCHEMA_V1.to_owned(),
+        generated_by: "ag-app governed_loop_engine production-engine fixtures".to_owned(),
+        canonical_schemas: vec![
+            "ag.governed-loop.operational-snapshot/v1".to_owned(),
+            CAMPAIGN_TRANSITION_HISTORY_SCHEMA_V1.to_owned(),
+            CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1.to_owned(),
+            NIGHTSHIFT_OBSERVATION_EXPORT_SCHEMA_V1.to_owned(),
+            NIGHTSHIFT_AUTHORING_CONTEXT_EXPORT_SCHEMA_V1.to_owned(),
+            NIGHTSHIFT_AUTHORING_CONTEXT_PROVENANCE_SCHEMA_V1.to_owned(),
+            DOCKET_INSPECTION_SCHEMA_V1.to_owned(),
+        ],
+        index,
+        campaigns,
+        semantic_link_targets,
+    }
+}
+
+fn assert_successor_semantic_link(
+    corpus: &DemoCorpusV1,
+    reader: &OperatorReaderV1,
+) -> GovernedRuntimeLinkV1 {
+    let proposal_targets = corpus
+        .semantic_link_targets
+        .iter()
+        .filter(|target| target.proposal.is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(proposal_targets.len(), 2);
+    assert_ne!(
+        proposal_targets[0].occurrence,
+        proposal_targets[1].occurrence
+    );
+    assert_ne!(proposal_targets[0].proposal, proposal_targets[1].proposal);
+    let successor = proposal_targets
+        .iter()
+        .find(|target| target.occurrence == occurrence(2))
+        .expect("successor occurrence has its own proposal link");
+    let link = GovernedRuntimeLinkV1 {
+        campaign: successor.campaign.as_digest().clone(),
+        occurrence: successor.occurrence,
+        proposal: successor
+            .proposal
+            .as_ref()
+            .map(|proposal| proposal.as_digest().clone()),
+    };
+    let detail = reader.campaign_detail_for_link(&link).unwrap();
+    let snapshot = selected_snapshot(&detail, &link).unwrap();
+    assert_eq!(snapshot.key().occurrence, occurrence(2));
+    assert_eq!(
+        snapshot.proposal().unwrap().reference(),
+        successor.proposal.clone().unwrap()
+    );
+    assert_eq!(snapshot.state().meta().expected_work(), &digest("work-2"));
+    link
+}
+
+#[test]
+#[ignore = "writes a deterministic operator presentation corpus to an explicit path"]
+fn write_operator_demo_corpus_from_production_engine_fixtures() {
+    let destination = std::env::var_os("AG_OPERATOR_DEMO_OUTPUT")
+        .expect("AG_OPERATOR_DEMO_OUTPUT must name the output file");
+    let corpus = build_operator_demo_corpus();
+    assert!(corpus.campaigns.len() >= 20);
+    let bytes = serde_json::to_vec_pretty(&corpus).unwrap();
+    std::fs::write(destination, bytes).unwrap();
+}
+
+fn assert_demo_semantic_links(corpus: &DemoCorpusV1, reader: &OperatorReaderV1) {
+    assert!(corpus.semantic_link_targets.len() >= 4);
+    assert_eq!(
+        corpus
+            .semantic_link_targets
+            .iter()
+            .map(|target| target.occurrence)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2
+    );
+    for target in &corpus.semantic_link_targets {
+        let link = GovernedRuntimeLinkV1 {
+            campaign: target.campaign.as_digest().clone(),
+            occurrence: target.occurrence,
+            proposal: target
+                .proposal
+                .as_ref()
+                .map(|proposal| proposal.as_digest().clone()),
+        };
+        let detail = reader.campaign_detail_for_link(&link).unwrap();
+        let selected = selected_snapshot(&detail, &link).unwrap();
+        assert_eq!(selected.key().campaign, target.campaign);
+        assert_eq!(selected.key().occurrence, target.occurrence);
+        if let Some(proposal) = &target.proposal {
+            assert_eq!(selected.proposal().unwrap().reference(), *proposal);
+        }
+        let html =
+            render::campaign_detail_for_link_with_context(&detail, reader.mode_label(), &link);
+        assert!(html.contains("semantic links carry identities, never authority"));
+        if target.proposal.is_some() {
+            if target.occurrence == occurrence(2) {
+                assert!(html.contains("authoring context not recorded"));
+                assert!(!html.contains("canonical Nightshift lineage"));
+            } else {
+                assert!(html.contains("canonical Nightshift lineage"));
+                assert!(html.contains("Lineage, not permission"));
+            }
+        }
+    }
+    assert!(corpus.semantic_link_targets.iter().any(|target| {
+        let link = GovernedRuntimeLinkV1 {
+            campaign: target.campaign.as_digest().clone(),
+            occurrence: target.occurrence,
+            proposal: target
+                .proposal
+                .as_ref()
+                .map(|proposal| proposal.as_digest().clone()),
+        };
+        let detail = reader.campaign_detail_for_link(&link).unwrap();
+        render::campaign_detail_for_link_with_context(&detail, reader.mode_label(), &link)
+            .contains("historical occurrence")
+    }));
+    let historical = corpus
+        .semantic_link_targets
+        .iter()
+        .find(|target| target.proposal.is_some())
+        .unwrap();
+    let historical_link = GovernedRuntimeLinkV1 {
+        campaign: historical.campaign.as_digest().clone(),
+        occurrence: historical.occurrence,
+        proposal: historical
+            .proposal
+            .as_ref()
+            .map(|proposal| proposal.as_digest().clone()),
+    };
+    let detail = reader.campaign_detail_for_link(&historical_link).unwrap();
+    assert_ne!(
+        selected_snapshot(&detail, &historical_link)
+            .unwrap()
+            .key()
+            .occurrence,
+        detail.inspect.value().unwrap().current.key().occurrence
+    );
+    let _ = assert_successor_semantic_link(corpus, reader);
+    let substituted = GovernedRuntimeLinkV1 {
+        proposal: Some(digest("unrelated-authoring-proposal")),
+        ..historical_link
+    };
+    assert!(reader.campaign_detail_for_link(&substituted).is_err());
+}
+
+#[test]
+fn operator_demo_corpus_round_trips_through_the_bounded_typed_reader() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("operator-demo.json");
+    let corpus = build_operator_demo_corpus();
+    std::fs::write(&path, serde_json::to_vec(&corpus).unwrap()).unwrap();
+    let reader = OperatorReaderV1::from_demo_corpus(&path).unwrap();
+    let index = reader.campaign_index().unwrap();
+    assert_eq!(index.campaigns.len(), corpus.campaigns.len());
+    assert!(index.campaigns.len() >= 20);
+
+    let mut counters = Vec::new();
+    for entry in &index.campaigns {
+        let detail = reader.campaign_detail(&entry.locator_token).unwrap();
+        let html = render::campaign_detail_with_context(&detail, reader.mode_label());
+        assert!(html.contains("deterministic demo corpus"));
+        assert!(html.contains("Raw canonical data and source diagnostics"));
+        if let Some(inspect) = detail.inspect.value() {
+            let counter = inspect.current.program_counter();
+            if !counters.contains(&counter) {
+                counters.push(counter);
+            }
+        }
+    }
+    assert_eq!(counters.len(), 10);
+    assert!(index.campaigns.iter().any(|entry| {
+        entry.projection.correspondence == ProjectionCorrespondenceV1::Disagreement
+    }));
+    assert!(
+        index.campaigns.iter().any(|entry| {
+            entry.projection.correspondence == ProjectionCorrespondenceV1::Partial
+        })
+    );
+
+    assert_demo_semantic_links(&corpus, &reader);
+}
+
+fn assert_human_required_halt_view() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    engine
+        .record_refusal(
+            RefusalCodeV1::HumanDecisionRequired,
+            Some(digest("operator-escalation-evidence")),
+            NOW + 1,
+        )
+        .unwrap();
+    engine
+        .halt(
+            HaltReasonRefV1::from_digest(digest("human-required")),
+            NOW + 2,
+        )
+        .unwrap();
+    let history = engine.history().unwrap();
+    let refusals = engine.refusal_history().unwrap();
+    assert_eq!(refusals.schema, CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1);
+    let html = render::campaign_detail(&operator_detail(
+        engine.current().unwrap(),
+        history,
+        refusals,
+    ));
+    assert!(html.contains("Halted"));
+    assert!(html.contains("HumanDecisionRequired"));
+    assert!(html.contains("non-authorizing facts"));
 }
 
 fn advance_to_spent(
@@ -612,6 +1549,106 @@ fn production_path_spends_once_settles_and_requires_a_new_occurrence() {
 }
 
 #[test]
+fn operator_views_render_every_canonical_counter_from_real_persisted_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let issuance = dispatched.issuance().unwrap().issuance.clone();
+    docket.make_indeterminate(&issuance);
+    let _ = engine.poll_docket(&mut docket, NOW + 6).unwrap();
+    docket.settle(&issuance, KnownOutcomeV1::Success);
+    let _ = engine.poll_docket(&mut docket, NOW + 7).unwrap();
+    let successor = engine
+        .open_continuation(occurrence(2), digest("work-2"), NOW + 8)
+        .unwrap();
+    assert_ne!(successor.key().occurrence, occurrence(1));
+    let _ = engine
+        .complete(
+            ObservationRefV1::from_digest(digest("terminal-observation")),
+            &digest("subject"),
+            TerminalWitnessRefV1::from_digest(digest("terminal-witness")),
+            &mut observation,
+            OBSERVATION_RESOLVER_ID,
+            NOW + 9,
+        )
+        .unwrap();
+
+    let complete_history = engine.history().unwrap();
+    assert_eq!(
+        complete_history.schema,
+        CAMPAIGN_TRANSITION_HISTORY_SCHEMA_V1
+    );
+    let counters = complete_history
+        .transitions
+        .iter()
+        .map(|transition| transition.successor.program_counter())
+        .collect::<Vec<_>>();
+    for expected in [
+        ProgramCounterV1::ObservationRequired,
+        ProgramCounterV1::ProposalRecorded,
+        ProgramCounterV1::StandingRequired,
+        ProgramCounterV1::AdmissiblePendingAuthorization,
+        ProgramCounterV1::AuthorizationConsumed,
+        ProgramCounterV1::Dispatched,
+        ProgramCounterV1::ReconciliationRequired,
+        ProgramCounterV1::SettledObservationRequired,
+        ProgramCounterV1::Completed,
+    ] {
+        assert!(counters.contains(&expected), "missing {expected:?}");
+    }
+
+    for (index, transition) in complete_history.transitions.iter().enumerate() {
+        let current = transition.successor.clone();
+        let mut history = complete_history.clone();
+        history.transitions.truncate(index + 1);
+        history.current_state_digest = current.state_digest().clone();
+        let refusals = CampaignRefusalHistoryV1 {
+            schema: CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1.to_owned(),
+            campaign: current.key().campaign.clone(),
+            verified_at_state_digest: current.state_digest().clone(),
+            refusals: Vec::new(),
+        };
+        let html = render::campaign_detail(&operator_detail(current.clone(), history, refusals));
+        assert!(html.contains(&format!("{:?}", current.program_counter())));
+        match current.program_counter() {
+            ProgramCounterV1::AuthorizationConsumed => {
+                assert!(html.contains("spent and cannot be reused"));
+            }
+            ProgramCounterV1::Dispatched => {
+                assert!(html.contains("outcome unknown"));
+                assert!(html.contains("Absence of a receipt is not failure"));
+            }
+            ProgramCounterV1::ReconciliationRequired => {
+                assert!(html.contains("Repeat dispatch is not authorized"));
+            }
+            ProgramCounterV1::SettledObservationRequired => {
+                assert!(html.contains("fresh independent observation is required"));
+            }
+            ProgramCounterV1::Completed => {
+                assert!(html.contains("completed:"));
+                assert!(
+                    html.contains(
+                        current
+                            .completed()
+                            .unwrap()
+                            .terminal_observation()
+                            .observation
+                            .as_str()
+                    )
+                );
+            }
+            _ => {}
+        }
+    }
+
+    assert_human_required_halt_view();
+}
+
+#[test]
 fn consequence_time_stale_observation_and_revoked_standing_do_not_spend() {
     let directory = tempfile::tempdir().unwrap();
     let mut engine = create_engine(&directory, ResidualSetV1::default());
@@ -731,6 +1768,10 @@ fn custody_crash_recovers_to_reconciliation_without_respend_or_repeat() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one restart matrix keeps every consequence boundary visibly in one witness"
+)]
 fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authority() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("campaign.sqlite");
@@ -804,6 +1845,10 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
 
     let mut docket = FakeDocket::default();
     engine = CampaignEngineV1::open(&database).unwrap();
+    assert_eq!(
+        engine.current().unwrap().program_counter(),
+        ProgramCounterV1::AuthorizationConsumed
+    );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
     assert!(matches!(
         engine.recover(&mut docket, NOW + 5).unwrap(),
@@ -832,6 +1877,10 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
 
     docket.settle(&issuance, KnownOutcomeV1::Success);
     engine = CampaignEngineV1::open(&database).unwrap();
+    assert_eq!(
+        engine.current().unwrap().program_counter(),
+        ProgramCounterV1::ReconciliationRequired
+    );
     let CampaignRecoveryV1::Advanced(settled) = engine.recover(&mut docket, NOW + 8).unwrap()
     else {
         panic!("exact Docket settlement must close reconciliation")
@@ -846,6 +1895,10 @@ fn restart_at_each_consequence_boundary_preserves_pc_and_never_recreates_authori
     drop(engine);
 
     engine = CampaignEngineV1::open(&database).unwrap();
+    assert_eq!(
+        engine.current().unwrap().program_counter(),
+        ProgramCounterV1::SettledObservationRequired
+    );
     let next = engine
         .open_continuation(occurrence(2), digest("work-1"), NOW + 9)
         .unwrap();
@@ -953,6 +2006,114 @@ fn indeterminate_attempt_blocks_repeat_until_exact_settlement() {
 }
 
 #[test]
+fn intervention_reconciliation_queries_only_exact_attempt_and_persists_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("campaign.sqlite");
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = ObservationBoundary::current(clean_basis());
+    let mut standing = StandingBoundary::current();
+    let _ = advance_to_spent(&mut engine, &mut observation, &mut standing);
+    let mut docket = FakeDocket::default();
+    let dispatched = engine.dispatch(&mut docket, NOW + 5).unwrap();
+    let issuance = dispatched.issuance().unwrap().issuance.clone();
+    docket.make_indeterminate(&issuance);
+    let DocketProgressV1::ReconciliationRequired(reconciling) =
+        engine.poll_docket(&mut docket, NOW + 6).unwrap()
+    else {
+        panic!("unknown outcome must reconcile")
+    };
+    let custody = reconciling.docket_custody().unwrap();
+    let request = intervention_request(
+        &reconciling,
+        GovernedInterventionClassV1::ReconcileAttempt {
+            issuance: custody.issuance.clone(),
+            attempt: custody.attempt.clone(),
+            evidence: vec![digest("operator-reconciliation-evidence")],
+        },
+        "reconcile-nonce",
+    );
+    let mut verifier = InterventionVerifier::default();
+
+    // Insufficient evidence remains visibly indeterminate and never repeats dispatch.
+    assert!(matches!(
+        engine
+            .request_reconciliation(
+                request.clone(),
+                &intervention_scope(),
+                &mut verifier,
+                &mut docket,
+                NOW + 7,
+            )
+            .unwrap(),
+        DocketProgressV1::ReconciliationRequired(_)
+    ));
+    assert_eq!(docket.accept_calls(), 1);
+    assert_eq!(
+        engine.current().unwrap().program_counter(),
+        ProgramCounterV1::ReconciliationRequired
+    );
+    assert_eq!(engine.refusal_history().unwrap().refusals.len(), 1);
+    // Exact transport replay is an idempotent read and retains one canonical
+    // outcome-unknown refusal rather than minting another request or dispatch.
+    assert!(matches!(
+        engine
+            .request_reconciliation(
+                request.clone(),
+                &intervention_scope(),
+                &mut verifier,
+                &mut docket,
+                NOW + 7,
+            )
+            .unwrap(),
+        DocketProgressV1::ReconciliationRequired(_)
+    ));
+    assert_eq!(engine.refusal_history().unwrap().refusals.len(), 1);
+    assert_eq!(docket.accept_calls(), 1);
+
+    docket.settle(&issuance, KnownOutcomeV1::Success);
+    let DocketProgressV1::Settled(settled) = engine
+        .request_reconciliation(
+            request.clone(),
+            &intervention_scope(),
+            &mut verifier,
+            &mut docket,
+            NOW + 8,
+        )
+        .unwrap()
+    else {
+        panic!("exact Docket settlement must settle")
+    };
+    assert_eq!(docket.accept_calls(), 1);
+    assert_eq!(
+        settled.program_counter(),
+        ProgramCounterV1::SettledObservationRequired
+    );
+    let history = engine.history().unwrap();
+    assert!(matches!(
+        &history.transitions.last().unwrap().evidence,
+        CampaignTransitionEvidenceV1::GovernedIntervention { verified }
+            if verified.request == request
+    ));
+
+    drop(engine);
+    let mut reopened = CampaignEngineV1::open(&database).unwrap();
+    assert_eq!(reopened.current().unwrap(), settled);
+    // The exact historical request cannot silently retarget or resettle.
+    assert!(
+        reopened
+            .request_reconciliation(
+                request,
+                &intervention_scope(),
+                &mut verifier,
+                &mut docket,
+                NOW + 9,
+            )
+            .is_err()
+    );
+    assert_eq!(docket.accept_calls(), 1);
+}
+
+#[test]
 fn human_return_is_one_use_and_opens_only_an_authority_empty_occurrence() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("campaign.sqlite");
@@ -1014,6 +2175,10 @@ fn human_return_is_one_use_and_opens_only_an_authority_empty_occurrence() {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one residual witness keeps persistence and nonce attacks visibly adjacent"
+)]
 fn residual_discharge_is_exact_durable_and_nonce_one_shot() {
     let directory = tempfile::tempdir().unwrap();
     let residual = ResidualObligationV1 {

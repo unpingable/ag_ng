@@ -685,6 +685,10 @@ fn create_engine(directory: &TempDir) -> CampaignEngineV1 {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the process witness keeps both fresh standing evaluations and kernel checks visible"
+)]
 fn real_resolver_output_passes_kernel_validation_at_decide_and_authorize() {
     let directory = tempfile::tempdir().unwrap();
     let store_path = directory.path().join("mandate-store.json");

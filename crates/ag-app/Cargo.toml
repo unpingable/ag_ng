@@ -68,6 +68,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+ag-operator-ui = { path = "../ag-operator-ui" }
 tempfile.workspace = true
 
 [lints]

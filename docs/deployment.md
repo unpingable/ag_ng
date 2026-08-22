@@ -1,5 +1,11 @@
 # Deployment contract
 
+This document governs the existing daemon/effect-plane packaging. The
+canonical `ag-loopctl` governed-loop deployment companion is
+[`governed-loop-deployment-qualification.md`](governed-loop-deployment-qualification.md);
+neither surface may be used as an alternate authority-bearing path for the
+other.
+
 AG-ng is a single-host, systemd-managed authority service. Installation and
 production enrollment are separate operations: the package may place binaries,
 units, examples, users, and empty directories, but it must not create an

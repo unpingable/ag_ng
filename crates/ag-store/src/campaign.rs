@@ -27,9 +27,10 @@ use std::time::Duration;
 
 use ag_campaign::CampaignId;
 use ag_campaign::governed::{
-    AgIssuanceRefV1, AgIssuanceV1, GovernedLoopKernelV1, HumanDispositionEffectV1,
-    HumanDispositionKindV1, HumanDispositionV1, HumanVerificationRefV1, OccurrenceKeyV1,
-    OccurrenceSnapshotV1, ProgramCounterV1, RefusalOutcomeV1,
+    AgIssuanceRefV1, AgIssuanceV1, GovernedInterventionClassV1, GovernedLoopKernelV1,
+    HumanDispositionEffectV1, HumanDispositionKindV1, HumanDispositionV1, HumanVerificationRefV1,
+    OccurrenceKeyV1, OccurrenceSnapshotV1, ProgramCounterV1, RefusalOutcomeV1,
+    VerifiedGovernedInterventionV1,
 };
 use ag_primitives::{Digest, JcsDocument};
 use rusqlite::{
@@ -39,11 +40,18 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current governed-loop campaign-store schema version.
-pub const CAMPAIGN_STORE_SCHEMA_VERSION: u32 = 1;
+pub const CAMPAIGN_STORE_SCHEMA_VERSION: u32 = 2;
 /// `SQLite` application identifier for this exact store family (`AGC1`).
 pub const CAMPAIGN_STORE_APPLICATION_ID: u32 = 0x4147_4331;
 /// Human-readable exact store schema identity.
-pub const CAMPAIGN_STORE_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v1";
+pub const CAMPAIGN_STORE_SCHEMA_NAME: &str = "ag-governed-loop-campaign-store/v2";
+
+/// Domain binding the exact deployment-owned runtime profile bytes.
+pub const RUNTIME_PROFILE_DIGEST_DOMAIN_V1: &str = "ag.governed-loop.runtime-profile/v1";
+/// Schema for the verified read-only transition-history projection.
+pub const CAMPAIGN_TRANSITION_HISTORY_SCHEMA_V1: &str = "ag.governed-loop.transition-history/v1";
+/// Schema for the verified read-only refusal-history projection.
+pub const CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1: &str = "ag.governed-loop.refusal-history/v1";
 
 const EVENT_DOMAIN_V1: &str = "ag.governed-loop.store-event/v1";
 const EVENT_GENESIS_DOMAIN_V1: &str = "ag.governed-loop.store-event-genesis/v1";
@@ -56,6 +64,13 @@ CREATE TABLE store_identity (
     schema_name TEXT NOT NULL,
     schema_version INTEGER NOT NULL,
     schema_digest TEXT NOT NULL
+) STRICT;
+
+CREATE TABLE runtime_profile (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    schema TEXT NOT NULL,
+    profile_digest TEXT NOT NULL UNIQUE,
+    profile_jcs BLOB NOT NULL
 ) STRICT;
 
 CREATE TABLE campaigns (
@@ -261,11 +276,26 @@ impl CampaignTransitionKindV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum CampaignTransitionEvidenceV1 {
+/// Exact additional evidence carried by one canonical store transition.
+pub enum CampaignTransitionEvidenceV1 {
+    /// Campaign genesis and its optional deployment profile binding.
+    Genesis {
+        /// Exact genesis-bound runtime-profile identity, when present.
+        runtime_profile: Option<Digest>,
+    },
+    /// Transition requires no additional store-owned evidence object.
     None,
+    /// Exact external human disposition and its verification reference.
     HumanDisposition {
+        /// Canonical human disposition artifact.
         artifact: HumanDispositionV1,
+        /// Exact external verification record.
         verification: HumanVerificationRefV1,
+    },
+    /// Exact authenticated intervention intent; never an AG capability.
+    GovernedIntervention {
+        /// Request and external principal/mandate verification receipt.
+        verified: VerifiedGovernedInterventionV1,
     },
 }
 
@@ -313,6 +343,87 @@ pub struct CampaignReplayReportV1 {
     pub human_dispositions: u64,
     /// Current authoritative state digest.
     pub current_state_digest: Digest,
+}
+
+/// One verified canonical transition journal entry in durable sequence order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignTransitionProjectionV1 {
+    /// Durable one-based store sequence.
+    pub sequence: u64,
+    /// Source occurrence, absent only at genesis.
+    pub source_occurrence: Option<String>,
+    /// Successor occurrence made authoritative by this transition.
+    pub successor_occurrence: String,
+    /// Exact typed transition kind.
+    pub kind: CampaignTransitionKindV1,
+    /// Exact predecessor state digest.
+    pub predecessor_state_digest: Digest,
+    /// Exact successor state digest.
+    pub successor_state_digest: Digest,
+    /// Full canonical successor snapshot, retained rather than reconstructed.
+    pub successor: OccurrenceSnapshotV1,
+    /// Exact transition evidence retained by the authoritative store.
+    pub evidence: CampaignTransitionEvidenceV1,
+    /// Digest of the canonical transition evidence.
+    pub evidence_digest: Digest,
+    /// Previous event-chain identity.
+    pub previous_event_digest: Digest,
+    /// This event's chained identity.
+    pub event_digest: Digest,
+    /// Durable recording time; this is a fact, not freshness authority.
+    pub recorded_at_unix_ms: u64,
+}
+
+/// Verified read-only transition history for the sole campaign in a store.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignTransitionHistoryV1 {
+    /// Exact projection schema.
+    pub schema: String,
+    /// Exact campaign identity.
+    pub campaign: CampaignId,
+    /// Canonical transitions in durable sequence order.
+    pub transitions: Vec<CampaignTransitionProjectionV1>,
+    /// State digest current when this projection was verified.
+    pub current_state_digest: Digest,
+}
+
+/// One durable non-authorizing refusal in recording order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignRefusalProjectionV1 {
+    /// Content-derived store refusal identity.
+    pub refusal: Digest,
+    /// Complete typed refusal fact.
+    pub outcome: RefusalOutcomeV1,
+    /// Durable recording time; not freshness authority.
+    pub recorded_at_unix_ms: u64,
+}
+
+/// Verified read-only non-authorizing refusal history.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CampaignRefusalHistoryV1 {
+    /// Exact projection schema.
+    pub schema: String,
+    /// Exact campaign identity.
+    pub campaign: CampaignId,
+    /// State digest at which replay verified the refusal materialization.
+    pub verified_at_state_digest: Digest,
+    /// Durable refusals ordered by recording time and exact identity.
+    pub refusals: Vec<CampaignRefusalProjectionV1>,
+}
+
+/// Exact deployment-owned runtime profile retained at campaign genesis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredRuntimeProfileV1 {
+    /// Versioned profile schema.
+    pub schema: String,
+    /// Domain-separated identity of the canonical profile bytes.
+    pub digest: Digest,
+    /// Exact canonical profile bytes.
+    pub canonical_bytes: Vec<u8>,
 }
 
 /// Transactional campaign-store failures.
@@ -371,6 +482,17 @@ impl CampaignStoreV1 {
         initial: &OccurrenceSnapshotV1,
         recorded_at_unix_ms: u64,
     ) -> Result<Self, CampaignStoreErrorV1> {
+        Self::create_with_runtime_profile(path, initial, None, recorded_at_unix_ms)
+    }
+
+    /// Creates a new store and atomically binds an optional deployment-owned
+    /// runtime profile into the genesis transaction.
+    pub fn create_with_runtime_profile(
+        path: &Path,
+        initial: &OccurrenceSnapshotV1,
+        runtime_profile: Option<(&str, &[u8])>,
+        recorded_at_unix_ms: u64,
+    ) -> Result<Self, CampaignStoreErrorV1> {
         initial.validate_integrity()?;
         if initial.program_counter() != ProgramCounterV1::ObservationRequired
             || initial.prior_occurrence().is_some()
@@ -416,6 +538,28 @@ impl CampaignStoreV1 {
                 schema_digest.as_str(),
             ],
         )?;
+        let runtime_profile_digest = if let Some((schema, profile_jcs)) = runtime_profile {
+            if schema.is_empty() || schema.chars().any(char::is_whitespace) {
+                return Err(CampaignStoreErrorV1::Canonical(
+                    "runtime profile schema must be one nonempty token".to_owned(),
+                ));
+            }
+            JcsDocument::from_canonical_bytes(profile_jcs).map_err(|error| {
+                CampaignStoreErrorV1::Canonical(format!(
+                    "runtime profile is not canonical JSON: {error}"
+                ))
+            })?;
+            let profile_digest = Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, profile_jcs);
+            transaction.execute(
+                "INSERT INTO runtime_profile
+                 (singleton, schema, profile_digest, profile_jcs)
+                 VALUES (1, ?1, ?2, ?3)",
+                params![schema, profile_digest.as_str(), profile_jcs],
+            )?;
+            Some(profile_digest)
+        } else {
+            None
+        };
         transaction.pragma_update(None, "application_id", CAMPAIGN_STORE_APPLICATION_ID)?;
         transaction.pragma_update(None, "user_version", CAMPAIGN_STORE_SCHEMA_VERSION)?;
 
@@ -424,7 +568,9 @@ impl CampaignStoreV1 {
         let occurrence = initial.key().occurrence.to_string();
         let previous_event_digest =
             Digest::hash_domain(EVENT_GENESIS_DOMAIN_V1, campaign.as_str().as_bytes());
-        let evidence = CampaignTransitionEvidenceV1::None;
+        let evidence = CampaignTransitionEvidenceV1::Genesis {
+            runtime_profile: runtime_profile_digest,
+        };
         let evidence_jcs = encode(&evidence)?;
         let evidence_digest = Digest::hash_domain(EVENT_DOMAIN_V1, &evidence_jcs);
         let event_digest = store_event_digest(
@@ -640,6 +786,34 @@ impl CampaignStoreV1 {
         Ok(receipts)
     }
 
+    /// Commits an existing authority-safe kernel transition while retaining
+    /// the exact authenticated intervention that selected it.
+    pub fn commit_governed_intervention(
+        &mut self,
+        expected: &OccurrenceSnapshotV1,
+        successor: &OccurrenceSnapshotV1,
+        kind: CampaignTransitionKindV1,
+        verified: &VerifiedGovernedInterventionV1,
+        recorded_at_unix_ms: u64,
+    ) -> Result<CampaignCommitReceiptV1, CampaignStoreErrorV1> {
+        validate_governed_intervention_evidence(expected, successor, kind, verified)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let receipt = write_transition(
+            &transaction,
+            expected,
+            successor,
+            kind,
+            &CampaignTransitionEvidenceV1::GovernedIntervention {
+                verified: verified.clone(),
+            },
+            recorded_at_unix_ms,
+        )?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
     /// Records a durable non-authorizing refusal without changing the PC.
     pub fn record_refusal(
         &mut self,
@@ -650,13 +824,14 @@ impl CampaignStoreV1 {
         if refusal.key != *current.key() || refusal.at_state_digest != *current.state_digest() {
             return Err(CampaignStoreErrorV1::BindingMismatch);
         }
+        validate_refusal_intervention_binding(refusal)?;
         let bytes = encode(refusal)?;
         let refusal_id = Digest::hash_domain(REFUSAL_DOMAIN_V1, &bytes);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
-            "INSERT INTO refusals
+            "INSERT OR IGNORE INTO refusals
              (refusal_id, campaign_id, occurrence_id, state_digest,
               refusal_jcs, recorded_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -698,10 +873,162 @@ impl CampaignStoreV1 {
         ))
     }
 
+    /// Returns the exact deployment-owned runtime profile, when this store
+    /// was created through the bound production surface.
+    pub fn runtime_profile(&self) -> Result<Option<StoredRuntimeProfileV1>, CampaignStoreErrorV1> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT schema, profile_digest, profile_jcs
+                 FROM runtime_profile WHERE singleton=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(schema, digest, canonical_bytes)| {
+            let digest = parse_digest(&digest)?;
+            let expected = Digest::hash_domain(RUNTIME_PROFILE_DIGEST_DOMAIN_V1, &canonical_bytes);
+            JcsDocument::from_canonical_bytes(&canonical_bytes).map_err(|error| {
+                CampaignStoreErrorV1::Corrupt(format!(
+                    "runtime profile is not canonical JSON: {error}"
+                ))
+            })?;
+            if schema.is_empty() || schema.chars().any(char::is_whitespace) || digest != expected {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "runtime profile binding differs from genesis".to_owned(),
+                ));
+            }
+            Ok(StoredRuntimeProfileV1 {
+                schema,
+                digest,
+                canonical_bytes,
+            })
+        })
+        .transpose()
+    }
+
     /// Performs deterministic transition replay and exact journal accounting.
     pub fn replay(&self) -> Result<CampaignReplayReportV1, CampaignStoreErrorV1> {
         self.verify_identity()?;
         replay_store(&self.connection)
+    }
+
+    /// Returns the exact verified transition journal in durable sequence
+    /// order. This is a read-only projection; it performs full replay and
+    /// refuses a concurrent/stale cut instead of reconciling it heuristically.
+    pub fn history(&self) -> Result<CampaignTransitionHistoryV1, CampaignStoreErrorV1> {
+        let campaign = self.campaign_id()?;
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, source_occurrence_id, successor_occurrence_id,
+                    transition_kind, predecessor_state_digest, successor_state_digest,
+                    successor_snapshot_jcs, evidence_jcs, evidence_digest,
+                    previous_event_digest, event_digest, recorded_at_unix_ms
+             FROM transitions WHERE campaign_id=?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map(params![campaign.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Vec<u8>>(6)?,
+                row.get::<_, Vec<u8>>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })?;
+        let mut transitions = Vec::new();
+        for row in rows {
+            let raw = row?;
+            transitions.push(CampaignTransitionProjectionV1 {
+                sequence: to_u64(raw.0)?,
+                source_occurrence: raw.1,
+                successor_occurrence: raw.2,
+                kind: CampaignTransitionKindV1::parse(&raw.3)?,
+                predecessor_state_digest: parse_digest(&raw.4)?,
+                successor_state_digest: parse_digest(&raw.5)?,
+                successor: decode(&raw.6)?,
+                evidence: decode(&raw.7)?,
+                evidence_digest: parse_digest(&raw.8)?,
+                previous_event_digest: parse_digest(&raw.9)?,
+                event_digest: parse_digest(&raw.10)?,
+                recorded_at_unix_ms: to_u64(raw.11)?,
+            });
+        }
+        drop(statement);
+        let replay = self.replay()?;
+        let length = u64::try_from(transitions.len())
+            .map_err(|_| CampaignStoreErrorV1::Corrupt("transition count overflow".to_owned()))?;
+        let last = transitions.last().ok_or_else(|| {
+            CampaignStoreErrorV1::Corrupt("transition history is empty".to_owned())
+        })?;
+        if replay.campaign != campaign
+            || replay.transitions != length
+            || replay.current_state_digest != last.successor_state_digest
+        {
+            return Err(CampaignStoreErrorV1::Corrupt(
+                "transition history differs from deterministic replay".to_owned(),
+            ));
+        }
+        Ok(CampaignTransitionHistoryV1 {
+            schema: CAMPAIGN_TRANSITION_HISTORY_SCHEMA_V1.to_owned(),
+            campaign,
+            transitions,
+            current_state_digest: replay.current_state_digest,
+        })
+    }
+
+    /// Returns every durable non-authorizing refusal after full replay has
+    /// verified its campaign, occurrence, state, and content-derived identity.
+    pub fn refusal_history(&self) -> Result<CampaignRefusalHistoryV1, CampaignStoreErrorV1> {
+        let replay = self.replay()?;
+        let mut statement = self.connection.prepare(
+            "SELECT refusal_id, refusal_jcs, recorded_at_unix_ms
+             FROM refusals WHERE campaign_id=?1
+             ORDER BY recorded_at_unix_ms, refusal_id",
+        )?;
+        let rows = statement.query_map(params![replay.campaign.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut refusals = Vec::new();
+        for row in rows {
+            let (refusal, bytes, recorded_at) = row?;
+            let outcome: RefusalOutcomeV1 = decode(&bytes)?;
+            let identity = parse_digest(&refusal)?;
+            if identity != Digest::hash_domain(REFUSAL_DOMAIN_V1, &bytes)
+                || outcome.key.campaign != replay.campaign
+            {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "refusal projection binding mismatch".to_owned(),
+                ));
+            }
+            validate_refusal_intervention_binding(&outcome)?;
+            refusals.push(CampaignRefusalProjectionV1 {
+                refusal: identity,
+                outcome,
+                recorded_at_unix_ms: to_u64(recorded_at)?,
+            });
+        }
+        Ok(CampaignRefusalHistoryV1 {
+            schema: CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1.to_owned(),
+            campaign: replay.campaign,
+            verified_at_state_digest: replay.current_state_digest,
+            refusals,
+        })
     }
 
     fn verify_identity(&self) -> Result<(), CampaignStoreErrorV1> {
@@ -728,8 +1055,24 @@ impl CampaignStoreV1 {
         {
             return Err(CampaignStoreErrorV1::StoreIdentity);
         }
+        let _ = self.runtime_profile()?;
         Ok(())
     }
+}
+
+fn validate_refusal_intervention_binding(
+    refusal: &RefusalOutcomeV1,
+) -> Result<(), CampaignStoreErrorV1> {
+    if let Some(verified) = &refusal.governed_intervention {
+        verified.request.validate_integrity()?;
+        // A refusal may intentionally describe a foreign/stale target.  The
+        // refusal coordinates identify where evaluation occurred; the exact
+        // request retains what the authenticated principal actually targeted.
+        if refusal.evidence.as_ref() != Some(verified.request.request.as_digest()) {
+            return Err(CampaignStoreErrorV1::BindingMismatch);
+        }
+    }
+    Ok(())
 }
 
 fn configure_connection(connection: &Connection) -> Result<(), CampaignStoreErrorV1> {
@@ -1416,6 +1759,15 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
         .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
     let head = Digest::parse(&head_text)
         .map_err(|error| CampaignStoreErrorV1::Corrupt(error.to_string()))?;
+    let stored_profile_digest = connection
+        .query_row(
+            "SELECT profile_digest FROM runtime_profile WHERE singleton=1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|digest| parse_digest(&digest))
+        .transpose()?;
 
     let mut statement = connection.prepare(
         "SELECT source_occurrence_id, successor_occurrence_id, transition_kind,
@@ -1510,11 +1862,19 @@ fn replay_store(connection: &Connection) -> Result<CampaignReplayReportV1, Campa
             )));
         }
         if index == 0 {
+            let CampaignTransitionEvidenceV1::Genesis {
+                runtime_profile: genesis_profile,
+            } = &row.evidence
+            else {
+                return Err(CampaignStoreErrorV1::Corrupt(
+                    "campaign genesis lacks its runtime-profile binding".to_owned(),
+                ));
+            };
             if row.kind != CampaignTransitionKindV1::CampaignCreated
                 || row.source_occurrence.is_some()
                 || row.snapshot.program_counter() != ProgramCounterV1::ObservationRequired
                 || row.snapshot.prior_occurrence().is_some()
-                || !matches!(row.evidence, CampaignTransitionEvidenceV1::None)
+                || genesis_profile.as_ref() != stored_profile_digest.as_ref()
             {
                 return Err(CampaignStoreErrorV1::Corrupt(
                     "invalid campaign genesis transition".to_owned(),
@@ -1707,10 +2067,65 @@ fn validate_replayed_evidence(
         (CampaignTransitionKindV1::HumanDisposition, _) => Err(CampaignStoreErrorV1::Corrupt(
             "human transition lacks exact disposition evidence".to_owned(),
         )),
+        (_, CampaignTransitionEvidenceV1::GovernedIntervention { verified }) => {
+            validate_governed_intervention_evidence(source, target, kind, verified)
+        }
         (_, CampaignTransitionEvidenceV1::None) => Ok(()),
         (_, _) => Err(CampaignStoreErrorV1::Corrupt(
-            "non-human transition carries human authority evidence".to_owned(),
+            "transition carries incompatible special evidence".to_owned(),
         )),
+    }
+}
+
+fn validate_governed_intervention_evidence(
+    source: &OccurrenceSnapshotV1,
+    target: &OccurrenceSnapshotV1,
+    kind: CampaignTransitionKindV1,
+    verified: &VerifiedGovernedInterventionV1,
+) -> Result<(), CampaignStoreErrorV1> {
+    verified.request.validate_integrity()?;
+    if verified.request.campaign != source.key().campaign
+        || verified.request.occurrence != source.key().occurrence
+        || verified.request.target_state_digest != *source.state_digest()
+    {
+        return Err(CampaignStoreErrorV1::BindingMismatch);
+    }
+    let exact = match &verified.request.intervention {
+        GovernedInterventionClassV1::RequestProbe { .. } => {
+            kind == CampaignTransitionKindV1::ProbeNoted
+                && source.key() == target.key()
+                && target.program_counter() == source.program_counter()
+        }
+        GovernedInterventionClassV1::OpenSuccessor {
+            successor_occurrence,
+            exact_work,
+        } => {
+            kind == CampaignTransitionKindV1::ContinuationOpened
+                && target.key().occurrence == *successor_occurrence
+                && target.state().meta().expected_work() == exact_work
+                && target.program_counter() == ProgramCounterV1::ObservationRequired
+        }
+        GovernedInterventionClassV1::HaltContinuation { .. } => {
+            kind == CampaignTransitionKindV1::Halted
+                && target.program_counter() == ProgramCounterV1::Halted
+        }
+        GovernedInterventionClassV1::ReconcileAttempt {
+            issuance, attempt, ..
+        } => {
+            kind == CampaignTransitionKindV1::ReconciledSettlement
+                && source.program_counter() == ProgramCounterV1::ReconciliationRequired
+                && source.docket_custody().is_some_and(|custody| {
+                    &custody.issuance == issuance && &custody.attempt == attempt
+                })
+                && target.program_counter() == ProgramCounterV1::SettledObservationRequired
+        }
+    };
+    if exact {
+        Ok(())
+    } else {
+        Err(CampaignStoreErrorV1::Corrupt(
+            "governed intervention evidence does not match transition".to_owned(),
+        ))
     }
 }
 

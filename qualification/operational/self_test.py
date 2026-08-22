@@ -9,8 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 EXPECTED = {
+    "ag.local_process_deployment_reopen": "runnable_locally_now",
     "ag.sqlite_wal_power_loss_recovery": "requires_fault_injection_environment",
     "ag.multi_process_contention": "runnable_locally_now",
+    "ag.authenticated_intervention_ingress": "runnable_locally_now",
     "ag.service_currentness_behavior": "requires_deployed_service",
     "ag.clock_and_expiry": "requires_deployed_service",
     "ag.process_isolation": "requires_trusted_host",

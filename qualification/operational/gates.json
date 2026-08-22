@@ -3,6 +3,16 @@
   "qualification_status": "not_assessed",
   "gates": [
     {
+      "id": "ag.local_process_deployment_reopen",
+      "classification": "runnable_locally_now",
+      "local_proxy": [
+        "governed_loop_provisioning profile seal, independent-process inspect, coherent closed-copy reopen, partial-copy refusal, and missing-custody tests",
+        "governed_loop_engine restart-at-each-program-counter tests"
+      ],
+      "closure_evidence": "A deployment enrollment seals exact executable, configuration, and signer-file identities into a create-once runtime profile; genesis binds it atomically; independent processes reopen and replay the same program counter without recreating authority.",
+      "local_proxy_does_not_establish": "abrupt host power-loss durability, live-filesystem backup coherence, OS principal isolation, secret revocation propagation, or physical execution"
+    },
+    {
       "id": "ag.sqlite_wal_power_loss_recovery",
       "classification": "requires_fault_injection_environment",
       "local_proxy": [
@@ -20,6 +30,17 @@
       ],
       "closure_evidence": "Independent processes competing from one authoritative predecessor yield one legal successor, preserve exact replay, and leave no second spend/dispatch path.",
       "local_proxy_does_not_establish": "production host load or network-filesystem behavior"
+    },
+    {
+      "id": "ag.authenticated_intervention_ingress",
+      "classification": "runnable_locally_now",
+      "local_proxy": [
+        "governed_intervention_ingress exact-byte, target-runtime, replay, restart, conflict, and receipt tests",
+        "ag-operator-ui canonical receipt projection tests",
+        "governed authority-surface and operator read-only structural checks"
+      ],
+      "closure_evidence": "One genesis-bound submitter delivers exact signed request bytes through the one-shot AG ingress; immutable receipts distinguish custody from governance, exact resend converges after restart, and read-only inspection exposes the result without mutation authority.",
+      "local_proxy_does_not_establish": "designated-host service-principal isolation, private-key custody or rotation, browser-user authentication, mandate-owner honesty, or abrupt power-loss durability"
     },
     {
       "id": "ag.service_currentness_behavior",

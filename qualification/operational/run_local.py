@@ -104,6 +104,18 @@ def main() -> int:
         ("kernel", ["cargo", "test", "--locked", "-p", "ag-campaign", "--test", "governed_loop"]),
         ("store", ["cargo", "test", "--locked", "-p", "ag-store", "--test", "governed_campaign_store"]),
         ("engine", ["cargo", "test", "--locked", "-p", "ag-app", "--test", "governed_loop_engine"]),
+        (
+            "deployment-provisioning",
+            ["cargo", "test", "--locked", "-p", "ag-app", "--test", "governed_loop_provisioning"],
+        ),
+        (
+            "intervention-ingress",
+            ["cargo", "test", "--locked", "-p", "ag-app", "--test", "governed_intervention_ingress"],
+        ),
+        (
+            "operator-read-projection",
+            ["cargo", "test", "--locked", "-p", "ag-operator-ui"],
+        ),
         ("executor-adapter", ["cargo", "test", "--locked", "-p", "ag-app", "effect_executor_adapter::tests"]),
         (
             "multiprocess-contention",
@@ -116,6 +128,8 @@ def main() -> int:
                 str(args.output / "multiprocess"),
             ],
         ),
+        ("governed-authority-surface", ["bash", "scripts/check-governed-loop-authority-surface.sh"]),
+        ("operator-read-only-surface", ["bash", "scripts/check-operator-ui-read-only.sh"]),
         ("release-isolation-scan", ["bash", "scripts/verify-effectd-isolation.sh"]),
     ]
     records = []
@@ -139,6 +153,7 @@ def main() -> int:
         "limitations": [
             "No deployed service was exercised.",
             "No abrupt power loss or block-I/O fault was injected.",
+            "No OS-principal or signer-custody isolation was established.",
             "No provider-specific physical effect was qualified.",
             "A passing result is development evidence only."
         ],

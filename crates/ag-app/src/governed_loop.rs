@@ -33,8 +33,9 @@ use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
 use ag_primitives::{Digest, JcsDocument};
 use ag_store::campaign::{
-    CampaignCommitReceiptV1, CampaignReplayReportV1, CampaignStoreErrorV1, CampaignStoreV1,
-    CampaignTransitionKindV1,
+    CampaignCommitReceiptV1, CampaignRefusalHistoryV1, CampaignReplayReportV1,
+    CampaignStoreErrorV1, CampaignStoreV1, CampaignTransitionHistoryV1, CampaignTransitionKindV1,
+    StoredRuntimeProfileV1,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -305,6 +306,38 @@ impl CampaignEngineV1 {
         Ok(Self { store })
     }
 
+    /// Creates one campaign whose production boundary profile is committed in
+    /// the same transaction as the authority-empty genesis occurrence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_runtime_profile(
+        database: &Path,
+        campaign: CampaignId,
+        occurrence: OccurrenceId,
+        program: ProgramBasisRefV1,
+        expected_work: Digest,
+        residuals: ResidualSetV1,
+        budget: LoopBudgetV1,
+        runtime_profile_schema: &str,
+        runtime_profile_jcs: &[u8],
+        now_unix_ms: u64,
+    ) -> Result<Self, CampaignEngineErrorV1> {
+        let initial = GovernedLoopKernelV1::create_initial(
+            campaign,
+            occurrence,
+            program,
+            expected_work,
+            residuals,
+            budget,
+        )?;
+        let store = CampaignStoreV1::create_with_runtime_profile(
+            database,
+            &initial,
+            Some((runtime_profile_schema, runtime_profile_jcs)),
+            now_unix_ms,
+        )?;
+        Ok(Self { store })
+    }
+
     /// Opens an existing campaign without reconstructing freshness or authority.
     pub fn open(database: &Path) -> Result<Self, CampaignEngineErrorV1> {
         Ok(Self {
@@ -320,6 +353,24 @@ impl CampaignEngineV1 {
     /// Runs deterministic store replay and accounting verification.
     pub fn replay(&self) -> Result<CampaignReplayReportV1, CampaignEngineErrorV1> {
         Ok(self.store.replay()?)
+    }
+
+    /// Returns the verified canonical transition journal without advancing
+    /// the campaign or invoking an external boundary.
+    pub fn history(&self) -> Result<CampaignTransitionHistoryV1, CampaignEngineErrorV1> {
+        Ok(self.store.history()?)
+    }
+
+    /// Returns verified durable non-authorizing refusal facts without
+    /// advancing the campaign or invoking an external boundary.
+    pub fn refusal_history(&self) -> Result<CampaignRefusalHistoryV1, CampaignEngineErrorV1> {
+        Ok(self.store.refusal_history()?)
+    }
+
+    /// Returns the immutable genesis-bound runtime profile. Raw library
+    /// fixtures may omit it; the production CLI refuses such stores.
+    pub fn runtime_profile(&self) -> Result<Option<StoredRuntimeProfileV1>, CampaignEngineErrorV1> {
+        Ok(self.store.runtime_profile()?)
     }
 
     /// Records a fresh observation plus exact proposal.
@@ -610,6 +661,174 @@ impl CampaignEngineV1 {
         Ok(effect)
     }
 
+    /// Applies one authenticated non-reconciliation intervention through the
+    /// existing authority-safe campaign law and stores the exact request as
+    /// transition evidence.  This path cannot mint AG authority or dispatch.
+    pub fn apply_governed_intervention<V: GovernedInterventionVerifierV1>(
+        &mut self,
+        request: GovernedInterventionRequestV1,
+        expected_scope: &GovernedInterventionAuthorityScopeV1,
+        verifier: &mut V,
+        now_unix_ms: u64,
+    ) -> Result<OccurrenceSnapshotV1, CampaignEngineErrorV1> {
+        let current = self.store.current()?;
+        let authenticated = GovernedLoopKernelV1::verify_governed_intervention(
+            request,
+            expected_scope,
+            verifier,
+            now_unix_ms,
+        )?;
+        let kind = match &authenticated.request.intervention {
+            GovernedInterventionClassV1::RequestProbe { .. } => {
+                CampaignTransitionKindV1::ProbeNoted
+            }
+            GovernedInterventionClassV1::OpenSuccessor { .. } => {
+                CampaignTransitionKindV1::ContinuationOpened
+            }
+            GovernedInterventionClassV1::HaltContinuation { .. } => {
+                CampaignTransitionKindV1::Halted
+            }
+            GovernedInterventionClassV1::ReconcileAttempt { .. } => {
+                return Err(KernelErrorV1::Intervention(
+                    "reconciliation requires the read-only Docket path",
+                )
+                .into());
+            }
+        };
+        let retained = authenticated.clone();
+        let effect = match GovernedLoopKernelV1::apply_verified_governed_intervention(
+            &current,
+            authenticated,
+        ) {
+            Ok(effect) => effect,
+            Err(error) => {
+                self.record_verified_intervention_refusal(
+                    &current,
+                    &retained,
+                    intervention_refusal_code(&error),
+                    now_unix_ms,
+                )?;
+                return Err(error.into());
+            }
+        };
+        let GovernedInterventionEffectV1::Transition {
+            successor,
+            verified: authenticated_evidence,
+        } = effect
+        else {
+            return Err(KernelErrorV1::Intervention("wrong intervention path").into());
+        };
+        self.store.commit_governed_intervention(
+            &current,
+            &successor,
+            kind,
+            &authenticated_evidence,
+            now_unix_ms,
+        )?;
+        Ok(successor)
+    }
+
+    /// Authenticates one exact reconciliation request and performs only a
+    /// read-only query for its already-consumed Docket attempt.  The request
+    /// cannot accept custody or call dispatch; only an exact Docket settlement
+    /// may advance the state.
+    pub fn request_reconciliation<V, D>(
+        &mut self,
+        request: GovernedInterventionRequestV1,
+        expected_scope: &GovernedInterventionAuthorityScopeV1,
+        verifier: &mut V,
+        docket: &mut D,
+        now_unix_ms: u64,
+    ) -> Result<DocketProgressV1, CampaignEngineErrorV1>
+    where
+        V: GovernedInterventionVerifierV1,
+        D: DocketCustodyPortV1,
+    {
+        let current = self.store.current()?;
+        let authenticated = GovernedLoopKernelV1::verify_governed_intervention(
+            request,
+            expected_scope,
+            verifier,
+            now_unix_ms,
+        )?;
+        let retained = authenticated.clone();
+        let effect = match GovernedLoopKernelV1::apply_verified_governed_intervention(
+            &current,
+            authenticated,
+        ) {
+            Ok(effect) => effect,
+            Err(error) => {
+                self.record_verified_intervention_refusal(
+                    &current,
+                    &retained,
+                    intervention_refusal_code(&error),
+                    now_unix_ms,
+                )?;
+                return Err(error.into());
+            }
+        };
+        let GovernedInterventionEffectV1::Reconcile(authenticated) = effect else {
+            return Err(KernelErrorV1::Intervention(
+                "non-reconciliation request used on reconciliation path",
+            )
+            .into());
+        };
+        let custody = current
+            .docket_custody()
+            .cloned()
+            .ok_or(CampaignEngineErrorV1::DocketResponse)?;
+        match docket.reconcile_attempt(&custody)? {
+            DocketIssuanceReconciliationV1::Accepted(returned) => {
+                if returned != custody {
+                    return Err(CampaignEngineErrorV1::DocketResponse);
+                }
+                self.record_verified_intervention_refusal(
+                    &current,
+                    &authenticated,
+                    RefusalCodeV1::InterventionOutcomeUnknown,
+                    now_unix_ms,
+                )?;
+                Ok(DocketProgressV1::ReconciliationRequired(current))
+            }
+            DocketIssuanceReconciliationV1::Indeterminate {
+                custody: returned,
+                indeterminate,
+            } => {
+                if returned != custody || current.indeterminate() != Some(&indeterminate) {
+                    return Err(CampaignEngineErrorV1::DocketResponse);
+                }
+                self.record_verified_intervention_refusal(
+                    &current,
+                    &authenticated,
+                    RefusalCodeV1::InterventionOutcomeUnknown,
+                    now_unix_ms,
+                )?;
+                Ok(DocketProgressV1::ReconciliationRequired(current))
+            }
+            DocketIssuanceReconciliationV1::Settled {
+                custody: returned,
+                settlement,
+            } => {
+                if returned != custody {
+                    return Err(CampaignEngineErrorV1::DocketResponse);
+                }
+                let successor =
+                    GovernedLoopKernelV1::record_reconciled_settlement(&current, settlement)?;
+                self.store.commit_governed_intervention(
+                    &current,
+                    &successor,
+                    CampaignTransitionKindV1::ReconciledSettlement,
+                    &authenticated,
+                    now_unix_ms,
+                )?;
+                Ok(DocketProgressV1::Settled(successor))
+            }
+            DocketIssuanceReconciliationV1::NotAccepted => {
+                Err(CampaignEngineErrorV1::DocketResponse)
+            }
+        }
+    }
+
     /// Completes from an authority-empty observation boundary only.
     #[allow(clippy::too_many_arguments)]
     pub fn complete<O: ObservationResolverV1>(
@@ -654,6 +873,26 @@ impl CampaignEngineV1 {
                 at_state_digest: current.state_digest().clone(),
                 code,
                 evidence,
+                governed_intervention: None,
+            },
+            now_unix_ms,
+        )?)
+    }
+
+    fn record_verified_intervention_refusal(
+        &mut self,
+        current: &OccurrenceSnapshotV1,
+        verified: &VerifiedGovernedInterventionV1,
+        code: RefusalCodeV1,
+        now_unix_ms: u64,
+    ) -> Result<Digest, CampaignEngineErrorV1> {
+        Ok(self.store.record_refusal(
+            &RefusalOutcomeV1 {
+                key: current.key().clone(),
+                at_state_digest: current.state_digest().clone(),
+                code,
+                evidence: Some(verified.request.request.as_digest().clone()),
+                governed_intervention: Some(verified.clone()),
             },
             now_unix_ms,
         )?)
@@ -905,3 +1144,16 @@ impl CampaignEngineV1 {
 
 /// Convenience type for batches of commit receipts returned by future callers.
 pub type CampaignCommitBatchV1 = Vec<CampaignCommitReceiptV1>;
+
+fn intervention_refusal_code(error: &KernelErrorV1) -> RefusalCodeV1 {
+    match error {
+        KernelErrorV1::BudgetExhausted(_) => RefusalCodeV1::BudgetExhausted,
+        KernelErrorV1::Intervention(
+            "wrong campaign" | "wrong occurrence" | "stale target state" | "wrong issuance"
+            | "wrong attempt",
+        )
+        | KernelErrorV1::OccurrenceMismatch
+        | KernelErrorV1::BindingMismatch(_) => RefusalCodeV1::InterventionBindingMismatch,
+        _ => RefusalCodeV1::InterventionNotApplicable,
+    }
+}

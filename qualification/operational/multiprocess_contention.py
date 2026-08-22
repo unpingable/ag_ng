@@ -19,6 +19,15 @@ from pathlib import Path
 from typing import Any
 
 
+# Published test-only Ed25519 PKCS#8 material. It authenticates no deployment
+# authority and exists only so genesis validation exercises the real key path.
+TEST_ISSUER_PKCS8_HEX = (
+    "3051020101300506032b657004220420c226c22f628685cd349518c28eff015f"
+    "d216a106bb49534286dceed3202b1c0e81210028d8b71d122a31cfd39f263132"
+    "75119934a021918f5d37d100ad2f27acbaf776"
+)
+
+
 def canonical_bytes(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
 
@@ -89,13 +98,15 @@ def main() -> int:
 
     program = args.ag_loopctl.resolve(strict=True)
     args.output.mkdir(mode=0o700, parents=True, exist_ok=False)
-    database = args.output / "campaign.sqlite"
-    genesis_path = args.output / "genesis.json"
-    halt_path = args.output / "halt.json"
+    root = args.output.resolve()
+    database = root / "campaign.sqlite"
+    genesis_path = root / "genesis.json"
+    halt_path = root / "halt.json"
     genesis = {
         "campaign": "sha256:" + "a" * 64,
         "occurrence": "00000000-0000-4000-8000-000000000001",
         "program": "sha256:" + "b" * 64,
+        "expected_ag_work": "sha256:" + "f" * 64,
         "residuals": [],
         "budget": {
             "retry_limit": 1,
@@ -110,7 +121,57 @@ def main() -> int:
     write_exclusive(genesis_path, canonical_bytes(genesis))
     write_exclusive(halt_path, canonical_bytes(halt))
 
-    init = run_or_raise([str(program), "init", "--database", str(database), "--genesis", str(genesis_path)])
+    catalog_path = root / "catalog.json"
+    trust_path = root / "docket-trust.json"
+    issuer_key_path = root / "issuer.pk8"
+    profile_path = root / "runtime-profile.json"
+    catalog = {
+        "schema": "ag.governed-loop.exact-work-catalog/v1",
+        "entries": {
+            "fixture.work/v1": {
+                "work_schema": "fixture.work/v1",
+                "subject": "sha256:" + "d" * 64,
+                "scope": "sha256:" + "e" * 64,
+                "precondition": {"required": [], "forbidden": []},
+            }
+        },
+    }
+    write_exclusive(catalog_path, canonical_bytes(catalog))
+    write_exclusive(trust_path, canonical_bytes({}))
+    write_exclusive(issuer_key_path, bytes.fromhex(TEST_ISSUER_PKCS8_HEX))
+
+    def pinned(path: Path) -> dict[str, str]:
+        return {"path": str(path), "identity": sha256(path.read_bytes())}
+
+    profile = {
+        "schema": "ag.governed-loop.runtime-profile/v1",
+        "profile_label": "multiprocess-contention-development",
+        "observation_resolver": pinned(program),
+        "observation_resolver_id": "unused-observation-resolver/v1",
+        "standing_resolver": pinned(program),
+        "standing_resolver_id": "unused-standing-resolver/v1",
+        "max_standing_ttl_ms": 60_000,
+        "exact_work_catalog": pinned(catalog_path),
+        "controlling_review": None,
+        "docket": {
+            "schema": "ag.governed-loop.docket-root/v1",
+            "docket_program": pinned(program),
+            "state_directory": str(root / "docket-state"),
+            "trust_config": pinned(trust_path),
+            "standing_resolver": pinned(program),
+            "executor_adapter": pinned(program),
+            "issuer_principal": "ag-contention-fixture",
+            "issuer_key_id": "fixture-key-1",
+            "issuer_key": pinned(issuer_key_path),
+        },
+        "human_verifier": None,
+    }
+    write_exclusive(profile_path, canonical_bytes(profile))
+
+    init = run_or_raise([
+        str(program), "init", "--database", str(database), "--genesis", str(genesis_path),
+        "--runtime-profile", str(profile_path),
+    ])
     halt_argv = [str(program), "halt", "--database", str(database), "--input", str(halt_path)]
     first = competing(halt_argv, args.writers)
     first_successes = [item for item in first if item["exit_code"] == 0]

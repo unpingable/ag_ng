@@ -1,0 +1,31 @@
+[package]
+name = "ag-operator-ui"
+description = "Phosphor-ng read-only local inspector for the canonical AG governed loop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "ag_operator_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ag-operator-ui"
+path = "src/main.rs"
+
+[dependencies]
+ag-campaign = { path = "../ag-campaign" }
+ag-primitives = { path = "../ag-primitives" }
+ag-store = { path = "../ag-store" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

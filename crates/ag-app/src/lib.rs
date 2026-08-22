@@ -14,6 +14,7 @@ pub mod effectd_activation;
 mod exact_exec;
 pub mod governed_loop;
 pub mod governed_ports;
+pub mod intervention_ingress;
 pub mod managed_pointer;
 pub mod peer;
 pub mod rpc_auth;
