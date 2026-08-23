@@ -54,6 +54,8 @@ nightshift --store STORE external-observation export --campaign-id ID \
   --occurrence-id UUID --evaluated-at-unix-ms DISPLAY_TIME \
   --evidence-ttl-ms DISPLAY_WINDOW
 docket governed-loop inspect --state STATE --issuance ID
+maude-observation-acquisition export-occurrence --ledger LEDGER \
+  --campaign-id ID --occurrence-id UUID
 ```
 
 All source programs must be absolute paths with their canonical executable
@@ -227,6 +229,47 @@ For occurrences with workflow-specific application/world evidence,
 Phosphor-ng also reads Nightshift's exact `external-observation export`
 projection. It shows authenticated producer custody, candidate/source
 identities, exact PlanNode claims, and whether the source time falls inside an
-explicit five-minute display window. That arithmetic age label is not
+explicit configured display window. That arithmetic age label is not
 Nightshift currentness. Docket settlement remains an attempt outcome rather
 than proof of present health; absent candidates remain honestly unrecorded.
+
+When `--maude-acquisition-bin` and `--maude-acquisition-ledger` are configured,
+Phosphor-ng also renders the exact occurrence-scoped acquisition trigger,
+request, adapter, settlement, evidence candidate, and immutable event stages.
+This source is mechanics provenance. `scheduled`, `adapter failed`, `custody
+outcome unknown`, `custody accepted`, and a separately rendered Nightshift
+currentness result are not collapsed into a monitoring status. The only Maude
+verb reachable from the inspector is the exact read-only `export-occurrence`
+shown above.
+
+The external-evidence panel now separates historical authenticated custody,
+display-only arithmetic evidence age, Nightshift composition/profile, and the
+owner-produced currentness result at the selected governed evaluation. A
+historical observation that was current at one evaluation is not labelled
+current now by the UI. See Maude's
+`docs/OBSERVATION-ACQUISITION-ORCHESTRATION.md` for trigger/recovery law.
+
+For Nightshift v4 decision-relative observations, the panel keeps effectful
+qualification and read-only steady-state evidence separate. It leads with the
+historical qualification's exact compiled-artifact binding, then shows the
+independently timed passive acquisition and Nightshift-owned currentness
+horizon. The UI states explicitly when no new fault test occurred. A new
+passive acquisition may refresh steady-state evidence; it neither renews the
+qualification timestamp nor creates a failure-survival claim.
+
+The PlanDocument shown in that panel is labelled as an owner-established exact
+qualification match. Nightshift admits the composition only after binding the
+proposal's target PlanDocument to Q at both admission and consequence time;
+the UI does not calculate or carry qualification between design revisions.
+Qualification occurrence, exact work, compilation, and PlanDocument remain
+visible together so a stable PlanNode cannot lose its artifact-generation
+context during cross-probing.
+
+For the closed local-Compose V1 workflow, deployment/effect and qualification
+of the exact artifact are one authorized workflow boundary. The retained
+lifecycle therefore contains no pre-Q2 passive C2 observation and the
+inspector must not imply one. S3 follows settled C2 qualification; the hostile
+Q1+S3 view proves only that passive freshness cannot make Q1 applicable to C2.
+The UI renders Q as evidence of a particular governed qualification occurrence,
+not as a mutable `qualified` attribute on an artifact. A future deploy-only,
+canary, or staging lifecycle would require a separate owner contract.

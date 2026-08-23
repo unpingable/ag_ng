@@ -21,10 +21,10 @@ use serde_json::Value;
 
 use crate::links::GovernedRuntimeLinkV1;
 use crate::model::{
-    AG_INTERVENTION_SUBMISSION_HISTORY_SCHEMA_V1, AgInspectV1, CAMPAIGN_DETAIL_SCHEMA_V1,
-    CAMPAIGN_INDEX_SCHEMA_V1, CampaignDetailV1, CampaignIndexEntryV1, CampaignIndexV1,
-    DEMO_CORPUS_SCHEMA_V1, DOCKET_INSPECTION_SCHEMA_V1, DemoCorpusV1, DocketInspectionV1,
-    ExternalObservationExportV1, InterventionSubmissionHistoryProjectionV1,
+    AG_INTERVENTION_SUBMISSION_HISTORY_SCHEMA_V1, AcquisitionHistoryV1, AgInspectV1,
+    CAMPAIGN_DETAIL_SCHEMA_V1, CAMPAIGN_INDEX_SCHEMA_V1, CampaignDetailV1, CampaignIndexEntryV1,
+    CampaignIndexV1, DEMO_CORPUS_SCHEMA_V1, DOCKET_INSPECTION_SCHEMA_V1, DemoCorpusV1,
+    DocketInspectionV1, ExternalObservationExportV1, InterventionSubmissionHistoryProjectionV1,
     NightshiftAuthoringContextExportV1, NightshiftAuthoringContextQueryV1,
     NightshiftAuthoringCustodyExportV1, NightshiftObservationExportV1, ProjectionCheckV1,
     ProjectionCorrespondenceV1, ReadCommandNameV1, RelatedSourceV1, SourceErrorKindV1,
@@ -59,6 +59,15 @@ pub struct DocketReadSourceV1 {
     pub state: PathBuf,
 }
 
+/// Optional Maude acquisition-orchestration read source.
+#[derive(Clone, Debug)]
+pub struct MaudeAcquisitionReadSourceV1 {
+    /// Exact closed acquisition CLI.
+    pub program: PathBuf,
+    /// Existing immutable trigger/request/event ledger.
+    pub ledger: PathBuf,
+}
+
 /// Closed local operator backend configuration.
 #[derive(Clone, Debug)]
 pub struct OperatorSourceConfigV1 {
@@ -70,6 +79,8 @@ pub struct OperatorSourceConfigV1 {
     pub nightshift: Option<NightshiftReadSourceV1>,
     /// Optional Docket custody/outcome source.
     pub docket: Option<DocketReadSourceV1>,
+    /// Optional Maude acquisition mechanics provenance.
+    pub maude_acquisition: Option<MaudeAcquisitionReadSourceV1>,
 }
 
 impl OperatorSourceConfigV1 {
@@ -92,6 +103,9 @@ impl OperatorSourceConfigV1 {
         }
         if let Some(source) = &self.docket {
             require_program_name(&source.program, "docket")?;
+        }
+        if let Some(source) = &self.maude_acquisition {
+            require_program_name(&source.program, "maude-observation-acquisition")?;
         }
         Ok(())
     }
@@ -123,6 +137,10 @@ enum CanonicalReadRequestV1 {
         evaluated_at_unix_ms: i64,
         evidence_ttl_ms: u64,
     },
+    MaudeExportObservationAcquisitions {
+        campaign: String,
+        occurrence: String,
+    },
     DocketInspect(String),
 }
 
@@ -144,6 +162,9 @@ impl CanonicalReadRequestV1 {
             }
             Self::NightshiftExportExternalObservation { .. } => {
                 ReadCommandNameV1::NightshiftExportExternalObservation
+            }
+            Self::MaudeExportObservationAcquisitions { .. } => {
+                ReadCommandNameV1::MaudeExportObservationAcquisitions
             }
             Self::DocketInspect(_) => ReadCommandNameV1::DocketGovernedLoopInspect,
         }
@@ -326,7 +347,8 @@ impl OperatorReaderV1 {
         let nightshift = self.collect_nightshift_sources(observations);
         let authoring_contexts = self.collect_authoring_sources(occurrences.clone());
         let authoring_custody = self.collect_authoring_custody_sources(occurrences.clone());
-        let external_observations = self.collect_external_observations(occurrences);
+        let external_observations = self.collect_external_observations(occurrences.clone());
+        let observation_acquisitions = self.collect_acquisition_sources(occurrences);
         let docket = self.collect_docket_sources(issuances);
 
         Ok(CampaignDetailV1 {
@@ -344,6 +366,7 @@ impl OperatorReaderV1 {
             authoring_contexts,
             authoring_custody,
             external_observations,
+            observation_acquisitions,
             docket,
         })
     }
@@ -459,6 +482,30 @@ impl OperatorReaderV1 {
                     unavailable(
                         "Nightshift",
                         ReadCommandNameV1::NightshiftExportExternalObservation,
+                        SourceErrorKindV1::Unavailable,
+                        "related-source process limit exceeded; fact not queried".to_owned(),
+                        None,
+                    )
+                },
+            })
+            .collect()
+    }
+
+    fn collect_acquisition_sources(
+        &self,
+        occurrences: BTreeSet<(String, String)>,
+    ) -> Vec<RelatedSourceV1<AcquisitionHistoryV1>> {
+        occurrences
+            .into_iter()
+            .enumerate()
+            .map(|(index, (campaign, occurrence))| RelatedSourceV1 {
+                identity: format!("{campaign}/{occurrence}"),
+                result: if index < RELATED_SOURCE_PROCESS_LIMIT {
+                    self.maude_acquisition_export(&campaign, &occurrence)
+                } else {
+                    unavailable(
+                        "Maude acquisition orchestrator",
+                        ReadCommandNameV1::MaudeExportObservationAcquisitions,
                         SourceErrorKindV1::Unavailable,
                         "related-source process limit exceeded; fact not queried".to_owned(),
                         None,
@@ -766,6 +813,34 @@ impl OperatorReaderV1 {
         )
     }
 
+    fn maude_acquisition_export(
+        &self,
+        campaign: &str,
+        occurrence: &str,
+    ) -> SourceResultV1<AcquisitionHistoryV1> {
+        let Some(_) = self
+            .canonical_config()
+            .ok()
+            .and_then(|value| value.maude_acquisition.as_ref())
+        else {
+            return unavailable(
+                "Maude acquisition orchestrator",
+                ReadCommandNameV1::MaudeExportObservationAcquisitions,
+                SourceErrorKindV1::NotConfigured,
+                "Maude acquisition source is not configured".to_owned(),
+                None,
+            );
+        };
+        self.capture_typed(
+            "Maude acquisition orchestrator",
+            &CanonicalReadRequestV1::MaudeExportObservationAcquisitions {
+                campaign: campaign.to_owned(),
+                occurrence: occurrence.to_owned(),
+            },
+            |value: &AcquisitionHistoryV1| value.validate_for_occurrence(campaign, occurrence),
+        )
+    }
+
     fn capture_typed<T>(
         &self,
         source: &str,
@@ -940,20 +1015,50 @@ fn canonical_command(
             ]);
             command
         }
-        CanonicalReadRequestV1::DocketInspect(issuance) => {
-            let source = config.docket.as_ref().ok_or_else(|| CaptureFailureV1 {
-                kind: SourceErrorKindV1::NotConfigured,
-                detail: "Docket source is not configured".to_owned(),
-                exit_status: None,
-            })?;
-            let mut command = Command::new(&source.program);
-            command
-                .args(["governed-loop", "inspect", "--state"])
-                .arg(&source.state)
-                .args(["--issuance", issuance]);
-            command
-        }
+        CanonicalReadRequestV1::DocketInspect(issuance) => docket_command(config, issuance)?,
+        CanonicalReadRequestV1::MaudeExportObservationAcquisitions {
+            campaign,
+            occurrence,
+        } => maude_acquisition_command(config, campaign, occurrence)?,
     };
+    Ok(command)
+}
+
+fn docket_command(
+    config: &OperatorSourceConfigV1,
+    issuance: &str,
+) -> Result<Command, CaptureFailureV1> {
+    let source = config.docket.as_ref().ok_or_else(|| CaptureFailureV1 {
+        kind: SourceErrorKindV1::NotConfigured,
+        detail: "Docket source is not configured".to_owned(),
+        exit_status: None,
+    })?;
+    let mut command = Command::new(&source.program);
+    command
+        .args(["governed-loop", "inspect", "--state"])
+        .arg(&source.state)
+        .args(["--issuance", issuance]);
+    Ok(command)
+}
+
+fn maude_acquisition_command(
+    config: &OperatorSourceConfigV1,
+    campaign: &str,
+    occurrence: &str,
+) -> Result<Command, CaptureFailureV1> {
+    let source = config
+        .maude_acquisition
+        .as_ref()
+        .ok_or_else(|| CaptureFailureV1 {
+            kind: SourceErrorKindV1::NotConfigured,
+            detail: "Maude acquisition source is not configured".to_owned(),
+            exit_status: None,
+        })?;
+    let mut command = Command::new(&source.program);
+    command
+        .args(["export-occurrence", "--ledger"])
+        .arg(&source.ledger)
+        .args(["--campaign-id", campaign, "--occurrence-id", occurrence]);
     Ok(command)
 }
 
@@ -1156,6 +1261,15 @@ fn validate_demo_detail(detail: &CampaignDetailV1) -> Result<(), String> {
             value.validate_for_occurrence(campaign_id, occurrence_id)?;
             if related.identity != format!("{campaign_id}/{occurrence_id}") {
                 return Err("demo external-observation related identity drift".to_owned());
+            }
+        }
+    }
+    for related in &detail.observation_acquisitions {
+        validate_source_raw(&related.result)?;
+        if let Some(value) = related.result.value() {
+            value.validate_for_occurrence(&value.campaign_id, &value.occurrence_id)?;
+            if related.identity != format!("{}/{}", value.campaign_id, value.occurrence_id) {
+                return Err("demo acquisition-history related identity drift".to_owned());
             }
         }
     }
@@ -1550,6 +1664,7 @@ mod tests {
             ag_loopctl: program,
             nightshift: None,
             docket: None,
+            maude_acquisition: None,
         })
         .unwrap();
         let index = reader.campaign_index().unwrap();
@@ -1622,6 +1737,7 @@ mod tests {
                 store: root.path().join("nightshift.sqlite"),
             }),
             docket: None,
+            maude_acquisition: None,
         })
         .unwrap();
         let result = reader.nightshift_authoring_export(&campaign, occurrence);
@@ -1682,6 +1798,7 @@ mod tests {
                 store: root.path().join("nightshift.sqlite"),
             }),
             docket: None,
+            maude_acquisition: None,
         })
         .unwrap();
         let result = reader.nightshift_authoring_custody_export(&campaign, occurrence);
@@ -1742,6 +1859,7 @@ mod tests {
                 store: root.path().join("nightshift.sqlite"),
             }),
             docket: None,
+            maude_acquisition: None,
         })
         .unwrap();
         let result = reader.nightshift_external_observation_export(&campaign, occurrence);
@@ -1762,6 +1880,64 @@ mod tests {
             "--evidence-ttl-ms\n{EXTERNAL_OBSERVATION_DISPLAY_TTL_MS}\n"
         )));
         assert!(!arguments.contains("cycle\nrun"));
+    }
+
+    #[test]
+    fn acquisition_history_uses_only_closed_occurrence_scoped_maude_read_verb() {
+        let root = tempfile::tempdir().unwrap();
+        let ag = root.path().join("ag-loopctl");
+        std::fs::write(&ag, b"#!/bin/sh\nexit 1\n").unwrap();
+        let program = root.path().join("maude-observation-acquisition");
+        let arguments = root.path().join("maude-acquisition-arguments");
+        let campaign = ag_primitives::Digest::hash_bytes(b"campaign").to_string();
+        let occurrence = "00000000-0000-0000-0000-000000000001";
+        let payload = serde_json::json!({
+            "schema": crate::model::MAUDE_ACQUISITION_HISTORY_SCHEMA_V1,
+            "campaign_id": campaign,
+            "occurrence_id": occurrence,
+            "acquisitions": [],
+        });
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{}'\n",
+                arguments.display(),
+                payload
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ag, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let reader = OperatorReaderV1::new(OperatorSourceConfigV1 {
+            campaign_root: root.path().to_owned(),
+            ag_loopctl: ag,
+            nightshift: None,
+            docket: None,
+            maude_acquisition: Some(MaudeAcquisitionReadSourceV1 {
+                program,
+                ledger: root.path().join("acquisition.sqlite"),
+            }),
+        })
+        .unwrap();
+        let result = reader.maude_acquisition_export(&campaign, occurrence);
+        assert!(matches!(
+            result,
+            SourceResultV1::Available {
+                command: ReadCommandNameV1::MaudeExportObservationAcquisitions,
+                value: AcquisitionHistoryV1 { acquisitions, .. },
+                ..
+            } if acquisitions.is_empty()
+        ));
+        assert_eq!(
+            std::fs::read_to_string(arguments).unwrap(),
+            format!(
+                "export-occurrence\n--ledger\n{}\n--campaign-id\n{}\n--occurrence-id\n{}\n",
+                root.path().join("acquisition.sqlite").display(),
+                campaign,
+                occurrence,
+            )
+        );
     }
 
     #[test]

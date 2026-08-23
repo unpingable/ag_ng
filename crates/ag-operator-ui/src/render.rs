@@ -367,6 +367,7 @@ fn campaign_detail_selection(
             &model.authoring_contexts,
             &model.authoring_custody,
             &model.external_observations,
+            &model.observation_acquisitions,
         );
         refusals(&mut body, &model.refusals);
         intervention_submissions(&mut body, model.intervention_submissions.as_ref());
@@ -732,6 +733,7 @@ fn evidence(
     authoring_contexts: &[RelatedSourceV1<crate::model::NightshiftAuthoringContextExportV1>],
     authoring_custody: &[RelatedSourceV1<crate::model::NightshiftAuthoringCustodyExportV1>],
     external_observations: &[RelatedSourceV1<crate::model::ExternalObservationExportV1>],
+    observation_acquisitions: &[RelatedSourceV1<crate::model::AcquisitionHistoryV1>],
 ) {
     body.push_str(
         "<div id=evidence class=grid><section class=panel><h2>Evidence and proposal</h2>",
@@ -817,7 +819,13 @@ fn evidence(
         body.push_str("<p class=empty>No proposal has been recorded for the selected state. No Maude authoring link can be constructed.</p>");
     }
     body.push_str("</section><section class=panel><h2>Nightshift provenance</h2>");
-    external_observation(body, current, external_observations);
+    external_observation(
+        body,
+        current,
+        external_observations,
+        observation_acquisitions,
+        nightshift,
+    );
     if nightshift.is_empty() {
         body.push_str("<p><span class=unknown>unknown</span> No observation lookup identity is available.</p>");
     }
@@ -832,12 +840,32 @@ fn external_observation(
     body: &mut String,
     current: &OccurrenceSnapshotV1,
     related: &[RelatedSourceV1<crate::model::ExternalObservationExportV1>],
+    acquisitions: &[RelatedSourceV1<crate::model::AcquisitionHistoryV1>],
+    nightshift: &[RelatedSourceV1<crate::model::NightshiftObservationExportV1>],
 ) {
     use crate::model::ExternalObservationEvidenceAgeV1;
 
-    let campaign = current.key().campaign.as_str();
-    let occurrence = current.key().occurrence.to_string();
+    let selected_observation = current.observation().or_else(|| {
+        current
+            .completed()
+            .map(ag_campaign::governed::CompletedV1::terminal_observation)
+    });
+    let composition = selected_observation.and_then(|resolution| {
+        resolution.nightshift_basis()?;
+        matching_external_composition(nightshift, resolution.observation().as_str())
+    });
+    let campaign = composition
+        .and_then(|value| value.get("source_campaign_id"))
+        .or_else(|| composition.and_then(|value| value.pointer("/qualification/campaign_id")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| current.key().campaign.as_str());
+    let occurrence = composition
+        .and_then(|value| value.get("source_occurrence_id"))
+        .or_else(|| composition.and_then(|value| value.pointer("/qualification/occurrence_id")))
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| current.key().occurrence.to_string(), str::to_owned);
     let identity = format!("{campaign}/{occurrence}");
+    acquisition_history(body, &identity, acquisitions);
     let Some(source) = related.iter().find(|source| source.identity == identity) else {
         body.push_str("<p class=k><span class=unknown>application evidence unavailable</span> No exact Nightshift candidate lookup was captured for this occurrence.</p>");
         return;
@@ -851,7 +879,177 @@ fn external_observation(
         return;
     };
     let observation = &item.observation;
-    let (selected_binding, selected_has_result_basis) = match (
+    let (selected_binding, selected_has_result_basis) =
+        external_observation_binding(current, composition, observation, &item.custody);
+    if !selected_binding {
+        body.push_str("<p class=source-error><span class=error>application-evidence disagreement</span> Nightshift returned a candidate for this occurrence whose proposal/work/issuance/attempt/settlement binding disagrees with the selected AG state.</p>");
+        return;
+    }
+    let age = match item.evidence_age {
+        ExternalObservationEvidenceAgeV1::FreshAtEvaluation => "inside display age window",
+        ExternalObservationEvidenceAgeV1::StaleAtEvaluation => "outside display age window",
+        ExternalObservationEvidenceAgeV1::NotYetObserved => "source time follows evaluation time",
+    };
+    let _ = write!(
+        body,
+        "<h3>Historical application/world evidence <span class=fact>custody authenticated</span></h3><p><strong>{:?}</strong> evidence for <strong>{:?}</strong>. <span class=k>Evidence age (display only): {}; evidence age is not currentness.</span></p><div class=kv>{}{}{}{}{}{}{}</div>",
+        observation.action,
+        observation.outcome,
+        age,
+        kv("candidate", &observation.observation_id),
+        kv("custody", &item.custody.custody_id),
+        kv("producer", &item.custody.producer_principal_id),
+        kv("attempt", &observation.attempt_id),
+        kv("settlement", &observation.settlement_id),
+        kv("evidence receipt", &observation.executor_evidence_receipt),
+        kv("observed at", &observation.observed_at_unix_ms.to_string()),
+    );
+    if let (Some(composition), Some(resolution)) = (composition, selected_observation) {
+        external_composition(body, composition, resolution);
+    } else {
+        body.push_str("<p class=k><span class=unknown>not composed</span> This authenticated historical candidate is not the source of the selected canonical observation.</p>");
+    }
+    external_claims(body, observation);
+    if !selected_has_result_basis {
+        body.push_str("<p class=note>The selected historical snapshot predates or no longer exposes the complete proposal/issuance/attempt/settlement tuple. The candidate remains occurrence-scoped; exact result coordinates are available in the raw owner record and are not inferred onto this snapshot.</p>");
+    }
+}
+
+fn matching_external_composition<'a>(
+    nightshift: &'a [RelatedSourceV1<crate::model::NightshiftObservationExportV1>],
+    observation_id: &str,
+) -> Option<&'a Value> {
+    nightshift.iter().find_map(|source| {
+        let SourceResultV1::Available { value, .. } = &source.result else {
+            return None;
+        };
+        if value.observation_id != observation_id || value.matches.len() != 1 {
+            return None;
+        }
+        let item = &value.matches[0];
+        let schema = item.observation.get("schema").and_then(Value::as_str);
+        if item
+            .observation
+            .get("observation_id")
+            .and_then(Value::as_str)
+            != Some(observation_id)
+            || !matches!(
+                schema,
+                Some("nightshift.observation_record.v3" | "nightshift.observation_record.v4")
+            )
+        {
+            return None;
+        }
+        item.observation
+            .get("external_evidence")
+            .or_else(|| item.observation.get("decision_external_evidence"))
+    })
+}
+
+fn acquisition_history(
+    body: &mut String,
+    identity: &str,
+    related: &[RelatedSourceV1<crate::model::AcquisitionHistoryV1>],
+) {
+    let Some(source) = related.iter().find(|source| source.identity == identity) else {
+        body.push_str("<h3>Observation acquisition</h3><p class=k><span class=unknown>not configured</span> No exact Maude acquisition-history lookup was captured for this occurrence.</p>");
+        return;
+    };
+    let SourceResultV1::Available { value, .. } = &source.result else {
+        body.push_str("<h3>Observation acquisition</h3><p class=k><span class=unknown>unavailable</span> The mechanics ledger could not be read. Nightshift evidence and currentness remain separate owner facts.</p>");
+        return;
+    };
+    if value.acquisitions.is_empty() {
+        body.push_str("<h3>Observation acquisition</h3><p class=k><span class=unknown>absent</span> No workflow-specific acquisition trigger is recorded for this exact occurrence.</p>");
+        return;
+    }
+    body.push_str(
+        "<h3>Observation acquisition <span class=projection>mechanics provenance</span></h3>",
+    );
+    for acquisition in &value.acquisitions {
+        let trigger = acquisition.get("trigger").unwrap_or(&Value::Null);
+        let request = acquisition.get("request").unwrap_or(&Value::Null);
+        let text = |object: &Value, field: &str| {
+            object
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or("malformed owner projection")
+                .to_owned()
+        };
+        let stages = acquisition
+            .get("events")
+            .and_then(Value::as_array)
+            .map_or_else(
+                || "malformed owner projection".to_owned(),
+                |events| {
+                    events
+                        .iter()
+                        .filter_map(|event| event.get("kind").and_then(Value::as_str))
+                        .map(escape)
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                },
+            );
+        let evidence = acquisition
+            .pointer("/evidence/handoff/observation/observation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("not durably acquired");
+        let _ = write!(
+            body,
+            "<div class=kv>{}{}{}{}{}{}{}</div><p class=k>Stages: {}. Acquisition mechanics may cause observation; only Nightshift determines custody composition/currentness.</p>",
+            kv("reason", &text(trigger, "reason")),
+            kv("trigger", &text(trigger, "trigger_id")),
+            kv("request", &text(request, "request_id")),
+            kv("adapter", &text(trigger, "adapter_id")),
+            kv("settlement", &text(trigger, "settlement_id")),
+            kv("evidence candidate", evidence),
+            kv("target runtime", &text(trigger, "target_runtime_id")),
+            stages,
+        );
+    }
+}
+
+fn external_observation_binding(
+    current: &OccurrenceSnapshotV1,
+    composition: Option<&Value>,
+    observation: &crate::model::ExternalObservationV1,
+    custody: &crate::model::ExternalObservationCustodyV1,
+) -> (bool, bool) {
+    if let Some(composition) = composition {
+        if let Some(qualification) = composition.get("qualification") {
+            let exact = |field: &str, value: &str| {
+                qualification.get(field).and_then(Value::as_str) == Some(value)
+            };
+            return (
+                exact("source_observation_id", &observation.observation_id)
+                    && exact("source_custody_id", &custody.custody_id)
+                    && exact("campaign_id", &observation.campaign_id)
+                    && exact("occurrence_id", &observation.occurrence_id)
+                    && exact("proposal_id", &observation.proposal_id)
+                    && exact("exact_work_id", &observation.exact_work_id)
+                    && exact("issuance_id", &observation.issuance_id)
+                    && exact("attempt_id", &observation.attempt_id)
+                    && exact("settlement_id", &observation.settlement_id),
+                true,
+            );
+        }
+        let exact = |field: &str, value: &str| {
+            composition.get(field).and_then(serde_json::Value::as_str) == Some(value)
+        };
+        return (
+            exact("source_observation_id", &observation.observation_id)
+                && exact("source_custody_id", &custody.custody_id)
+                && exact("source_campaign_id", &observation.campaign_id)
+                && exact("source_occurrence_id", &observation.occurrence_id)
+                && exact("source_proposal_id", &observation.proposal_id)
+                && exact("source_exact_work_id", &observation.exact_work_id)
+                && exact("source_issuance_id", &observation.issuance_id)
+                && exact("source_attempt_id", &observation.attempt_id)
+                && exact("source_settlement_id", &observation.settlement_id),
+            true,
+        );
+    }
+    match (
         current.proposal(),
         current.issuance(),
         current.docket_custody(),
@@ -866,30 +1064,116 @@ fn external_observation(
             true,
         ),
         _ => (true, false),
-    };
-    if !selected_binding {
-        body.push_str("<p class=source-error><span class=error>application-evidence disagreement</span> Nightshift returned a candidate for this occurrence whose proposal/work/issuance/attempt/settlement binding disagrees with the selected AG state.</p>");
+    }
+}
+
+fn external_composition(
+    body: &mut String,
+    composition: &Value,
+    resolution: &ag_campaign::governed::VersionedObservationResolutionV1,
+) {
+    if let Some(qualification) = composition.get("qualification") {
+        let q = |name: &str| {
+            qualification
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or("malformed owner projection")
+        };
+        let scalar = |pointer: &str| {
+            composition.pointer(pointer).map_or_else(
+                || "malformed owner projection".to_owned(),
+                |value| match value {
+                    Value::Number(value) => value.to_string(),
+                    Value::String(value) => value.clone(),
+                    _ => "malformed owner projection".to_owned(),
+                },
+            )
+        };
+        let _ = write!(
+            body,
+            "<h3>Decision-relative evidence <span class=fact>qualification + passive observation</span></h3><p><strong>Historical qualification</strong> records the governed fault test that occurred for the exact artifact. <strong>Current steady-state</strong> records what the passive adapter learned by looking again. No new failure test was performed.</p><div class=kv>{}{}{}{}{}{}{}{}{}{}{}{}{}</div><p class=k>The target PlanDocument label is an owner-established exact match, not a UI inference. Re-observation refreshes only the passive component. Qualification applicability uses exact PlanDocument, compilation, work, subject, and scope identity; its acquisition time is not relabelled as present-world currentness.</p>",
+            kv("decision profile", &scalar("/profile/profile_id")),
+            kv("qualification", q("qualification_id")),
+            kv(
+                "target PlanDocument (qualification exact match)",
+                q("plan_document_digest")
+            ),
+            kv("qualified compilation", q("compilation_id")),
+            kv("qualified exact work", q("exact_work_id")),
+            kv("qualification occurrence", q("occurrence_id")),
+            kv(
+                "qualification acquired",
+                &scalar("/qualification/acquired_at_unix_ms")
+            ),
+            kv(
+                "passive observation",
+                &scalar("/steady_state_observation_id")
+            ),
+            kv("passive custody", &scalar("/steady_state_custody_id")),
+            kv(
+                "passive observed at",
+                &scalar("/steady_state_observed_at_unix_ms")
+            ),
+            kv(
+                "passive horizon (exclusive)",
+                &scalar("/fresh_until_unix_ms")
+            ),
+            kv("canonical observation", resolution.observation().as_str()),
+            kv(
+                "Nightshift currentness at governed evaluation",
+                resolution.status_label()
+            ),
+        );
         return;
     }
-    let age = match item.evidence_age {
-        ExternalObservationEvidenceAgeV1::FreshAtEvaluation => "inside display age window",
-        ExternalObservationEvidenceAgeV1::StaleAtEvaluation => "outside display age window",
-        ExternalObservationEvidenceAgeV1::NotYetObserved => "source time follows evaluation time",
+    let field = |name: &str| {
+        composition
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("malformed owner projection")
+    };
+    let purpose = composition
+        .pointer("/profile/purpose")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("malformed owner projection");
+    let numeric = |pointer: &str| {
+        composition
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(
+                || "malformed owner projection".to_owned(),
+                |value| value.to_string(),
+            )
     };
     let _ = write!(
         body,
-        "<h3>Application/world evidence <span class=fact>authenticated candidate</span></h3><p><strong>{:?}</strong> evidence for <strong>{:?}</strong>. <span class=k>{}; age is not currentness.</span></p><div class=kv>{}{}{}{}{}{}{}</div>",
-        observation.action,
-        observation.outcome,
-        age,
-        kv("candidate", &observation.observation_id),
-        kv("custody", &item.custody.custody_id),
-        kv("producer", &item.custody.producer_principal_id),
-        kv("attempt", &observation.attempt_id),
-        kv("settlement", &observation.settlement_id),
-        kv("evidence receipt", &observation.executor_evidence_receipt),
-        kv("observed at", &observation.observed_at_unix_ms.to_string()),
+        "<h3>Nightshift composition <span class=fact>admitted for {}</span></h3><div class=kv>{}{}{}{}{}{}{}{}{}</div><p class=k>Nightshift admitted the closed claim set for this exact decision profile. The existing DecisionBasis remains the diagnostic condition/delivery projection; composition provenance is bound through the canonical observation identity rather than being relabelled as an NQ atom.</p>",
+        escape(purpose),
+        kv("composition", field("composition_id")),
+        kv(
+            "profile",
+            composition
+                .pointer("/profile/profile_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("malformed owner projection")
+        ),
+        kv("profile max age ms", &numeric("/profile/max_age_ms")),
+        kv("source occurrence", field("source_occurrence_id")),
+        kv("source PlanDocument", field("source_plan_document_digest")),
+        kv("source compilation", field("source_compilation_id")),
+        kv("canonical observation", resolution.observation().as_str()),
+        kv(
+            "Nightshift currentness at governed evaluation",
+            resolution.status_label()
+        ),
+        kv(
+            "evidence horizon (exclusive)",
+            &numeric("/fresh_until_unix_ms")
+        ),
     );
+}
+
+fn external_claims(body: &mut String, observation: &crate::model::ExternalObservationV1) {
     body.push_str("<ul class=facts>");
     for claim in &observation.claims {
         let _ = write!(
@@ -901,10 +1185,7 @@ fn external_observation(
             escape(&claim.compiled_output_identity),
         );
     }
-    body.push_str("</ul><p class=k>Docket settlement establishes the exact attempt outcome, not present-world health. Producer authentication establishes custody, not standing or authorization. This candidate is not a canonical Nightshift currentness resolution.</p>");
-    if !selected_has_result_basis {
-        body.push_str("<p class=note>The selected historical snapshot predates or no longer exposes the complete proposal/issuance/attempt/settlement tuple. The candidate remains occurrence-scoped; exact result coordinates are available in the raw owner record and are not inferred onto this snapshot.</p>");
-    }
+    body.push_str("</ul><p class=k>Docket settlement establishes the exact attempt outcome, not present-world health. Producer authentication establishes custody, not standing or authorization. The candidate remains historical evidence; the separately rendered Nightshift resolution records currentness for its exact governed evaluation and deadline, not an inferred present-time result.</p>");
 }
 
 fn authoring_context(
@@ -1270,6 +1551,9 @@ fn raw_sources(body: &mut String, model: &CampaignDetailV1) {
     for source in &model.external_observations {
         source_summary(body, &source.result);
     }
+    for source in &model.observation_acquisitions {
+        source_summary(body, &source.result);
+    }
     for source in &model.docket {
         source_summary(body, &source.result);
     }
@@ -1616,5 +1900,68 @@ mod tests {
         assert!(body.contains("received"));
         assert!(body.contains("delivery is not authorization"));
         assert!(!body.contains("approved"));
+    }
+
+    #[test]
+    fn acquisition_projection_keeps_mechanics_separate_from_currentness() {
+        let campaign = Digest::hash_bytes(b"campaign").to_string();
+        let occurrence = "00000000-0000-4000-8000-000000000000";
+        let id = |label: &[u8]| Digest::hash_bytes(label).to_string();
+        let request_id = id(b"request");
+        let acquisition = serde_json::json!({
+            "schema": "maude.external-evidence-acquisition-export/v1",
+            "trigger": {
+                "reason": "post_settlement",
+                "trigger_id": id(b"trigger"),
+                "adapter_id": "maude.local-compose-observation-adapter",
+                "settlement_id": id(b"settlement"),
+                "target_runtime_id": "nightshift:local"
+            },
+            "request": {"request_id": request_id},
+            "events": [
+                {"kind": "trigger_recorded"},
+                {"kind": "adapter_returned_evidence"},
+                {"kind": "custody_outcome_unknown"}
+            ],
+            "evidence": {"handoff": {"observation": {"observation_id": id(b"observation")}}}
+        });
+        let history = crate::model::AcquisitionHistoryV1 {
+            schema: crate::model::MAUDE_ACQUISITION_HISTORY_SCHEMA_V1.to_owned(),
+            campaign_id: campaign.clone(),
+            occurrence_id: occurrence.to_owned(),
+            acquisitions: vec![acquisition.clone()],
+        };
+        let related = vec![RelatedSourceV1 {
+            identity: format!("{campaign}/{occurrence}"),
+            result: SourceResultV1::Available {
+                source: "Maude acquisition orchestrator".to_owned(),
+                command: crate::model::ReadCommandNameV1::MaudeExportObservationAcquisitions,
+                captured_at_unix_ms: 1,
+                raw: serde_json::to_value(&history).unwrap(),
+                value: history,
+            },
+        }];
+        let mut body = String::new();
+        acquisition_history(&mut body, &format!("{campaign}/{occurrence}"), &related);
+        assert!(body.contains("mechanics provenance"));
+        assert!(
+            body.contains("trigger_recorded → adapter_returned_evidence → custody_outcome_unknown")
+        );
+        assert!(body.contains("only Nightshift determines custody composition/currentness"));
+        assert!(!body.contains("monitoring status"));
+    }
+
+    #[test]
+    fn qualification_view_keeps_target_generation_and_passive_time_distinct() {
+        let source = include_str!("render.rs");
+        assert!(source.contains("target PlanDocument (qualification exact match)"));
+        assert!(source.contains("qualification occurrence"));
+        assert!(source.contains("qualified exact work"));
+        assert!(source.contains("No new failure test was performed"));
+        assert!(source.contains(
+            "The target PlanDocument label is an owner-established exact match, not a UI inference"
+        ));
+        let forbidden_claim = ["qualification", " carried", " forward"].concat();
+        assert!(!source.contains(&forbidden_claim));
     }
 }

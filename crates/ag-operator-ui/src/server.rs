@@ -366,6 +366,7 @@ mod tests {
             ag_loopctl: root.path().join("ag-loopctl"),
             nightshift: None,
             docket: None,
+            maude_acquisition: None,
         })
         .unwrap();
         let page = route("/", &reader);
@@ -397,6 +398,7 @@ mod tests {
             ag_loopctl: root.path().join("ag-loopctl"),
             nightshift: None,
             docket: None,
+            maude_acquisition: None,
         })
         .unwrap();
         let response = route(

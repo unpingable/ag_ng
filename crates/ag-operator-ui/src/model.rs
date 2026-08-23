@@ -47,6 +47,9 @@ pub const NIGHTSHIFT_EXTERNAL_OBSERVATION_CUSTODY_SCHEMA_V1: &str =
 /// Exact workflow-specific `PlanNode` claim schema.
 pub const NIGHTSHIFT_EXTERNAL_OBSERVATION_CLAIM_SCHEMA_V1: &str =
     "maude.local-compose-world-claim/v1";
+/// Exact Maude acquisition-orchestration occurrence history schema.
+pub const MAUDE_ACQUISITION_HISTORY_SCHEMA_V1: &str =
+    "maude.external-evidence-acquisition-history/v1";
 /// Exact supported Docket inspection schema.
 pub const DOCKET_INSPECTION_SCHEMA_V1: &str = "docket.governed-loop.inspection/v1";
 /// Exact schema for a deterministic, read-only presentation corpus.
@@ -531,6 +534,22 @@ pub struct ExternalObservationExportV1 {
     pub matches: Vec<ExternalObservationExportMatchV1>,
 }
 
+/// Read-only occurrence-scoped Maude orchestration history. Individual
+/// immutable trigger/request/event records remain available verbatim; the UI
+/// projects their closed fields but never treats them as currentness.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcquisitionHistoryV1 {
+    /// Exact export schema.
+    pub schema: String,
+    /// Exact source campaign.
+    pub campaign_id: String,
+    /// Exact historical source occurrence.
+    pub occurrence_id: String,
+    /// Immutable acquisition exports in ledger order.
+    pub acquisitions: Vec<Value>,
+}
+
 /// Authentication retained by Docket with the exact AG issuance.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -617,6 +636,8 @@ pub enum ReadCommandNameV1 {
     NightshiftExportAuthoringCustody,
     /// Nightshift authenticated workflow-specific external observation.
     NightshiftExportExternalObservation,
+    /// Maude exact acquisition trigger/request/event history.
+    MaudeExportObservationAcquisitions,
     /// Docket exact persisted governed-loop record.
     DocketGovernedLoopInspect,
 }
@@ -795,6 +816,10 @@ pub struct CampaignDetailV1 {
     /// keyed by exact governed occurrence. It is not cycle currentness.
     #[serde(default)]
     pub external_observations: Vec<RelatedSourceV1<ExternalObservationExportV1>>,
+    /// Workflow-specific observation-acquisition orchestration records. This
+    /// is mechanics provenance, never Nightshift currentness.
+    #[serde(default)]
+    pub observation_acquisitions: Vec<RelatedSourceV1<AcquisitionHistoryV1>>,
     /// Docket records keyed by exact AG issuance identity.
     pub docket: Vec<RelatedSourceV1<DocketInspectionV1>>,
 }
@@ -1138,6 +1163,138 @@ impl ExternalObservationExportV1 {
         }
         Ok(())
     }
+}
+
+impl AcquisitionHistoryV1 {
+    /// Validate only exact custody/orchestration relationships. Event meaning
+    /// remains Maude-owned and is not promoted into currentness or health.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a substituted occurrence, unsupported record schema, malformed
+    /// canonical identity, or event sequence that does not belong to its exact
+    /// request.
+    pub fn validate_for_occurrence(&self, campaign: &str, occurrence: &str) -> Result<(), String> {
+        if self.schema != MAUDE_ACQUISITION_HISTORY_SCHEMA_V1
+            || self.campaign_id != campaign
+            || self.occurrence_id != occurrence
+            || self.acquisitions.len() > 64
+        {
+            return Err("Maude acquisition history schema, target, or bound is invalid".into());
+        }
+        for acquisition in &self.acquisitions {
+            validate_acquisition(acquisition, campaign, occurrence)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_acquisition(
+    acquisition: &Value,
+    campaign: &str,
+    occurrence: &str,
+) -> Result<(), String> {
+    let object = acquisition
+        .as_object()
+        .ok_or_else(|| "Maude acquisition export is not an object".to_owned())?;
+    if object.get("schema").and_then(Value::as_str)
+        != Some("maude.external-evidence-acquisition-export/v1")
+    {
+        return Err("unsupported Maude acquisition export schema".into());
+    }
+    let trigger = object
+        .get("trigger")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Maude acquisition export lacks trigger".to_owned())?;
+    let request = object
+        .get("request")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Maude acquisition export lacks request".to_owned())?;
+    let reason = trigger
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if trigger.get("schema").and_then(Value::as_str)
+        != Some("maude.external-evidence-acquisition-trigger/v1")
+        || trigger.get("campaign_id").and_then(Value::as_str) != Some(campaign)
+        || trigger.get("occurrence_id").and_then(Value::as_str) != Some(occurrence)
+        || request.get("schema").and_then(Value::as_str)
+            != Some("maude.external-evidence-acquisition-request/v1")
+        || request.get("trigger_id") != trigger.get("trigger_id")
+        || request.get("reason") != trigger.get("reason")
+        || !matches!(
+            reason,
+            "post_settlement" | "reobserve_for_successor" | "reobserve_after_stale"
+        )
+    {
+        return Err("Maude acquisition trigger/request relationship is substituted".into());
+    }
+    for field in ["trigger_id", "settlement_id", "attempt_id", "issuance_id"] {
+        let value = trigger
+            .get(field)
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if Digest::parse(value).is_err() {
+            return Err(format!("Maude acquisition {field} is malformed"));
+        }
+    }
+    let request_id = request
+        .get("request_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Maude acquisition request identity is absent".to_owned())?;
+    Digest::parse(request_id)
+        .map_err(|_| "Maude acquisition request identity is malformed".to_owned())?;
+    let events = object
+        .get("events")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Maude acquisition events are malformed".to_owned())?;
+    if events.len() > 64 || !object.get("nonclaims").is_some_and(Value::is_array) {
+        return Err("Maude acquisition events/nonclaims are malformed".into());
+    }
+    for (index, event) in events.iter().enumerate() {
+        validate_acquisition_event(event, index + 1, request_id)?;
+    }
+    Ok(())
+}
+
+fn validate_acquisition_event(
+    event: &Value,
+    sequence: usize,
+    request_id: &str,
+) -> Result<(), String> {
+    let event = event
+        .as_object()
+        .ok_or_else(|| "Maude acquisition event is not an object".to_owned())?;
+    let kind = event
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if event.get("schema").and_then(Value::as_str)
+        != Some("maude.external-evidence-acquisition-event/v1")
+        || event.get("request_id").and_then(Value::as_str) != Some(request_id)
+        || event.get("sequence").and_then(Value::as_u64) != Some(sequence as u64)
+        || !matches!(
+            kind,
+            "trigger_recorded"
+                | "acquisition_scheduled"
+                | "adapter_invocation_started"
+                | "adapter_returned_evidence"
+                | "adapter_failed"
+                | "custody_accepted"
+                | "custody_refused"
+                | "custody_outcome_unknown"
+                | "reobservation_refused"
+        )
+    {
+        return Err("Maude acquisition event relationship is malformed".into());
+    }
+    let event_id = event
+        .get("event_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Digest::parse(event_id)
+        .map(|_| ())
+        .map_err(|_| "Maude acquisition event identity is malformed".to_owned())
 }
 
 impl ExternalObservationExportMatchV1 {

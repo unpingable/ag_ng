@@ -239,6 +239,7 @@ fn profile_seal_reopen_inspect_and_missing_custody_fail_closed() {
         ag_loopctl: Path::new(env!("CARGO_BIN_EXE_ag-loopctl")).to_owned(),
         nightshift: None,
         docket: None,
+        maude_acquisition: None,
     })
     .unwrap();
     let index = reader.campaign_index().unwrap();

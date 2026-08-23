@@ -51,17 +51,41 @@ if ! rg -q 'campaign: Digest' "$ui/src/links.rs" \
   exit 1
 fi
 
-for verb in inspect status replay history refusals intervention-submissions export-observation export-authoring-context export-authoring-custody external-observation; do
+for verb in inspect status replay history refusals intervention-submissions export-observation export-authoring-context export-authoring-custody external-observation export-occurrence; do
   if ! rg -q "$verb" "$ui/src/source.rs"; then
     echo "operator UI closed read-command surface lost $verb" >&2
     exit 1
   fi
 done
 
+if ! rg -Fq 'Acquisition mechanics may cause observation; only Nightshift determines custody composition/currentness.' "$ui/src/render.rs"; then
+  echo "operator UI lost acquisition/currentness owner distinction" >&2
+  exit 1
+fi
+
 if rg -n 'ExternalObservation(Custody|Claim|Export).*::(new|mint|seal)' "$ui/src"; then
   echo "operator UI can construct owner-side external observation/custody" >&2
   exit 1
 fi
+
+if ! rg -q 'age is not currentness' "$ui/src/render.rs" \
+  || rg -n 'evidence_age.*(Current|currentness)|observed_at.*fresh_until|fresh_until.*observed_at' "$ui/src"; then
+  echo "Phosphor-ng display-age projection drifted into canonical currentness" >&2
+  exit 1
+fi
+
+for owner_projection in \
+  'Historical application/world evidence' \
+  'Evidence age (display only)' \
+  'Nightshift currentness at governed evaluation' \
+  'Historical qualification' \
+  'Current steady-state' \
+  'No new failure test was performed.'; do
+  if ! rg -Fq "$owner_projection" "$ui/src/render.rs"; then
+    echo "operator UI lost the custody/age/currentness distinction: $owner_projection" >&2
+    exit 1
+  fi
+done
 
 if rg -n 'AuthoringContextProvenanceV1::(new|mint|seal)|AuthoringContextCustodyProvenanceV1::(new|mint|seal)|MaudeAuthoringContext(Input|Handoff)V1|HmacAuthenticationV1' "$ui/src"; then
   echo "operator UI can construct owner-side authoring provenance" >&2

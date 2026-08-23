@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use ag_operator_ui::server::{serve, validate_bind_ip};
 use ag_operator_ui::source::{
-    DocketReadSourceV1, NightshiftReadSourceV1, OperatorReaderV1, OperatorSourceConfigV1,
+    DocketReadSourceV1, MaudeAcquisitionReadSourceV1, NightshiftReadSourceV1, OperatorReaderV1,
+    OperatorSourceConfigV1,
 };
 use anyhow::{Context as _, Result, bail};
 use clap::Parser;
@@ -25,7 +26,7 @@ struct Args {
     ag_loopctl: Option<PathBuf>,
 
     /// Deterministic captured corpus for presentation qualification only.
-    #[arg(long, conflicts_with_all = ["campaign_root", "ag_loopctl", "nightshift_bin", "nightshift_store", "docket_bin", "docket_state"])]
+    #[arg(long, conflicts_with_all = ["campaign_root", "ag_loopctl", "nightshift_bin", "nightshift_store", "docket_bin", "docket_state", "maude_acquisition_bin", "maude_acquisition_ledger"])]
     demo_corpus: Option<PathBuf>,
 
     /// Absolute path to the canonical `nightshift` executable.
@@ -43,6 +44,14 @@ struct Args {
     /// Existing Docket state directory.
     #[arg(long, requires = "docket_bin")]
     docket_state: Option<PathBuf>,
+
+    /// Absolute path to the closed Maude acquisition CLI.
+    #[arg(long, requires = "maude_acquisition_ledger")]
+    maude_acquisition_bin: Option<PathBuf>,
+
+    /// Existing Maude acquisition trigger/request/event ledger.
+    #[arg(long, requires = "maude_acquisition_bin")]
+    maude_acquisition_ledger: Option<PathBuf>,
 
     /// Loopback address for the local HTTP listener.
     #[arg(long, default_value = "127.0.0.1:8417")]
@@ -67,6 +76,11 @@ fn main() -> Result<()> {
             (None, None) => None,
             _ => bail!("Docket binary and state must be configured together"),
         };
+        let maude_acquisition = match (args.maude_acquisition_bin, args.maude_acquisition_ledger) {
+            (Some(program), Some(ledger)) => Some(MaudeAcquisitionReadSourceV1 { program, ledger }),
+            (None, None) => None,
+            _ => bail!("Maude acquisition binary and ledger must be configured together"),
+        };
         OperatorReaderV1::new(OperatorSourceConfigV1 {
             campaign_root: args
                 .campaign_root
@@ -76,6 +90,7 @@ fn main() -> Result<()> {
                 .context("--ag-loopctl is required outside demo mode")?,
             nightshift,
             docket,
+            maude_acquisition,
         })
         .map_err(anyhow::Error::msg)
         .context("validate read-only operator sources")?

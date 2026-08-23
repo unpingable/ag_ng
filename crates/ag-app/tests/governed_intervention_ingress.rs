@@ -420,6 +420,7 @@ fn exact_submission_is_inspectable_restart_safe_and_idempotent() {
         ag_loopctl: Path::new(env!("CARGO_BIN_EXE_ag-loopctl")).to_owned(),
         nightshift: None,
         docket: None,
+        maude_acquisition: None,
     })
     .unwrap();
     let detail = reader
