@@ -28,6 +28,14 @@ use serde::{Deserialize, Serialize};
 pub const EFFECT_EXECUTOR_WORK_SCHEMA_V1: &str = "ag-effectd.docket-executor-work/v1";
 /// Exact sealed executor-plan schema.
 pub const EFFECT_EXECUTOR_PLAN_SCHEMA_V1: &str = "ag-effectd.docket-executor-plan/v1";
+/// External Docket-owned transport law implemented independently by `ag-effectd`.
+pub const DOCKET_EXECUTOR_TRANSPORT_SCHEMA_V1: &str = "docket.governed-executor-transport/v1";
+/// External Docket-owned dispatch schema implemented by `EffectExecutorDispatchV1`.
+pub const DOCKET_EXECUTOR_DISPATCH_SCHEMA_V1: &str = "docket.governed-executor-dispatch/v1";
+/// External Docket-owned outcome schema implemented by `EffectExecutorOutcomeV1`.
+pub const DOCKET_EXECUTOR_OUTCOME_SCHEMA_V1: &str = "docket.governed-executor-outcome/v1";
+/// V1 transport document bound shared by Docket and every executor adapter.
+pub const DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1: u64 = 1024 * 1024;
 
 const STORE_SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS docket_effect_attempt (

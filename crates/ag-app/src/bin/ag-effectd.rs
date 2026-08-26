@@ -4,15 +4,13 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 use ag_app::effect_executor_adapter::{
-    EffectExecutorDispatchV1, execute_effect_attempt, load_effect_executor_plan,
-    reconcile_effect_attempt,
+    DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1, EffectExecutorDispatchV1, execute_effect_attempt,
+    load_effect_executor_plan, reconcile_effect_attempt,
 };
 use ag_primitives::JcsDocument;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
-
-const MAX_DISPATCH_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -70,10 +68,10 @@ fn main() -> anyhow::Result<()> {
 fn read_stdin_strict<T: DeserializeOwned>() -> anyhow::Result<T> {
     let mut bytes = Vec::new();
     std::io::stdin()
-        .take(MAX_DISPATCH_BYTES + 1)
+        .take(DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1 + 1)
         .read_to_end(&mut bytes)
         .context("read exact Docket dispatch")?;
-    if bytes.is_empty() || bytes.len() as u64 > MAX_DISPATCH_BYTES {
+    if bytes.is_empty() || bytes.len() as u64 > DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1 {
         anyhow::bail!("Docket dispatch is empty or exceeds the exact bound");
     }
     let document = JcsDocument::parse(&bytes).context("strict Docket dispatch JSON")?;

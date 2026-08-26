@@ -9,6 +9,9 @@ resolves fresh observation and current standing, decides admissibility,
 durably spends one AG authorization, issues one exact record to Docket, and
 consumes Docket settlement into observation-required or reconciliation state.
 Docket owns execution custody and attempt identity; executors own mechanics;
+the generic dispatch/outcome/reconcile transport law is Docket-owned as
+`docket.governed-executor-transport/v1`, and `ag-effectd` implements it
+independently while retaining its sealed plans, journal, and mechanics receipts;
 NQ owns diagnostic evaluation; Nightshift owns recurrence. This implementation
 is qualification-ready development code, not an earned qualification or
 deployment claim. Older vertical documents remain valid only for the narrower
