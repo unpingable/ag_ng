@@ -12,6 +12,7 @@ pub mod effect_executor_adapter;
 pub mod effectd;
 pub mod effectd_activation;
 mod exact_exec;
+pub mod governed_campaign_v0;
 pub mod governed_loop;
 pub mod governed_ports;
 pub mod intervention_ingress;
