@@ -1,0 +1,73 @@
+{
+  "artifact_receipts": [],
+  "artifacts": [],
+  "declared_command": {
+    "argc": 0,
+    "argv_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "class": "receipt",
+    "scrubbed": true
+  },
+  "evidence_reservation": "sha256:694d72b1bf0bff3103e63bb3d8e2c581f1348df2cb040f198f12ecf6cef11e10",
+  "export_policy": {
+    "excluded_classes": [
+      "blob"
+    ],
+    "included_classes": [
+      "recipe",
+      "receipt"
+    ]
+  },
+  "notes": "synthetic contract specimen; no endpoint or campaign execution claim",
+  "outcome": "completed",
+  "porter_version": "0.0.1",
+  "preserved": true,
+  "refusal_reason": null,
+  "replay": {
+    "checksums": "SHA256SUMS",
+    "class": "receipt",
+    "commands": [
+      {
+        "argv": [
+          "sha256sum",
+          "-c",
+          "SHA256SUMS"
+        ],
+        "cwd": "runs/2026-08-28T22-32-38Z-14fa1b"
+      },
+      {
+        "argv": [
+          "./porter",
+          "show",
+          "2026-08-28T22-32-38Z-14fa1b"
+        ],
+        "cwd": "."
+      }
+    ],
+    "local_custody": {
+      "artifacts": "artifacts/",
+      "transcripts": "transcripts/"
+    },
+    "record": "record.json"
+  },
+  "run_id": "2026-08-28T22-32-38Z-14fa1b",
+  "schema": "porter.record.v1",
+  "steps": [],
+  "substrate": {
+    "class": "receipt",
+    "declared_fact_keys": [],
+    "declared_keys": [
+      "socket_path"
+    ],
+    "ephemeral": false,
+    "fact_mismatch_count": 0,
+    "kind": "vm",
+    "observed_keys": [],
+    "scrubbed": true,
+    "transport": "serial-socket"
+  },
+  "target": {
+    "class": "receipt",
+    "scheme": "serial",
+    "scrubbed": true
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "schema": "nq.campaign-stage-realization-qualification/v2",
+  "receipt_id": "reservation-qualification:glass-heron.stage-1.reservation/v2:velvet-pigeon.synthetic-realization-1",
+  "evaluator_id": "nq.campaign-stage-realization-evaluator/v2",
+  "evaluator_version": "0.1.0",
+  "evaluator_executable_sha256": "sha256:20d480b09d2cd2becdeaf2d018442925f5c2f4cde6fa371bba9c23fc6199b840",
+  "evaluated_at_unix_ms": 1000,
+  "profile_id": "glass-heron.stage-1.reservation/v2",
+  "profile_sha256": "sha256:7a07f877917809b26b3967e63b9639332ff26d9ce6db8baa0e84073c4f7b92bc",
+  "evidence_id": "velvet-pigeon.synthetic-realization-1",
+  "evidence_sha256": "sha256:bdfb055592191d5f00374da986f3a4197e3744732379a091d9c1107364d92aec",
+  "evidence_reservation": "sha256:694d72b1bf0bff3103e63bb3d8e2c581f1348df2cb040f198f12ecf6cef11e10",
+  "campaign_packet_sha256": "sha256:3ccd8cb4dc06bfeb49a4542afc83ec8020b951db14dd32c360a4bf3d6b6cfd0a",
+  "stage_id": "stage-1",
+  "repository_id": "sha256:d5d1916e8fbd597c07ab67ff9274fc2ac6ac379771d299c2aa694b6d4a47d48e",
+  "repository_ref": "refs/heads/main",
+  "realizations": [
+    {
+      "evidence_reservation": "sha256:694d72b1bf0bff3103e63bb3d8e2c581f1348df2cb040f198f12ecf6cef11e10",
+      "docket_attempt": "sha256:dd8b965dc4f1cee772b67b981e2ed722dc2ed14fd5d2d5d7cf44f03017c54120",
+      "executor_plan_template": "sha256:ed41c0ad17503a3c6a2721988c2cc53ed65cd083f050c7b6f34d4130fc916681",
+      "executor_plan": "sha256:6d3b79be273356b3414837d4e30183310b2f7fd2181145c42d47858cb06eec1c",
+      "docket_settlement": "sha256:bdc18b2272a8fa1d2a1f9c610350d72311d43f333d1be6033df616c236ee8e96",
+      "porter_run_id": "2026-08-28T22-32-38Z-14fa1b",
+      "porter_record_sha256": "sha256:0a9d48f22383adef1707c382b7237e86423ad56cda3f9495c21b27dc5e7ef388",
+      "executor_receipt": "sha256:950441e6c83027b9a5c2463ce5663c4161368463da7323c6da3bbe610adb8266",
+      "predecessor_head": {
+        "object_format": "sha1",
+        "digest": "1111111111111111111111111111111111111111"
+      },
+      "predecessor_tree": {
+        "object_format": "sha1",
+        "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "result_head": {
+        "object_format": "sha1",
+        "digest": "4444444444444444444444444444444444444444"
+      },
+      "result_tree": {
+        "object_format": "sha1",
+        "digest": "dddddddddddddddddddddddddddddddddddddddd"
+      }
+    }
+  ],
+  "status": "QUALIFIED",
+  "reasons": [
+    "ALL_REQUIRED_PREDICATES_HOLD"
+  ],
+  "does_not_establish": [
+    "standing",
+    "authorization",
+    "successor choice",
+    "continuation",
+    "effect authority",
+    "freshness or present applicability",
+    "reservation validity outside this exact profile"
+  ],
+  "receipt_sha256": "sha256:212380331b99b11e432cb5d810d87fa46ca29a6057a18286f3868276f88d4903"
+}

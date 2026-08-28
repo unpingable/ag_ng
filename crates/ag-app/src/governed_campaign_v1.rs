@@ -4,6 +4,8 @@
 //! future evidence slot; it is not execution, evidence, qualification,
 //! applicability, standing, settlement, authorization, or continuation.
 
+#![allow(missing_docs)]
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -214,11 +216,16 @@ impl CampaignStageV1 {
         {
             return Err("campaign stage/reservation binding mismatch".into());
         }
-        validate_template(
+        validate_template_slots(
             &self.executor_plan_template,
             &self.executor_plan_template_sha256,
+            &["evidence_reservation"],
         )?;
-        validate_template(&self.nq_profile_template, &self.nq_profile_template_sha256)?;
+        validate_template_slots(
+            &self.nq_profile_template,
+            &self.nq_profile_template_sha256,
+            &["campaign_packet_sha256", "evidence_reservation"],
+        )?;
         Ok(())
     }
 }
@@ -332,10 +339,39 @@ pub fn canonical_sha256(value: &serde_json::Value) -> Result<String, String> {
     let bytes = serde_jcs::to_vec(value).map_err(|error| error.to_string())?;
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
+/// packet has been sealed: its predeclared reservation and its own identity.
+/// Materialize the two closed, non-random NQ profile coordinates after the
+pub fn materialize_nq_profile_template(
+    template: &serde_json::Value,
+    reservation: &str,
+    campaign_packet_sha256: &str,
+) -> Result<serde_json::Value, String> {
+    if !is_digest(reservation) || !is_digest(campaign_packet_sha256) {
+        return Err("malformed NQ template coordinate".into());
+    }
+    let mut value = template.clone();
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "NQ profile template must be an object".to_owned())?;
+    for (name, exact) in [
+        ("evidence_reservation", reservation),
+        ("campaign_packet_sha256", campaign_packet_sha256),
+    ] {
+        let slot = object
+            .get_mut(name)
+            .ok_or_else(|| format!("NQ profile template has no {name}"))?;
+        if slot.as_str() != Some("") {
+            return Err("NQ profile template is not cycle-free".into());
+        }
+        *slot = serde_json::Value::String(exact.to_owned());
+    }
+    Ok(value)
+}
 
-fn validate_template(
+fn validate_template_slots(
     template: &serde_json::Value,
     expected_template_hash: &str,
+    empty_slots: &[&str],
 ) -> Result<(), String> {
     if canonical_sha256(template)? != expected_template_hash {
         return Err("reservation template hash mismatch".into());
@@ -343,12 +379,12 @@ fn validate_template(
     let object = template
         .as_object()
         .ok_or_else(|| "reservation template must be an object".to_owned())?;
-    if object
-        .get("evidence_reservation")
-        .and_then(serde_json::Value::as_str)
-        != Some("")
-    {
-        return Err("reservation template is not cycle-free".into());
+    for name in empty_slots {
+        if object.get(*name).and_then(serde_json::Value::as_str) != Some("") {
+            return Err(format!(
+                "reservation template slot {name} is not cycle-free"
+            ));
+        }
     }
     Ok(())
 }

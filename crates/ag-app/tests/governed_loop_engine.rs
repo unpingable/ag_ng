@@ -3211,6 +3211,46 @@ fn v2_catalog_schema_is_closed_and_v1_serialization_is_unchanged() {
 }
 
 #[test]
+fn external_reservation_realization_authorizes_exactly_once() {
+    let Ok(path) = std::env::var("VELVET_PIGEON_RESOLUTION_INPUT") else {
+        eprintln!("VELVET-PIGEON cross-office specimen not requested");
+        return;
+    };
+    let resolution: ObservationResolutionV3 =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        resolution.basis.basis_type,
+        "nightshift.repository-qualification-reservation-applicability/v1"
+    );
+    assert_eq!(resolution.status, TypedObservationStatusV1::Current);
+    assert_eq!(resolution.key.campaign, campaign());
+    assert_eq!(resolution.key.occurrence, occurrence(1));
+    assert_eq!(resolution.subject, digest("subject"));
+
+    let catalog = typed_catalog(resolution.basis.clone());
+    let observation_ref = resolution.observation.clone();
+    let directory = tempfile::tempdir().unwrap();
+    let mut engine = create_engine(&directory, ResidualSetV1::default());
+    let mut observation = FixedRepositoryQualificationResolution(resolution);
+    let mut standing = StandingBoundary::current();
+    engine
+        .record_proposal(
+            observation_ref,
+            proposal("work-1"),
+            ProposalClassV1::Initial,
+            &mut observation,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            NOW + 1,
+        )
+        .unwrap();
+    engine.require_standing(NOW + 2).unwrap();
+    engine.decide_with_catalog_v2(&mut observation, &mut standing, &catalog, None, REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID, MAX_STANDING_TTL_MS, NOW + 3).unwrap();
+    let authorized = engine.authorize_with_catalog_v2(&mut observation, &mut standing, &catalog, None, REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID, MAX_STANDING_TTL_MS, NOW + 4).unwrap();
+    assert_eq!(authorized.program_counter(), ProgramCounterV1::AuthorizationConsumed);
+    assert_eq!(engine.replay().unwrap().ag_spends, 1);
+}
+
+#[test]
 fn rollout_precondition_refuses_a_condition_present_basis() {
     // T8: a rollout-style policy (`required = {condition.clean}`) refuses the
     // same condition-present basis a remediation policy admits in T9. The

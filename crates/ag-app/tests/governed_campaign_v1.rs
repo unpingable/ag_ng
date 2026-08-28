@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use ag_app::governed_campaign_v1::*;
 
 fn digest(byte: char) -> String {
@@ -15,7 +17,8 @@ fn template(schema: &str, stage: usize) -> serde_json::Value {
     serde_json::json!({
         "schema": schema,
         "stage_id": format!("stage-{stage}"),
-        "evidence_reservation": ""
+        "evidence_reservation": "",
+        "campaign_packet_sha256": ""
     })
 }
 
@@ -25,6 +28,11 @@ fn packet() -> CampaignPacketV1 {
     for index in 0..3 {
         let ordinal = u32::try_from(index + 1).unwrap();
         let plan_template = template("gcl.worker-vm-executor-plan/v2", index + 1);
+        let mut plan_template = plan_template;
+        plan_template
+            .as_object_mut()
+            .unwrap()
+            .remove("campaign_packet_sha256");
         let nq_template = template("nq.campaign-stage-qualification-profile/v2", index + 1);
         let predecessor = if index == 0 {
             PredecessorBindingV1::InitialGit {
@@ -164,9 +172,58 @@ fn exact_reservation_materialization_is_not_profile_wildcarding() {
         exact["evidence_reservation"],
         stage.reservation.reservation_id
     );
-    assert!(
-        !serde_json::to_string(&packet)
+    let nq = materialize_nq_profile_template(
+        &stage.nq_profile_template,
+        &stage.reservation.reservation_id,
+        &packet.packet_id,
+    )
+    .unwrap();
+    assert_eq!(nq["evidence_reservation"], stage.reservation.reservation_id);
+    assert_eq!(nq["campaign_packet_sha256"], packet.packet_id);
+    let mut not_a_template = stage.nq_profile_template.clone();
+    not_a_template["campaign_packet_sha256"] = serde_json::json!(packet.packet_id);
+    assert!(materialize_nq_profile_template(
+        &not_a_template,
+        &stage.reservation.reservation_id,
+        &packet.packet_id
+    )
+    .is_err());
+    assert!(!serde_json::to_string(&packet)
+        .unwrap()
+        .contains("executor_plan_sha256"));
+}
+
+#[test]
+fn frozen_glass_heron_packet_closes_before_stage_one() {
+    let Ok(path) = std::env::var("VELVET_PIGEON_PACKET_INPUT") else {
+        eprintln!("VELVET-PIGEON packet fixture not requested");
+        return;
+    };
+    let packet: CampaignPacketV1 = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    packet.validate().unwrap();
+    let text = serde_json::to_string(&packet).unwrap();
+    for stage in &packet.stages {
+        assert!(!text.contains("\"porter_run_id\""));
+        assert!(!stage
+            .executor_plan_template
+            .as_object()
             .unwrap()
-            .contains("executor_plan_sha256")
-    );
+            .contains_key("expected_result_head"));
+        assert!(!stage
+            .executor_plan_template
+            .as_object()
+            .unwrap()
+            .contains_key("expected_result_tree"));
+        materialize_template(
+            &stage.executor_plan_template,
+            &stage.reservation.reservation_id,
+        )
+        .unwrap();
+        materialize_nq_profile_template(
+            &stage.nq_profile_template,
+            &stage.reservation.reservation_id,
+            &packet.packet_id,
+        )
+        .unwrap();
+    }
 }
