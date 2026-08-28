@@ -15,8 +15,10 @@ import sys
 import time
 from typing import Any
 
-REQUEST_SCHEMA = "ag.gcl-v1-worker-request/v1"
-OUTCOME_SCHEMA = "ag.gcl-v1-worker-outcome/v1"
+REQUEST_SCHEMA_V1 = "ag.gcl-v1-worker-request/v1"
+REQUEST_SCHEMA_V2 = "ag.gcl-v1-worker-request/v2"
+OUTCOME_SCHEMA_V1 = "ag.gcl-v1-worker-outcome/v1"
+OUTCOME_SCHEMA_V2 = "ag.gcl-v1-worker-outcome/v2"
 JOURNAL_SCHEMA = "ag.gcl-v1-worker-journal/v1"
 STATE = Path("/var/lib/gcl-state")
 CREDS = Path("/var/lib/gcl-credentials/codex")
@@ -141,7 +143,7 @@ def exact_request_path(raw_value: str) -> Path:
 def load_request(raw_value: str) -> tuple[Path, dict[str, Any], str]:
     path = exact_request_path(raw_value)
     request = json.loads(path.read_bytes())
-    required = {
+    required_v1 = {
         "schema",
         "session_id",
         "attempt_id",
@@ -158,8 +160,14 @@ def load_request(raw_value: str) -> tuple[Path, dict[str, Any], str]:
         "effort",
         "timeout_seconds",
     }
-    if set(request) != required or request.get("schema") != REQUEST_SCHEMA:
+    schema = request.get("schema") if isinstance(request, dict) else None
+    required = required_v1 | ({"evidence_reservation"} if schema == REQUEST_SCHEMA_V2 else set())
+    if set(request) != required or schema not in {REQUEST_SCHEMA_V1, REQUEST_SCHEMA_V2}:
         raise Refusal("request schema or fields mismatch")
+    if schema == REQUEST_SCHEMA_V2 and not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", request["evidence_reservation"],
+    ):
+        raise Refusal("invalid evidence reservation")
     if request["session_id"] != session_id():
         raise Refusal("session substitution")
     for key in ("attempt_id", "marker"):
@@ -227,7 +235,12 @@ def public_outcome(attempt: dict[str, Any]) -> dict[str, Any]:
         "changed_paths",
         "detail",
     )
-    value = {"schema": OUTCOME_SCHEMA}
+    request_schema = attempt.get("request_schema", REQUEST_SCHEMA_V1)
+    value = {
+        "schema": OUTCOME_SCHEMA_V2 if request_schema == REQUEST_SCHEMA_V2 else OUTCOME_SCHEMA_V1,
+    }
+    if request_schema == REQUEST_SCHEMA_V2:
+        value["evidence_reservation"] = attempt.get("evidence_reservation")
     value.update({key: attempt.get(key) for key in keys})
     return value
 
@@ -302,6 +315,8 @@ def reserve(request: dict[str, Any], digest: str) -> tuple[dict[str, Any], bool]
             raise Refusal("attempt ordinal or three-attempt capacity refusal")
         attempt = {
             "session_id": request["session_id"],
+            "request_schema": request["schema"],
+            "evidence_reservation": request.get("evidence_reservation"),
             "attempt_id": request["attempt_id"],
             "marker": request["marker"],
             "ordinal": request["ordinal"],
@@ -320,8 +335,9 @@ def current(request: dict[str, Any], digest: str) -> dict[str, Any]:
         journal = load_journal()
         attempt = find_attempt(journal, request)
         if attempt is None:
-            return {
-                "schema": OUTCOME_SCHEMA,
+            absent = {
+                "request_schema": request["schema"],
+                "evidence_reservation": request.get("evidence_reservation"),
                 "session_id": request["session_id"],
                 "attempt_id": request["attempt_id"],
                 "marker": request["marker"],
@@ -331,6 +347,7 @@ def current(request: dict[str, Any], digest: str) -> dict[str, Any]:
                 "worker_invocations": 0,
                 "detail": "no exact attempt exists",
             }
+            return public_outcome(absent)
         if attempt["request_sha256"] != digest:
             raise Refusal("conflicting exact replay")
         return public_outcome(attempt)
