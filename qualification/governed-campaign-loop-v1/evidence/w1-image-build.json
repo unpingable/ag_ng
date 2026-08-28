@@ -1,0 +1,17 @@
+{
+  "bwrap_sha256": "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c",
+  "capacity": 3,
+  "checksum_manifest_sha256": "ee5d4762c360593bc480ad345cbb78eee0e70dbf6bd2301c8bfc8b2007d4c7b3",
+  "codex_sha256": "cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40",
+  "credential_device_uuid": "b6cfde5e-4c8d-4480-ad9c-ae5373f4fc2a",
+  "guest_host_key_fingerprint": "SHA256:lfOs3oJujqPYLTGDYO+81mFMLfnLztO/YhAR6xXma1U",
+  "network_endpoint": "127.0.0.1:23022",
+  "qemu_executable": "/usr/bin/qemu-system-x86_64",
+  "qemu_sha256": "8a35ccba41582fc6c38b9df85fc9e35fa1d42f414d2d7d8090ee9b2f5e7c0854",
+  "release": "20260826",
+  "root_image_sha256": "f7cf2245cea7b691f817bf8a37362d795e832fda6e21ea5737722c0164940570",
+  "schema": "ag.gcl-v1-worker-image-build/v1",
+  "source_sha256": "d0fe84bb5f80853425fa6be28e2c106f30104c3cfe8611933f2e65c9b63f0e30",
+  "source_url": "https://cloud-images.ubuntu.com/releases/releases/noble/release-20260826/ubuntu-24.04-server-cloudimg-amd64.img",
+  "state_device_uuid": "5770408c-1391-4a4d-9e92-9a98419f7b03"
+}

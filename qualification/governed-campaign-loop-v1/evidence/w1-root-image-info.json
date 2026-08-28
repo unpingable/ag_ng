@@ -1,0 +1,40 @@
+[
+    {
+        "children": [
+            {
+                "name": "file",
+                "info": {
+                    "children": [
+                    ],
+                    "virtual-size": 2743271424,
+                    "filename": "/data/git/ag_ng/.campaign-local/gcl-v1/worker/gcl-v1-worker-root.qcow2",
+                    "format": "file",
+                    "actual-size": 2743214080,
+                    "format-specific": {
+                        "type": "file",
+                        "data": {
+                        }
+                    },
+                    "dirty-flag": false
+                }
+            }
+        ],
+        "virtual-size": 34359738368,
+        "filename": "/data/git/ag_ng/.campaign-local/gcl-v1/worker/gcl-v1-worker-root.qcow2",
+        "cluster-size": 65536,
+        "format": "qcow2",
+        "actual-size": 2743214080,
+        "format-specific": {
+            "type": "qcow2",
+            "data": {
+                "compat": "1.1",
+                "compression-type": "zlib",
+                "lazy-refcounts": false,
+                "refcount-bits": 16,
+                "corrupt": false,
+                "extended-l2": false
+            }
+        },
+        "dirty-flag": false
+    }
+]

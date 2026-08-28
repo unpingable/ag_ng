@@ -1,0 +1,33 @@
+{
+  "classification": "KVM-AVAILABLE",
+  "cgroup_controllers": ["cpuset", "cpu", "io", "memory", "hugetlb", "pids", "rdma", "misc"],
+  "cgroup_version": 2,
+  "date": "2026-08-28",
+  "device": {
+    "group": "kvm",
+    "major_minor": "10:232",
+    "mode": "0660",
+    "path": "/dev/kvm",
+    "readable_by_execution_user": true,
+    "writable_by_execution_user": true
+  },
+  "execution_user": {"gid": 1000, "kvm_gid": 109, "name": "jbeck", "uid": 1000},
+  "loaded_modules": ["kvm_amd", "kvm"],
+  "mellanox": {
+    "current_interface_fact_only": "enp4s0",
+    "ipv4": "192.168.69.30/22",
+    "mac_identity": "24:8a:07:f8:1d:91",
+    "network_manager_profile": "crow-mellanox",
+    "profile_uuid": "5a0cc298-0f9f-3039-b41b-6d4be111c0f8"
+  },
+  "qemu": {
+    "command": ["/usr/bin/qemu-system-x86_64", "-accel", "kvm", "-machine", "q35", "-nodefaults", "-display", "none", "-qmp", "stdio"],
+    "executable_sha256": "8a35ccba41582fc6c38b9df85fc9e35fa1d42f414d2d7d8090ee9b2f5e7c0854",
+    "qmp_commands": ["qmp_capabilities", "query-kvm", "quit"],
+    "query_kvm": {"enabled": true, "present": true},
+    "quit_was_clean": true,
+    "version": "8.2.2"
+  },
+  "schema": "ag.gcl-v1-w0-kvm-preflight/v1",
+  "systemd_version": 255
+}

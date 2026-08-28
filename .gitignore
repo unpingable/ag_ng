@@ -5,6 +5,7 @@
 *.db-shm
 *.db-wal
 *.sock
+.campaign-local/
 
 # Python bytecode from the qualification harness test step.
 __pycache__/

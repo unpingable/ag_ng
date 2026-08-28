@@ -1,0 +1,64 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+die() {
+  printf 'gcl-worker-shell refusal: %s\n' "$*" >&2
+  exit 125
+}
+
+[[ "${GCL_WORKSPACE:-}" == /var/lib/gcl-state/attempts/*/repo ]] ||
+  die "missing or invalid admitted workspace"
+workspace="$(realpath -e -- "${GCL_WORKSPACE}")"
+[[ "$workspace" == /var/lib/gcl-state/attempts/*/repo ]] ||
+  die "workspace canonical path escaped attempt root"
+[[ ! -L "$workspace" && -d "$workspace" ]] ||
+  die "workspace is not a real directory"
+[[ "$(stat -c '%u:%g' -- "$workspace")" == "2001:2001" ]] ||
+  die "workspace custody is not gcl-workload"
+
+cwd="$(realpath -e -- "$PWD")"
+case "$cwd/" in
+  "$workspace/"*) ;;
+  *) die "current directory is outside admitted workspace" ;;
+esac
+relative="${cwd#"$workspace"}"
+sandbox_cwd="/workspace${relative}"
+bwrap=/usr/local/libexec/gcl/bwrap
+[[ "$(sha256sum "$bwrap" | cut -d' ' -f1)" == "77360cb751ccedc5971391444ac86a8a33c15b04d6b4a6fe45f5d25496e62c4c" ]] ||
+  die "Bubblewrap identity mismatch"
+
+bwrap_args=(
+  --die-with-parent
+  --new-session
+  --unshare-user
+  --unshare-pid
+  --unshare-ipc
+  --unshare-uts
+  --unshare-cgroup-try
+  --unshare-net
+  --uid 2001
+  --gid 2001
+  --ro-bind /usr /usr
+  --symlink usr/bin /bin
+  --symlink usr/sbin /sbin
+  --symlink usr/lib /lib
+  --symlink usr/lib64 /lib64
+  --ro-bind /etc /etc
+  --ro-bind /sys /sys
+  --proc /proc
+  --dev /dev
+  --tmpfs /tmp
+  --tmpfs /run
+  --dir /var
+  --dir /home
+  --dir /home/gcl-workload
+  --bind "$workspace" /workspace
+  --chdir "$sandbox_cwd"
+  --setenv HOME /home/gcl-workload
+  --setenv USER gcl-workload
+  --setenv LOGNAME gcl-workload
+  --setenv SHELL /bin/bash
+  --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+)
+
+exec "$bwrap" "${bwrap_args[@]}" /usr/bin/bash "$@"

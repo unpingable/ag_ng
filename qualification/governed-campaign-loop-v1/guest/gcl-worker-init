@@ -1,0 +1,40 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+die() {
+  printf 'gcl-worker-init refusal: %s\n' "$*" >&2
+  exit 1
+}
+
+for mountpoint in /var/lib/gcl-state /var/lib/gcl-credentials; do
+  mountpoint -q "$mountpoint" || die "$mountpoint is not a mounted device"
+done
+
+state_source="$(findmnt -n -o SOURCE /var/lib/gcl-state)"
+credential_source="$(findmnt -n -o SOURCE /var/lib/gcl-credentials)"
+[[ "$(blkid -s LABEL -o value "$state_source")" == GCL_STATE ]] ||
+  die "wrong state-device label"
+[[ "$(blkid -s LABEL -o value "$credential_source")" == GCL_CREDENTIALS ]] ||
+  die "wrong credential-device label"
+
+install -d -m 0750 -o gcl-parent -g gcl-parent /var/lib/gcl-state/inbox
+install -d -m 0750 -o gcl-parent -g gcl-parent /var/lib/gcl-state/attempts
+install -d -m 0700 -o gcl-parent -g gcl-parent /var/lib/gcl-state/journal
+install -d -m 0700 -o gcl-parent -g gcl-parent /var/lib/gcl-credentials/codex
+session_id="$(tr -d '\r\n' </sys/class/dmi/id/product_serial)"
+[[ "$session_id" =~ ^[a-z0-9][a-z0-9-]{7,79}$ ]] || die "invalid SMBIOS session identity"
+printf '%s\n' "$session_id" >/run/gcl-session-id
+chmod 0444 /run/gcl-session-id
+
+
+loginctl enable-linger gcl-parent
+systemctl start user@2000.service
+test -S /run/user/2000/bus || die "gcl-parent user manager unavailable"
+
+root_options="$(findmnt -n -o OPTIONS /)"
+case ",$root_options," in
+  *,ro,*) ;;
+  *) die "root is not read-only" ;;
+esac
+
+printf 'ready\n' > /run/gcl-worker-ready
