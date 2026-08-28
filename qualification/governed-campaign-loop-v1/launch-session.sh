@@ -72,7 +72,7 @@ qemu_argv=(
   -drive "if=virtio,file=$state_image,format=raw,cache=none,aio=native"
   -drive "if=virtio,file=$credential_image,format=raw,cache=none,aio=native"
   -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$port-:22"
-  -device virtio-net-pci,netdev=net0,mac=52:54:00:67:63:01
+  -device virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56
   -object rng-random,id=rng0,filename=/dev/urandom
   -device virtio-rng-pci,rng=rng0
   -smbios "type=1,serial=$session_id"
@@ -121,13 +121,15 @@ PY
 started=0
 cleanup() {
   status=$?
-  trap - EXIT
+  trap - EXIT INT TERM
   if [[ "$status" != 0 && "$started" == 1 ]]; then
     systemctl --user stop "$unit" >/dev/null 2>&1 || true
   fi
   exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 "${systemd_argv[@]}"
 started=1
@@ -166,7 +168,7 @@ PY
   sleep 2
 done
 [[ "$ready" == 1 ]] || die 'pinned guest identity did not become ready'
-trap - EXIT
+trap - EXIT INT TERM
 chmod 0600 "$session"/*
 printf 'W3 session launched: %s\n' "$session_id"
 printf 'Unit: %s\n' "$unit"
