@@ -13,8 +13,8 @@ workspace="$(realpath -e -- "${GCL_WORKSPACE}")"
   die "workspace canonical path escaped attempt root"
 [[ ! -L "$workspace" && -d "$workspace" ]] ||
   die "workspace is not a real directory"
-[[ "$(stat -c '%u:%g' -- "$workspace")" == "2001:2001" ]] ||
-  die "workspace custody is not gcl-workload"
+[[ "$(stat -c '%u:%g' -- "$workspace")" == "2000:2000" ]] ||
+  die "workspace custody is not gcl-parent"
 
 cwd="$(realpath -e -- "$PWD")"
 case "$cwd/" in

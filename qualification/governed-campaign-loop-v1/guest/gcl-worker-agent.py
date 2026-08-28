@@ -389,20 +389,19 @@ def prepare_workspace(request: dict[str, Any]) -> tuple[Path, Path, Path]:
         raise Refusal("fresh attempt workspace already exists")
     attempt_root.mkdir(mode=0o755, parents=True)
     transcript.touch(mode=0o600)
-    os.chown(attempt_root, 2001, 2001)
     bundle = Path(request["bundle_path"])
-    run(["/usr/bin/git", "clone", "--no-checkout", str(bundle), str(repo)], uid=2001)
-    run(["/usr/bin/git", "remote", "remove", "origin"], cwd=repo, uid=2001)
-    run(["/usr/bin/git", "checkout", "--detach", request["base_commit"]], cwd=repo, uid=2001)
-    head = run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=repo, uid=2001).stdout.strip()
-    tree = run(["/usr/bin/git", "rev-parse", "HEAD^{tree}"], cwd=repo, uid=2001).stdout.strip()
+    run(["/usr/bin/git", "clone", "--no-checkout", str(bundle), str(repo)], uid=2000)
+    run(["/usr/bin/git", "remote", "remove", "origin"], cwd=repo, uid=2000)
+    run(["/usr/bin/git", "checkout", "--detach", request["base_commit"]], cwd=repo, uid=2000)
+    head = run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=repo, uid=2000).stdout.strip()
+    tree = run(["/usr/bin/git", "rev-parse", "HEAD^{tree}"], cwd=repo, uid=2000).stdout.strip()
     if head != request["base_commit"] or tree != request["base_tree"]:
         raise Refusal("wrong predecessor in guest workspace")
-    run(["/usr/bin/git", "config", "user.name", "GCL V1 Worker"], cwd=repo, uid=2001)
+    run(["/usr/bin/git", "config", "user.name", "GCL V1 Worker"], cwd=repo, uid=2000)
     run(
         ["/usr/bin/git", "config", "user.email", "gcl-v1-worker@invalid"],
         cwd=repo,
-        uid=2001,
+        uid=2000,
     )
     return attempt_root, repo, transcript
 
@@ -503,10 +502,10 @@ def internal_run(raw_path: str) -> None:
             return
 
         dirty = run(
-            ["/usr/bin/git", "status", "--porcelain=v1", "-z"], cwd=repo, uid=2001
+            ["/usr/bin/git", "status", "--porcelain=v1", "-z"], cwd=repo, uid=2000
         ).stdout
         if dirty:
-            run(["/usr/bin/git", "add", "-A"], cwd=repo, uid=2001)
+            run(["/usr/bin/git", "add", "-A"], cwd=repo, uid=2000)
             run(
                 [
                     "/usr/bin/git",
@@ -515,9 +514,9 @@ def internal_run(raw_path: str) -> None:
                     f"GCL V1 stage {request['ordinal']} candidate",
                 ],
                 cwd=repo,
-                uid=2001,
+                uid=2000,
             )
-        head = run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=repo, uid=2001).stdout.strip()
+        head = run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=repo, uid=2000).stdout.strip()
         if head == request["base_commit"]:
             update_attempt(
                 request["attempt_id"],
@@ -545,7 +544,7 @@ def internal_run(raw_path: str) -> None:
                 f"^{request['base_commit']}",
             ],
             cwd=repo,
-            uid=2001,
+            uid=2000,
         )
         changed = run(
             [
@@ -557,11 +556,11 @@ def internal_run(raw_path: str) -> None:
                 head,
             ],
             cwd=repo,
-            uid=2001,
+            uid=2000,
         ).stdout.split("\0")
         changed = [item for item in changed if item]
         tree = run(
-            ["/usr/bin/git", "rev-parse", f"{head}^{{tree}}"], cwd=repo, uid=2001
+            ["/usr/bin/git", "rev-parse", f"{head}^{{tree}}"], cwd=repo, uid=2000
         ).stdout.strip()
         update_attempt(
             request["attempt_id"],

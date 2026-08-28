@@ -103,10 +103,14 @@ included in a campaign packet, stored in a host repository, or copied into a
 transcript. Authentication evidence is limited to the exit status and redacted
 method reported by `codex login status`.
 
-The Codex parent is deliberately distinct from its workload UID. Repository
-mutation is performed only by the workload UID inside Bubblewrap. The parent
-cannot use repository permissions as a path around the command boundary, and
-the workload cannot use DAC or a mount path to reach the credential store.
+The parent agent and its Git custody mechanics own the attempt workspace as
+guest UID 2000. Every model-controlled shell command crosses the immutable
+Bubblewrap wrapper and runs as UID 2001 inside a private user, PID, IPC, UTS,
+cgroup, and network namespace. Only the one attempt workspace is writable in
+that namespace. The credential device is not mounted there, so the workload
+cannot use DAC or a filesystem path to reach it. Parent-side Git operations
+after model completion create the candidate bundle but make no qualification
+claim.
 
 ## Network law
 
