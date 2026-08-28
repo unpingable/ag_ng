@@ -187,6 +187,7 @@ for _ in $(seq 1 120); do
   if ssh-keyscan -T 3 -p "$port" 127.0.0.1 >"$known_hosts.partial" 2>/dev/null &&
      grep -q 'ssh-ed25519' "$known_hosts.partial"; then
     mv "$known_hosts.partial" "$known_hosts"
+    chmod 0600 "$known_hosts"
     if ssh -p "$port" -i "$client_key" -o IdentitiesOnly=yes \
       -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
       -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 \
