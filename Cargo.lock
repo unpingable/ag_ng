@@ -60,6 +60,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ag-external-authz"
+version = "0.1.0"
+dependencies = [
+ "ag-app",
+ "ag-campaign",
+ "ag-primitives",
+ "ag-protocol",
+ "ag-store",
+ "clap",
+ "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "ag-kernel"
 version = "0.1.0"
 dependencies = [

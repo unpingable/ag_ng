@@ -4,6 +4,7 @@ members = [
     "crates/ag-app",
     "crates/ag-campaign",
     "crates/ag-effect",
+    "crates/ag-external-authz",
     "crates/ag-kernel",
     "crates/ag-migrate",
     "crates/ag-operator-ui",
