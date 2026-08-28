@@ -3736,3 +3736,85 @@ fn each_occurrence_binds_its_own_expected_work() {
     );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
 }
+
+#[test]
+fn three_external_nq_nightshift_observations_each_authorize_exact_work() {
+    let Ok(path) = std::env::var("GCL_V0_RESOLUTIONS_INPUT") else {
+        eprintln!("GCL V0 AG cross-office specimen not requested");
+        return;
+    };
+    let resolutions: Vec<ObservationResolutionV3> =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(resolutions.len(), 3);
+
+    let mut basis_identities = BTreeSet::new();
+    for (index, resolution) in resolutions.into_iter().enumerate() {
+        assert_eq!(resolution.schema, OBSERVATION_RESOLUTION_SCHEMA_V3);
+        assert_eq!(
+            resolution.resolver_id,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID
+        );
+        assert_eq!(
+            resolution.basis.basis_type,
+            REPOSITORY_QUALIFICATION_BASIS_TYPE
+        );
+        assert_eq!(resolution.key.campaign, campaign());
+        assert_eq!(resolution.key.occurrence, occurrence(1));
+        assert_eq!(resolution.subject, digest("subject"));
+        assert_eq!(resolution.status, TypedObservationStatusV1::Current);
+        assert!(basis_identities.insert(resolution.basis.basis_identity.clone()));
+        let now = resolution.resolved_at_unix_ms;
+
+        let catalog = typed_catalog(resolution.basis.clone());
+        let observation_ref = resolution.observation.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let mut engine = create_engine(&directory, ResidualSetV1::default());
+        let mut observation = FixedRepositoryQualificationResolution(resolution);
+        let mut standing = StandingBoundary::current();
+        engine
+            .record_proposal(
+                observation_ref,
+                proposal("work-1"),
+                ProposalClassV1::Initial,
+                &mut observation,
+                REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                now + 1,
+            )
+            .unwrap();
+        engine.require_standing(now + 2).unwrap();
+        engine
+            .decide_with_catalog_v2(
+                &mut observation,
+                &mut standing,
+                &catalog,
+                None,
+                REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                STANDING_RESOLVER_ID,
+                MAX_STANDING_TTL_MS,
+                now + 3,
+            )
+            .unwrap();
+        let authorized = engine
+            .authorize_with_catalog_v2(
+                &mut observation,
+                &mut standing,
+                &catalog,
+                None,
+                REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                STANDING_RESOLVER_ID,
+                MAX_STANDING_TTL_MS,
+                now + 4,
+            )
+            .unwrap();
+        assert_eq!(
+            authorized.program_counter(),
+            ProgramCounterV1::AuthorizationConsumed
+        );
+        assert_eq!(
+            engine.replay().unwrap().ag_spends,
+            1,
+            "stage {}",
+            index + 1
+        );
+    }
+}
