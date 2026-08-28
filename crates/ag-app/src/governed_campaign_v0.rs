@@ -736,3 +736,98 @@ pub enum RestartActionV0 {
     /// Terminal stop.
     Stop,
 }
+
+/// Existing-office operations required by the unattended V0 driver.
+///
+/// Implementations transport exact retained facts. They do not delegate
+/// qualification judgment to the controller: the only qualification method
+/// returns an AG disposition after NQ evaluation and Nightshift applicability.
+pub trait CampaignOfficePortV0 {
+    /// Re-establish all workspace, predecessor, worker, and resource predicates.
+    fn admit_stage(
+        &mut self,
+        packet: &CampaignPacketV0,
+        stage: &CampaignStageV0,
+    ) -> Result<StageAdmissionV0, String>;
+
+    /// Submit exactly the packet attempt to Docket custody. Implementations
+    /// must reconcile a lost response and may not create another attempt.
+    fn dispatch_exact_attempt(
+        &mut self,
+        packet: &CampaignPacketV0,
+        stage: &CampaignStageV0,
+    ) -> Result<(), String>;
+
+    /// Read/reconcile the exact Docket attempt to one settled result.
+    fn reconcile_exact_attempt(
+        &mut self,
+        packet: &CampaignPacketV0,
+        stage: &CampaignStageV0,
+    ) -> Result<StageSettlementV0, String>;
+
+    /// Request factual gates, NQ evaluation, Nightshift applicability, and
+    /// AG's exact successor or terminal decision. No caller verdict exists.
+    fn qualify_and_ask_ag(
+        &mut self,
+        packet: &CampaignPacketV0,
+        stage: &CampaignStageV0,
+        settlement: &StageSettlementV0,
+    ) -> Result<(QualificationDispositionV0, StageFreezeV0), String>;
+
+    /// Persist authority-free controller coordination after every transition.
+    /// AG and Docket remain the truth stores for authority and attempts.
+    fn persist_snapshot(&mut self, snapshot: &CampaignSnapshotV0) -> Result<(), String>;
+}
+
+/// Drive the exact three-stage V0 packet without interstage human input.
+///
+/// The function stops only at `HUMAN_REQUIRED`, a typed controller refusal,
+/// or an external-office error. It never selects a stage or retries an effect.
+///
+/// # Errors
+///
+/// Returns an error when an existing office cannot establish an exact fact or
+/// when the authority-free coordination snapshot cannot be durably retained.
+pub fn run_unattended_v0<P: CampaignOfficePortV0>(
+    packet: &CampaignPacketV0,
+    mut snapshot: CampaignSnapshotV0,
+    offices: &mut P,
+) -> Result<CampaignSnapshotV0, String> {
+    packet.validate().map_err(|error| error.to_string())?;
+    loop {
+        let stage = packet
+            .stages
+            .get(snapshot.stage_index)
+            .ok_or_else(|| "controller snapshot names an unknown V0 stage".to_owned())?;
+        snapshot = match snapshot.phase {
+            CampaignPhaseV0::Prepared => {
+                let admission = offices.admit_stage(packet, stage)?;
+                snapshot.admit(packet, &admission)?
+            }
+            CampaignPhaseV0::Admitted => {
+                offices.dispatch_exact_attempt(packet, stage)?;
+                snapshot.dispatched(packet, &stage.attempt_id)?
+            }
+            CampaignPhaseV0::Executing => {
+                let settlement = offices.reconcile_exact_attempt(packet, stage)?;
+                snapshot.settled(packet, settlement)?
+            }
+            CampaignPhaseV0::Qualifying => {
+                let settlement = snapshot
+                    .settlement
+                    .as_ref()
+                    .ok_or_else(|| "qualifying snapshot has no Docket settlement".to_owned())?
+                    .clone();
+                let (disposition, freeze) =
+                    offices.qualify_and_ask_ag(packet, stage, &settlement)?;
+                snapshot.qualified_and_frozen(packet, disposition, freeze)?
+            }
+            CampaignPhaseV0::Frozen => snapshot.observe_successor(packet)?,
+            CampaignPhaseV0::Observed => {
+                return Err("OBSERVED is not a durable dispatch boundary".into());
+            }
+            CampaignPhaseV0::HumanRequired | CampaignPhaseV0::Stopped => return Ok(snapshot),
+        };
+        offices.persist_snapshot(&snapshot)?;
+    }
+}

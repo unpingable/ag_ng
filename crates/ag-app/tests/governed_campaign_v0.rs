@@ -185,12 +185,10 @@ fn packet_freezes_three_exact_profiles_and_rejects_modification() {
 #[test]
 fn caller_verdicts_and_raw_success_have_no_positive_transition() {
     for status in ["qualified", "failed", "indeterminate"] {
-        assert!(
-            serde_json::from_value::<QualificationDispositionV0>(
-                serde_json::json!({"disposition":status,"record":{}})
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_value::<QualificationDispositionV0>(
+            serde_json::json!({"disposition":status,"record":{}})
+        )
+        .is_err());
     }
     let packet = packet();
     let mut raw = authorization(&packet, 0);
@@ -316,5 +314,128 @@ fn three_stages_run_unattended_then_ag_requires_human() {
     assert_eq!(
         state.restart_action(&packet).unwrap(),
         RestartActionV0::Stop
+    );
+}
+
+#[derive(Default)]
+struct RecordingOffices {
+    admissions: Vec<String>,
+    dispatches: Vec<String>,
+    reconciliations: Vec<String>,
+    qualifications: Vec<String>,
+    snapshots: Vec<CampaignSnapshotV0>,
+}
+
+impl CampaignOfficePortV0 for RecordingOffices {
+    fn admit_stage(
+        &mut self,
+        packet: &CampaignPacketV0,
+        stage: &CampaignStageV0,
+    ) -> Result<StageAdmissionV0, String> {
+        let index = packet
+            .stages
+            .iter()
+            .position(|candidate| candidate.stage_id == stage.stage_id)
+            .ok_or_else(|| "unknown stage".to_owned())?;
+        self.admissions.push(stage.stage_id.clone());
+        Ok(admission(packet, index))
+    }
+
+    fn dispatch_exact_attempt(
+        &mut self,
+        _packet: &CampaignPacketV0,
+        stage: &CampaignStageV0,
+    ) -> Result<(), String> {
+        self.dispatches.push(stage.attempt_id.clone());
+        Ok(())
+    }
+
+    fn reconcile_exact_attempt(
+        &mut self,
+        packet: &CampaignPacketV0,
+        stage: &CampaignStageV0,
+    ) -> Result<StageSettlementV0, String> {
+        let index = packet
+            .stages
+            .iter()
+            .position(|candidate| candidate.stage_id == stage.stage_id)
+            .ok_or_else(|| "unknown stage".to_owned())?;
+        self.reconciliations.push(stage.attempt_id.clone());
+        Ok(settlement(packet, index))
+    }
+
+    fn qualify_and_ask_ag(
+        &mut self,
+        packet: &CampaignPacketV0,
+        stage: &CampaignStageV0,
+        _settlement: &StageSettlementV0,
+    ) -> Result<(QualificationDispositionV0, StageFreezeV0), String> {
+        let index = packet
+            .stages
+            .iter()
+            .position(|candidate| candidate.stage_id == stage.stage_id)
+            .ok_or_else(|| "unknown stage".to_owned())?;
+        self.qualifications.push(stage.stage_id.clone());
+        let disposition = if index < 2 {
+            QualificationDispositionV0::SuccessorAuthorized(authorization(packet, index))
+        } else {
+            QualificationDispositionV0::TerminalHumanRequired(AgTerminalHumanStopV0 {
+                stage_id: stage.stage_id.clone(),
+                nq_profile_sha256: stage.nq_qualification_profile_sha256.clone(),
+                basis_identity: digest('2'),
+                program_counter: "HUMAN_REQUIRED".into(),
+            })
+        };
+        Ok((disposition, freeze(packet, index)))
+    }
+
+    fn persist_snapshot(&mut self, snapshot: &CampaignSnapshotV0) -> Result<(), String> {
+        self.snapshots.push(snapshot.clone());
+        Ok(())
+    }
+}
+
+#[test]
+fn driver_runs_three_stages_and_persists_every_transition() {
+    let packet = packet();
+    let mut offices = RecordingOffices::default();
+    let final_state = run_unattended_v0(
+        &packet,
+        CampaignSnapshotV0::prepare(&packet).unwrap(),
+        &mut offices,
+    )
+    .unwrap();
+
+    assert_eq!(final_state.phase, CampaignPhaseV0::HumanRequired);
+    assert_eq!(offices.admissions, ["stage-1", "stage-2", "stage-3"]);
+    assert_eq!(offices.dispatches, ["attempt-1", "attempt-2", "attempt-3"]);
+    assert_eq!(
+        offices.reconciliations,
+        ["attempt-1", "attempt-2", "attempt-3"]
+    );
+    assert_eq!(offices.qualifications, ["stage-1", "stage-2", "stage-3"]);
+    assert_eq!(offices.snapshots.len(), 14);
+    assert_eq!(offices.snapshots.last(), Some(&final_state));
+}
+
+#[test]
+fn restored_executing_snapshot_reconciles_without_redispatch() {
+    let packet = packet();
+    let executing = CampaignSnapshotV0::prepare(&packet)
+        .unwrap()
+        .admit(&packet, &admission(&packet, 0))
+        .unwrap()
+        .dispatched(&packet, "attempt-1")
+        .unwrap();
+    let encoded = serde_json::to_vec(&executing).unwrap();
+    let restored: CampaignSnapshotV0 = serde_json::from_slice(&encoded).unwrap();
+    let mut offices = RecordingOffices::default();
+
+    let final_state = run_unattended_v0(&packet, restored, &mut offices).unwrap();
+    assert_eq!(final_state.phase, CampaignPhaseV0::HumanRequired);
+    assert_eq!(offices.dispatches, ["attempt-2", "attempt-3"]);
+    assert_eq!(
+        offices.reconciliations,
+        ["attempt-1", "attempt-2", "attempt-3"]
     );
 }
