@@ -1,0 +1,78 @@
+{
+  "campaign": "GLASS-HERON",
+  "classification": "HUMAN-JUDGMENT-REQUIRED",
+  "cross_office_identity_chain": [
+    "V0 requires every exact future Nightshift basis and AG V2 catalog entry before Stage 1",
+    "Nightshift basis identity includes exact source Docket attempt, settlement, state, and snapshot",
+    "Docket settlement identity includes the exact executor receipt",
+    "W5 executor receipt includes exact Porter record SHA-256 and Porter run identity",
+    "Porter run identity includes a fresh secrets.token_hex value"
+  ],
+  "docket": {
+    "commit": "c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b",
+    "tree": "19573c62de34efc4651b7af52bb9315339255194"
+  },
+  "forbidden_resolutions": [
+    "weaken AG exact-basis catalog matching",
+    "construct or replace the catalog after Stage 1",
+    "substitute a logical settlement for the production Docket settlement",
+    "remove Porter identity from the W5 mechanics receipt",
+    "pre-run or self-judge future factual qualification evidence",
+    "add a deterministic Porter run reservation by reopening frozen W2 or W5"
+  ],
+  "nq": {
+    "commit": "4f1e6a1018ff3f8133c707bd117ab56c537980b1",
+    "tree": "d90dd1e57c4721c0e848dc84865667178f708122"
+  },
+  "nightshift": {
+    "commit": "e2675dd854dbfe633bf14456595d722e88bf92bc",
+    "tree": "bd7afe042251fc4f007413871589a01d26e0583f"
+  },
+  "observed_at": "2026-08-28T16:31:47-04:00",
+  "porter_random_run_identity_source": "porterlib/record.py:new_run_id",
+  "predecessor": {
+    "campaign_driver_commit": "b6cb51bb6abc459b04ef0a64fc79ef4f6ec90a55",
+    "campaign_driver_tree": "be106f4daf438f1d87a116ca92b5236a5a6f3cef",
+    "porter_commit": "5931698b7b071c560862144c34b779eefe262688",
+    "porter_tree": "f5919b7a0c594cfbac0747af588c5f621cf48e79",
+    "w6_controller_commit": "cee1b6304591aaf2fb3bb8ddc3e29948ec1e297a",
+    "w6_controller_tree": "30bfedfc70ae5d01e90c7ac933990cd2a22f4c34",
+    "w6_repair_commits": [
+      "746d3919bfaa32d6b4377f2205155c4dd73e585b",
+      "cee1b6304591aaf2fb3bb8ddc3e29948ec1e297a"
+    ],
+    "w6_root_sha256": "00afb09883966d2f1cfdcf133eac14b010f0ae8651ebf153105428f3ee90bb8b",
+    "w6_session_manifest_sha256": "d4eac7cd827cea11162140407d7f0a1fbb0d73affec849ea4b4e79c6f0623018"
+  },
+  "schema": "ag.gcl-v1.glass-heron-pre-admission-stop/v1",
+  "session": {
+    "attempt_capacity": 3,
+    "attempts_consumed": 0,
+    "boot_id": "f240c2da-92e5-4106-b37f-5f2eff1a7550",
+    "codex_invocations": 0,
+    "guest_attempt_journal_absent_record_sha256": "172fd50f98e6eb2656d9e365a0c0ad48e5e00d79af11246198bfc2b9d0b719b6",
+    "guest_attempt_workspace_empty_record_sha256": "09be8946d671d32ae0d31bb569914000616d4222bdd597012cd603243890bd24",
+    "launch_spec_sha256": "9a27bbf65125d6c70a3c274588caa5a1986718f8a835294bb78daf6642e9cc74",
+    "manifest_sha256": "bb9b3c6d96d79ffe3d4d8e8a7565cd17c591bd4e2af10ab8f8bfbad6cd37e25f",
+    "qemu_pid": 352217,
+    "qemu_start_ticks": "1203099",
+    "session_id": "gcl-v1-20260828-007",
+    "state": "active-idle",
+    "systemd_unit": "gcl-v1vm-gcl-v1-20260828-007.service",
+    "systemd_unit_sha256": "9d2f34ec70dbf36ed996f134d68dbd4748013b762f528dc6b736289d8507f760"
+  },
+  "slug": "gcl-v1-w7-w8-real-codex-specimen-reconcile",
+  "stage_cardinality": {
+    "ag_spends": 0,
+    "candidate_artifacts": 0,
+    "codex_invocations": 0,
+    "docket_attempts": 0,
+    "host_applications": 0,
+    "nightshift_observations": 0,
+    "nq_receipts": 0,
+    "result_commits": 0
+  },
+  "stop_boundary": "W7 before fixture creation, packet freeze, Stage 1 admission, or Docket custody",
+  "track": "Governed Campaign Loop V1",
+  "w8_started": false
+}
