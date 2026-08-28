@@ -24,7 +24,8 @@ RESOLVER_BIN = NIGHTSHIFT / "target/debug/nightshift-observation-resolver"
 CAMPAIGN = "sha256:606605c73dcea732c7b937c27dd6d9c19f2b4e37109ecec7cbdb8d85d0f60466"
 SUBJECT = "sha256:3dbab9cb9e27fa0a039a75c275834d633b658c25db6a252c5924999d5bc4989c"
 OCCURRENCE = "00000000-0000-0000-0000-000000000001"
-SESSION_MANIFEST = "sha256:d4eac7cd827cea11162140407d7f0a1fbb0d73affec849ea4b4e79c6f0623018"
+SESSION_ID = "gcl-v1-20260828-007"
+SESSION_MANIFEST = "sha256:bb9b3c6d96d79ffe3d4d8e8a7565cd17c591bd4e2af10ab8f8bfbad6cd37e25f"
 NONCLAIMS = ["execution", "success", "qualification", "applicability", "standing", "settlement", "authorization", "continuation"]
 
 
@@ -65,35 +66,34 @@ def run(argv: list[str], *, stdin: bytes | None = None, expect: int = 0) -> subp
     return result
 
 
-def plan_template(ordinal: int, predecessor_head: str, predecessor_tree: str) -> dict[str, object]:
-    zeros = "0" * 64
+def plan_template(ordinal: int, predecessor: dict[str, object]) -> dict[str, object]:
     return {
-        "schema": "campaign-driver-ng.gcl-v1-worker-vm-plan/v2",
+        "schema": "ag.gcl-v1-worker-vm-plan-template/v1",
+        "runtime_schema": "campaign-driver-ng.gcl-v1-worker-vm-plan/v2",
         "work_schema": "campaign-driver-ng.gcl-v1-worker-vm-work/v1",
         "attempt_store": "/var/lib/gcl-v1/velvet-pigeon/attempts.sqlite3",
         "subject": SUBJECT,
         "scope": text_digest(f"glass-heron-stage-{ordinal}-scope"),
         "ordinal": ordinal,
         "evidence_reservation": "",
-        "session_id": "gcl-v1-20260828-006",
-        "session_manifest": "/var/lib/gcl-v1/sessions/gcl-v1-20260828-006/manifest.json",
+        "predecessor": predecessor,
+        "session_id": SESSION_ID,
+        "session_manifest": f"/var/lib/gcl-v1/sessions/{SESSION_ID}/manifest.json",
         "session_manifest_sha256": SESSION_MANIFEST[7:],
-        "porter_program": "/data/git/porter/bin/porter",
-        "porter_program_sha256": zeros,
+        "porter_program": "/data/git/porter/porter",
+        "porter_program_sha256": "2fad0404ca1d394da8b93ac563c8325686c950ec0b5ddd09f2f10fd5161e6625",
         "porter_repository": "/data/git/porter",
         "porter_commit": "a838501de2fc220bfc838904733114e41124b744",
-        "porter_profile": "/var/lib/gcl-v1/sessions/gcl-v1-20260828-006/porter-profile.json",
-        "porter_profile_sha256": zeros,
+        "porter_profile": f"/var/lib/gcl-v1/sessions/{SESSION_ID}/porter-profile.json",
+        "porter_profile_sha256": "31406bdb1b75598e276283ce4fe394423cc807472d4e81c3230f039021cabcdd",
         "executor_module": "/data/git/campaign-driver-ng/qualification/gcl-v1/worker_vm_executor.py",
-        "executor_module_sha256": zeros,
+        "executor_module_sha256": "7dbe858036f99c26d5711164a72ac1d15a7a1bc6df9d397594a885f5a3651bc5",
         "custody_module": "/data/git/campaign-driver-ng/qualification/gcl-v1/worker_vm_custody.py",
-        "custody_module_sha256": zeros,
+        "custody_module_sha256": "40b3d5737459290a79889fb4766f24d0bb41155bdd2d10a7754e78e1218229fe",
         "porter_runs": "/var/lib/gcl-v1/velvet-pigeon/porter-runs",
         "governed_repository": "/var/lib/gcl-v1/glass-heron/repository",
-        "predecessor_head": predecessor_head,
-        "predecessor_tree": predecessor_tree,
         "prompt": f"/var/lib/gcl-v1/glass-heron/stage-{ordinal}.txt",
-        "prompt_sha256": zeros,
+        "prompt_sha256": hashlib.sha256(f"GLASS-HERON predeclared stage {ordinal}\n".encode()).hexdigest(),
         "allowed_paths": [f"src/stage_{ordinal}.py", f"tests/test_stage_{ordinal}.py"],
         "model": "gpt-5.6-sol",
         "effort": "medium",
@@ -102,7 +102,7 @@ def plan_template(ordinal: int, predecessor_head: str, predecessor_tree: str) ->
     }
 
 
-def nq_template(ordinal: int, predecessor_head: str, predecessor_tree: str, executor_template: str) -> dict[str, object]:
+def nq_template(ordinal: int, predecessor: dict[str, object], executor_template: str) -> dict[str, object]:
     context = {
         "executable_sha256": text_digest("/usr/bin/python3"),
         "argv_transcript_sha256": text_digest(f"stage-{ordinal}-gate-argv"),
@@ -110,15 +110,15 @@ def nq_template(ordinal: int, predecessor_head: str, predecessor_tree: str, exec
         "environment_transcript_sha256": text_digest("LC_ALL=C"),
     }
     return {
-        "schema": "nq.campaign-stage-realization-profile/v2",
+        "schema": "ag.nq-campaign-stage-realization-profile-template/v1",
+        "runtime_schema": "nq.campaign-stage-realization-profile/v2",
         "profile_id": f"glass-heron.stage-{ordinal}.reservation/v2",
         "evidence_reservation": "",
         "campaign_packet_sha256": "",
         "stage_id": f"stage-{ordinal}",
         "repository_id": text_digest("glass-heron-disposable-repository"),
         "repository_ref": "refs/heads/main",
-        "predecessor_head": {"object_format": "sha1", "digest": predecessor_head},
-        "predecessor_tree": {"object_format": "sha1", "digest": predecessor_tree},
+        "predecessor": predecessor,
         "executor_plan_template": executor_template,
         "expected_evidence_producer": {"producer_id": "velvet-pigeon.synthetic-evidence/v1", "producer_version": "1", "executable_sha256": text_digest("velvet-pigeon-evidence-producer/v1")},
         "ordered_gates": [{"ordinal": 0, "gate_id": "synthetic-chain-contract", "context": context, "required_exit_code": 0}],
@@ -137,17 +137,17 @@ def seal_reservation(value: dict[str, object]) -> dict[str, object]:
 
 
 def build_packet() -> dict[str, object]:
-    heads = ["1" * 40, "2" * 40, "3" * 40]
-    trees = ["a" * 40, "b" * 40, "c" * 40]
+    initial_head = "17e910339353a8143aadf8ba6e1b320b75a2963e"
+    initial_tree = "fa99fe996205236c10f31a84a41b607a7be44f26"
     works = [text_digest(f"glass-heron-stage-{i}-work") for i in range(1, 4)]
     stages: list[dict[str, object]] = []
     prior_reservation = ""
     for ordinal in range(1, 4):
-        plan = plan_template(ordinal, heads[ordinal - 1], trees[ordinal - 1])
-        plan_hash = digest(plan)
-        nq = nq_template(ordinal, heads[ordinal - 1], trees[ordinal - 1], plan_hash)
-        predecessor = ({"kind": "initial_git", "head": {"object_format": "sha1", "digest": heads[0]}, "tree": {"object_format": "sha1", "digest": trees[0]}}
+        predecessor = ({"kind": "initial_git", "head": {"object_format": "sha1", "digest": initial_head}, "tree": {"object_format": "sha1", "digest": initial_tree}}
                        if ordinal == 1 else {"kind": "prior_stage_realization", "stage_id": f"stage-{ordinal - 1}", "reservation": prior_reservation})
+        plan = plan_template(ordinal, predecessor)
+        plan_hash = digest(plan)
+        nq = nq_template(ordinal, predecessor, plan_hash)
         successor = ({"kind": "stage", "stage_id": f"stage-{ordinal + 1}", "work_schema": f"glass-heron.stage-{ordinal + 1}/v1", "work": works[ordinal]}
                      if ordinal < 3 else {"kind": "human_required"})
         reservation = seal_reservation({
@@ -204,13 +204,21 @@ def main() -> None:
     run_id, record_sha = porter_record(reservation, "velvet-pigeon-primary")
     plan = copy.deepcopy(stage["executor_plan_template"])
     plan["evidence_reservation"] = reservation
-    plan_identity = ag_domain_digest("ag-effectd.docket-executor-plan/v2", plan)
+    plan["schema"] = plan.pop("runtime_schema")
+    plan.pop("predecessor")
+    plan["predecessor_head"] = stage["reservation"]["predecessor"]["head"]["digest"]
+    plan["predecessor_tree"] = stage["reservation"]["predecessor"]["tree"]["digest"]
     attempt = text_digest("velvet-pigeon-docket-attempt")
+    plan_identity = ag_domain_digest("ag-effectd.docket-executor-plan/v2", plan)
     settlement = text_digest("velvet-pigeon-docket-settlement")
     executor_receipt = text_digest("velvet-pigeon-executor-receipt")
     profile = copy.deepcopy(stage["nq_profile_template"])
     profile["evidence_reservation"] = reservation
     profile["campaign_packet_sha256"] = packet["packet_id"]
+    profile["schema"] = profile.pop("runtime_schema")
+    predecessor = profile.pop("predecessor")
+    profile["predecessor_head"] = predecessor["head"]
+    profile["predecessor_tree"] = predecessor["tree"]
     profile_path = write("nq-profile.v2.json", profile)
     profile_sha = digest(profile)
     context = profile["ordered_gates"][0]["context"]

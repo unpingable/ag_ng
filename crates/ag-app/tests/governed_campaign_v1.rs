@@ -13,12 +13,24 @@ fn git(byte: char) -> GitObjectV1 {
     }
 }
 
-fn template(schema: &str, stage: usize) -> serde_json::Value {
+fn plan_template(stage: usize, predecessor: &PredecessorBindingV1) -> serde_json::Value {
     serde_json::json!({
-        "schema": schema,
+        "schema": "ag.gcl-v1-worker-vm-plan-template/v1",
+        "runtime_schema": "campaign-driver-ng.gcl-v1-worker-vm-plan/v2",
         "stage_id": format!("stage-{stage}"),
         "evidence_reservation": "",
-        "campaign_packet_sha256": ""
+        "predecessor": predecessor,
+    })
+}
+
+fn nq_template(stage: usize, predecessor: &PredecessorBindingV1) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "ag.nq-campaign-stage-realization-profile-template/v1",
+        "runtime_schema": "nq.campaign-stage-realization-profile/v2",
+        "stage_id": format!("stage-{stage}"),
+        "evidence_reservation": "",
+        "campaign_packet_sha256": "",
+        "predecessor": predecessor,
     })
 }
 
@@ -27,13 +39,6 @@ fn packet() -> CampaignPacketV1 {
     let mut stages: Vec<CampaignStageV1> = Vec::new();
     for index in 0..3 {
         let ordinal = u32::try_from(index + 1).unwrap();
-        let plan_template = template("gcl.worker-vm-executor-plan/v2", index + 1);
-        let mut plan_template = plan_template;
-        plan_template
-            .as_object_mut()
-            .unwrap()
-            .remove("campaign_packet_sha256");
-        let nq_template = template("nq.campaign-stage-qualification-profile/v2", index + 1);
         let predecessor = if index == 0 {
             PredecessorBindingV1::InitialGit {
                 head: git('1'),
@@ -45,6 +50,8 @@ fn packet() -> CampaignPacketV1 {
                 reservation: stages[index - 1].reservation.reservation_id.clone(),
             }
         };
+        let plan_template = plan_template(index + 1, &predecessor);
+        let nq_template = nq_template(index + 1, &predecessor);
         let successor = if index < 2 {
             SuccessorLawV1::Stage {
                 stage_id: format!("stage-{}", index + 2),
@@ -163,9 +170,11 @@ fn exact_reservation_materialization_is_not_profile_wildcarding() {
     let mut wrong = stage.executor_plan_template.clone();
     wrong["evidence_reservation"] = serde_json::json!(digest('0'));
     assert!(materialize_template(&wrong, &stage.reservation.reservation_id).is_err());
-    let exact = materialize_template(
+    let exact = materialize_executor_plan_template(
         &stage.executor_plan_template,
-        &stage.reservation.reservation_id,
+        &stage.reservation,
+        git('1'),
+        git('A'),
     )
     .unwrap();
     assert_eq!(
@@ -174,23 +183,31 @@ fn exact_reservation_materialization_is_not_profile_wildcarding() {
     );
     let nq = materialize_nq_profile_template(
         &stage.nq_profile_template,
-        &stage.reservation.reservation_id,
+        &stage.reservation,
         &packet.packet_id,
+        git('1'),
+        git('A'),
     )
     .unwrap();
     assert_eq!(nq["evidence_reservation"], stage.reservation.reservation_id);
     assert_eq!(nq["campaign_packet_sha256"], packet.packet_id);
     let mut not_a_template = stage.nq_profile_template.clone();
     not_a_template["campaign_packet_sha256"] = serde_json::json!(packet.packet_id);
-    assert!(materialize_nq_profile_template(
-        &not_a_template,
-        &stage.reservation.reservation_id,
-        &packet.packet_id
-    )
-    .is_err());
-    assert!(!serde_json::to_string(&packet)
-        .unwrap()
-        .contains("executor_plan_sha256"));
+    assert!(
+        materialize_nq_profile_template(
+            &not_a_template,
+            &stage.reservation,
+            &packet.packet_id,
+            git('1'),
+            git('A'),
+        )
+        .is_err()
+    );
+    assert!(
+        !serde_json::to_string(&packet)
+            .unwrap()
+            .contains("executor_plan_sha256")
+    );
 }
 
 #[test]
@@ -204,25 +221,51 @@ fn frozen_glass_heron_packet_closes_before_stage_one() {
     let text = serde_json::to_string(&packet).unwrap();
     for stage in &packet.stages {
         assert!(!text.contains("\"porter_run_id\""));
-        assert!(!stage
-            .executor_plan_template
-            .as_object()
-            .unwrap()
-            .contains_key("expected_result_head"));
-        assert!(!stage
-            .executor_plan_template
-            .as_object()
-            .unwrap()
-            .contains_key("expected_result_tree"));
-        materialize_template(
+        assert!(
+            !stage
+                .executor_plan_template
+                .as_object()
+                .unwrap()
+                .contains_key("expected_result_head")
+        );
+        assert!(
+            !stage
+                .executor_plan_template
+                .as_object()
+                .unwrap()
+                .contains_key("expected_result_tree")
+        );
+        assert!(
+            !stage
+                .executor_plan_template
+                .as_object()
+                .unwrap()
+                .contains_key("predecessor_head")
+        );
+        assert!(
+            !stage
+                .executor_plan_template
+                .as_object()
+                .unwrap()
+                .contains_key("predecessor_tree")
+        );
+        let (head, tree) = match &stage.reservation.predecessor {
+            PredecessorBindingV1::InitialGit { head, tree } => (head.clone(), tree.clone()),
+            PredecessorBindingV1::PriorStageRealization { .. } => (git('2'), git('B')),
+        };
+        materialize_executor_plan_template(
             &stage.executor_plan_template,
-            &stage.reservation.reservation_id,
+            &stage.reservation,
+            head.clone(),
+            tree.clone(),
         )
         .unwrap();
         materialize_nq_profile_template(
             &stage.nq_profile_template,
-            &stage.reservation.reservation_id,
+            &stage.reservation,
             &packet.packet_id,
+            head,
+            tree,
         )
         .unwrap();
     }

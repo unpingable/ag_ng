@@ -7,7 +7,7 @@
     "class": "receipt",
     "scrubbed": true
   },
-  "evidence_reservation": "sha256:694d72b1bf0bff3103e63bb3d8e2c581f1348df2cb040f198f12ecf6cef11e10",
+  "evidence_reservation": "sha256:34ee1476209fa117e59f3f591a6d24d552c425d9e1d422fd61d6217b7239790a",
   "export_policy": {
     "excluded_classes": [
       "blob"
@@ -32,13 +32,13 @@
           "-c",
           "SHA256SUMS"
         ],
-        "cwd": "runs/2026-08-28T22-32-38Z-14fa1b"
+        "cwd": "runs/2026-08-28T22-48-23Z-40b920"
       },
       {
         "argv": [
           "./porter",
           "show",
-          "2026-08-28T22-32-38Z-14fa1b"
+          "2026-08-28T22-48-23Z-40b920"
         ],
         "cwd": "."
       }
@@ -49,7 +49,7 @@
     },
     "record": "record.json"
   },
-  "run_id": "2026-08-28T22-32-38Z-14fa1b",
+  "run_id": "2026-08-28T22-48-23Z-40b920",
   "schema": "porter.record.v1",
   "steps": [],
   "substrate": {

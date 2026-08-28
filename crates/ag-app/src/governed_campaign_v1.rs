@@ -221,10 +221,20 @@ impl CampaignStageV1 {
             &self.executor_plan_template_sha256,
             &["evidence_reservation"],
         )?;
+        validate_predecessor_template(
+            &self.executor_plan_template,
+            &self.reservation.predecessor,
+            "ag.gcl-v1-worker-vm-plan-template/v1",
+        )?;
         validate_template_slots(
             &self.nq_profile_template,
             &self.nq_profile_template_sha256,
             &["campaign_packet_sha256", "evidence_reservation"],
+        )?;
+        validate_predecessor_template(
+            &self.nq_profile_template,
+            &self.reservation.predecessor,
+            "ag.nq-campaign-stage-realization-profile-template/v1",
         )?;
         Ok(())
     }
@@ -314,6 +324,46 @@ impl CampaignPacketV1 {
     }
 }
 
+/// Materialize one exact W5 runtime plan from a frozen predecessor-coordinate
+/// template. This is construction, not qualification of a prior realization.
+pub fn materialize_executor_plan_template(
+    template: &serde_json::Value,
+    reservation: &ExternalEvidenceReservationV1,
+    predecessor_head: GitObjectV1,
+    predecessor_tree: GitObjectV1,
+) -> Result<serde_json::Value, String> {
+    reservation.validate()?;
+    if !predecessor_head.validate() || !predecessor_tree.validate() {
+        return Err("malformed realized predecessor identity".into());
+    }
+    if let PredecessorBindingV1::InitialGit { head, tree } = &reservation.predecessor {
+        if head != &predecessor_head || tree != &predecessor_tree {
+            return Err("initial predecessor realization mismatch".into());
+        }
+    }
+    validate_predecessor_template(
+        template,
+        &reservation.predecessor,
+        "ag.gcl-v1-worker-vm-plan-template/v1",
+    )?;
+    let mut value = materialize_template(template, &reservation.reservation_id)?;
+    let object = value
+        .as_object_mut()
+        .ok_or("executor template is not an object")?;
+    let runtime_schema = object
+        .remove("runtime_schema")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or("executor template has no runtime schema")?;
+    if runtime_schema != "campaign-driver-ng.gcl-v1-worker-vm-plan/v2" {
+        return Err("executor runtime schema mismatch".into());
+    }
+    object.remove("predecessor");
+    object.insert("schema".into(), runtime_schema.into());
+    object.insert("predecessor_head".into(), predecessor_head.digest.into());
+    object.insert("predecessor_tree".into(), predecessor_tree.digest.into());
+    Ok(value)
+}
+
 pub fn materialize_template(
     template: &serde_json::Value,
     reservation: &str,
@@ -339,22 +389,38 @@ pub fn canonical_sha256(value: &serde_json::Value) -> Result<String, String> {
     let bytes = serde_jcs::to_vec(value).map_err(|error| error.to_string())?;
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
-/// packet has been sealed: its predeclared reservation and its own identity.
-/// Materialize the two closed, non-random NQ profile coordinates after the
+/// Materialize an exact NQ profile after packet sealing and predecessor
+/// realization. The template and packet remain unchanged.
 pub fn materialize_nq_profile_template(
     template: &serde_json::Value,
-    reservation: &str,
+    reservation: &ExternalEvidenceReservationV1,
     campaign_packet_sha256: &str,
+    predecessor_head: GitObjectV1,
+    predecessor_tree: GitObjectV1,
 ) -> Result<serde_json::Value, String> {
-    if !is_digest(reservation) || !is_digest(campaign_packet_sha256) {
+    reservation.validate()?;
+    if !is_digest(campaign_packet_sha256)
+        || !predecessor_head.validate()
+        || !predecessor_tree.validate()
+    {
         return Err("malformed NQ template coordinate".into());
     }
+    if let PredecessorBindingV1::InitialGit { head, tree } = &reservation.predecessor {
+        if head != &predecessor_head || tree != &predecessor_tree {
+            return Err("initial NQ predecessor realization mismatch".into());
+        }
+    }
+    validate_predecessor_template(
+        template,
+        &reservation.predecessor,
+        "ag.nq-campaign-stage-realization-profile-template/v1",
+    )?;
     let mut value = template.clone();
     let object = value
         .as_object_mut()
         .ok_or_else(|| "NQ profile template must be an object".to_owned())?;
     for (name, exact) in [
-        ("evidence_reservation", reservation),
+        ("evidence_reservation", reservation.reservation_id.as_str()),
         ("campaign_packet_sha256", campaign_packet_sha256),
     ] {
         let slot = object
@@ -365,7 +431,41 @@ pub fn materialize_nq_profile_template(
         }
         *slot = serde_json::Value::String(exact.to_owned());
     }
+    let runtime_schema = object
+        .remove("runtime_schema")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or("NQ template has no runtime schema")?;
+    if runtime_schema != "nq.campaign-stage-realization-profile/v2" {
+        return Err("NQ runtime schema mismatch".into());
+    }
+    object.remove("predecessor");
+    object.insert("schema".into(), runtime_schema.into());
+    object.insert(
+        "predecessor_head".into(),
+        serde_json::to_value(predecessor_head).map_err(|error| error.to_string())?,
+    );
+    object.insert(
+        "predecessor_tree".into(),
+        serde_json::to_value(predecessor_tree).map_err(|error| error.to_string())?,
+    );
     Ok(value)
+}
+
+fn validate_predecessor_template(
+    template: &serde_json::Value,
+    predecessor: &PredecessorBindingV1,
+    schema: &str,
+) -> Result<(), String> {
+    let object = template
+        .as_object()
+        .ok_or("predecessor template is not an object")?;
+    if object.get("schema").and_then(serde_json::Value::as_str) != Some(schema)
+        || object.get("predecessor")
+            != Some(&serde_json::to_value(predecessor).map_err(|error| error.to_string())?)
+    {
+        return Err("template/predecessor binding mismatch".into());
+    }
+    Ok(())
 }
 
 fn validate_template_slots(
