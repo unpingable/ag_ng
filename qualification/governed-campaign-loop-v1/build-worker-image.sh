@@ -176,6 +176,7 @@ done
   "$here/guest/gcl-worker-agent.py" \
   "$here/guest/gcl-worker-shell" \
   "$here/guest/gcl-worker-init" \
+  "$here/guest/gcl-worker-bwrap.apparmor" \
   "$here/guest/provision-worker.sh" \
   ubuntu@127.0.0.1:/tmp/gcl-provision/
 "${bootstrap_ssh[@]}" ubuntu@127.0.0.1 \

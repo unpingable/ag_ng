@@ -7,7 +7,7 @@ export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  ca-certificates git nftables openssh-server uidmap util-linux
+  apparmor ca-certificates git nftables openssh-server uidmap util-linux
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 
@@ -22,9 +22,12 @@ id gcl-workload >/dev/null 2>&1 ||
 
 install -d -m 0755 -o root -g root /usr/local/libexec/gcl/codex-resources
 install -m 0755 -o root -g root "$source_dir/codex" /usr/local/libexec/gcl/codex
-install -m 4755 -o root -g root "$source_dir/bwrap" \
+install -m 0755 -o root -g root "$source_dir/bwrap" \
   /usr/local/libexec/gcl/codex-resources/bwrap
 ln -f /usr/local/libexec/gcl/codex-resources/bwrap /usr/local/libexec/gcl/bwrap
+install -m 0644 -o root -g root "$source_dir/gcl-worker-bwrap.apparmor" \
+  /etc/apparmor.d/gcl-worker-bwrap
+/usr/sbin/apparmor_parser -Q -K /etc/apparmor.d/gcl-worker-bwrap
 install -m 0755 -o root -g root "$source_dir/gcl-worker-agent.py" \
   /usr/local/libexec/gcl-worker-agent
 install -m 0755 -o root -g root "$source_dir/gcl-worker-shell" \
@@ -92,11 +95,12 @@ cat >/etc/systemd/system/gcl-worker-init.service <<'EOF'
 [Unit]
 Description=Initialize the exact GCL V1 worker devices
 RequiresMountsFor=/var/lib/gcl-state /var/lib/gcl-credentials
-After=local-fs.target
+After=apparmor.service local-fs.target
 Before=ssh.service
 
 [Service]
 Type=oneshot
+ExecStartPre=/sbin/apparmor_parser -r -K /etc/apparmor.d/gcl-worker-bwrap
 ExecStart=/usr/local/libexec/gcl-worker-init
 RemainAfterExit=yes
 
@@ -126,6 +130,7 @@ sha256sum \
   /usr/local/libexec/gcl-worker-agent \
   /usr/local/libexec/gcl-worker-shell \
   /usr/local/libexec/gcl-worker-init \
+  /etc/apparmor.d/gcl-worker-bwrap \
   /etc/nftables.conf \
   /etc/ssh/sshd_config.d/70-gcl-worker.conf \
   /etc/systemd/system/gcl-worker-init.service \

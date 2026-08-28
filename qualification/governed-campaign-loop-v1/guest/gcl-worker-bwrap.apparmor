@@ -1,0 +1,7 @@
+# Grant only user-namespace creation to the immutable non-setuid worker helper.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile gcl-worker-bwrap /usr/local/libexec/gcl/{bwrap,codex-resources/bwrap} flags=(unconfined) {
+  userns,
+}
