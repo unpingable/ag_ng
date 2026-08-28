@@ -16,7 +16,7 @@ from typing import Any
 
 
 SESSION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{7,79}$")
-ROOT_SHA = "896c8b710ce475739e02e970f5e8a5ea152afe75e5a12499f06607f462185e5f"
+ROOT_SHA = "00afb09883966d2f1cfdcf133eac14b010f0ae8651ebf153105428f3ee90bb8b"
 QEMU_SHA = "8a35ccba41582fc6c38b9df85fc9e35fa1d42f414d2d7d8090ee9b2f5e7c0854"
 PORTER_COMMIT = "5931698b7b071c560862144c34b779eefe262688"
 
@@ -179,7 +179,7 @@ def strict_ssh_argv(worker: Path, port: int) -> list[str]:
         "-i", str(worker / "gcl-v1-worker-ssh"),
         "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=yes",
-        "-o", f"UserKnownHostsFile={worker / 'known_hosts-r2'}",
+        "-o", f"UserKnownHostsFile={worker / 'known_hosts-r3'}",
         "-o", "GlobalKnownHostsFile=/dev/null",
         "-o", "PasswordAuthentication=no",
         "-o", "KbdInteractiveAuthentication=no",
@@ -242,9 +242,9 @@ def main() -> int:
     if text(["git", "-C", str(porter), "status", "--porcelain"]):
         raise Refusal("Porter worktree is not clean")
     porter_tree = text(["git", "-C", str(porter), "rev-parse", "HEAD^{tree}"])
-    known_hosts = worker / "known_hosts-r2"
+    known_hosts = worker / "known_hosts-r3"
     client_public = worker / "gcl-v1-worker-ssh.pub"
-    build_receipt = json.loads((custody / "build-root-r2" / "build-receipt.json").read_text())
+    build_receipt = json.loads((custody / "build-root-r3" / "build-receipt.json").read_text())
     guest_fingerprint = build_receipt["guest_host_key_fingerprint"]
     if guest_fingerprint not in known_fingerprints(known_hosts):
         raise Refusal("pinned guest host key is absent")
@@ -298,8 +298,8 @@ def main() -> int:
     (session / "systemd-unit.txt").write_bytes(unit_text)
     devices = {
         "root": {
-            **stat_identity(worker / "gcl-v1-worker-root-r2.qcow2"),
-            "sha256": sha256(worker / "gcl-v1-worker-root-r2.qcow2"),
+            **stat_identity(worker / "gcl-v1-worker-root-r3.qcow2"),
+            "sha256": sha256(worker / "gcl-v1-worker-root-r3.qcow2"),
             "qemu_read_only": True,
         },
         "state": {
