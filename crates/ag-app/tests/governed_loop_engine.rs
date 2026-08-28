@@ -2,37 +2,37 @@
 //! custody, restart, reconciliation, continuation, and human disposition.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Barrier, Mutex};
 
 use ag_app::governed_loop::{
     CampaignEngineErrorV1, CampaignEngineV1, CampaignRecoveryV1, DocketProgressV1,
-    EXACT_WORK_CATALOG_SCHEMA_V1, EXACT_WORK_CATALOG_SCHEMA_V2, ExactObservationBasisRequirementV1,
-    ExactWorkCatalogEntryV1, ExactWorkCatalogEntryV2, ExactWorkCatalogV1, ExactWorkCatalogV2,
-    WorkPreconditionV1,
+    ExactObservationBasisRequirementV1, ExactWorkCatalogEntryV1, ExactWorkCatalogEntryV2,
+    ExactWorkCatalogV1, ExactWorkCatalogV2, WorkPreconditionV1, EXACT_WORK_CATALOG_SCHEMA_V1,
+    EXACT_WORK_CATALOG_SCHEMA_V2,
 };
-use ag_campaign::CampaignId;
 use ag_campaign::governed::*;
+use ag_campaign::CampaignId;
 use ag_operator_ui::links::GovernedRuntimeLinkV1;
 use ag_operator_ui::model::{
-    AgInspectV1, CAMPAIGN_DETAIL_SCHEMA_V1, CAMPAIGN_INDEX_SCHEMA_V1, CampaignDetailV1,
-    CampaignIndexEntryV1, CampaignIndexV1, DEMO_CORPUS_SCHEMA_V1, DOCKET_INSPECTION_SCHEMA_V1,
-    DemoCorpusV1, DemoSemanticLinkTargetV1, DocketAuthenticationV1, DocketInspectionV1,
-    DocketRecordInspectionV1, DocketRecordStatusV1, NIGHTSHIFT_AUTHORING_CONTEXT_EXPORT_SCHEMA_V1,
+    AgInspectV1, CampaignDetailV1, CampaignIndexEntryV1, CampaignIndexV1, DemoCorpusV1,
+    DemoSemanticLinkTargetV1, DocketAuthenticationV1, DocketInspectionV1, DocketRecordInspectionV1,
+    DocketRecordStatusV1, NightshiftAuthoringContextExportV1,
+    NightshiftAuthoringContextProvenanceV1, NightshiftAuthoringContextQueryV1, NightshiftFamilyV1,
+    NightshiftObservationExportV1, NightshiftObservationMatchV1, NightshiftOrderKeyV1,
+    ProjectionCheckV1, ProjectionCorrespondenceV1, ReadCommandNameV1, RelatedSourceV1,
+    RuntimeProfileBindingV1, SourceErrorKindV1, SourceResultV1, CAMPAIGN_DETAIL_SCHEMA_V1,
+    CAMPAIGN_INDEX_SCHEMA_V1, DEMO_CORPUS_SCHEMA_V1, DOCKET_INSPECTION_SCHEMA_V1,
+    NIGHTSHIFT_AUTHORING_CONTEXT_EXPORT_SCHEMA_V1,
     NIGHTSHIFT_AUTHORING_CONTEXT_PROVENANCE_SCHEMA_V1, NIGHTSHIFT_OBSERVATION_EXPORT_SCHEMA_V1,
-    NightshiftAuthoringContextExportV1, NightshiftAuthoringContextProvenanceV1,
-    NightshiftAuthoringContextQueryV1, NightshiftFamilyV1, NightshiftObservationExportV1,
-    NightshiftObservationMatchV1, NightshiftOrderKeyV1, ProjectionCheckV1,
-    ProjectionCorrespondenceV1, ReadCommandNameV1, RelatedSourceV1, RuntimeProfileBindingV1,
-    SourceErrorKindV1, SourceResultV1,
 };
 use ag_operator_ui::render;
-use ag_operator_ui::source::{OperatorReaderV1, hex_encode, selected_snapshot};
+use ag_operator_ui::source::{hex_encode, selected_snapshot, OperatorReaderV1};
 use ag_primitives::Digest;
 use ag_store::campaign::{
-    CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1, CAMPAIGN_TRANSITION_HISTORY_SCHEMA_V1,
     CampaignRefusalHistoryV1, CampaignReplayReportV1, CampaignTransitionEvidenceV1,
-    CampaignTransitionHistoryV1,
+    CampaignTransitionHistoryV1, CAMPAIGN_REFUSAL_HISTORY_SCHEMA_V1,
+    CAMPAIGN_TRANSITION_HISTORY_SCHEMA_V1,
 };
 use serde::Serialize;
 use tempfile::TempDir;
@@ -700,11 +700,9 @@ fn authenticated_probe_request_is_durable_authority_neutral_and_one_use_by_state
     assert!(accepted_html.contains("operator intent"));
     assert!(accepted_html.contains("authenticated request evidence, not authorization"));
     // Exact replay is stale because the request binds its predecessor digest.
-    assert!(
-        reopened
-            .apply_governed_intervention(request, &intervention_scope(), &mut verifier, NOW + 2,)
-            .is_err()
-    );
+    assert!(reopened
+        .apply_governed_intervention(request, &intervention_scope(), &mut verifier, NOW + 2,)
+        .is_err());
     assert_eq!(reopened.current().unwrap(), successor);
     let refusals = reopened.refusal_history().unwrap();
     assert_eq!(refusals.refusals.len(), 1);
@@ -1487,11 +1485,10 @@ fn operator_demo_corpus_round_trips_through_the_bounded_typed_reader() {
     assert!(index.campaigns.iter().any(|entry| {
         entry.projection.correspondence == ProjectionCorrespondenceV1::Disagreement
     }));
-    assert!(
-        index.campaigns.iter().any(|entry| {
-            entry.projection.correspondence == ProjectionCorrespondenceV1::Partial
-        })
-    );
+    assert!(index
+        .campaigns
+        .iter()
+        .any(|entry| { entry.projection.correspondence == ProjectionCorrespondenceV1::Partial }));
 
     assert_demo_semantic_links(&corpus, &reader);
 }
@@ -1604,20 +1601,18 @@ fn recording_a_proposal_is_informational_and_evaluates_no_catalog_policy() {
     // preserves the current state.
     engine.require_standing(NOW + 2).unwrap();
     let before = engine.current().unwrap();
-    assert!(
-        engine
-            .decide(
-                &mut observation,
-                &mut standing,
-                &refusing_catalog(),
-                None,
-                OBSERVATION_RESOLVER_ID,
-                STANDING_RESOLVER_ID,
-                MAX_STANDING_TTL_MS,
-                NOW + 3,
-            )
-            .is_err()
-    );
+    assert!(engine
+        .decide(
+            &mut observation,
+            &mut standing,
+            &refusing_catalog(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 3,
+        )
+        .is_err());
     assert_eq!(engine.current().unwrap(), before);
     assert_eq!(engine.replay().unwrap().ag_spends, 0);
 
@@ -1675,20 +1670,18 @@ fn production_path_spends_once_settles_and_requires_a_new_occurrence() {
         settled.program_counter(),
         ProgramCounterV1::SettledObservationRequired
     );
-    assert!(
-        engine
-            .authorize(
-                &mut observation,
-                &mut standing,
-                &catalog(),
-                None,
-                OBSERVATION_RESOLVER_ID,
-                STANDING_RESOLVER_ID,
-                MAX_STANDING_TTL_MS,
-                NOW + 8
-            )
-            .is_err()
-    );
+    assert!(engine
+        .authorize(
+            &mut observation,
+            &mut standing,
+            &catalog(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 8
+        )
+        .is_err());
 
     let next = engine
         .open_continuation(occurrence(2), digest("work-1"), NOW + 9)
@@ -1785,16 +1778,14 @@ fn operator_views_render_every_canonical_counter_from_real_persisted_history() {
             }
             ProgramCounterV1::Completed => {
                 assert!(html.contains("completed:"));
-                assert!(
-                    html.contains(
-                        current
-                            .completed()
-                            .unwrap()
-                            .terminal_observation()
-                            .observation()
-                            .as_str()
-                    )
-                );
+                assert!(html.contains(
+                    current
+                        .completed()
+                        .unwrap()
+                        .terminal_observation()
+                        .observation()
+                        .as_str()
+                ));
             }
             _ => {}
         }
@@ -1835,39 +1826,35 @@ fn consequence_time_stale_observation_and_revoked_standing_do_not_spend() {
     let before = engine.current().unwrap();
 
     observation.status = ObservationStatusV1::Stale;
-    assert!(
-        engine
-            .authorize(
-                &mut observation,
-                &mut standing,
-                &catalog(),
-                None,
-                OBSERVATION_RESOLVER_ID,
-                STANDING_RESOLVER_ID,
-                MAX_STANDING_TTL_MS,
-                NOW + 4
-            )
-            .is_err()
-    );
+    assert!(engine
+        .authorize(
+            &mut observation,
+            &mut standing,
+            &catalog(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 4
+        )
+        .is_err());
     assert_eq!(engine.current().unwrap(), before);
     assert_eq!(engine.replay().unwrap().ag_spends, 0);
 
     observation.status = ObservationStatusV1::Current;
     standing.status = StandingStatusV1::Revoked;
-    assert!(
-        engine
-            .authorize(
-                &mut observation,
-                &mut standing,
-                &catalog(),
-                None,
-                OBSERVATION_RESOLVER_ID,
-                STANDING_RESOLVER_ID,
-                MAX_STANDING_TTL_MS,
-                NOW + 5
-            )
-            .is_err()
-    );
+    assert!(engine
+        .authorize(
+            &mut observation,
+            &mut standing,
+            &catalog(),
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 5
+        )
+        .is_err());
     assert_eq!(engine.current().unwrap(), before);
     assert_eq!(engine.replay().unwrap().ag_spends, 0);
 }
@@ -1884,12 +1871,10 @@ fn custody_crash_recovers_to_reconciliation_without_respend_or_repeat() {
 
     let mut docket = FakeDocket::default();
     docket.set_panic_after_accept();
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| {
-            let _ = engine.dispatch(&mut docket, NOW + 5);
-        }))
-        .is_err()
-    );
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _ = engine.dispatch(&mut docket, NOW + 5);
+    }))
+    .is_err());
     drop(engine);
 
     let mut recovered = CampaignEngineV1::open(&database).unwrap();
@@ -2142,11 +2127,9 @@ fn indeterminate_attempt_blocks_repeat_until_exact_settlement() {
         ProgramCounterV1::ReconciliationRequired
     );
     assert!(engine.dispatch(&mut docket, NOW + 7).is_err());
-    assert!(
-        engine
-            .open_continuation(occurrence(2), digest("work-1"), NOW + 8)
-            .is_err()
-    );
+    assert!(engine
+        .open_continuation(occurrence(2), digest("work-1"), NOW + 8)
+        .is_err());
     assert_eq!(docket.accept_calls(), 1);
 
     docket.settle(&issuance, KnownOutcomeV1::Success);
@@ -2254,17 +2237,15 @@ fn intervention_reconciliation_queries_only_exact_attempt_and_persists_result() 
     let mut reopened = CampaignEngineV1::open(&database).unwrap();
     assert_eq!(reopened.current().unwrap(), settled);
     // The exact historical request cannot silently retarget or resettle.
-    assert!(
-        reopened
-            .request_reconciliation(
-                request,
-                &intervention_scope(),
-                &mut verifier,
-                &mut docket,
-                NOW + 9,
-            )
-            .is_err()
-    );
+    assert!(reopened
+        .request_reconciliation(
+            request,
+            &intervention_scope(),
+            &mut verifier,
+            &mut docket,
+            NOW + 9,
+        )
+        .is_err());
     assert_eq!(docket.accept_calls(), 1);
 }
 
@@ -2422,19 +2403,17 @@ fn residual_discharge_is_exact_durable_and_nonce_one_shot() {
         nonce,
         expires_at_unix_ms: NOW + 1_000,
     };
-    assert!(
-        engine
-            .apply_human_disposition(
-                replayed_nonce,
-                &scope,
-                None,
-                &mut ObservationBoundary::current(clean_basis()),
-                OBSERVATION_RESOLVER_ID,
-                &mut HumanVerifier,
-                NOW + 3,
-            )
-            .is_err()
-    );
+    assert!(engine
+        .apply_human_disposition(
+            replayed_nonce,
+            &scope,
+            None,
+            &mut ObservationBoundary::current(clean_basis()),
+            OBSERVATION_RESOLVER_ID,
+            &mut HumanVerifier,
+            NOW + 3,
+        )
+        .is_err());
     assert_eq!(engine.current().unwrap(), cleared);
     assert_eq!(engine.replay().unwrap().human_dispositions, 1);
 }
@@ -2593,19 +2572,17 @@ fn human_disposition_binding_attacks_and_direct_dispatch_refuse_without_transiti
         },
     ];
     for attack in attacks {
-        assert!(
-            engine
-                .apply_human_disposition(
-                    attack,
-                    &scope,
-                    Some(occurrence(2)),
-                    &mut ObservationBoundary::current(clean_basis()),
-                    OBSERVATION_RESOLVER_ID,
-                    &mut HumanVerifier,
-                    NOW + 2,
-                )
-                .is_err()
-        );
+        assert!(engine
+            .apply_human_disposition(
+                attack,
+                &scope,
+                Some(occurrence(2)),
+                &mut ObservationBoundary::current(clean_basis()),
+                OBSERVATION_RESOLVER_ID,
+                &mut HumanVerifier,
+                NOW + 2,
+            )
+            .is_err());
         assert_eq!(engine.current().unwrap(), halted);
     }
     let mut docket = FakeDocket::default();
@@ -2988,20 +2965,18 @@ fn exact_typed_basis_catalog_admits_and_spends_once_without_atoms() {
         ProgramCounterV1::AuthorizationConsumed
     );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
-    assert!(
-        engine
-            .authorize_with_catalog_v2(
-                &mut observation,
-                &mut standing,
-                &catalog,
-                None,
-                OBSERVATION_RESOLVER_ID,
-                STANDING_RESOLVER_ID,
-                MAX_STANDING_TTL_MS,
-                NOW + 5,
-            )
-            .is_err()
-    );
+    assert!(engine
+        .authorize_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            OBSERVATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 5,
+        )
+        .is_err());
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
 }
 
@@ -3071,6 +3046,10 @@ fn advance_repository_specimen(
     engine.require_standing(NOW + 2).unwrap();
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "closed hostile Q4 matrix stays reviewable together"
+)]
 #[test]
 fn repository_qualification_basis_authorizes_only_the_predeclared_exact_successor() {
     let expected = repository_basis();
@@ -3106,34 +3085,68 @@ fn repository_qualification_basis_authorizes_only_the_predeclared_exact_successo
             NOW + 4,
         )
         .unwrap();
-    assert_eq!(authorized.program_counter(), ProgramCounterV1::AuthorizationConsumed);
+    assert_eq!(
+        authorized.program_counter(),
+        ProgramCounterV1::AuthorizationConsumed
+    );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
 
-    for case in ["type", "profile", "occurrence", "observation", "subject", "resolver", "stale"] {
+    for case in [
+        "type",
+        "profile",
+        "occurrence",
+        "observation",
+        "subject",
+        "resolver",
+        "stale",
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let mut engine = create_engine(&directory, ResidualSetV1::default());
         let mut boundary = RepositoryQualificationBoundary::current(expected.clone());
         let mut standing = StandingBoundary::current();
         advance_repository_specimen(&mut engine, &mut boundary);
         match case {
-            "type" => boundary.basis = TypedOpaqueObservationBasisV1::new(
-                "worker.asserted-qualified/v1".to_owned(), expected.basis_identity.clone()).unwrap(),
-            "profile" => boundary.basis = TypedOpaqueObservationBasisV1::new(
-                REPOSITORY_QUALIFICATION_BASIS_TYPE.to_owned(),
-                digest("substituted-applicability-profile")).unwrap(),
+            "type" => {
+                boundary.basis = TypedOpaqueObservationBasisV1::new(
+                    "worker.asserted-qualified/v1".to_owned(),
+                    expected.basis_identity.clone(),
+                )
+                .unwrap();
+            }
+            "profile" => {
+                boundary.basis = TypedOpaqueObservationBasisV1::new(
+                    REPOSITORY_QUALIFICATION_BASIS_TYPE.to_owned(),
+                    digest("substituted-applicability-profile"),
+                )
+                .unwrap();
+            }
             "occurrence" => boundary.substitute_occurrence = Some(occurrence(99)),
-            "observation" => boundary.substitute_observation = Some(
-                ObservationRefV1::from_digest(digest("worker-self-asserted-observation"))),
+            "observation" => {
+                boundary.substitute_observation = Some(ObservationRefV1::from_digest(digest(
+                    "worker-self-asserted-observation",
+                )));
+            }
             "subject" => boundary.substitute_subject = Some(digest("other-subject")),
             "resolver" => boundary.resolver_id = "controller.self-qualification/v1".to_owned(),
             "stale" => boundary.status = TypedObservationStatusV1::Stale,
             _ => unreachable!(),
         }
         let before = engine.current().unwrap();
-        assert!(engine.decide_with_catalog_v2(
-            &mut boundary, &mut standing, &catalog, None,
-            REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID,
-            MAX_STANDING_TTL_MS, NOW + 3).is_err(), "{case}");
+        assert!(
+            engine
+                .decide_with_catalog_v2(
+                    &mut boundary,
+                    &mut standing,
+                    &catalog,
+                    None,
+                    REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                    STANDING_RESOLVER_ID,
+                    MAX_STANDING_TTL_MS,
+                    NOW + 3
+                )
+                .is_err(),
+            "{case}"
+        );
         assert_eq!(engine.current().unwrap(), before, "{case}");
         assert_eq!(engine.replay().unwrap().ag_spends, 0, "{case}");
     }
@@ -3141,15 +3154,28 @@ fn repository_qualification_basis_authorizes_only_the_predeclared_exact_successo
     let directory = tempfile::tempdir().unwrap();
     let mut engine = create_engine(&directory, ResidualSetV1::default());
     let mut boundary = RepositoryQualificationBoundary::current(expected);
-    assert!(engine.record_proposal(
-        ObservationRefV1::from_digest(digest("repository-qualification-observation")),
-        proposal("worker-substituted-work"), ProposalClassV1::Initial, &mut boundary,
-        REPOSITORY_QUALIFICATION_RESOLVER_ID, NOW + 1).is_err());
+    assert!(engine
+        .record_proposal(
+            ObservationRefV1::from_digest(digest("repository-qualification-observation")),
+            proposal("worker-substituted-work"),
+            ProposalClassV1::Initial,
+            &mut boundary,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            NOW + 1
+        )
+        .is_err());
     assert_eq!(boundary.calls, 0);
     assert_eq!(engine.replay().unwrap().ag_spends, 0);
 
-    for source in [include_str!("../src/governed_loop.rs"), include_str!("../../ag-campaign/src/governed.rs")] {
-        for forbidden in ["nq.campaign-stage-qualification", "NqQualificationStatus", "ordered_gates"] {
+    for source in [
+        include_str!("../src/governed_loop.rs"),
+        include_str!("../../ag-campaign/src/governed.rs"),
+    ] {
+        for forbidden in [
+            "nq.campaign-stage-qualification",
+            "NqQualificationStatus",
+            "ordered_gates",
+        ] {
             assert!(!source.contains(forbidden));
         }
     }
@@ -3165,7 +3191,10 @@ fn external_nq_nightshift_resolution_authorizes_the_exact_catalog_entry() {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(resolution.schema, OBSERVATION_RESOLUTION_SCHEMA_V3);
     assert_eq!(resolution.resolver_id, REPOSITORY_QUALIFICATION_RESOLVER_ID);
-    assert_eq!(resolution.basis.basis_type, REPOSITORY_QUALIFICATION_BASIS_TYPE);
+    assert_eq!(
+        resolution.basis.basis_type,
+        REPOSITORY_QUALIFICATION_BASIS_TYPE
+    );
     assert_eq!(resolution.key.campaign, campaign());
     assert_eq!(resolution.key.occurrence, occurrence(1));
     assert_eq!(resolution.subject, digest("subject"));
@@ -3177,19 +3206,45 @@ fn external_nq_nightshift_resolution_authorizes_the_exact_catalog_entry() {
     let mut engine = create_engine(&directory, ResidualSetV1::default());
     let mut observation = FixedRepositoryQualificationResolution(resolution);
     let mut standing = StandingBoundary::current();
-    engine.record_proposal(
-        observation_ref, proposal("work-1"), ProposalClassV1::Initial,
-        &mut observation, REPOSITORY_QUALIFICATION_RESOLVER_ID, NOW + 1).unwrap();
+    engine
+        .record_proposal(
+            observation_ref,
+            proposal("work-1"),
+            ProposalClassV1::Initial,
+            &mut observation,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            NOW + 1,
+        )
+        .unwrap();
     engine.require_standing(NOW + 2).unwrap();
-    engine.decide_with_catalog_v2(
-        &mut observation, &mut standing, &catalog, None,
-        REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID,
-        MAX_STANDING_TTL_MS, NOW + 3).unwrap();
-    let authorized = engine.authorize_with_catalog_v2(
-        &mut observation, &mut standing, &catalog, None,
-        REPOSITORY_QUALIFICATION_RESOLVER_ID, STANDING_RESOLVER_ID,
-        MAX_STANDING_TTL_MS, NOW + 4).unwrap();
-    assert_eq!(authorized.program_counter(), ProgramCounterV1::AuthorizationConsumed);
+    engine
+        .decide_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 3,
+        )
+        .unwrap();
+    let authorized = engine
+        .authorize_with_catalog_v2(
+            &mut observation,
+            &mut standing,
+            &catalog,
+            None,
+            REPOSITORY_QUALIFICATION_RESOLVER_ID,
+            STANDING_RESOLVER_ID,
+            MAX_STANDING_TTL_MS,
+            NOW + 4,
+        )
+        .unwrap();
+    assert_eq!(
+        authorized.program_counter(),
+        ProgramCounterV1::AuthorizationConsumed
+    );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
 }
 
@@ -3735,4 +3790,78 @@ fn each_occurrence_binds_its_own_expected_work() {
         ProgramCounterV1::ProposalRecorded
     );
     assert_eq!(engine.replay().unwrap().ag_spends, 1);
+}
+
+#[test]
+fn three_external_nq_nightshift_observations_each_authorize_exact_work() {
+    let Ok(path) = std::env::var("GCL_V0_RESOLUTIONS_INPUT") else {
+        eprintln!("GCL V0 AG cross-office specimen not requested");
+        return;
+    };
+    let resolutions: Vec<ObservationResolutionV3> =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(resolutions.len(), 3);
+
+    let mut basis_identities = BTreeSet::new();
+    for (index, resolution) in resolutions.into_iter().enumerate() {
+        assert_eq!(resolution.schema, OBSERVATION_RESOLUTION_SCHEMA_V3);
+        assert_eq!(resolution.resolver_id, REPOSITORY_QUALIFICATION_RESOLVER_ID);
+        assert_eq!(
+            resolution.basis.basis_type,
+            REPOSITORY_QUALIFICATION_BASIS_TYPE
+        );
+        assert_eq!(resolution.key.campaign, campaign());
+        assert_eq!(resolution.key.occurrence, occurrence(1));
+        assert_eq!(resolution.subject, digest("subject"));
+        assert_eq!(resolution.status, TypedObservationStatusV1::Current);
+        assert!(basis_identities.insert(resolution.basis.basis_identity.clone()));
+        let now = resolution.resolved_at_unix_ms;
+
+        let catalog = typed_catalog(resolution.basis.clone());
+        let observation_ref = resolution.observation.clone();
+        let directory = tempfile::tempdir().unwrap();
+        let mut engine = create_engine(&directory, ResidualSetV1::default());
+        let mut observation = FixedRepositoryQualificationResolution(resolution);
+        let mut standing = StandingBoundary::current();
+        engine
+            .record_proposal(
+                observation_ref,
+                proposal("work-1"),
+                ProposalClassV1::Initial,
+                &mut observation,
+                REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                now + 1,
+            )
+            .unwrap();
+        engine.require_standing(now + 2).unwrap();
+        engine
+            .decide_with_catalog_v2(
+                &mut observation,
+                &mut standing,
+                &catalog,
+                None,
+                REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                STANDING_RESOLVER_ID,
+                MAX_STANDING_TTL_MS,
+                now + 3,
+            )
+            .unwrap();
+        let authorized = engine
+            .authorize_with_catalog_v2(
+                &mut observation,
+                &mut standing,
+                &catalog,
+                None,
+                REPOSITORY_QUALIFICATION_RESOLVER_ID,
+                STANDING_RESOLVER_ID,
+                MAX_STANDING_TTL_MS,
+                now + 4,
+            )
+            .unwrap();
+        assert_eq!(
+            authorized.program_counter(),
+            ProgramCounterV1::AuthorizationConsumed
+        );
+        assert_eq!(engine.replay().unwrap().ag_spends, 1, "stage {}", index + 1);
+    }
 }
