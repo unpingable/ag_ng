@@ -32,13 +32,13 @@
           "-c",
           "SHA256SUMS"
         ],
-        "cwd": "runs/2026-08-28T22-48-27Z-ac692d"
+        "cwd": "runs/2026-08-28T23-13-27Z-f1f59f"
       },
       {
         "argv": [
           "./porter",
           "show",
-          "2026-08-28T22-48-27Z-ac692d"
+          "2026-08-28T23-13-27Z-f1f59f"
         ],
         "cwd": "."
       }
@@ -49,7 +49,7 @@
     },
     "record": "record.json"
   },
-  "run_id": "2026-08-28T22-48-27Z-ac692d",
+  "run_id": "2026-08-28T23-13-27Z-f1f59f",
   "schema": "porter.record.v1",
   "steps": [],
   "substrate": {

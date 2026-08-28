@@ -438,7 +438,6 @@ pub fn materialize_nq_profile_template(
     if runtime_schema != "nq.campaign-stage-realization-profile/v2" {
         return Err("NQ runtime schema mismatch".into());
     }
-    object.remove("predecessor");
     object.insert("schema".into(), runtime_schema.into());
     object.insert(
         "predecessor_head".into(),

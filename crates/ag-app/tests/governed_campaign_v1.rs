@@ -191,23 +191,20 @@ fn exact_reservation_materialization_is_not_profile_wildcarding() {
     .unwrap();
     assert_eq!(nq["evidence_reservation"], stage.reservation.reservation_id);
     assert_eq!(nq["campaign_packet_sha256"], packet.packet_id);
+    assert_eq!(nq["predecessor"], stage.nq_profile_template["predecessor"]);
     let mut not_a_template = stage.nq_profile_template.clone();
     not_a_template["campaign_packet_sha256"] = serde_json::json!(packet.packet_id);
-    assert!(
-        materialize_nq_profile_template(
-            &not_a_template,
-            &stage.reservation,
-            &packet.packet_id,
-            git('1'),
-            git('A'),
-        )
-        .is_err()
-    );
-    assert!(
-        !serde_json::to_string(&packet)
-            .unwrap()
-            .contains("executor_plan_sha256")
-    );
+    assert!(materialize_nq_profile_template(
+        &not_a_template,
+        &stage.reservation,
+        &packet.packet_id,
+        git('1'),
+        git('A'),
+    )
+    .is_err());
+    assert!(!serde_json::to_string(&packet)
+        .unwrap()
+        .contains("executor_plan_sha256"));
 }
 
 #[test]
@@ -221,34 +218,26 @@ fn frozen_glass_heron_packet_closes_before_stage_one() {
     let text = serde_json::to_string(&packet).unwrap();
     for stage in &packet.stages {
         assert!(!text.contains("\"porter_run_id\""));
-        assert!(
-            !stage
-                .executor_plan_template
-                .as_object()
-                .unwrap()
-                .contains_key("expected_result_head")
-        );
-        assert!(
-            !stage
-                .executor_plan_template
-                .as_object()
-                .unwrap()
-                .contains_key("expected_result_tree")
-        );
-        assert!(
-            !stage
-                .executor_plan_template
-                .as_object()
-                .unwrap()
-                .contains_key("predecessor_head")
-        );
-        assert!(
-            !stage
-                .executor_plan_template
-                .as_object()
-                .unwrap()
-                .contains_key("predecessor_tree")
-        );
+        assert!(!stage
+            .executor_plan_template
+            .as_object()
+            .unwrap()
+            .contains_key("expected_result_head"));
+        assert!(!stage
+            .executor_plan_template
+            .as_object()
+            .unwrap()
+            .contains_key("expected_result_tree"));
+        assert!(!stage
+            .executor_plan_template
+            .as_object()
+            .unwrap()
+            .contains_key("predecessor_head"));
+        assert!(!stage
+            .executor_plan_template
+            .as_object()
+            .unwrap()
+            .contains_key("predecessor_tree"));
         let (head, tree) = match &stage.reservation.predecessor {
             PredecessorBindingV1::InitialGit { head, tree } => (head.clone(), tree.clone()),
             PredecessorBindingV1::PriorStageRealization { .. } => (git('2'), git('B')),

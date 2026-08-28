@@ -216,7 +216,7 @@ def main() -> None:
     profile["evidence_reservation"] = reservation
     profile["campaign_packet_sha256"] = packet["packet_id"]
     profile["schema"] = profile.pop("runtime_schema")
-    predecessor = profile.pop("predecessor")
+    predecessor = profile["predecessor"]
     profile["predecessor_head"] = predecessor["head"]
     profile["predecessor_tree"] = predecessor["tree"]
     profile_path = write("nq-profile.v2.json", profile)
@@ -229,6 +229,7 @@ def main() -> None:
     evidence = {"schema": "nq.campaign-stage-realization-evidence/v2", "evidence_id": "velvet-pigeon.synthetic-realization-1", "profile_id": profile["profile_id"],
                 "profile_sha256": profile_sha, "evidence_reservation": reservation, "campaign_packet_sha256": packet["packet_id"], "stage_id": profile["stage_id"],
                 "repository_id": profile["repository_id"], "repository_ref": profile["repository_ref"], "realizations": [chain], "producer": profile["expected_evidence_producer"],
+                "predecessor_qualification": None,
                 "qualification_started_at_unix_ms": 900, "qualification_finished_at_unix_ms": 950,
                 "gates": [{"ordinal": 0, "gate_id": "synthetic-chain-contract", "context": context, "started_at_unix_ms": 910, "finished_at_unix_ms": 920,
                            "outcome": {"outcome": "COMPLETED", "exit_code": 0, "stdout_sha256": text_digest("synthetic chain exact"), "stderr_sha256": text_digest("")}}],

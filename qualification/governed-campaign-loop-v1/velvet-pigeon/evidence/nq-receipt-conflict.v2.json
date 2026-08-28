@@ -3,12 +3,12 @@
   "receipt_id": "reservation-qualification:glass-heron.stage-1.reservation/v2:velvet-pigeon.synthetic-realization-conflict",
   "evaluator_id": "nq.campaign-stage-realization-evaluator/v2",
   "evaluator_version": "0.1.0",
-  "evaluator_executable_sha256": "sha256:20d480b09d2cd2becdeaf2d018442925f5c2f4cde6fa371bba9c23fc6199b840",
+  "evaluator_executable_sha256": "sha256:2ace93ac5549aa0b53c1d9405cd8ed027e93c2d014d187df9cc66b5f426557fc",
   "evaluated_at_unix_ms": 1001,
   "profile_id": "glass-heron.stage-1.reservation/v2",
-  "profile_sha256": "sha256:16139fff13e99513ae8befd21b5b2f0af6daa2d376c63c47493bf59a4e2b1f80",
+  "profile_sha256": "sha256:e5c6f96767052a627dcabddb98424c920bc4c963f0ed235c82a3b174f1e05dad",
   "evidence_id": "velvet-pigeon.synthetic-realization-conflict",
-  "evidence_sha256": "sha256:1e6673726d3ff50c10f82d27f42b7c3a69500c6ddbb45729832312dd54639592",
+  "evidence_sha256": "sha256:cece9857b88feb6d3427ac0b422a9dbca05a6e68cfa27b2c5a9f7c463fc46d95",
   "evidence_reservation": "sha256:34ee1476209fa117e59f3f591a6d24d552c425d9e1d422fd61d6217b7239790a",
   "campaign_packet_sha256": "sha256:02b89310808fdc09f8949e57d60ff9692f02316212ee985d2952f840daf67e85",
   "stage_id": "stage-1",
@@ -21,8 +21,8 @@
       "executor_plan_template": "sha256:e39b1466d356b57245982b48b9647bbf3b1923ed9dca600bc423a873df2ae4d8",
       "executor_plan": "sha256:7165a915d299109c08edd23174b4841da4e89e1e2c9ebc43acea859240fc4ca9",
       "docket_settlement": "sha256:bdc18b2272a8fa1d2a1f9c610350d72311d43f333d1be6033df616c236ee8e96",
-      "porter_run_id": "2026-08-28T22-48-27Z-ac692d",
-      "porter_record_sha256": "sha256:ea718ab7664ecfc2626580c6d4aa3f068f742057484f3093d0826dc0f7100181",
+      "porter_run_id": "2026-08-28T23-13-27Z-f1f59f",
+      "porter_record_sha256": "sha256:47cb4e706d4b77fdb05d79a287274089ac46efafda42fdf8cbf42120f8dd3dc3",
       "executor_receipt": "sha256:9320b7056c4de75b1ccf4c2d3c29988d791e8bd53ddd21246d8496b715cba4be",
       "predecessor_head": {
         "object_format": "sha1",
@@ -55,5 +55,5 @@
     "freshness or present applicability",
     "reservation validity outside this exact profile"
   ],
-  "receipt_sha256": "sha256:fd684d3fd4655bae3df54c86d4aa3a74a1d7e17a03c2440dd3c7949103528b79"
+  "receipt_sha256": "sha256:a9a38d657545a489ebdb58ce94057a1d80106f3783ea30bc784babf19ac040b0"
 }
