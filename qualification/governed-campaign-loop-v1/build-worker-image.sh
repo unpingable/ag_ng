@@ -6,6 +6,7 @@ repo="$(cd "$here/../.." && pwd)"
 custody="$repo/.campaign-local/gcl-v1"
 downloads="$custody/downloads"
 root_only="${GCL_ROOT_ONLY_REBUILD:-0}"
+root_revision="${GCL_ROOT_REBUILD_REVISION:-r1}"
 build="$custody/build"
 outputs="$custody/worker"
 release=20260826
@@ -19,9 +20,13 @@ credential_image="$outputs/gcl-v1-worker-credentials.raw"
 client_key="$outputs/gcl-v1-worker-ssh"
 known_hosts="$outputs/known_hosts"
 if [[ "$root_only" == 1 ]]; then
-  build="$custody/build-root-r1"
-  root_image="$outputs/gcl-v1-worker-root-r1.qcow2"
-  known_hosts="$outputs/known_hosts-r1"
+  [[ "$root_revision" =~ ^r[1-9][0-9]*$ ]] || {
+    printf 'build-worker-image refusal: invalid root rebuild revision\n' >&2
+    exit 1
+  }
+  build="$custody/build-root-$root_revision"
+  root_image="$outputs/gcl-v1-worker-root-$root_revision.qcow2"
+  known_hosts="$outputs/known_hosts-$root_revision"
 fi
 port=23022
 codex=/home/jbeck/.nvm/versions/node/v24.13.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex
@@ -184,6 +189,8 @@ for _ in $(seq 1 120); do
     mv "$known_hosts.partial" "$known_hosts"
     if ssh -p "$port" -i "$client_key" -o IdentitiesOnly=yes \
       -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" \
+      -o BatchMode=yes -o ConnectTimeout=5 -o ConnectionAttempts=1 \
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=2 \
       gcl-parent@127.0.0.1 /usr/local/libexec/gcl-worker-agent identity \
       >"$build/identity.json"; then
       ready=1
@@ -199,6 +206,11 @@ runtime_scp=(
   -o IdentitiesOnly=yes
   -o StrictHostKeyChecking=yes
   -o UserKnownHostsFile="$known_hosts"
+  -o BatchMode=yes
+  -o ConnectTimeout=5
+  -o ConnectionAttempts=1
+  -o ServerAliveInterval=15
+  -o ServerAliveCountMax=2
 )
 "${runtime_scp[@]}" \
   gcl-parent@127.0.0.1:/usr/local/share/gcl-worker/packages.tsv \
@@ -250,7 +262,7 @@ python3 - "$build/build-receipt.json" <<PY
 import json, pathlib
 receipt = {
   "schema": "ag.gcl-v1-worker-image-build/v1",
-  "root_only_rebuild": $([[ "$root_only" == 1 ]] && printf true || printf false),
+  "root_only_rebuild": $([[ "$root_only" == 1 ]] && printf True || printf False),
   "release": "$release",
   "source_url": "$base_url/$image_name",
   "source_sha256": "$observed",

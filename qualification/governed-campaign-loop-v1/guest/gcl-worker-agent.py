@@ -60,6 +60,7 @@ def run(
     *,
     cwd: Path | None = None,
     uid: int | None = None,
+    environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = argv
     if uid is not None:
@@ -71,7 +72,14 @@ def run(
             "--",
             *argv,
         ]
-    return subprocess.run(command, cwd=cwd, check=True, text=True, capture_output=True)
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        env=environment,
+        check=True,
+        text=True,
+        capture_output=True,
+    )
 
 
 def fsync_dir(path: Path) -> None:
@@ -506,6 +514,17 @@ def internal_run(raw_path: str) -> None:
         ).stdout
         if dirty:
             run(["/usr/bin/git", "add", "-A"], cwd=repo, uid=2000)
+            commit_environment = dict(os.environ)
+            commit_environment.update(
+                {
+                    "GIT_AUTHOR_NAME": "GCL V1 Worker",
+                    "GIT_AUTHOR_EMAIL": "gcl-v1-worker@invalid",
+                    "GIT_AUTHOR_DATE": f"2001-01-0{request['ordinal']}T00:00:00+00:00",
+                    "GIT_COMMITTER_NAME": "GCL V1 Worker",
+                    "GIT_COMMITTER_EMAIL": "gcl-v1-worker@invalid",
+                    "GIT_COMMITTER_DATE": f"2001-01-0{request['ordinal']}T00:00:00+00:00",
+                }
+            )
             run(
                 [
                     "/usr/bin/git",
@@ -515,6 +534,7 @@ def internal_run(raw_path: str) -> None:
                 ],
                 cwd=repo,
                 uid=2000,
+                environment=commit_environment,
             )
         head = run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=repo, uid=2000).stdout.strip()
         if head == request["base_commit"]:
