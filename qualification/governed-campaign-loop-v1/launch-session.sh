@@ -14,16 +14,16 @@ custody="$repo/.campaign-local/gcl-v1"
 worker="$custody/worker"
 sessions="$custody/sessions"
 session="$sessions/$session_id"
-root_image="$worker/gcl-v1-worker-root.qcow2"
+root_image="$worker/gcl-v1-worker-root-r2.qcow2"
 state_image="$worker/gcl-v1-worker-state.raw"
 credential_image="$worker/gcl-v1-worker-credentials.raw"
-known_hosts="$worker/known_hosts"
+known_hosts="$worker/known_hosts-r2"
 client_key="$worker/gcl-v1-worker-ssh"
 client_public="$client_key.pub"
 qemu=/usr/bin/qemu-system-x86_64
 port=23022
 unit="gcl-v1vm-${session_id}.service"
-root_sha=f7cf2245cea7b691f817bf8a37362d795e832fda6e21ea5737722c0164940570
+root_sha=896c8b710ce475739e02e970f5e8a5ea152afe75e5a12499f06607f462185e5f
 qemu_sha=8a35ccba41582fc6c38b9df85fc9e35fa1d42f414d2d7d8090ee9b2f5e7c0854
 
 die() { printf 'launch-session refusal: %s\n' "$*" >&2; exit 1; }
