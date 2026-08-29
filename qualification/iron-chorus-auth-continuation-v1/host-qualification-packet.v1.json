@@ -1,0 +1,69 @@
+{
+  "schema": "iron-chorus.host-qualification-packet/v1",
+  "campaign": "IRON-CHORUS",
+  "work_item": "AUTH-CONTINUATION-V1",
+  "generated_on": "2026-08-29",
+  "repository_pins": {
+    "ag_base": "f6161732c641d4acfbc69e2cdd72cc18c476b87b",
+    "ag_foundation": "4f36e9570d49f21e32e7f7b5f84e8055161ee12f",
+    "ag_implementation": "625f1d8",
+    "codex_base": "b152a7fd85815f90cbe10375f24e8d1593e7bbb0",
+    "codex_foundation": "5de6a3336f1556559ec8db5593a907f6493019e3",
+    "codex_implementation": "6e21836d37",
+    "docket_contract": "c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b"
+  },
+  "rules": {
+    "working_directory": "a clean, disposable local VM or campaign-owned fixture",
+    "capture": "record argv, exit status, stdout, stderr, kernel, distribution, uid, gid, and relevant path metadata",
+    "no_substitution": "do not replace an unsupported userns or bubblewrap case with a weaker command",
+    "protected_boundary": "root/service checks are read-only and require separate operator approval"
+  },
+  "cases": [
+    {
+      "id": "userns-map-root",
+      "authority": "unprivileged local qualification",
+      "argv": ["unshare", "--user", "--map-root-user", "/usr/bin/id", "-u"],
+      "expected": {
+        "exit_status": 0,
+        "stdout_exact": "0\n",
+        "stderr_exact": ""
+      },
+      "unsupported_when": "the kernel or host policy refuses creation of an unprivileged user namespace",
+      "unsupported_classification": "host_unsupported"
+    },
+    {
+      "id": "bubblewrap-read-only-root",
+      "authority": "unprivileged local qualification",
+      "argv": ["bwrap", "--unshare-user", "--uid", "0", "--gid", "0", "--ro-bind", "/", "/", "/usr/bin/true"],
+      "expected": {
+        "exit_status": 0,
+        "stdout_exact": "",
+        "stderr_exact": ""
+      },
+      "unsupported_when": "bubblewrap is absent or the host permission boundary refuses its user namespace",
+      "unsupported_classification": "host_unsupported"
+    },
+    {
+      "id": "root-authorization-custody-metadata",
+      "authority": "protected read-only operator approval",
+      "argv": ["sudo", "-n", "stat", "-Lc", "%F %a %u %g", "/var/lib/ag-external-authorizer"],
+      "expected": {
+        "exit_status": 0,
+        "stdout_pattern": "^directory 700 [0-9]+ [0-9]+\n$",
+        "interpretation": "the durable daemon custody root is a real mode-0700 directory owned by the configured service identity"
+      },
+      "not_run_classification": "protected_approval_required"
+    },
+    {
+      "id": "root-authorization-service-binding",
+      "authority": "protected read-only operator approval",
+      "argv": ["sudo", "-n", "systemctl", "show", "--property=User,Group,ExecStart,FragmentPath", "ag-external-authorizer.service"],
+      "expected": {
+        "exit_status": 0,
+        "stdout_required_keys": ["User", "Group", "ExecStart", "FragmentPath"],
+        "interpretation": "the service identity, exact binary/config arguments, and unit provenance match the independently approved deployment manifest"
+      },
+      "not_run_classification": "protected_approval_required"
+    }
+  ]
+}
