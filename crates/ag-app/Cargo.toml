@@ -39,6 +39,10 @@ path = "src/bin/ag-loopctl.rs"
 name = "ag-standing-resolver"
 path = "src/bin/ag_standing_resolver.rs"
 
+[[bin]]
+name = "ag-gcl-v1-glass-heron"
+path = "src/bin/ag_gcl_v1_glass_heron.rs"
+
 [dependencies]
 ag-campaign = { path = "../ag-campaign" }
 ag-effect = { path = "../ag-effect" }
