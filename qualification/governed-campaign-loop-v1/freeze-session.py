@@ -18,7 +18,7 @@ from typing import Any
 SESSION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{7,79}$")
 ROOT_SHA = "00afb09883966d2f1cfdcf133eac14b010f0ae8651ebf153105428f3ee90bb8b"
 QEMU_SHA = "8a35ccba41582fc6c38b9df85fc9e35fa1d42f414d2d7d8090ee9b2f5e7c0854"
-PORTER_COMMIT = "5931698b7b071c560862144c34b779eefe262688"
+PORTER_COMMIT = "a838501de2fc220bfc838904733114e41124b744"
 
 
 class Refusal(RuntimeError):
