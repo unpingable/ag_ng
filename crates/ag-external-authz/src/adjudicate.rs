@@ -72,6 +72,7 @@ use ag_store::campaign::CampaignStoreErrorV1;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::custody::{persist_outcome, persist_request, sync_new_occurrence};
 use crate::protocol::{
     ADMISSIBILITY_DECISION_CONTINUE, AuthorizationOutcomeV1, ERROR_SCHEMA_V1, ErrorKindV1,
     ExternalAuthorizationErrorV1, ExternalAuthorizationRequestV1, ExternalAuthorizationResponseV1,
@@ -275,6 +276,24 @@ fn invalid_request(
         Some(request.request_id.clone()),
         reason,
     )
+}
+
+fn persist_decision(
+    occurrence_dir: &std::path::Path,
+    request: &ExternalAuthorizationRequestV1,
+    outcome: AdjudicationOutcomeV1,
+) -> AdjudicationOutcomeV1 {
+    let AdjudicationOutcomeV1::Decision(response) = &outcome else {
+        return outcome;
+    };
+    if let Err(reason) = persist_outcome(occurrence_dir, response) {
+        return reject(
+            ErrorKindV1::Infrastructure,
+            Some(request.request_id.clone()),
+            format!("failed to persist authorization outcome: {reason}"),
+        );
+    }
+    outcome
 }
 
 /// Strict semantic validation beyond the decoded wire shape. Every failure
@@ -593,6 +612,15 @@ pub fn adjudicate(
             );
         }
     }
+    if let Err(reason) = sync_new_occurrence(&config.state_dir)
+        .and_then(|()| persist_request(&occurrence_dir, request))
+    {
+        return reject(
+            ErrorKindV1::Infrastructure,
+            Some(request.request_id.clone()),
+            format!("failed to establish request custody: {reason}"),
+        );
+    }
     let database = occurrence_dir.join("campaign.sqlite");
     let mut engine = match CampaignEngineV1::create(
         &database,
@@ -623,7 +651,13 @@ pub fn adjudicate(
     };
     let spent = match drive(&mut engine, config, &derived, request, now_unix_ms) {
         Ok(spent) => spent,
-        Err(error) => return map_engine_error(&mut engine, request, error, now_unix_ms),
+        Err(error) => {
+            return persist_decision(
+                &occurrence_dir,
+                request,
+                map_engine_error(&mut engine, request, error, now_unix_ms),
+            );
+        }
     };
     let (Some(issuance), Some(ag_spend), Some(standing)) = (
         spent.issuance(),
@@ -647,5 +681,9 @@ pub fn adjudicate(
         mandate_ref: standing.mandate.as_str().to_owned(),
         standing_expires_at_unix_ms: standing.expires_at_unix_ms,
     });
-    AdjudicationOutcomeV1::Decision(response)
+    persist_decision(
+        &occurrence_dir,
+        request,
+        AdjudicationOutcomeV1::Decision(response),
+    )
 }

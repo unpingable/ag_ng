@@ -17,6 +17,10 @@ pub const REQUEST_SCHEMA_V1: &str = "ag.external-authorization-request:v1";
 pub const RESPONSE_SCHEMA_V1: &str = "ag.external-authorization:v1";
 /// Exact non-decision error-response schema.
 pub const ERROR_SCHEMA_V1: &str = "ag.external-authorization-error:v1";
+/// Exact read-only adjudication lookup request schema.
+pub const LOOKUP_REQUEST_SCHEMA_V1: &str = "ag.external-authorization-lookup-request:v1";
+/// Exact read-only adjudication lookup response schema.
+pub const LOOKUP_RESPONSE_SCHEMA_V1: &str = "ag.external-authorization-lookup:v1";
 
 /// Maximum length of any human-readable reason string on the wire.
 pub const MAX_REASON_CHARS: usize = 4000;
@@ -137,6 +141,25 @@ pub struct ExternalAuthorizationRequestV1 {
     pub admissibility: AdmissibilityDescriptorV1,
 }
 
+/// Exact read-only lookup for one previously submitted authorization request.
+/// `request_digest` is SHA-256 over the serialized request bytes under daemon
+/// custody; it prevents a caller from reconciling a substituted request that
+/// reuses only selected correlation fields.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalAuthorizationLookupRequestV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Fresh lookup correlation identity (a UUID).
+    pub lookup_request_id: String,
+    /// Original authorization request identity.
+    pub authorization_request_id: String,
+    /// Exact authorization occurrence identity.
+    pub authorization_occurrence_id: String,
+    /// SHA-256 of the complete serialized original request.
+    pub request_digest: Digest,
+}
+
 /// The closed wire decision vocabulary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -221,6 +244,39 @@ pub struct ExternalAuthorizationResponseV1 {
     pub failure: Option<IndeterminateDetailV1>,
 }
 
+/// Closed read-only adjudication lookup status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LookupStatusV1 {
+    /// No daemon-custodied request exists for the exact occurrence.
+    NotFound,
+    /// Request custody exists but no durable decision is available.
+    OutcomeUnknown,
+    /// A durable decision exists and is returned exactly.
+    Resolved,
+}
+
+/// Exact read-only adjudication lookup response.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalAuthorizationLookupResponseV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Echoed lookup correlation identity.
+    pub lookup_request_id: String,
+    /// Echoed original authorization request identity.
+    pub authorization_request_id: String,
+    /// Echoed occurrence identity.
+    pub authorization_occurrence_id: String,
+    /// Echoed complete-request digest.
+    pub request_digest: Digest,
+    /// Read-only resolution state.
+    pub status: LookupStatusV1,
+    /// Original durable decision, present exactly when `status` is `resolved`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ExternalAuthorizationResponseV1>,
+}
+
 /// The closed non-decision error kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -302,6 +358,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ErrorKindV1::InvalidRequest).unwrap(),
             serde_json::json!("invalid_request")
+        );
+        assert_eq!(
+            serde_json::to_value(LookupStatusV1::OutcomeUnknown).unwrap(),
+            serde_json::json!("outcome_unknown")
         );
     }
 }

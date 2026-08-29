@@ -66,7 +66,9 @@
 //! cross-occurrence comparison is the only meaningful determinism check.
 
 pub mod adjudicate;
+pub mod custody;
 pub mod daemon;
 pub mod framing;
+pub mod lookup;
 pub mod protocol;
 pub mod standing;

@@ -26,9 +26,11 @@ use thiserror::Error;
 
 use crate::adjudicate::{AdjudicationOutcomeV1, DaemonConfigV1, adjudicate};
 use crate::framing::{read_request_frame, write_response_frame};
+use crate::lookup::{LookupOutcomeV1, lookup};
 use crate::protocol::{
-    ERROR_SCHEMA_V1, ErrorKindV1, ExternalAuthorizationErrorV1, ExternalAuthorizationRequestV1,
-    bounded_reason,
+    ERROR_SCHEMA_V1, ErrorKindV1, ExternalAuthorizationErrorV1,
+    ExternalAuthorizationLookupRequestV1, ExternalAuthorizationRequestV1, LOOKUP_REQUEST_SCHEMA_V1,
+    REQUEST_SCHEMA_V1, bounded_reason,
 };
 
 /// Startup custody or runtime failures.
@@ -179,6 +181,18 @@ fn invalid_frame_error(reason: impl Into<String>) -> ExternalAuthorizationErrorV
     }
 }
 
+fn invalid_schema_error(
+    request_id: Option<String>,
+    reason: impl Into<String>,
+) -> ExternalAuthorizationErrorV1 {
+    ExternalAuthorizationErrorV1 {
+        schema: ERROR_SCHEMA_V1.to_owned(),
+        request_id,
+        kind: ErrorKindV1::InvalidRequest,
+        reason: bounded_reason(reason),
+    }
+}
+
 /// Handles one short-lived connection: reads exactly one request frame,
 /// adjudicates, writes exactly one response frame, and returns. Malformed
 /// input fails the connection closed with a best-effort error response and
@@ -194,8 +208,8 @@ pub fn handle_connection(stream: &mut UnixStream, config: &DaemonConfigV1, now_u
             return;
         }
     };
-    let request: ExternalAuthorizationRequestV1 = match strict_json_from_slice(&frame) {
-        Ok(request) => request,
+    let envelope: serde_json::Value = match strict_json_from_slice(&frame) {
+        Ok(envelope) => envelope,
         Err(error) => {
             send_frame(
                 stream,
@@ -204,9 +218,58 @@ pub fn handle_connection(stream: &mut UnixStream, config: &DaemonConfigV1, now_u
             return;
         }
     };
-    match adjudicate(config, &request, now_unix_ms) {
-        AdjudicationOutcomeV1::Decision(response) => send_frame(stream, &response),
-        AdjudicationOutcomeV1::Rejected(error) => send_frame(stream, &error),
+    let Some(schema) = envelope.get("schema").and_then(serde_json::Value::as_str) else {
+        send_frame(
+            stream,
+            &invalid_frame_error("request lacks a string schema"),
+        );
+        return;
+    };
+    match schema {
+        REQUEST_SCHEMA_V1 => {
+            let request: ExternalAuthorizationRequestV1 = match strict_json_from_slice(&frame) {
+                Ok(request) => request,
+                Err(error) => {
+                    send_frame(
+                        stream,
+                        &invalid_frame_error(format!("invalid authorization request: {error}")),
+                    );
+                    return;
+                }
+            };
+            match adjudicate(config, &request, now_unix_ms) {
+                AdjudicationOutcomeV1::Decision(response) => send_frame(stream, &response),
+                AdjudicationOutcomeV1::Rejected(error) => send_frame(stream, &error),
+            }
+        }
+        LOOKUP_REQUEST_SCHEMA_V1 => {
+            let request: ExternalAuthorizationLookupRequestV1 = match strict_json_from_slice(&frame)
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    send_frame(
+                        stream,
+                        &invalid_frame_error(format!("invalid lookup request: {error}")),
+                    );
+                    return;
+                }
+            };
+            match lookup(config, &request) {
+                LookupOutcomeV1::Lookup(response) => send_frame(stream, &response),
+                LookupOutcomeV1::Rejected(error) => send_frame(stream, &error),
+            }
+        }
+        other => {
+            let request_id = envelope
+                .get("request_id")
+                .or_else(|| envelope.get("lookup_request_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            send_frame(
+                stream,
+                &invalid_schema_error(request_id, format!("unsupported request schema {other}")),
+            );
+        }
     }
 }
 
