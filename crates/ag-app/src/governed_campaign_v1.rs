@@ -6,6 +6,7 @@
 
 #![allow(missing_docs)]
 
+use ag_primitives::{Digest as AgDigest, JcsDocument};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
@@ -362,6 +363,19 @@ pub fn materialize_executor_plan_template(
     object.insert("predecessor_head".into(), predecessor_head.digest.into());
     object.insert("predecessor_tree".into(), predecessor_tree.digest.into());
     Ok(value)
+}
+
+/// Computes the exact identity W5 reports for a materialized executor plan.
+///
+/// This remains unknown while a predecessor-coordinate template is frozen.
+pub fn executor_plan_identity(plan: &serde_json::Value) -> Result<String, String> {
+    if plan.get("schema").and_then(serde_json::Value::as_str)
+        != Some("campaign-driver-ng.gcl-v1-worker-vm-plan/v2")
+    {
+        return Err("executor runtime plan schema mismatch".into());
+    }
+    let bytes = JcsDocument::canonicalize(plan).map_err(|error| error.to_string())?;
+    Ok(AgDigest::hash_domain("ag-effectd.docket-executor-plan/v2", bytes.as_bytes()).to_string())
 }
 
 pub fn materialize_template(
