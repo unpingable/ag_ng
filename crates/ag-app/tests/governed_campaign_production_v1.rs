@@ -343,12 +343,13 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("ag.sqlite3");
     let journal_path = directory.path().join("lifecycle.sqlite3");
-    let journal = ProductionLifecycleJournalV1::create(&journal_path, &contract).unwrap();
+    let mut journal = ProductionLifecycleJournalV1::create(&journal_path, &contract).unwrap();
     assert!(
         journal
             .record_verified_start(&contract.verified_start)
             .unwrap()
     );
+    journal = ProductionLifecycleJournalV1::open(&journal_path).unwrap();
 
     let (mut predecessor_head, mut predecessor_tree) =
         match &packet.stages[0].reservation.predecessor {
@@ -388,6 +389,12 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
     let mandate = MandateRefV1::from_digest(Digest::parse(&first.mandate).unwrap());
     let mut settled_stage_3 = None;
     let mut terminal_resolution = None;
+    let mut executor_plan_ids = Vec::new();
+    let mut issuance_ids = Vec::new();
+    let mut spend_ids = Vec::new();
+    let mut attempt_ids = Vec::new();
+    let mut settlement_ids = Vec::new();
+    let mut currentness_ids = Vec::new();
 
     for index in 0..3 {
         let stage = &contract.stages[index];
@@ -411,6 +418,7 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
             mandate: mandate.clone(),
         };
         let current_plan_id = executor_plan_identity(&current_plan).unwrap();
+        executor_plan_ids.push(current_plan_id.clone());
         let proposal = ExactWorkProposalV1::new(
             CampaignId::from_digest(Digest::parse(&contract.campaign_id).unwrap()),
             Digest::parse(&stage.subject).unwrap(),
@@ -434,9 +442,11 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
                 NOW + 10 + (index as u64) * 100,
             )
             .unwrap();
+        engine = CampaignEngineV1::open(&database).unwrap();
         engine
             .require_standing(NOW + 11 + (index as u64) * 100)
             .unwrap();
+        engine = CampaignEngineV1::open(&database).unwrap();
         let exact_catalog = catalog(stage, basis);
         engine
             .decide_with_catalog_v2(
@@ -451,6 +461,7 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
             )
             .unwrap();
         assert!(engine.current().unwrap().issuance().is_none());
+        engine = CampaignEngineV1::open(&database).unwrap();
         let authorized = engine
             .authorize_with_catalog_v2(
                 &mut observation,
@@ -473,20 +484,32 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
                     .is_err()
             );
         }
-        contract
+        let validated = contract
             .validate_issuance(stage.ordinal, &authorized, &current_plan)
             .unwrap();
+        issuance_ids.push(validated.issuance.as_str().to_owned());
+        spend_ids.push(validated.spend.as_str().to_owned());
         journal
             .record_issuance(stage.ordinal, &authorized, &current_plan)
             .unwrap();
+        journal = ProductionLifecycleJournalV1::open(&journal_path).unwrap();
 
         engine = CampaignEngineV1::open(&database).unwrap();
         let dispatched = engine
             .dispatch(&mut docket, NOW + 14 + (index as u64) * 100)
             .unwrap();
+        attempt_ids.push(
+            dispatched
+                .docket_custody()
+                .unwrap()
+                .attempt
+                .as_str()
+                .to_owned(),
+        );
         journal
             .record_docket_custody(stage.ordinal, &dispatched, &current_plan)
             .unwrap();
+        journal = ProductionLifecycleJournalV1::open(&journal_path).unwrap();
         engine = CampaignEngineV1::open(&database).unwrap();
         let DocketProgressV1::Settled(settled) = engine
             .poll_docket(&mut docket, NOW + 15 + (index as u64) * 100)
@@ -494,9 +517,11 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
         else {
             panic!("fixture Docket must settle");
         };
+        settlement_ids.push(settled.settlement().unwrap().settlement.as_str().to_owned());
         journal
             .record_settlement(stage.ordinal, &settled, &current_plan)
             .unwrap();
+        journal = ProductionLifecycleJournalV1::open(&journal_path).unwrap();
 
         let realization_observation = if index < 2 {
             &contract.stages[index + 1].observation
@@ -514,6 +539,7 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
             .unwrap(),
             NOW + 16 + (index as u64) * 100,
         );
+        currentness_ids.push(realization.currentness().as_str().to_owned());
         journal
             .record_reservation_current(
                 stage.ordinal,
@@ -522,6 +548,7 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
                 NOW + 17 + (index as u64) * 100,
             )
             .unwrap();
+        journal = ProductionLifecycleJournalV1::open(&journal_path).unwrap();
 
         if index < 2 {
             let next = &contract.stages[index + 1];
@@ -554,6 +581,7 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
             journal
                 .record_continuation_opened(next.ordinal, &opened, &current_plan)
                 .unwrap();
+            journal = ProductionLifecycleJournalV1::open(&journal_path).unwrap();
         } else {
             settled_stage_3 = Some(settled);
             terminal_resolution = Some(realization);
@@ -579,6 +607,53 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
     assert_eq!(docket.records.len(), 3);
     assert_eq!(journal.events().unwrap().len(), 16);
     assert!(contract.stages.get(3).is_none());
+
+    if let Ok(output) = std::env::var("BRASS_RABBIT_EVIDENCE_DIR") {
+        let output = PathBuf::from(output);
+        std::fs::create_dir_all(&output).unwrap();
+        let events = journal.events().unwrap();
+        let summary = serde_json::json!({
+            "schema": "ag.governed-campaign.brass-rabbit-specimen/v1",
+            "lifecycle_id": contract.lifecycle_id,
+            "verified_start_basis": contract.verified_start.basis_id,
+            "campaign_packet_id": contract.campaign_packet_id,
+            "logical_stage_works": contract.stages.iter().map(|stage| stage.logical_work.clone()).collect::<Vec<_>>(),
+            "executor_plan_templates": contract.stages.iter().map(|stage| stage.executor_plan_template_sha256.clone()).collect::<Vec<_>>(),
+            "materialized_executor_plans": executor_plan_ids,
+            "ag_spends": spend_ids,
+            "ag_issuances": issuance_ids,
+            "docket_attempts": attempt_ids,
+            "settlements": settlement_ids,
+            "reservation_currentness": currentness_ids,
+            "human_required_receipt": receipt.receipt_id,
+            "cardinality": {
+                "verified_starts": 1,
+                "ag_spends": 3,
+                "ag_issuances": 3,
+                "docket_attempts": 3,
+                "reservation_realizations": 3,
+                "human_required": 1,
+                "stage_4": 0
+            }
+        });
+        for (name, value) in [
+            (
+                "production-lifecycle.v1.json",
+                serde_json::to_value(&contract).unwrap(),
+            ),
+            (
+                "lifecycle-events.v1.json",
+                serde_json::to_value(&events).unwrap(),
+            ),
+            (
+                "human-required-receipt.v1.json",
+                serde_json::to_value(&receipt).unwrap(),
+            ),
+            ("specimen-summary.v1.json", summary),
+        ] {
+            std::fs::write(output.join(name), serde_jcs::to_vec(&value).unwrap()).unwrap();
+        }
+    }
 
     let reopened = ProductionLifecycleJournalV1::open(&journal_path).unwrap();
     assert_eq!(reopened.contract(), &contract);
