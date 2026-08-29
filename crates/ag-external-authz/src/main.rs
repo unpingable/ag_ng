@@ -36,6 +36,9 @@ struct Arguments {
     /// Maximum standing-answer lifetime the kernel accepts, in milliseconds.
     #[arg(long)]
     max_standing_ttl_ms: u64,
+    /// Maximum declarative-admissibility receipt age, in milliseconds.
+    #[arg(long)]
+    max_admissibility_age_ms: u64,
     /// The standing authority's answer lease, in milliseconds.
     #[arg(long)]
     answer_ttl_ms: u64,
@@ -55,6 +58,7 @@ fn main() -> ExitCode {
         observation_resolver_id: arguments.observation_resolver_id,
         standing_resolver_id: arguments.standing_resolver_id,
         max_standing_ttl_ms: arguments.max_standing_ttl_ms,
+        max_admissibility_age_ms: arguments.max_admissibility_age_ms,
         answer_ttl_ms: arguments.answer_ttl_ms,
     };
     if let Err(error) = validate_startup(

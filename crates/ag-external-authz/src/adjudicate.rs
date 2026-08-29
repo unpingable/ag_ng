@@ -24,7 +24,7 @@
 //! | `KernelErrorV1::StandingAbsent`                | `refused`       | `absent_standing`                  |
 //! | `KernelErrorV1::StandingNotCurrent`            | `refused`       | `standing_not_current`             |
 //! | `KernelErrorV1::Inadmissible`                  | `refused`       | `inadmissible_exact_work`          |
-//! | `KernelErrorV1::ObservationNotCurrent`         | `refused`       | `stale_observation`                |
+//! | `KernelErrorV1::ObservationNotCurrent`         | `refused`       | `admissibility_not_current`        |
 //! | `KernelErrorV1::ObservationContradiction`      | `refused`       | `contradiction`                    |
 //! | `KernelErrorV1::BudgetExhausted`               | `refused`       | `budget_exhausted` (reserved)      |
 //! | `ExternalBoundaryErrorV1::Refused`             | `refused`       | `external_boundary_refused` (reserved) |
@@ -36,12 +36,13 @@
 //! `occurrence_already_adjudicated` are reachable. `inadmissible_exact_work`
 //! is structurally unreachable (the catalog entry is derived from the same
 //! validated request the proposal is built from, and the expected-work
-//! digest is the same digest the proposal carries). `stale_observation`,
-//! `contradiction`, `budget_exhausted`, `external_boundary_refused`, and
-//! `indeterminate` are mapped but reserved: the shipped fixtures never
-//! produce them (the observation fixture always answers `Current` with a
-//! fresh window, and the budget has zero retry/probe/escalation limits that
-//! the daemon never spends).
+//! digest is the same digest the proposal carries). `contradiction`,
+//! `budget_exhausted`, `external_boundary_refused`, and `indeterminate` are
+//! mapped but reserved. `admissibility_not_current` is reachable:
+//! admissibility is current
+//! only while `evaluation_time <= now < evaluation_time + configured maximum
+//! age`. The budget has zero retry/probe/escalation limits that the daemon
+//! never spends.
 
 #![allow(
     clippy::large_enum_variant,
@@ -119,6 +120,9 @@ pub struct DaemonConfigV1 {
     pub standing_resolver_id: String,
     /// Maximum standing-answer lifetime the kernel accepts.
     pub max_standing_ttl_ms: u64,
+    /// Maximum age of a declarative-admissibility receipt. The exclusive
+    /// deadline is `evaluation_time + max_admissibility_age_ms`.
+    pub max_admissibility_age_ms: u64,
     /// The standing authority's own answer lease; also the observation
     /// fixture's freshness window.
     pub answer_ttl_ms: u64,
@@ -141,6 +145,9 @@ impl DaemonConfigV1 {
         if self.answer_ttl_ms == 0 {
             return Err("answer_ttl_ms must be positive".to_owned());
         }
+        if self.max_admissibility_age_ms == 0 {
+            return Err("max_admissibility_age_ms must be positive".to_owned());
+        }
         if self.answer_ttl_ms > self.max_standing_ttl_ms {
             return Err("answer_ttl_ms must not exceed max_standing_ttl_ms".to_owned());
         }
@@ -158,13 +165,16 @@ pub enum AdjudicationOutcomeV1 {
     Rejected(ExternalAuthorizationErrorV1),
 }
 
-/// In-process observation boundary: always answers `Current` for the exact
-/// typed opaque basis derived from the request's admissibility receipt, with
-/// a fresh window rooted at the engine's own clock reading.
+/// In-process observation boundary for the exact typed opaque basis derived
+/// from the request's admissibility receipt. It never refreshes the receipt:
+/// currentness is bounded by the original evaluation time and the configured
+/// exclusive expiry.
 struct DeclarativeAdmissibilityObservationV1 {
     basis: TypedOpaqueObservationBasisV1,
     resolver_id: String,
     freshness_window_ms: u64,
+    evaluated_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
 }
 
 /// Exact content whose digest witnesses one observation-currentness answer.
@@ -184,7 +194,15 @@ impl ObservationResolverV1 for DeclarativeAdmissibilityObservationV1 {
         request: &ObservationResolutionRequestV1<'_>,
     ) -> Result<VersionedObservationResolutionV1, ExternalBoundaryErrorV1> {
         let resolved_at = request.now_unix_ms;
-        let fresh_until = resolved_at.saturating_add(self.freshness_window_ms);
+        let fresh_until = resolved_at
+            .saturating_add(self.freshness_window_ms)
+            .min(self.expires_at_unix_ms);
+        let status =
+            if self.evaluated_at_unix_ms <= resolved_at && resolved_at < self.expires_at_unix_ms {
+                TypedObservationStatusV1::Current
+            } else {
+                TypedObservationStatusV1::Stale
+            };
         let binding =
             self.basis
                 .binding_digest()
@@ -216,7 +234,7 @@ impl ObservationResolverV1 for DeclarativeAdmissibilityObservationV1 {
             basis: self.basis.clone(),
             resolver_id: self.resolver_id.clone(),
             subject: request.subject.clone(),
-            status: TypedObservationStatusV1::Current,
+            status,
             resolved_at_unix_ms: resolved_at,
             fresh_until_unix_ms: fresh_until,
         }
@@ -398,9 +416,10 @@ fn map_kernel_error(error: &KernelErrorV1) -> KernelMappingV1 {
             "inadmissible_exact_work",
             Some(RefusalCodeV1::InadmissibleExactWork),
         ),
-        KernelErrorV1::ObservationNotCurrent => {
-            KernelMappingV1::Refused("stale_observation", Some(RefusalCodeV1::StaleObservation))
-        }
+        KernelErrorV1::ObservationNotCurrent => KernelMappingV1::Refused(
+            "admissibility_not_current",
+            Some(RefusalCodeV1::StaleObservation),
+        ),
         KernelErrorV1::ObservationContradiction => {
             KernelMappingV1::Refused("contradiction", Some(RefusalCodeV1::Contradiction))
         }
@@ -480,6 +499,11 @@ fn drive(
         basis: derived.basis.clone(),
         resolver_id: config.observation_resolver_id.clone(),
         freshness_window_ms: config.answer_ttl_ms,
+        evaluated_at_unix_ms: request.admissibility.evaluation_time_unix_ms,
+        expires_at_unix_ms: request
+            .admissibility
+            .evaluation_time_unix_ms
+            .saturating_add(config.max_admissibility_age_ms),
     };
     let mut standing = StandingStoreResolverV1::new(
         config.standing_store.clone(),

@@ -62,6 +62,7 @@ pub fn fixture() -> Fixture {
         observation_resolver_id: OBSERVATION_RESOLVER_ID.to_owned(),
         standing_resolver_id: STANDING_RESOLVER_ID.to_owned(),
         max_standing_ttl_ms: MAX_STANDING_TTL_MS,
+        max_admissibility_age_ms: ANSWER_TTL_MS,
         answer_ttl_ms: ANSWER_TTL_MS,
     };
     Fixture {

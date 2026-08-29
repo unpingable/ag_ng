@@ -87,6 +87,58 @@ fn happy_path_authorizes_and_commits_the_spend() {
     assert!(engine.refusal_history().unwrap().refusals.is_empty());
 }
 
+fn assert_admissibility_not_current(
+    fixture: &common::Fixture,
+    occurrence: Uuid,
+    request: &ag_external_authz::protocol::ExternalAuthorizationRequestV1,
+) {
+    let response = decision(adjudicate(&fixture.config, request, NOW));
+
+    assert_eq!(response.decision, ExternalDecisionV1::Refused);
+    assert_eq!(
+        response.refusal.expect("refusal detail").code,
+        "admissibility_not_current"
+    );
+    assert!(response.authorization.is_none());
+    let engine = CampaignEngineV1::open(&store_path(fixture, occurrence)).unwrap();
+    assert_eq!(engine.replay().unwrap().ag_spends, 0);
+    assert_eq!(
+        engine.refusal_history().unwrap().refusals[0].outcome.code,
+        RefusalCodeV1::StaleObservation
+    );
+}
+
+#[test]
+fn an_admissibility_receipt_from_the_future_is_not_current() {
+    let (fixture, subject, scope) = active_fixture();
+    let occurrence = Uuid::new_v4();
+    let mut request = default_request(occurrence, &subject, &scope);
+    request.admissibility.evaluation_time_unix_ms = NOW + 1;
+
+    assert_admissibility_not_current(&fixture, occurrence, &request);
+}
+
+#[test]
+fn a_stale_admissibility_receipt_is_not_refreshed() {
+    let (fixture, subject, scope) = active_fixture();
+    let occurrence = Uuid::new_v4();
+    let mut request = default_request(occurrence, &subject, &scope);
+    request.admissibility.evaluation_time_unix_ms =
+        NOW - fixture.config.max_admissibility_age_ms - 1;
+
+    assert_admissibility_not_current(&fixture, occurrence, &request);
+}
+
+#[test]
+fn admissibility_expiring_exactly_at_consequence_time_is_not_current() {
+    let (fixture, subject, scope) = active_fixture();
+    let occurrence = Uuid::new_v4();
+    let mut request = default_request(occurrence, &subject, &scope);
+    request.admissibility.evaluation_time_unix_ms = NOW - fixture.config.max_admissibility_age_ms;
+
+    assert_admissibility_not_current(&fixture, occurrence, &request);
+}
+
 #[test]
 fn absent_mandate_is_refused_as_absent_standing() {
     let fixture = fixture();
