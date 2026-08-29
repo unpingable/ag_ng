@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 
 use ag_app::standing_authority::{MandateStatusV1, StandingMandateStoreV1, StandingMandateV1};
 use ag_external_authz::adjudicate::DaemonConfigV1;
+use ag_external_authz::admissibility::computed_receipt_digest;
 use ag_external_authz::protocol::{
-    ActionDescriptorV1, AdmissibilityDescriptorV1, ExternalAuthorizationRequestV1,
+    ActionDescriptorV1, AdmissibilityDescriptorV1, EvidenceUsedV1, ExternalAuthorizationRequestV1,
     OccurrenceDescriptorV1, OccurrenceStageV1, REQUEST_SCHEMA_V1,
 };
 use ag_primitives::Digest;
@@ -109,11 +110,10 @@ pub fn request(
     occurrence_id: Uuid,
     subject: &Digest,
     scope: &Digest,
-    receipt: &Digest,
     stage: OccurrenceStageV1,
     canonical_json: &str,
 ) -> ExternalAuthorizationRequestV1 {
-    ExternalAuthorizationRequestV1 {
+    let mut request = ExternalAuthorizationRequestV1 {
         schema: REQUEST_SCHEMA_V1.to_owned(),
         request_id: Uuid::new_v4().to_string(),
         occurrence: OccurrenceDescriptorV1 {
@@ -135,11 +135,25 @@ pub fn request(
             profile_id: "codex.admissibility-profile/v1".to_owned(),
             profile_revision: "7".to_owned(),
             decision: "continue".to_owned(),
-            evaluation_time_unix_ms: NOW - 10,
-            evidence_used: vec![],
-            receipt_digest: receipt.clone(),
+            evaluation_time_unix_ms: NOW,
+            evidence_used: vec![EvidenceUsedV1 {
+                requirement_id: "req-1".to_owned(),
+                fact_id: "fact-1".to_owned(),
+                receipt_id: Digest::parse(&format!("sha256:{}", "d".repeat(64))).unwrap(),
+                qualifier_id: "qualifier-1".to_owned(),
+                qualifier_revision: "rev-1".to_owned(),
+            }],
+            receipt_digest: Digest::hash_bytes(b"initialized below"),
         },
-    }
+    };
+    request.admissibility.receipt_digest = computed_receipt_digest(&request.admissibility).unwrap();
+    request
+}
+
+/// Recomputes the exact receipt identity after an intentional semantic
+/// fixture change.
+pub fn rebind_admissibility(request: &mut ExternalAuthorizationRequestV1) {
+    request.admissibility.receipt_digest = computed_receipt_digest(&request.admissibility).unwrap();
 }
 
 /// The default valid request: generic tool proposal over the default action.
@@ -152,7 +166,6 @@ pub fn default_request(
         occurrence_id,
         subject,
         scope,
-        &digest("admissibility-receipt"),
         OccurrenceStageV1::GenericToolProposal,
         DEFAULT_ACTION_JSON,
     )

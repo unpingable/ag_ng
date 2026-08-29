@@ -12,8 +12,8 @@ use ag_external_authz::protocol::{
 };
 use ag_external_authz::standing::load_standing_store;
 use common::{
-    ANSWER_TTL_MS, NOW, active_fixture, default_request, digest, fixture, mandate, store_path,
-    write_standing_store,
+    ANSWER_TTL_MS, NOW, active_fixture, default_request, digest, fixture, mandate,
+    rebind_admissibility, store_path, write_standing_store,
 };
 use uuid::Uuid;
 
@@ -113,7 +113,8 @@ fn an_admissibility_receipt_from_the_future_is_not_current() {
     let (fixture, subject, scope) = active_fixture();
     let occurrence = Uuid::new_v4();
     let mut request = default_request(occurrence, &subject, &scope);
-    request.admissibility.evaluation_time_unix_ms = NOW + 1;
+    request.admissibility.evaluation_time_unix_ms = NOW + 1_000;
+    rebind_admissibility(&mut request);
 
     assert_admissibility_not_current(&fixture, occurrence, &request);
 }
@@ -124,7 +125,8 @@ fn a_stale_admissibility_receipt_is_not_refreshed() {
     let occurrence = Uuid::new_v4();
     let mut request = default_request(occurrence, &subject, &scope);
     request.admissibility.evaluation_time_unix_ms =
-        NOW - fixture.config.max_admissibility_age_ms - 1;
+        NOW - fixture.config.max_admissibility_age_ms - 1_000;
+    rebind_admissibility(&mut request);
 
     assert_admissibility_not_current(&fixture, occurrence, &request);
 }
@@ -135,6 +137,7 @@ fn admissibility_expiring_exactly_at_consequence_time_is_not_current() {
     let occurrence = Uuid::new_v4();
     let mut request = default_request(occurrence, &subject, &scope);
     request.admissibility.evaluation_time_unix_ms = NOW - fixture.config.max_admissibility_age_ms;
+    rebind_admissibility(&mut request);
 
     assert_admissibility_not_current(&fixture, occurrence, &request);
 }
@@ -340,6 +343,26 @@ fn action_digest_substitution_is_invalid_input_not_a_decision() {
     assert_eq!(error.kind, ErrorKindV1::InvalidRequest);
     assert_eq!(error.request_id, Some(request.request_id.clone()));
     // No decision was recorded: no per-occurrence state exists.
+    assert!(!store_path(&fixture, occurrence).exists());
+    assert!(
+        std::fs::read_dir(&fixture.state_dir)
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn receipt_transcript_substitution_is_invalid_before_custody_or_spend() {
+    let (fixture, subject, scope) = active_fixture();
+    let occurrence = Uuid::new_v4();
+    let mut request = default_request(occurrence, &subject, &scope);
+    request.admissibility.evaluation_time_unix_ms -= 1_000;
+
+    let error = rejected(adjudicate(&fixture.config, &request, NOW));
+
+    assert_eq!(error.kind, ErrorKindV1::InvalidRequest);
+    assert!(error.reason.contains("exact transcript"), "{error:?}");
     assert!(!store_path(&fixture, occurrence).exists());
     assert!(
         std::fs::read_dir(&fixture.state_dir)

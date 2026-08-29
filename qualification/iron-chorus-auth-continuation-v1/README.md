@@ -1,5 +1,9 @@
 # IRON-CHORUS authorization-continuation qualification
 
+Audit classification: **pending independent re-audit**. Repair work following
+the refused audit is committed only to the isolated campaign branches and must
+not be pushed or treated as accepted until a fresh authority audit succeeds.
+
 Implementation pair:
 
 - AG `625f1d8` on
@@ -10,7 +14,9 @@ Implementation pair:
 
 Observed host-supported results:
 
-- `cargo test -p ag-external-authz`: 41 passed across five test binaries
+- repaired `cargo test -p ag-external-authz`: 46 passed across five test
+  binaries, including the exact cross-boundary receipt digest vector,
+  deterministic substitution fixtures, and pre-custody mismatch rejection
 - `cargo test -p ag-campaign --test governed_loop`: 40 passed
 - `cargo test -p ag-app --test governed_loop_engine`: 41 passed, one explicit
   corpus-writer fixture ignored
@@ -32,3 +38,8 @@ weaken the authority boundary.
 No production activation, protected approval, service mutation, or live
 effect was performed. The adjacent-process test writes only to its temporary
 local fixture and proves the already-existing AG/Docket/effectd seam.
+
+The sealed host packet itself is unchanged: its host-dependent commands,
+expected evidence, repository foundations, and prior implementation pins
+remain exact. This README supplies the current pending-re-audit classification
+without claiming that any sealed host-dependent case was rerun.

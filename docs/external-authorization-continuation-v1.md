@@ -30,6 +30,17 @@ result, not native approval and not permission to execute directly.
 
 ## Exact admissibility currentness
 
+Before currentness or standing is evaluated, both sides validate one receipt
+identity transcript owned by Codex external-reviewer receipt v1. The transcript
+is canonical JSON over `evaluation_time` in Unix seconds, `evidence_used` in
+supplied order, `profile_id`, and `profile_revision`. Every evidence entry
+binds `fact_id`, `qualifier_id`, `qualifier_revision`, `receipt_id`, and
+`requirement_id`; optional provenance is explicit JSON `null`. Codex validates
+this digest at reviewer intake and again immediately before request
+construction. AG reconstructs the same transcript from its millisecond wire
+field and validates it before request custody, governed state, or spend. A
+subsecond wire time cannot name the seconds-domain receipt and is invalid.
+
 The external authorizer accepts a structurally and cryptographically valid
 admissibility receipt only while
 
@@ -106,6 +117,15 @@ AG-owned authenticated signed-issuance output connected to Docket's canonical
 settlement contracts.
 
 ## Qualification record
+
+Classification: **pending independent re-audit**. The prior independent audit
+refused the implementation because receipt identity was not recomputed at the
+cross-process boundaries and generic direct handlers could bypass the
+post-native-approval contributor. Repair commits now add the shared transcript
+validator, deterministic bound-field substitutions, pre-custody AG rejection,
+and fail-closed classification for unsupported Codex handler families. Prior
+qualification results remain historical evidence; the repaired heads require
+fresh independent acceptance before push or activation.
 
 The implementation and boundary checks run for this campaign are recorded in
 `qualification/iron-chorus-auth-continuation-v1/README.md`. Host-dependent

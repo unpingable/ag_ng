@@ -72,6 +72,7 @@ use ag_store::campaign::CampaignStoreErrorV1;
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::admissibility::validate_receipt_digest;
 use crate::custody::{persist_outcome, persist_request, sync_new_occurrence};
 use crate::protocol::{
     ADMISSIBILITY_DECISION_CONTINUE, AuthorizationOutcomeV1, ERROR_SCHEMA_V1, ErrorKindV1,
@@ -321,6 +322,7 @@ fn validate_request(request: &ExternalAuthorizationRequestV1) -> Result<(), Stri
             "admissibility.decision must be exactly `{ADMISSIBILITY_DECISION_CONTINUE}`"
         ));
     }
+    validate_receipt_digest(&request.admissibility)?;
     if request.action.work_schema != request.occurrence.stage.work_schema() {
         return Err(format!(
             "work_schema {} is inconsistent with stage {:?}",
