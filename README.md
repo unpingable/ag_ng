@@ -23,6 +23,12 @@ Governor. Its authority boundary is deliberately narrow:
 > Workers propose. AG governs one exact occurrence. Docket custodies one
 > attempt. An authority-neutral executor performs only the exact mechanics.
 
+External harness authors can start with the
+[`AG-ng + Docket adoption quickstart`](docs/ag-ng-docket-adoption.md). It builds the exact
+qualified Docket revision and runs a deterministic non-Git managed-file example through
+authorization, custody, duplicate handling, acknowledgement-loss uncertainty, restart, and
+reconciliation without an LLM subscription.
+
 The workspace is organized around non-convertible judgment-family types, an
 unprivileged governor daemon, a credential-isolated provider daemon, and a
 minimal privileged effect broker. The initial production target is a
