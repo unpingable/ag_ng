@@ -73,6 +73,18 @@
         "path": "evidence/run-004-systemd-evidence-v1.json",
         "length": 4363,
         "sha256": "sha256:78314f7f05b9159c20cb07a8141e436b036c64f660ccd1282476d22aac09f1b7"
+      },
+      {
+        "kind": "final_guest_teardown_observation",
+        "path": "evidence/run-004-final-guest-teardown-observation.txt",
+        "length": 702,
+        "sha256": "sha256:6d9e6b7258d140e174c72aefc91253caf5b3b6f7a1bff26ad4d4f49c58fd17b7"
+      },
+      {
+        "kind": "final_host_teardown_observation",
+        "path": "evidence/run-004-final-host-teardown-observation.txt",
+        "length": 571,
+        "sha256": "sha256:8990f28ecac51650a40bc4dd5f9cb3d7968201cf168f7f47e8022d95abc0b0ca"
       }
     ],
     "live_qualification": {

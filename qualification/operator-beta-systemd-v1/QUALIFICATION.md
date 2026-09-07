@@ -84,10 +84,14 @@ remained; the overlay and controller evidence are retained for audit.
 - [executor outcome](evidence/run-004-executor-outcome-v1.json)
 - [typed effect receipt](evidence/run-004-effect-receipt-v1.json)
 - [raw systemd evidence](evidence/run-004-systemd-evidence-v1.json)
+- [final guest teardown observation](evidence/run-004-final-guest-teardown-observation.txt)
+- [final host teardown observation](evidence/run-004-final-host-teardown-observation.txt)
 
-The receipt schema and tests bind their exact lengths, SHA-256 digests,
-subject/scope/work/attempt/marker chain, owner receipt/evidence identities, and
-the distinct post-restart `NOT_ESTABLISHED_TARGET_INACTIVE_HTTP_ABSENT` fact.
+The receipt schema and tests bind every artifact length and SHA-256 digest,
+recompute the plan/work, canonical receipt, and domain-separated evidence
+identities, bind the subject/scope/attempt/marker chain, and retain exact guest
+and host teardown observations alongside the distinct post-restart
+`NOT_ESTABLISHED_TARGET_INACTIVE_HTTP_ABSENT` fact.
 
 ## Qualification gates
 

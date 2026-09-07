@@ -1,0 +1,13 @@
+schema=ag.operator-beta-systemd-m1a-final-host-teardown-observation/v1
+observed_at=2026-09-07T11:01:52Z
+campaign_vm_name=ag-m1a-run004-teardown-verify
+campaign_vm_process_absent=true
+campaign_overlay_open_by_process_absent=true
+forwarded_listener_24444_absent=true
+forwarded_listener_24445_absent=true
+unrelated_qemu_process_count=2
+unrelated_qemu_1_pid=1215171 owner=civild fixture=fresh-kn-k port=24322
+unrelated_qemu_2_pid=1215462 owner=civild fixture=fresh-kn-n port=24323
+controller_evidence_retained=true
+effect_or_mechanics_invoked=false
+observation_complete=true

@@ -271,8 +271,9 @@ The bounded executable M1A owner result directly qualifies:
     metadata/BLOB bound substitutions;
 13. Debian 12 target-local package, system-bus permission, backup/restore,
     service restart order, and teardown; and
-14. successful enactment followed by missing or contradictory fresh NQ
-    postcondition evidence.
+14. successful enactment followed by direct controller observation that the
+    disabled target is inactive and HTTP is absent after restart. Classic NQ
+    pre/post observation integration remains a separate unqualified M1B lane.
 
 The exact result and retained run-004 evidence require independent result audit
 before publication. Current gate:
