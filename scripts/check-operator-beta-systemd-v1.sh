@@ -16,6 +16,10 @@ tests=crates/ag-app/src/effect_executor_adapter/systemd_executor_v2/qualificatio
 adapter=crates/ag-app/src/effect_executor_adapter.rs
 cli=crates/ag-app/src/bin/ag-effectd.rs
 manifest=crates/ag-app/Cargo.toml
+package_control=debian/control
+package_rules=debian/rules
+package_install=debian/agent-governor-ng-systemd-executor.install
+package_test=debian/tests/systemd-executor-package-contract
 
 [[ -f "$contract" && -f "$runtime" && -f "$driver" ]] ||
   fail "accepted contract or owner implementation is missing"
@@ -78,6 +82,14 @@ rg -q 'systemd_attempt_in_progress' "$cli" &&
   fail "bounded lock contention is not the fixed Docket transport refusal"
 if rg -q 'Command::new|systemctl|/bin/sh|sh -c' "$runtime" "$driver"; then
   fail "systemd backend acquired a subprocess control path"
+fi
+
+rg -q '^Package: agent-governor-ng-systemd-executor$' "$package_control" &&
+  rg -q -- '--features systemd-dbus --target-dir target/systemd-dbus' "$package_rules" &&
+  rg -q '^target/systemd-dbus/release/ag-effectd usr/libexec/agent-governor-ng$' "$package_install" ||
+  fail "dedicated feature-enabled process-adapter package is missing"
+if rg -q 'systemctl (start|stop|restart)|deb-systemd-invoke|\.service usr/' "$package_install" "$package_test"; then
+  fail "process-adapter package acquired a service lifecycle action"
 fi
 
 dependency_graph="$(cargo tree --locked --offline --package ag-app --features systemd-dbus --edges normal,build --prefix none --format '{p}')"

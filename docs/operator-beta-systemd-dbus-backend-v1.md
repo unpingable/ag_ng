@@ -94,6 +94,29 @@ V2 systemd plan selects the real backend. A qualified package binds the exact
 feature set and executable digest; there is no runtime environment toggle,
 schema fallback, or automatic backend substitution.
 
+The M1A package is the separate binary package
+`agent-governor-ng-systemd-executor`. It installs only the feature-enabled
+process adapter at `/usr/libexec/agent-governor-ng/ag-effectd`. It does not
+replace the default `/usr/bin/ag-effectd`, install a service or target unit,
+own an attempt store, or run a maintainer-script lifecycle action. The existing
+`agent-governor-ng` package and its service-shaped deployment skeleton remain
+outside this M1A change. Package presence is not execution standing; only an
+exact Docket dispatch plus the sealed V2 plan admits one adapter attempt.
+
+For qualification item 13, package lifecycle preservation has the following
+bounded meaning. Before package removal or replacement, no adapter process may
+be active. The target service state and exact executor attempt-store database,
+WAL state, and `.systemd-execution-lock` anchor are recorded. A campaign-owned
+backup is accepted only when a read-only SQLite integrity check succeeds and
+the database and anchor byte lengths and SHA-256 digests reproduce. Install,
+remove, and reinstall must not change those files or the target service. After
+reinstall, query-only `reconcile` must reproduce the retained terminal outcome
+without invoking mechanics. This is package-lifecycle evidence for the one
+executor store; it is not the separately defined coherent three-store AG
+backup protocol and does not authorize restoring a copied database as live
+state. Package cleanup and fixture teardown occur only after the retained
+outcome and postcondition observations have been captured.
+
 The backend connects directly to the local system bus. The beta target catalog
 admits exactly:
 

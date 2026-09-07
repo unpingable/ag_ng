@@ -30,3 +30,15 @@ Description: governed batch-agent authority membrane
  .
  This package skeleton does not imply production readiness; consult the
  installed release checklist before enabling any service.
+
+Package: agent-governor-ng-systemd-executor
+Architecture: amd64 arm64
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ systemd (>= 252)
+Description: target-local systemd effect process adapter for Agent Governor NG
+ This package contains the feature-enabled, authority-neutral process adapter
+ used for one exact Docket-custodied systemd attempt. It installs no service,
+ configuration, authority state, target definition, or mutable store and does
+ not start, stop, enable, disable, or restart any unit.

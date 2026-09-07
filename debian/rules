@@ -11,10 +11,16 @@ override_dh_auto_configure:
 
 override_dh_auto_build:
 	cargo build --locked --offline --release --workspace
+	cargo build --locked --offline --release -p ag-app --bin ag-effectd \
+		--features systemd-dbus --target-dir target/systemd-dbus
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	cargo test --locked --offline --workspace --all-targets
+	cargo test --locked --offline -p ag-app --features systemd-dbus \
+		effect_executor_adapter
+	cargo test --locked --offline -p ag-app --features systemd-dbus \
+		--test systemd_executor_v2_cli
 	python3 qualification/clean-host/validate.py
 	python3 -m unittest discover -s qualification/clean-host -p 'test_*.py'
 endif

@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+fail() {
+    echo "systemd-executor-package-contract: $*" >&2
+    exit 1
+}
+
+package=agent-governor-ng-systemd-executor
+adapter=/usr/libexec/agent-governor-ng/ag-effectd
+
+[ -x "$adapter" ] || fail "missing executable $adapter"
+[ "$(stat -c '%U:%G:%a' "$adapter")" = "root:root:755" ] ||
+    fail "unexpected executable custody for $adapter"
+"$adapter" --help >/dev/null
+
+paths=$(dpkg-query -L "$package")
+printf '%s\n' "$paths" | grep -Fxq "$adapter" ||
+    fail "package file inventory omits $adapter"
+if printf '%s\n' "$paths" | grep -Eq '/(systemd/system|systemd/user)/|\.service$|/etc/|/var/|/run/'; then
+    fail "process-adapter package acquired service, configuration, or mutable-state paths"
+fi
+
+for unit in agd.service ag-effectd.service ag-providerd.service constellation-beta-http-fixture.service; do
+    systemctl show "$unit" -p ActiveState -p UnitFileState 2>/dev/null || true
+done

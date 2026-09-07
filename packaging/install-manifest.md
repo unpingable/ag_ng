@@ -24,6 +24,15 @@ must not enter a package until their named release gates pass.
 | `migration/` | `/usr/share/doc/agent-governor-ng/migration/` | immutable-source manifest, partial disposition ledger, receipts, and hostile specimens |
 | Debian copyright/changelog/`README.Debian` | `/usr/share/doc/agent-governor-ng/` | ordinary package metadata and installed-path guidance |
 
+The separate `agent-governor-ng-systemd-executor` binary package contains only
+`target/systemd-dbus/release/ag-effectd` at
+`/usr/libexec/agent-governor-ng/ag-effectd`. That executable is built with the
+exact `systemd-dbus` feature. The package contains no unit, maintainer script,
+configuration, mutable store, target definition, authority record, or runtime
+directory. Installing, upgrading, removing, or reinstalling it therefore does
+not itself start, stop, enable, disable, or restart the governed target or any
+AG service. Docket invokes the installed path as a bounded process adapter.
+
 The package does **not** install `/etc/agent-governor/*.toml`, an RPC signing
 key, provider credential, encrypted credential blob, target drop-in file, authority
 domain, epoch, enrollment root, database, object, backup, managed target,

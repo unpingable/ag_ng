@@ -6,6 +6,7 @@ import unittest
 from jsonschema import Draft202012Validator, ValidationError
 
 ROOT = pathlib.Path(__file__).resolve().parent
+REPOSITORY = ROOT.parents[1]
 
 
 def digest(char: str) -> str:
@@ -222,6 +223,27 @@ class ContractTests(unittest.TestCase):
         candidate["unit"] = "../other.service"
         with self.assertRaises(ValidationError):
             self.evidence.validate(candidate)
+
+    def test_dedicated_package_is_feature_bound_and_authority_neutral(self):
+        control = (REPOSITORY / "debian/control").read_text()
+        rules = (REPOSITORY / "debian/rules").read_text()
+        install = (
+            REPOSITORY / "debian/agent-governor-ng-systemd-executor.install"
+        ).read_text()
+        package_test = (
+            REPOSITORY / "debian/tests/systemd-executor-package-contract"
+        ).read_text()
+
+        self.assertIn("Package: agent-governor-ng-systemd-executor", control)
+        self.assertIn("--features systemd-dbus --target-dir target/systemd-dbus", rules)
+        self.assertEqual(
+            install,
+            "target/systemd-dbus/release/ag-effectd usr/libexec/agent-governor-ng\n",
+        )
+        self.assertNotIn("systemctl start", package_test)
+        self.assertNotIn("systemctl stop", package_test)
+        self.assertNotIn("systemctl restart", package_test)
+        self.assertIn("process-adapter package acquired service", package_test)
 
 if __name__ == "__main__":
     unittest.main()
