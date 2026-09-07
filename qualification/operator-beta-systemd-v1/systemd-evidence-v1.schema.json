@@ -145,6 +145,7 @@
           "kind": {
             "enum": [
               "get_machine_id_reply",
+              "ref_unit_reply",
               "get_unit_reply",
               "pre_active_state_reply",
               "pre_unit_file_state_reply",
@@ -230,6 +231,8 @@
               "systemd_machine_identity_malformed",
               "systemd_machine_identity_mismatch",
               "systemd_manager_proxy_unavailable",
+              "systemd_unit_reference_timeout",
+              "systemd_unit_reference_failed",
               "systemd_unit_lookup_timeout",
               "systemd_unit_lookup_failed",
               "systemd_unit_lookup_malformed",
@@ -256,6 +259,7 @@
                 "kind": {
                   "enum": [
                     "get_machine_id_reply",
+                    "ref_unit_reply",
                     "get_unit_reply",
                     "pre_active_state_reply",
                     "pre_unit_file_state_reply"

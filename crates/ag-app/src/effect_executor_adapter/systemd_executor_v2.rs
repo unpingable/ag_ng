@@ -291,7 +291,7 @@ impl SystemdDbusEvidenceV1 {
         }
         let mut prior = 0;
         let mut prior_rank = None;
-        let mut seen = [false; 8];
+        let mut seen = [false; 9];
         for (index, message) in self.messages.iter().enumerate() {
             let Some(rank) = message_kind_rank(&message.kind) else {
                 return Err("systemd-evidence-message-kind".to_owned());
@@ -300,7 +300,7 @@ impl SystemdDbusEvidenceV1 {
                 || (index > 0 && message.elapsed_ms < prior)
                 || message.elapsed_ms > self.elapsed_ms
                 || prior_rank.is_some_and(|prior| rank < prior)
-                || (rank != 5 && seen[rank as usize])
+                || (rank != 6 && seen[rank as usize])
             {
                 return Err("systemd-evidence-message-shape".to_owned());
             }
@@ -328,7 +328,7 @@ impl SystemdDbusEvidenceV1 {
                     && self.resulting_unit_file_state.is_none()
                     && self.job_path.is_none()
                     && self.job_result.is_none()
-                    && !seen[4..].iter().any(|present| *present) => {}
+                    && !seen[5..].iter().any(|present| *present) => {}
             SystemdEvidenceClassV1::Indeterminate
                 if self.resulting_active_state.is_none()
                     && self.resulting_unit_file_state.is_none() => {}
@@ -389,6 +389,8 @@ fn outcome_code_is_known(class: SystemdEvidenceClassV1, code: &str) -> bool {
                 | "systemd_machine_identity_malformed"
                 | "systemd_machine_identity_mismatch"
                 | "systemd_manager_proxy_unavailable"
+                | "systemd_unit_reference_timeout"
+                | "systemd_unit_reference_failed"
                 | "systemd_unit_lookup_timeout"
                 | "systemd_unit_lookup_failed"
                 | "systemd_unit_lookup_malformed"
@@ -435,13 +437,14 @@ fn outcome_code_is_known(class: SystemdEvidenceClassV1, code: &str) -> bool {
 fn message_kind_rank(kind: &str) -> Option<u8> {
     match kind {
         "get_machine_id_reply" => Some(0),
-        "get_unit_reply" => Some(1),
-        "pre_active_state_reply" => Some(2),
-        "pre_unit_file_state_reply" => Some(3),
-        "start_unit_reply" => Some(4),
-        "job_removed_signal" => Some(5),
-        "post_active_state_reply" => Some(6),
-        "post_unit_file_state_reply" => Some(7),
+        "ref_unit_reply" => Some(1),
+        "get_unit_reply" => Some(2),
+        "pre_active_state_reply" => Some(3),
+        "pre_unit_file_state_reply" => Some(4),
+        "start_unit_reply" => Some(5),
+        "job_removed_signal" => Some(6),
+        "post_active_state_reply" => Some(7),
+        "post_unit_file_state_reply" => Some(8),
         _ => None,
     }
 }
@@ -1514,6 +1517,7 @@ mod tests {
             job_result: Some("done".to_owned()),
             messages: [
                 "get_machine_id_reply",
+                "ref_unit_reply",
                 "get_unit_reply",
                 "pre_active_state_reply",
                 "pre_unit_file_state_reply",

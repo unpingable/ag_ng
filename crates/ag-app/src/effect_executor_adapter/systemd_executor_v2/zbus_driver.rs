@@ -254,6 +254,27 @@ async fn run(plan: &EffectExecutorSystemdPlanV2) -> DriverObservationV2 {
         }
     };
 
+    let Some(reference_reply) =
+        within(preflight_timeout, manager.call_method("RefUnit", &(unit,))).await
+    else {
+        return transcript.failure(
+            "systemd_unit_reference_timeout",
+            "unit reference did not complete before StartUnit",
+        );
+    };
+    let reference_reply = match reference_reply {
+        Ok(message) => message,
+        Err(_) => {
+            return transcript.failure(
+                "systemd_unit_reference_failed",
+                "unit reference failed before StartUnit",
+            );
+        }
+    };
+    if let Err(code) = transcript.record("ref_unit_reply", &reference_reply) {
+        return transcript.failure(code, "unit reference reply exceeded evidence bounds");
+    }
+
     let Some(unit_reply) =
         within(preflight_timeout, manager.call_method("GetUnit", &(unit,))).await
     else {

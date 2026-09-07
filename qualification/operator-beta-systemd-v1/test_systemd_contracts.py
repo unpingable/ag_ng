@@ -75,6 +75,7 @@ def success_evidence():
             for index, kind in enumerate(
                 [
                     "get_machine_id_reply",
+                    "ref_unit_reply",
                     "get_unit_reply",
                     "pre_active_state_reply",
                     "pre_unit_file_state_reply",

@@ -46,6 +46,7 @@ start_line="$(rg -n 'call_method\("StartUnit"' "$driver" | cut -d: -f1)"
   fail "JobRemoved subscription no longer precedes StartUnit"
 rg -q 'Connection::system\(\)' "$driver" &&
   rg -q 'call_method\("GetMachineId"' "$driver" &&
+  rg -q 'call_method\("RefUnit"' "$driver" &&
   rg -q 'call_method\("GetUnit"' "$driver" ||
   fail "local system-bus machine and unit preflight is incomplete"
 rg -q 'live_machine_identity != plan\.systemd_machine_identity' "$driver" ||

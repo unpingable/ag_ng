@@ -126,7 +126,7 @@ For one Docket-reserved V2 attempt the backend performs:
 10. commit evidence and the terminal Docket execution receipt atomically.
 
 `Failed` is permitted only when retained evidence proves that step 6 was not
-transmitted: connection, identity, lookup, property, prestate, and subscription
+transmitted: connection, identity, unit reference/lookup, property, prestate, and subscription
 failures. The M1A post-transmission manager-error allowlist is explicitly
 empty.
 
@@ -155,7 +155,10 @@ existing executor attempt store for V2 attempts. It binds:
 - live peer machine identity;
 - both V2 timeout values, ordered wall-clock testimony, and monotonic elapsed
   durations used for the local bounds;
-- decoded unit object path, prestate, job path, job result, and poststate;
+- retained `RefUnit` reply, decoded unit object path, prestate, job path, job
+  result, and poststate; the connection-scoped reference prevents an installed,
+  inactive unit from being garbage-collected between lookup and `StartUnit` and
+  grants no independent start authority;
 - ordered exact D-Bus reply/signal bytes with message-kind labels; and
 - a domain-separated digest over the canonical record.
 
@@ -220,7 +223,9 @@ Before this contract becomes an executable M1A result, directly exercise:
 4. wrong plan/work schema, machine, either timeout, unit, action, both
    prestates, work, attempt, marker, effect index, executable, and feature-set
    substitutions;
-5. system bus unavailable and unit lookup/property-read refusal before call;
+5. system bus unavailable and unit reference/lookup/property-read refusal
+   before call, including an installed inactive unit initially absent from
+   `GetUnit`;
 6. subscription failure and proven loss before transmission remain no-effect;
 7. every post-transmission manager method error remains indeterminate under
    the explicitly empty allowlist;

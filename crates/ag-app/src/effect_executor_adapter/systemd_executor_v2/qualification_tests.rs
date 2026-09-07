@@ -82,6 +82,7 @@ fn success_observation() -> DriverObservationV2 {
         job_result: Some("done".to_owned()),
         messages: [
             "get_machine_id_reply",
+            "ref_unit_reply",
             "get_unit_reply",
             "pre_active_state_reply",
             "pre_unit_file_state_reply",
@@ -533,13 +534,16 @@ fn same_name_inert_evidence_guards_refuse_before_permitted_mutation_is_trusted()
 }
 
 #[test]
-fn coherent_message_kind_and_order_substitutions_refuse_replay() {
-    for case in ["kind", "order"] {
+fn coherent_message_kind_order_and_reference_substitutions_refuse_replay() {
+    for case in ["kind", "order", "missing-reference"] {
         let (_directory, plan, dispatch) = fixture();
         run_script(&plan, &dispatch, success_observation());
         coherently_reseal_evidence(&plan, &dispatch, |evidence| match case {
             "kind" => evidence.messages[0].kind = "get_unit_reply".to_owned(),
             "order" => evidence.messages.swap(0, 1),
+            "missing-reference" => {
+                evidence.messages.remove(1);
+            }
             _ => unreachable!(),
         });
         assert!(
