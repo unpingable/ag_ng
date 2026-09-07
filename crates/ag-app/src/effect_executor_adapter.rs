@@ -24,6 +24,15 @@ use ag_primitives::{Digest, JcsDocument};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
+mod systemd_executor_v2;
+
+pub use systemd_executor_v2::{
+    EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2, EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
+    EffectExecutorSystemdPlanV2, execute_systemd_effect_attempt, load_effect_executor_systemd_plan,
+    reconcile_systemd_effect_attempt, reopen_systemd_dbus_evidence,
+};
+use systemd_executor_v2::{MAX_PLAN_BYTES, decode_effect_executor_systemd_plan};
+
 /// Exact Docket work-schema accepted by this adapter.
 pub const EFFECT_EXECUTOR_WORK_SCHEMA_V1: &str = "ag-effectd.docket-executor-work/v1";
 /// Exact sealed executor-plan schema.
@@ -53,7 +62,84 @@ CREATE TABLE IF NOT EXISTS docket_effect_attempt (
     (status!='started' AND receipt IS NOT NULL AND receipt_body IS NOT NULL)
   )
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS systemd_dbus_evidence (
+  attempt TEXT PRIMARY KEY NOT NULL,
+  evidence TEXT UNIQUE NOT NULL,
+  outcome_class TEXT NOT NULL
+    CHECK (outcome_class IN ('success','failure','indeterminate')),
+  raw_len INTEGER NOT NULL CHECK (raw_len > 0 AND raw_len <= 1048576),
+  message_count INTEGER NOT NULL CHECK (message_count >= 0 AND message_count <= 16),
+  maximum_message_bytes INTEGER NOT NULL
+    CHECK (maximum_message_bytes >= 0 AND maximum_message_bytes <= 65536),
+  cumulative_message_bytes INTEGER NOT NULL
+    CHECK (cumulative_message_bytes >= 0 AND cumulative_message_bytes <= 262144),
+  raw BLOB NOT NULL,
+  CHECK (length(raw) = raw_len)
+) STRICT;
+
+CREATE TRIGGER IF NOT EXISTS systemd_dbus_evidence_no_update
+BEFORE UPDATE ON systemd_dbus_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS systemd_dbus_evidence_no_delete
+BEFORE DELETE ON systemd_dbus_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only');
+END;
 ";
+fn systemd_evidence_table_has_rows(connection: &Connection) -> Result<bool, String> {
+    let exists = connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='systemd_dbus_evidence'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("systemd-evidence-schema-inspect:{error}"))?
+        .is_some();
+    if !exists {
+        return Ok(false);
+    }
+    connection
+        .query_row("SELECT count(*) FROM systemd_dbus_evidence", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|count| count > 0)
+        .map_err(|error| format!("systemd-evidence-row-count:{error}"))
+}
+
+pub(super) fn validate_systemd_evidence_guards(connection: &Connection) -> Result<(), String> {
+    for (name, operation) in [
+        (
+            "systemd_dbus_evidence_no_update",
+            "BEFORE UPDATE ON systemd_dbus_evidence",
+        ),
+        (
+            "systemd_dbus_evidence_no_delete",
+            "BEFORE DELETE ON systemd_dbus_evidence",
+        ),
+    ] {
+        let sql = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type='trigger' AND name=?1 AND tbl_name='systemd_dbus_evidence'",
+                [name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("systemd-evidence-guard-inspect:{error}"))?
+            .ok_or_else(|| format!("systemd-evidence-guard-missing:{name}"))?;
+        if !sql.contains(operation)
+            || !sql.contains("SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only')")
+        {
+            return Err(format!("systemd-evidence-guard-substitution:{name}"));
+        }
+    }
+    Ok(())
+}
 
 /// Docket-to-executor message.  Its fields are exact references, not bearer
 /// authority accepted independently by this adapter.
@@ -194,6 +280,81 @@ pub fn load_effect_executor_plan(path: &Path) -> Result<EffectExecutorPlanV1, St
         .map_err(|error| format!("effect-executor-plan-decode:{error}"))?;
     validate_plan(&plan)?;
     Ok(plan)
+}
+
+/// One schema-discriminated executor plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoadedEffectExecutorPlan {
+    /// Exact legacy V1 plan.
+    V1(EffectExecutorPlanV1),
+    /// Exact machine-bound systemd V2 plan.
+    SystemdV2(EffectExecutorSystemdPlanV2),
+}
+
+#[derive(Deserialize)]
+struct EffectExecutorPlanSchemaProbe {
+    schema: String,
+}
+
+impl LoadedEffectExecutorPlan {
+    /// Derive the exact owner work identity.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a plan whose retained fields do not produce a valid owner identity.
+    pub fn identity(&self) -> Result<Digest, String> {
+        match self {
+            Self::V1(plan) => plan.identity(),
+            Self::SystemdV2(plan) => plan.identity(),
+        }
+    }
+}
+
+/// Discriminate the exact plan schema before typed decoding.
+///
+/// # Errors
+///
+/// Refuses an unrecognized schema, invalid canonical bytes, or an invalid plan.
+pub fn load_effect_executor_plan_any(path: &Path) -> Result<LoadedEffectExecutorPlan, String> {
+    if !path.is_absolute() {
+        return Err("effect-executor-plan-path-not-absolute".to_owned());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("effect-executor-plan-open:{}:{error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("effect-executor-plan-metadata:{error}"))?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_PLAN_BYTES {
+        return Err("effect-executor-plan-not-bounded-regular-file".to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_PLAN_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("effect-executor-plan-read:{error}"))?;
+    if bytes.len() as u64 > MAX_PLAN_BYTES {
+        return Err("effect-executor-plan-too-large".to_owned());
+    }
+    let body = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+    let canonical = JcsDocument::from_canonical_bytes(body)
+        .map_err(|error| format!("effect-executor-plan-not-canonical:{error}"))?;
+    let probe: EffectExecutorPlanSchemaProbe = serde_json::from_slice(canonical.as_bytes())
+        .map_err(|error| format!("effect-executor-plan-schema-probe:{error}"))?;
+    match probe.schema.as_str() {
+        EFFECT_EXECUTOR_PLAN_SCHEMA_V1 => {
+            let plan: EffectExecutorPlanV1 = serde_json::from_slice(canonical.as_bytes())
+                .map_err(|error| format!("effect-executor-plan-decode:{error}"))?;
+            validate_plan(&plan)?;
+            Ok(LoadedEffectExecutorPlan::V1(plan))
+        }
+        EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2 => {
+            decode_effect_executor_systemd_plan(&canonical).map(LoadedEffectExecutorPlan::SystemdV2)
+        }
+        _ => Err("effect-executor-plan-schema".to_owned()),
+    }
 }
 
 /// Executes one exact Docket-custodied attempt or returns its prior outcome.
@@ -616,6 +777,9 @@ impl EffectAttemptStoreV1 {
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(|error| format!("effect-executor-store-busy:{error}"))?;
+        if systemd_evidence_table_has_rows(&connection)? {
+            validate_systemd_evidence_guards(&connection)?;
+        }
         // Two first deliveries can discover the newly created database at the
         // same time. `busy_timeout` covers SQLITE_BUSY, but SQLite can report
         // SQLITE_LOCKED while the other connection changes journal mode or
@@ -628,6 +792,7 @@ impl EffectAttemptStoreV1 {
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;",
         )?;
         execute_batch_with_lock_retry(&connection, "effect-executor-store-schema", STORE_SCHEMA)?;
+        validate_systemd_evidence_guards(&connection)?;
         Ok(Self { connection })
     }
 
@@ -850,7 +1015,7 @@ fn checkpoint(connection: &Connection) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ag_effect::TargetId;
+    use ag_effect::{SystemdUnitActionV1, TargetId};
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     fn fixture() -> (
@@ -1019,6 +1184,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn machine_less_v1_systemd_failure_and_terminal_replay_remain_exact() {
+        let (_directory, mut plan, mut dispatch) = fixture();
+        plan.effect = CanonicalEffectV1::SystemdUnit {
+            target: TargetId::parse("legacy-systemd").unwrap(),
+            unit: "legacy.service".to_owned(),
+            action: SystemdUnitActionV1::Start,
+            expected_active_state: "inactive".to_owned(),
+            expected_unit_file_state: "disabled".to_owned(),
+        };
+        plan.artifacts.clear();
+        dispatch.work = plan.identity().unwrap();
+
+        let first = execute_effect_attempt(&plan, &dispatch).unwrap();
+        assert_eq!(first.outcome, EffectExecutorOutcomeClassV1::Failure);
+        let replay = execute_effect_attempt(&plan, &dispatch).unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(reconcile_effect_attempt(&plan, &dispatch).unwrap(), first);
+
+        let connection = Connection::open(&plan.attempt_store).unwrap();
+        let body: Vec<u8> = connection
+            .query_row(
+                "SELECT receipt_body FROM docket_effect_attempt",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt: DocketEffectExecutionReceiptV1 = serde_json::from_slice(&body).unwrap();
+        let ExecutionOutcomeV1::Failed { failure } = receipt.outcome else {
+            panic!("legacy machine-less systemd must remain a definite failure");
+        };
+        assert_eq!(
+            failure.source_code.as_deref(),
+            Some("systemd_backend_unavailable")
+        );
+    }
     #[test]
     fn plan_identity_matches_the_pinned_cross_repo_vector() {
         // The identical plan document and expected digest are pinned in

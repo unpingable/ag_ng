@@ -37,6 +37,7 @@ rustls = { version = "=0.23.37", default-features = false, features = ["std", "r
 rustls-pki-types = "=1.14.0"
 rustls-webpki = "=0.103.9"
 rustix = { version = "1.1.4", features = ["fs"] }
+zbus = "4.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_jcs = "0.2.0"
 serde_json = "1.0.150"

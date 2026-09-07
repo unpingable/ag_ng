@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ag-effectd.docket-executor-systemd-plan.v2.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "attempt_store",
+    "subject",
+    "scope",
+    "effect_index",
+    "effect",
+    "file_policy",
+    "systemd_machine_identity",
+    "execution_lock_timeout_ms",
+    "job_timeout_ms"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ag-effectd.docket-executor-systemd-plan/v2"
+    },
+    "attempt_store": {
+      "type": "string",
+      "pattern": "^/"
+    },
+    "subject": {
+      "$ref": "#/$defs/digest"
+    },
+    "scope": {
+      "$ref": "#/$defs/digest"
+    },
+    "effect_index": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "target",
+        "unit",
+        "action",
+        "expected_active_state",
+        "expected_unit_file_state"
+      ],
+      "properties": {
+        "kind": {
+          "const": "systemd_unit"
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 9,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9:_.@-]+\\.service$"
+        },
+        "action": {
+          "enum": [
+            "start",
+            "stop",
+            "restart",
+            "reload",
+            "enable",
+            "disable"
+          ]
+        },
+        "expected_active_state": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "expected_unit_file_state": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        }
+      }
+    },
+    "file_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "max_content_bytes",
+        "trusted_ancestor_uid",
+        "trusted_parent_uid",
+        "require_private_parent_writes"
+      ],
+      "properties": {
+        "max_content_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "trusted_ancestor_uid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "trusted_parent_uid": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "require_private_parent_writes": {
+          "type": "boolean"
+        }
+      }
+    },
+    "systemd_machine_identity": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "execution_lock_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5000
+    },
+    "job_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30000
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

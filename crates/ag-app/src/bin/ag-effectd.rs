@@ -4,8 +4,9 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 use ag_app::effect_executor_adapter::{
-    DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1, EffectExecutorDispatchV1, execute_effect_attempt,
-    load_effect_executor_plan, reconcile_effect_attempt,
+    DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1, EffectExecutorDispatchV1, LoadedEffectExecutorPlan,
+    execute_effect_attempt, execute_systemd_effect_attempt, load_effect_executor_plan_any,
+    reconcile_effect_attempt, reconcile_systemd_effect_attempt,
 };
 use ag_primitives::JcsDocument;
 use anyhow::Context as _;
@@ -46,23 +47,45 @@ fn main() -> anyhow::Result<()> {
     let arguments = Arguments::parse();
     match arguments.command {
         Command::PlanId { plan } => {
-            let plan = load_effect_executor_plan(&plan).map_err(anyhow::Error::msg)?;
+            let plan = load_effect_executor_plan_any(&plan).map_err(anyhow::Error::msg)?;
             println!("{}", plan.identity().map_err(anyhow::Error::msg)?);
         }
         Command::Execute { plan } => {
-            let plan = load_effect_executor_plan(&plan).map_err(anyhow::Error::msg)?;
+            let plan = load_effect_executor_plan_any(&plan).map_err(anyhow::Error::msg)?;
             let dispatch: EffectExecutorDispatchV1 = read_stdin_strict()?;
-            let outcome = execute_effect_attempt(&plan, &dispatch).map_err(anyhow::Error::msg)?;
+            let outcome = match &plan {
+                LoadedEffectExecutorPlan::V1(plan) => execute_effect_attempt(plan, &dispatch),
+                LoadedEffectExecutorPlan::SystemdV2(plan) => {
+                    execute_systemd_effect_attempt(plan, &dispatch)
+                }
+            }
+            .map_or_else(handle_adapter_error, Ok)?;
             write_canonical(&outcome)?;
         }
         Command::Reconcile { plan } => {
-            let plan = load_effect_executor_plan(&plan).map_err(anyhow::Error::msg)?;
+            let plan = load_effect_executor_plan_any(&plan).map_err(anyhow::Error::msg)?;
             let dispatch: EffectExecutorDispatchV1 = read_stdin_strict()?;
-            let outcome = reconcile_effect_attempt(&plan, &dispatch).map_err(anyhow::Error::msg)?;
+            let outcome = match &plan {
+                LoadedEffectExecutorPlan::V1(plan) => reconcile_effect_attempt(plan, &dispatch),
+                LoadedEffectExecutorPlan::SystemdV2(plan) => {
+                    reconcile_systemd_effect_attempt(plan, &dispatch)
+                }
+            }
+            .map_or_else(handle_adapter_error, Ok)?;
             write_canonical(&outcome)?;
         }
     }
     Ok(())
+}
+
+fn handle_adapter_error(
+    error: String,
+) -> anyhow::Result<ag_app::effect_executor_adapter::EffectExecutorOutcomeV1> {
+    if error == "systemd_attempt_in_progress" {
+        eprintln!("systemd_attempt_in_progress");
+        std::process::exit(75);
+    }
+    Err(anyhow::Error::msg(error))
 }
 
 fn read_stdin_strict<T: DeserializeOwned>() -> anyhow::Result<T> {

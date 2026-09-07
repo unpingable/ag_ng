@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [features]
 worker-fixture = []
+systemd-dbus = ["dep:async-io", "dep:futures-util", "dep:zbus"]
 
 [[bin]]
 name = "agd"
@@ -40,6 +41,7 @@ name = "ag-standing-resolver"
 path = "src/bin/ag_standing_resolver.rs"
 
 [dependencies]
+async-io = { version = "2.3.2", optional = true }
 ag-campaign = { path = "../ag-campaign" }
 ag-effect = { path = "../ag-effect" }
 ag-kernel = { path = "../ag-kernel" }
@@ -52,6 +54,7 @@ base64.workspace = true
 clap.workspace = true
 hex.workspace = true
 libc.workspace = true
+futures-util = { version = "0.3.30", optional = true }
 nix = { workspace = true, features = ["uio"] }
 rand.workspace = true
 ring.workspace = true
@@ -66,6 +69,7 @@ toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+zbus = { workspace = true, optional = true }
 
 [dev-dependencies]
 ag-operator-ui = { path = "../ag-operator-ui" }

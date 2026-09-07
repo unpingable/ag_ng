@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ag-effectd.systemd-dbus-evidence.v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "work",
+    "attempt",
+    "marker",
+    "effect_index",
+    "systemd_machine_identity",
+    "unit",
+    "action",
+    "expected_active_state",
+    "expected_unit_file_state",
+    "execution_lock_timeout_ms",
+    "job_timeout_ms",
+    "started_at_unix_ms",
+    "finished_at_unix_ms",
+    "elapsed_ms",
+    "live_machine_identity",
+    "unit_object_path",
+    "previous_active_state",
+    "previous_unit_file_state",
+    "job_path",
+    "job_result",
+    "resulting_active_state",
+    "resulting_unit_file_state",
+    "outcome_class",
+    "outcome_code",
+    "messages"
+  ],
+  "properties": {
+    "schema": {
+      "const": "ag-effectd.systemd-dbus-evidence/v1"
+    },
+    "work": {
+      "$ref": "#/$defs/digest"
+    },
+    "attempt": {
+      "$ref": "#/$defs/digest"
+    },
+    "marker": {
+      "$ref": "#/$defs/digest"
+    },
+    "effect_index": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "systemd_machine_identity": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "unit": {
+      "type": "string",
+      "minLength": 9,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9:_.@-]+\\.service$"
+    },
+    "action": {
+      "enum": ["start", "stop", "restart", "reload", "enable", "disable"]
+    },
+    "expected_active_state": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "expected_unit_file_state": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "execution_lock_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5000
+    },
+    "job_timeout_ms": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 30000
+    },
+    "started_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "finished_at_unix_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "live_machine_identity": {
+      "anyOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "unit_object_path": {
+      "$ref": "#/$defs/nullable_string"
+    },
+    "previous_active_state": {
+      "$ref": "#/$defs/nullable_string"
+    },
+    "previous_unit_file_state": {
+      "$ref": "#/$defs/nullable_string"
+    },
+    "job_path": {
+      "$ref": "#/$defs/nullable_string"
+    },
+    "job_result": {
+      "$ref": "#/$defs/nullable_string"
+    },
+    "resulting_active_state": {
+      "$ref": "#/$defs/nullable_string"
+    },
+    "resulting_unit_file_state": {
+      "$ref": "#/$defs/nullable_string"
+    },
+    "outcome_class": {
+      "enum": ["success", "failure", "indeterminate"]
+    },
+    "outcome_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "messages": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "elapsed_ms", "bytes"],
+        "properties": {
+          "kind": {
+            "enum": [
+              "get_machine_id_reply",
+              "get_unit_reply",
+              "pre_active_state_reply",
+              "pre_unit_file_state_reply",
+              "start_unit_reply",
+              "job_removed_signal",
+              "post_active_state_reply",
+              "post_unit_file_state_reply"
+            ]
+          },
+          "elapsed_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "bytes": {
+            "type": "array",
+            "maxItems": 65536,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome_class": { "const": "success" }
+        },
+        "required": ["outcome_class"]
+      },
+      "then": {
+        "properties": {
+          "action": { "const": "start" },
+          "live_machine_identity": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+          "unit_object_path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "previous_active_state": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "previous_unit_file_state": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "job_path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "job_result": { "const": "done" },
+          "resulting_active_state": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "resulting_unit_file_state": { "type": "string", "minLength": 1, "maxLength": 1024 },
+          "outcome_code": { "const": "start_unit_completed" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome_class": { "enum": ["failure", "indeterminate"] }
+        },
+        "required": ["outcome_class"]
+      },
+      "then": {
+        "properties": {
+          "resulting_active_state": { "type": "null" },
+          "resulting_unit_file_state": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome_class": { "const": "failure" }
+        },
+        "required": ["outcome_class"]
+      },
+      "then": {
+        "properties": {
+          "job_path": { "type": "null" },
+          "job_result": { "type": "null" },
+          "outcome_code": {
+            "enum": [
+              "systemd_action_not_qualified",
+              "system_bus_connection_timeout",
+              "system_bus_unavailable",
+              "systemd_peer_proxy_unavailable",
+              "systemd_machine_identity_timeout",
+              "systemd_machine_identity_unavailable",
+              "systemd_machine_identity_malformed",
+              "systemd_machine_identity_mismatch",
+              "systemd_manager_proxy_unavailable",
+              "systemd_unit_lookup_timeout",
+              "systemd_unit_lookup_failed",
+              "systemd_unit_lookup_malformed",
+              "systemd_property_timeout",
+              "systemd_property_failed",
+              "systemd_property_malformed",
+              "systemd_property_not_string",
+              "systemd_manager_call_timeout",
+              "systemd_manager_call_failed",
+              "systemd_manager_reply_malformed",
+              "systemd_prestate_mismatch",
+              "systemd_job_subscription_failed",
+              "dbus_evidence_size_overflow",
+              "dbus_evidence_message_count",
+              "dbus_evidence_message_too_large",
+              "dbus_evidence_cumulative_too_large",
+              "dbus_evidence_message_bound"
+            ]
+          },
+          "messages": {
+            "items": {
+              "type": "object",
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "get_machine_id_reply",
+                    "get_unit_reply",
+                    "pre_active_state_reply",
+                    "pre_unit_file_state_reply"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome_class": { "const": "indeterminate" }
+        },
+        "required": ["outcome_class"]
+      },
+      "then": {
+        "properties": {
+          "outcome_code": {
+            "enum": [
+              "reserved_attempt_without_terminal_receipt",
+              "systemd_start_reply_timeout",
+              "systemd_start_method_error",
+              "systemd_start_reply_malformed",
+              "systemd_job_timeout",
+              "systemd_job_stream_ended",
+              "systemd_job_signal_malformed",
+              "systemd_job_unit_mismatch",
+              "systemd_job_result_not_done",
+              "systemd_poststate_timeout",
+              "systemd_property_failed",
+              "systemd_property_malformed",
+              "systemd_property_not_string",
+              "systemd_manager_call_failed",
+              "systemd_manager_reply_malformed",
+              "dbus_evidence_size_overflow",
+              "dbus_evidence_message_count",
+              "dbus_evidence_message_too_large",
+              "dbus_evidence_cumulative_too_large",
+              "dbus_evidence_message_bound"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "nullable_string": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  }
+}
