@@ -1,15 +1,18 @@
 # Operator-beta systemd D-Bus backend contract
 
 **Recorded:** 2026-09-07
-**Status:** `SECOND_CONTRACT_CORRECTION_READY_FOR_INDEPENDENT_REAUDIT__RUNTIME_NOT_IMPLEMENTED`
+**Status:** `M1A_OWNER_RESULT_QUALIFIED__PUBLICATION_NOT_ASSERTED_BY_THIS_ARTIFACT`
+
 **Owner:** AG-ng
 **Owner base:** `81bcdf9819f0ee3c388e4d0d4502db4769dc315f`
 **Release-basis acceptance:** Cartography
 `2e9a7657c414bd6307efd09fa0104fc6fb92938c`
 
-This is the M1A contract freeze for the fixed non-production systemd HTTP
-service recovery. It does not activate a backend, authorize an effect, contact
-the system bus, create a VM, or qualify the end-to-end beta path.
+This is the implemented and locally qualified M1A owner contract for the fixed
+non-production systemd HTTP service recovery. The bounded run used an isolated
+Debian 12 local VM and exact campaign-owned fixture. This record does not
+authorize another effect, activate production, qualify the Docket/NQ
+composition, or assert current target state from the historical receipt.
 
 ## Existing owner boundary
 
@@ -242,7 +245,7 @@ custody have exactly one permitted relation.
 
 ## Qualification gate
 
-Before this contract becomes an executable M1A result, directly exercise:
+The bounded executable M1A owner result directly qualifies:
 
 1. the existing pinned non-systemd V1 identity vector remains byte-identical;
 2. a machine-less V1 systemd unavailable failure and terminal replay remain
@@ -271,6 +274,6 @@ Before this contract becomes an executable M1A result, directly exercise:
 14. successful enactment followed by missing or contradictory fresh NQ
     postcondition evidence.
 
-The second corrected contract checkpoint requires independent re-audit before
-runtime wiring. Current gate:
-`M1A_SECOND_CONTRACT_CORRECTION_READY_FOR_REAUDIT__RUNTIME_NOT_STARTED`.
+The exact result and retained run-004 evidence require independent result audit
+before publication. Current gate:
+`M1A_OWNER_RESULT_QUALIFIED__INDEPENDENT_RESULT_AUDIT_REQUIRED`.

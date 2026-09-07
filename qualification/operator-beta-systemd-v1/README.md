@@ -1,13 +1,14 @@
-# Operator-beta systemd D-Bus backend V1 — package checkpoint
+# Operator-beta systemd D-Bus backend V1 — M1A owner result
 
-Status: **PACKAGE CORRECTION READY FOR INDEPENDENT RE-AUDIT / LIVE PACKAGE
-LIFECYCLE NOT RUN**
+Status: **QUALIFIED FOR THE BOUNDED M1A OWNER SCOPE / PUBLICATION NOT ASSERTED
+BY THIS ARTIFACT**
 
-The runtime parent `3dd6cbd394e05b4ba3ac2504cebd11a75996fcae` is independently
-accepted. The first package checkpoint
-`ca8fa74fe55085acb9cb9f53bb5027e77b686884` is its exact non-rewriting child;
-this correction retains that ancestry. It does not qualify, publish, deploy,
-or activate the backend.
+The runtime parent `3dd6cbd394e05b4ba3ac2504cebd11a75996fcae` and package
+correction `4f64dbe551356b7cc891134f51ec03fc3c856c9f` are independently
+accepted. The bounded owner result qualifies that exact package subject and
+tree; it does not qualify Docket integration, classic NQ observation,
+production deployment, or current target state after restart. Publication is
+repository custody and is not inferred by this result artifact.
 
 ## Implemented boundary
 
@@ -34,11 +35,11 @@ or activate the backend.
 
 ## Repository-local qualification
 
-The implementation checkpoint passed:
+The implementation and result passed:
 
 - focused Rust adapter replay: 24 passed; one schema fixture emitter ignored;
 - CLI transport qualification: 1 passed;
-- Draft 2020-12 schema/runtime/package parity: 9 passed;
+- Draft 2020-12 schema/runtime/package/receipt qualification: 13 passed;
 - the operator-beta boundary gate and deterministic injected negative control;
 - feature-enabled release build and dependency/isolation inspection;
 - attributable all-target Clippy with accepted-base lint allowances;
@@ -49,17 +50,26 @@ The accepted-base authority-surface gate remains red because two
 `campaign-driver-ng` references already exist unchanged in
 `governed_campaign_v1.rs`. This checkpoint does not alter or waive that debt.
 
-## Explicitly not run or claimed
+## Live package qualification and remaining exclusions
 
-No `.deb` was constructed or installed for this checkpoint. Package
-install/remove/reinstall, its before/after target-state and attempt-store cuts,
-and package-origin execution remain NOT_RUN. No new system-bus call, systemd
-unit action, provider contact, deployment, service activation, Docket process
-integration, or production target mutation was performed by the package
-checkpoint. The retained run-003 owner evidence is prior runtime qualification,
-not package-lifecycle evidence and not a present-postcondition claim.
+Run-004 constructed and installed the campaign-owned binary package on an
+isolated Debian 12 local VM. The fixed target started once, duplicate execute
+and reconcile replayed the exact terminal result without mechanics, package
+remove/reinstall preserved the invocation and store, and a cold restart kept
+historical enactment distinct from the newly observed inactive target. The
+package, target, guest data, store, backup, VM process, and forwarded listeners
+were removed; controller evidence remains for audit.
 
-The next lawful transition is independent re-audit of the exact non-rewriting
-package correction. Only an accepted result may construct the campaign-owned
-binary package and proceed to the isolated Debian 12 install/remove/reinstall,
-reconcile, and teardown matrix defined by the parent campaign records.
+The full Debian source-package build through `dpkg-buildpackage` remains
+NOT_RUN because the controller lacks the declared Debian build dependencies.
+Docket process integration, AG authorization consumption, classic NQ
+observation, Nightshift launch, provider/model work, production deployment,
+general systemd actions, literal physical exactly-once execution, and the
+post-restart current postcondition remain unqualified. See
+[`QUALIFICATION.md`](QUALIFICATION.md) and the closed
+[`qualification-receipt.v1.json`](qualification-receipt.v1.json).
+
+The next lawful transition is independent audit of the exact non-rewriting
+M1A result. An accepted result may be published to its established campaign
+remote; it does not authorize a default-branch merge, deployment, or target
+activation.

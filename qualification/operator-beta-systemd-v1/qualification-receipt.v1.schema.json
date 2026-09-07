@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AG operator-beta systemd M1A exact qualification receipt V1",
+  "const": {
+    "schema": "ag.operator-beta-systemd-m1a-qualification/v1",
+    "campaign": "constellation-operator-beta-systemd-effect-v1",
+    "owner": "AG-ng",
+    "classification": "QUALIFIED",
+    "recorded_at": "2026-09-07T10:27:00Z",
+    "subjects": {
+      "contract": "60de056e32b4c070de050dabcc5e836d4c017aad",
+      "accepted_runtime": "3dd6cbd394e05b4ba3ac2504cebd11a75996fcae",
+      "qualified_package_checkpoint": "4f64dbe551356b7cc891134f51ec03fc3c856c9f",
+      "qualified_tree": "9ef6509d8727cb388e86daf20f9226989756a059"
+    },
+    "scope": {
+      "effect": "SystemdUnit/start",
+      "target": "constellation-beta-http-fixture.service",
+      "guest": "Debian 12 amd64",
+      "systemd": "252",
+      "kernel": "6.1.0-52-cloud-amd64",
+      "machine_identity": "bb1aa44ac2984af89f6d3ac865cd0004",
+      "package": "agent-governor-ng-systemd-executor",
+      "package_version": "0.1.0-1+m1a3",
+      "adapter_path": "/usr/libexec/agent-governor-ng/ag-effectd"
+    },
+    "package": {
+      "archive_sha256": "sha256:2852dc8a516980c4a1936d64a3a3f472d95fccf5eb3935f01a1be277f6b24f26",
+      "archive_length": 2637642,
+      "executable_sha256": "sha256:d2c021892d470d227548bf94ceb943d6b9457592176f289bd9864b40a3aeb460",
+      "installed_mode": "root:root:755",
+      "payload_directories_mode": "root:root:755",
+      "source_recipe_present": true,
+      "controller_debhelper_build": "NOT_RUN_MISSING_DECLARED_DEBIAN_BUILD_DEPENDENCIES",
+      "service_or_maintainer_lifecycle": false
+    },
+    "occurrence": {
+      "subject": "sha256:c3c44b229a2e14197eccef0c774c46f438fbe2aef80925498c5cdcd4eb13de47",
+      "scope": "sha256:8af637fa343a1e1968c2e4f0a44141208d5c17205ae73de883a760c8115e8ced",
+      "work": "sha256:976d8ebe16a7423a42617e21952aa4578f3284650850cb7ec246897260bc4027",
+      "attempt": "sha256:6099f35b21f6cc7b16a430369d7d03e4173704e3ee866edc9ea8d3709ef1aa8a",
+      "marker": "sha256:0457cbd8ff5db9a7d95eb2e2a1c72bf2c1055f8a8367a1c8201e11a1ef0a1d04",
+      "receipt": "sha256:05cab6185fc19c509cc1b48d4aae776d7bb406a8e14e31de0af5f9bc87481eed",
+      "evidence": "sha256:4a7f962a774384f86b21f3b4a9e22d3e67ed964f86c86b86a3adac00c1f8f93d"
+    },
+    "artifacts": [
+      {
+        "kind": "plan",
+        "path": "evidence/run-004-systemd-plan-v2.json",
+        "length": 756,
+        "sha256": "sha256:fe064bc9c540b48758dd4ce367fd0ac524f0ec107107d5b3c7aa5c6c2de4322c"
+      },
+      {
+        "kind": "dispatch",
+        "path": "evidence/run-004-docket-dispatch-v1.json",
+        "length": 475,
+        "sha256": "sha256:510b7903b7a5f9b745cb795829a8770ea82a214b16a15cf5478d7404eb6fdff4"
+      },
+      {
+        "kind": "executor_outcome",
+        "path": "evidence/run-004-executor-outcome-v1.json",
+        "length": 273,
+        "sha256": "sha256:a228a9ef0eadd6808d7825983d8d30536bbfae7d4727e467095a4e0b8d9c32fb"
+      },
+      {
+        "kind": "effect_receipt",
+        "path": "evidence/run-004-effect-receipt-v1.json",
+        "length": 774,
+        "sha256": "sha256:05cab6185fc19c509cc1b48d4aae776d7bb406a8e14e31de0af5f9bc87481eed"
+      },
+      {
+        "kind": "systemd_evidence",
+        "path": "evidence/run-004-systemd-evidence-v1.json",
+        "length": 4363,
+        "sha256": "sha256:78314f7f05b9159c20cb07a8141e436b036c64f660ccd1282476d22aac09f1b7"
+      }
+    ],
+    "live_qualification": {
+      "base_image_sha512": "sha512:490f38e2665bc4c31f1bd4cd66dfab3c7695f652a62862a7034d95f8f05ede4146d6dd55c70cc8b0ac9d9b4f54e18f8860bd5ad5ebfb7a8d5e934f3d12cf3817",
+      "prestate": "inactive/disabled/http_absent",
+      "enactment": "success",
+      "fresh_poststate": "active/running/disabled/http_present",
+      "exactly_one_start_observed": true,
+      "execute_replay_byte_identical": true,
+      "reconcile_byte_identical": true,
+      "package_remove_reinstall_preserved_invocation": true,
+      "package_remove_reinstall_preserved_store": true,
+      "source_store_integrity": "ok",
+      "copied_store_integrity": "ok",
+      "stable_cut_wal": "absent_or_zero_length",
+      "attempt_store_sha256": "sha256:093bd31e7712a7da84c9a4b784da31e1ece22a8640571cf515e3e6acd4a509db",
+      "lock_anchor_sha256": "sha256:48106591f41030a9a457267d77a4c3e2e7f29eab478ccd79f670e8fe76c8b2a3",
+      "restart_reconcile_byte_identical": true,
+      "current_support_after_restart": "NOT_ESTABLISHED_TARGET_INACTIVE_HTTP_ABSENT",
+      "missing_restart_plan_refused": true,
+      "exact_plan_resupply_required": true,
+      "teardown_interruption_recovered": true,
+      "final_teardown_complete": true
+    },
+    "qualified_claims": [
+      "MACHINE_BOUND_SYSTEMD_V2_OWNER_EXECUTION",
+      "KNOWN_NO_EFFECT_KNOWN_EFFECT_OUTCOME_UNKNOWN_SEPARATION",
+      "AT_MOST_ONE_START_PER_EXACT_ATTEMPT",
+      "TERMINAL_REPLAY_WITHOUT_MECHANICS",
+      "OWNER_EVIDENCE_AND_RECEIPT_REOPEN",
+      "INERT_TARGET_LOCAL_PACKAGE_LIFECYCLE",
+      "HISTORICAL_ENACTMENT_DISTINCT_FROM_CURRENT_POSTCONDITION"
+    ],
+    "not_qualified": [
+      "Docket process integration",
+      "AG authorization issuance or one-use consumption integration",
+      "classic NQ pre/post observation integration",
+      "Nightshift or Foreman launch integration",
+      "real provider or model lifecycle",
+      "production deployment",
+      "Debian source-package build through debhelper on the controller",
+      "general systemd actions beyond the fixed start fixture",
+      "literal exactly-once physical execution",
+      "current postcondition after target restart"
+    ],
+    "authority": {
+      "creates_authorization": false,
+      "creates_docket_standing": false,
+      "proves_current_postcondition": false,
+      "claims_distributed_exactly_once": false
+    },
+    "teardown": {
+      "package_absent": true,
+      "target_unit_absent": true,
+      "target_data_absent": true,
+      "guest_store_absent": true,
+      "guest_backup_absent": true,
+      "vm_process_absent": true,
+      "forwarded_listeners_absent": true,
+      "controller_evidence_retained": true
+    }
+  }
+}
