@@ -1,7 +1,7 @@
 # Operator-beta systemd D-Bus backend contract
 
 **Recorded:** 2026-09-07
-**Status:** `CONTRACT_CORRECTION_READY_FOR_INDEPENDENT_REAUDIT__RUNTIME_NOT_IMPLEMENTED`
+**Status:** `SECOND_CONTRACT_CORRECTION_READY_FOR_INDEPENDENT_REAUDIT__RUNTIME_NOT_IMPLEMENTED`
 **Owner:** AG-ng
 **Owner base:** `81bcdf9819f0ee3c388e4d0d4502db4769dc315f`
 **Release-basis acceptance:** Cartography
@@ -67,11 +67,17 @@ attempt-store, subject, scope, effect-index, file-policy, and exact
 `systemd_machine_identity`. V2 accepts only that effect family and no
 preparation checkpoint or artifacts.
 
+V2 also requires `execution_lock_timeout_ms` and `job_timeout_ms`. Both
+participate in canonicalization and work identity. Runtime validation admits
+`1..=5_000` for lock acquisition and `1..=30_000` for the job result. The
+beta plan fixes them to 5,000 ms and 30,000 ms respectively; neither Docket nor
+an environment variable supplies a hidden wider wait.
+
 The machine identity is the lowercase 32-hex value returned by the target
 system bus. It participates in V2 canonicalization and work identity. The
 backend compares the live peer identity before any unit method call. A coherent
-machine-ID substitution therefore changes the sealed work and refuses before
-invocation.
+machine-ID or timeout substitution therefore changes the sealed work and
+refuses before invocation when outside its exact admitted plan.
 
 The loader discriminates V1 and V2 by exact schema before typed decoding.
 Docket's outer transport remains
@@ -94,8 +100,10 @@ admits exactly:
 - machine: the target VM's retained machine ID;
 - unit: `constellation-beta-http-fixture.service`;
 - action: `start`;
-- expected active state: `inactive`; and
-- expected unit-file state: `disabled`.
+- expected active state: `inactive`;
+- expected unit-file state: `disabled`;
+- execution-lock timeout: 5,000 ms; and
+- job-result timeout: 30,000 ms.
 
 Other closed enum actions remain known vocabulary but return
 `systemd_action_not_qualified` before invocation in this tranche. Supporting
@@ -113,22 +121,22 @@ For one Docket-reserved V2 attempt the backend performs:
 5. subscribe to the exact manager job result;
 6. begin one `StartUnit(unit, "replace")` call;
 7. retain the returned exact job object path;
-8. wait within the declared bounded deadline for the matching job result;
+8. wait until the V2-bound monotonic job deadline for the matching job result;
 9. read the same unit properties again; and
 10. commit evidence and the terminal Docket execution receipt atomically.
 
 `Failed` is permitted only when retained evidence proves that step 6 was not
-transmitted, including connection, identity, lookup, property, prestate, and
-subscription failures, or when an explicitly allowlisted manager method-error
-reply proves no job was queued. A generic call error is not proof of
-non-transmission.
+transmitted: connection, identity, lookup, property, prestate, and subscription
+failures. The M1A post-transmission manager-error allowlist is explicitly
+empty.
 
 The uncertainty boundary begins when transmission of `StartUnit` is
-attempted, not when its reply or job path is received. Every unproved
-post-transmission cut is `Indeterminate`: send/reply loss, missing job path,
-timeout, unmatched or malformed job testimony, non-`done` terminal job
-result, poststate-read failure, or terminal-custody failure. No transport error
-is promoted into a known no-effect result.
+attempted, not when its reply or job path is received. Every method error and
+every other unproved post-transmission cut is `Indeterminate`: send/reply
+loss, missing job path, timeout, unmatched or malformed job testimony,
+non-`done` terminal job result, poststate-read failure, or terminal-custody
+failure. No transport or manager error is promoted into a known no-effect
+result in this tranche.
 
 Only the matching `JobRemoved` result `done`, followed by exact poststate
 reads and durable evidence custody, yields the existing typed
@@ -145,7 +153,8 @@ existing executor attempt store for V2 attempts. It binds:
 - Docket work, attempt, marker, and effect index;
 - sealed machine identity, unit, action, and expected prestate;
 - live peer machine identity;
-- ordered observation/invocation/completion timestamps;
+- both V2 timeout values, ordered wall-clock testimony, and monotonic elapsed
+  durations used for the local bounds;
 - decoded unit object path, prestate, job path, job result, and poststate;
 - ordered exact D-Bus reply/signal bytes with message-kind labels; and
 - a domain-separated digest over the canonical record.
@@ -171,11 +180,14 @@ does not get reconstructed from the current unit state.
 ## Crash and concurrency cuts
 
 Every execute or reconcile call first opens the validated regular attempt-store
-file and participates in one bounded exclusive execution lock. The lock is
-local concurrency evidence, not workflow authority. While the lock is held,
-another caller performs no database transition and no system-bus call; it
-returns an explicit nonterminal/in-progress transport result for Docket to
-retain without inventing an executor receipt.
+file and participates in one exclusive execution lock bounded by the exact V2
+`execution_lock_timeout_ms`. The lock is local concurrency evidence, not
+workflow authority. If it remains held at the monotonic deadline, the adapter
+exits nonzero with fixed sanitized `systemd_attempt_in_progress` stderr and no
+stdout outcome or executor receipt. This is a Docket V1 process-transport
+refusal, not a new executor outcome. Docket preserves its existing
+transport-refusal/outcome-unknown custody and may later use its existing
+reconcile path.
 
 The lock holder then reopens the attempt:
 
@@ -205,15 +217,18 @@ Before this contract becomes an executable M1A result, directly exercise:
 2. a machine-less V1 systemd unavailable failure and terminal replay remain
    valid and never select the real backend;
 3. exact successful V2 beta start with raw evidence reopen;
-4. wrong plan/work schema, machine, unit, action, both prestates, work, attempt,
-   marker, effect index, executable, and feature-set substitutions;
+4. wrong plan/work schema, machine, either timeout, unit, action, both
+   prestates, work, attempt, marker, effect index, executable, and feature-set
+   substitutions;
 5. system bus unavailable and unit lookup/property-read refusal before call;
 6. subscription failure and proven loss before transmission remain no-effect;
-7. explicit allowlisted manager refusal with no job;
-8. post-send/pre-reply loss, timeout, wrong job path, wrong job result,
-   malformed and oversized message remain indeterminate;
-9. duplicate and concurrent delivery with one observed method call, no
-   concurrent terminal overwrite, and exact final attempt/evidence agreement;
+7. every post-transmission manager method error remains indeterminate under
+   the explicitly empty allowlist;
+8. post-send/pre-reply loss, job-deadline expiry, wrong job path, wrong job
+   result, malformed and oversized message remain indeterminate;
+9. duplicate and concurrent delivery with one observed method call, exact
+   lock-deadline nonzero/no-stdout refusal, no concurrent terminal overwrite,
+   and exact final attempt/evidence agreement;
 10. restart and query-only reconcile with no method call;
 11. fault between evidence insert and terminal update rolls back both;
 12. evidence row deletion, content mutation, kind relabel, order change, and
@@ -223,6 +238,6 @@ Before this contract becomes an executable M1A result, directly exercise:
 14. successful enactment followed by missing or contradictory fresh NQ
     postcondition evidence.
 
-The corrected contract checkpoint requires independent re-audit before runtime
-wiring. Current gate:
-`M1A_CONTRACT_CORRECTION_READY_FOR_REAUDIT__RUNTIME_NOT_STARTED`.
+The second corrected contract checkpoint requires independent re-audit before
+runtime wiring. Current gate:
+`M1A_SECOND_CONTRACT_CORRECTION_READY_FOR_REAUDIT__RUNTIME_NOT_STARTED`.
