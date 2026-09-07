@@ -46,7 +46,8 @@ cargo build --locked --manifest-path docket/Cargo.toml -p gwr-local --bin docket
 cargo build --locked --manifest-path ag-ng/Cargo.toml \
   -p ag-app --bin ag-effectd --example docket_file_harness
 
-RUN_ROOT="$(mktemp -d)/ag-ng-docket-example"
+RUN_PARENT="$(mktemp -d)"
+RUN_ROOT="$RUN_PARENT/ag-ng-docket-example"
 ag-ng/target/debug/examples/docket_file_harness \
   "$(pwd)/docket/target/debug/docket" \
   "$(pwd)/ag-ng/target/debug/ag-effectd" \
@@ -75,7 +76,7 @@ path. It prints and retains `summary.json`. A passing summary contains these fac
 }
 ```
 
-Inspect `permitted/observed-effect`, all three `ag-campaign.sqlite` stores, the permitted and acknowledgement-loss `docket-state/state.sqlite` and `executor-attempts.sqlite` stores, and the read surfaces:
+Inspect the effect file and machine-readable summary first:
 
 ```sh
 python3 -m json.tool "$RUN_ROOT/summary.json"
@@ -95,13 +96,18 @@ docket/target/debug/docket governed-loop inspect \
   --state "$RUN_ROOT/permitted/docket-state" --issuance "$ISSUANCE"
 ```
 
-To clean up, confirm `RUN_ROOT` contains this example summary, then remove only that
-directory:
+The AG, Docket, and executor SQLite files under `RUN_ROOT` are persistence artifacts, not
+a documented raw-query API. Preserve them together for restart/reconciliation; use the
+summary and Docket command above for this example.
+
+When finished, confirm `RUN_ROOT` contains this example summary, then remove only that
+directory and its empty campaign-created parent:
 
 ```sh
 test -f "$RUN_ROOT/summary.json"
 python3 -m json.tool "$RUN_ROOT/summary.json" >/dev/null
 rm -rf -- "$RUN_ROOT"
+rmdir -- "$RUN_PARENT"
 ```
 
 The example enrolls and writes no resource outside `RUN_ROOT`.
