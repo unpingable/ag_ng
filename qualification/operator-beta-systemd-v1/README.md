@@ -1,11 +1,13 @@
-# Operator-beta systemd D-Bus backend V1 — implementation checkpoint
+# Operator-beta systemd D-Bus backend V1 — package checkpoint
 
-Status: **READY FOR INDEPENDENT CODE AUDIT / LIVE VM QUALIFICATION NOT RUN**
+Status: **PACKAGE CORRECTION READY FOR INDEPENDENT RE-AUDIT / LIVE PACKAGE
+LIFECYCLE NOT RUN**
 
-This checkpoint implements the accepted M1A contract at
-`docs/operator-beta-systemd-dbus-backend-v1.md` on the exact contract parent
-`60de056e32b4c070de050dabcc5e836d4c017aad`. It does not qualify, publish,
-deploy, or activate the backend.
+The runtime parent `3dd6cbd394e05b4ba3ac2504cebd11a75996fcae` is independently
+accepted. The first package checkpoint
+`ca8fa74fe55085acb9cb9f53bb5027e77b686884` is its exact non-rewriting child;
+this correction retains that ancestry. It does not qualify, publish, deploy,
+or activate the backend.
 
 ## Implemented boundary
 
@@ -36,7 +38,7 @@ The implementation checkpoint passed:
 
 - focused Rust adapter replay: 24 passed; one schema fixture emitter ignored;
 - CLI transport qualification: 1 passed;
-- Draft 2020-12 schema/runtime parity: 8 passed;
+- Draft 2020-12 schema/runtime/package parity: 9 passed;
 - the operator-beta boundary gate and deterministic injected negative control;
 - feature-enabled release build and dependency/isolation inspection;
 - attributable all-target Clippy with accepted-base lint allowances;
@@ -49,13 +51,15 @@ The accepted-base authority-surface gate remains red because two
 
 ## Explicitly not run or claimed
 
-No system-bus call, systemd unit action, disposable VM exercise, provider
-contact, deployment, service activation, Docket process integration, or
-production target mutation was performed. No present postcondition is claimed.
-A successful owner receipt would remain enactment testimony; fresh target-local
-systemd state and controller-vantage HTTP evidence are separate M1A
-live-qualification inputs.
+No `.deb` was constructed or installed for this checkpoint. Package
+install/remove/reinstall, its before/after target-state and attempt-store cuts,
+and package-origin execution remain NOT_RUN. No new system-bus call, systemd
+unit action, provider contact, deployment, service activation, Docket process
+integration, or production target mutation was performed by the package
+checkpoint. The retained run-003 owner evidence is prior runtime qualification,
+not package-lifecycle evidence and not a present-postcondition claim.
 
-The next lawful transition is independent code audit of the exact checkpoint.
-Only an accepted code result may proceed to the isolated Debian 12 M1A package
-and disposable-VM matrix defined by the parent campaign records.
+The next lawful transition is independent re-audit of the exact non-rewriting
+package correction. Only an accepted result may construct the campaign-owned
+binary package and proceed to the isolated Debian 12 install/remove/reinstall,
+reconcile, and teardown matrix defined by the parent campaign records.

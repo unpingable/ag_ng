@@ -105,12 +105,17 @@ exact Docket dispatch plus the sealed V2 plan admits one adapter attempt.
 
 For qualification item 13, package lifecycle preservation has the following
 bounded meaning. Before package removal or replacement, no adapter process may
-be active. The target service state and exact executor attempt-store database,
-WAL state, and `.systemd-execution-lock` anchor are recorded. A campaign-owned
-backup is accepted only when a read-only SQLite integrity check succeeds and
-the database and anchor byte lengths and SHA-256 digests reproduce. Install,
-remove, and reinstall must not change those files or the target service. After
-reinstall, query-only `reconcile` must reproduce the retained terminal outcome
+be active. Both stable cuts require the SQLite WAL to be absent or zero-length;
+a nonempty WAL refuses this qualification rather than being omitted or copied
+as though the main database were complete. The target service state and exact
+executor attempt-store database, WAL absence/zero-length fact, and
+`.systemd-execution-lock` anchor are recorded. A campaign-owned backup is
+accepted only when a read-only SQLite integrity check succeeds, the copied
+database independently reopens, the copied WAL is likewise absent or
+zero-length, and the database and anchor byte lengths and SHA-256 digests
+reproduce. Install, remove, and reinstall must not change those files, the WAL
+fact, or the target service. After reinstall, query-only `reconcile` must
+reproduce the retained terminal outcome
 without invoking mechanics. This is package-lifecycle evidence for the one
 executor store; it is not the separately defined coherent three-store AG
 backup protocol and does not authorize restoring a copied database as live
