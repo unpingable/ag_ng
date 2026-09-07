@@ -12,6 +12,7 @@ fail() {
 contract=docs/operator-beta-systemd-dbus-backend-v1.md
 runtime=crates/ag-app/src/effect_executor_adapter/systemd_executor_v2.rs
 driver=crates/ag-app/src/effect_executor_adapter/systemd_executor_v2/zbus_driver.rs
+tests=crates/ag-app/src/effect_executor_adapter/systemd_executor_v2/qualification_tests.rs
 adapter=crates/ag-app/src/effect_executor_adapter.rs
 cli=crates/ag-app/src/bin/ag-effectd.rs
 manifest=crates/ag-app/Cargo.toml
@@ -53,11 +54,19 @@ rg -q '"systemd_start_method_error"' "$driver" &&
   rg -q 'transcript\.indeterminate\(' "$driver" ||
   fail "post-transmission manager error is not outcome-unknown"
 
-rg -q 'systemd_dbus_evidence_no_update' "$adapter" &&
-  rg -q 'systemd_dbus_evidence_no_delete' "$adapter" &&
+rg -q 'SYSTEMD_EVIDENCE_UPDATE_TRIGGER_SQL' "$adapter" &&
+  rg -q 'SYSTEMD_EVIDENCE_DELETE_TRIGGER_SQL' "$adapter" &&
+  rg -q 'normalized_sql\(&sql\) != expected' "$adapter" &&
   rg -q 'TransactionBehavior::Immediate' "$runtime" &&
-  rg -q 'systemd-evidence-without-terminal' "$runtime" ||
+  rg -q 'systemd-evidence-without-terminal' "$runtime" &&
+  rg -q 'same_name_inert_evidence_guards_refuse_before_permitted_mutation_is_trusted' "$tests" ||
   fail "append-only atomic evidence/terminal custody is incomplete"
+rg -q '\.systemd-execution-lock' "$runtime" &&
+  rg -q 'bind_or_validate_store_anchor' "$runtime" &&
+  rg -q 'validate_current_paths' "$runtime" &&
+  rg -q 'systemd-store-identity-substitution' "$runtime" &&
+  rg -q 'pathname_replacement_cannot_split_concurrent_writers_or_invoke_mechanics' "$tests" ||
+  fail "stable attempt-store lock and pathname custody is incomplete"
 rg -q 'MAX_MESSAGES: usize = 16' "$runtime" &&
   rg -q 'MAX_MESSAGE_BYTES: usize = 64 \* 1024' "$runtime" &&
   rg -q 'MAX_CUMULATIVE_MESSAGE_BYTES: usize = 256 \* 1024' "$runtime" ||

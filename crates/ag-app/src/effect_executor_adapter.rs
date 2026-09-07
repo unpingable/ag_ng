@@ -11,7 +11,6 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ag_effect::CanonicalEffectV1;
 use ag_effect::executor::{
     ArtifactReadErrorV1, ArtifactSourceV1, CapabilityFailureV1, CapabilityOutcomeV1,
     DocketCustodiedExecutionPermitV1, DocketEffectExecutionReceiptV1, EffectExecutorV1,
@@ -20,18 +19,19 @@ use ag_effect::executor::{
     PointerPreparationSuccessV1, SystemdDbusBackendV1, SystemdManagerReloadRequestV1,
     SystemdManagerReloadSuccessV1, SystemdUnitRequestV1, SystemdUnitSuccessV1,
 };
+use ag_effect::CanonicalEffectV1;
 use ag_primitives::{Digest, JcsDocument};
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 mod systemd_executor_v2;
 
+use systemd_executor_v2::{decode_effect_executor_systemd_plan, MAX_PLAN_BYTES};
 pub use systemd_executor_v2::{
+    execute_systemd_effect_attempt, load_effect_executor_systemd_plan,
+    reconcile_systemd_effect_attempt, reopen_systemd_dbus_evidence, EffectExecutorSystemdPlanV2,
     EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2, EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
-    EffectExecutorSystemdPlanV2, execute_systemd_effect_attempt, load_effect_executor_systemd_plan,
-    reconcile_systemd_effect_attempt, reopen_systemd_dbus_evidence,
 };
-use systemd_executor_v2::{MAX_PLAN_BYTES, decode_effect_executor_systemd_plan};
 
 /// Exact Docket work-schema accepted by this adapter.
 pub const EFFECT_EXECUTOR_WORK_SCHEMA_V1: &str = "ag-effectd.docket-executor-work/v1";
@@ -90,6 +90,13 @@ BEGIN
   SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only');
 END;
 ";
+const SYSTEMD_EVIDENCE_UPDATE_TRIGGER_SQL: &str = "CREATE TRIGGER systemd_dbus_evidence_no_update BEFORE UPDATE ON systemd_dbus_evidence BEGIN SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only'); END";
+const SYSTEMD_EVIDENCE_DELETE_TRIGGER_SQL: &str = "CREATE TRIGGER systemd_dbus_evidence_no_delete BEFORE DELETE ON systemd_dbus_evidence BEGIN SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only'); END";
+
+fn normalized_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn systemd_evidence_table_has_rows(connection: &Connection) -> Result<bool, String> {
     let exists = connection
         .query_row(
@@ -112,14 +119,14 @@ fn systemd_evidence_table_has_rows(connection: &Connection) -> Result<bool, Stri
 }
 
 pub(super) fn validate_systemd_evidence_guards(connection: &Connection) -> Result<(), String> {
-    for (name, operation) in [
+    for (name, expected) in [
         (
             "systemd_dbus_evidence_no_update",
-            "BEFORE UPDATE ON systemd_dbus_evidence",
+            SYSTEMD_EVIDENCE_UPDATE_TRIGGER_SQL,
         ),
         (
             "systemd_dbus_evidence_no_delete",
-            "BEFORE DELETE ON systemd_dbus_evidence",
+            SYSTEMD_EVIDENCE_DELETE_TRIGGER_SQL,
         ),
     ] {
         let sql = connection
@@ -132,9 +139,7 @@ pub(super) fn validate_systemd_evidence_guards(connection: &Connection) -> Resul
             .optional()
             .map_err(|error| format!("systemd-evidence-guard-inspect:{error}"))?
             .ok_or_else(|| format!("systemd-evidence-guard-missing:{name}"))?;
-        if !sql.contains(operation)
-            || !sql.contains("SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only')")
-        {
+        if normalized_sql(&sql) != expected {
             return Err(format!("systemd-evidence-guard-substitution:{name}"));
         }
     }

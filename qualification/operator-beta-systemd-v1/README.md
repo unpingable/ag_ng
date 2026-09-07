@@ -17,7 +17,10 @@ deploy, or activate the backend.
   bytes, subscribes to `JobRemoved` before `StartUnit`, and keeps
   pre-transmission failure separate from post-transmission indeterminate
   outcomes.
-- One exclusive attempt-store lock serializes mechanics. Evidence and the
+- One logical execution lock combines a stable derived sidecar lock with the
+  attempt-store inode lock. The sidecar durably binds the exact store
+  device/inode, and path identity is checked around SQLite access, so pathname
+  replacement cannot split campaign-owned concurrent writers. Evidence and the
   terminal Docket receipt commit in one SQLite immediate transaction.
   Reconciliation reopens exact custody and never resumes mechanics.
 - Evidence validation closes message shape/order, byte bounds, owner outcome
@@ -31,7 +34,7 @@ deploy, or activate the backend.
 
 The implementation checkpoint passed:
 
-- focused Rust adapter replay: 22 passed; one schema fixture emitter ignored;
+- focused Rust adapter replay: 24 passed; one schema fixture emitter ignored;
 - CLI transport qualification: 1 passed;
 - Draft 2020-12 schema/runtime parity: 8 passed;
 - the operator-beta boundary gate and deterministic injected negative control;

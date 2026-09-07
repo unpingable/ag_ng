@@ -312,6 +312,39 @@ fn execution_lock_contention_is_a_transport_refusal_and_never_calls_driver() {
 }
 
 #[test]
+fn pathname_replacement_cannot_split_concurrent_writers_or_invoke_mechanics() {
+    let (directory, mut plan, mut dispatch) = fixture();
+    plan.execution_lock_timeout_ms = 1;
+    dispatch.work = plan.identity().unwrap();
+    let held = ExecutionLockV2::acquire(&plan.attempt_store, 1)
+        .unwrap()
+        .unwrap();
+    let replaced_store = directory.path().join("replaced-attempts.sqlite");
+    std::fs::rename(&plan.attempt_store, &replaced_store).unwrap();
+    std::fs::File::create(&plan.attempt_store).unwrap();
+
+    assert!(ExecutionLockV2::acquire(&plan.attempt_store, 1)
+        .unwrap()
+        .is_none());
+    drop(held);
+    let Err(replacement_error) = ExecutionLockV2::acquire(&plan.attempt_store, 1) else {
+        panic!("replacement store must refuse lock custody");
+    };
+    assert_eq!(replacement_error, "systemd-store-identity-substitution");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let driver = ScriptedDriver {
+        calls: Arc::clone(&calls),
+        observation: success_observation(),
+    };
+    assert_eq!(
+        execute_with_driver(&plan, &dispatch, &driver, false).unwrap_err(),
+        "systemd-store-identity-substitution"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn oversized_driver_evidence_refuses_before_evidence_or_terminal_commit() {
     let (_directory, plan, dispatch) = fixture();
     let mut observation = success_observation();
@@ -434,6 +467,68 @@ fn evidence_guard_deletion_content_and_metadata_substitutions_refuse_reopen() {
             reconcile_systemd_effect_attempt(&plan, &dispatch).is_err(),
             "{case}"
         );
+    }
+}
+
+#[test]
+fn same_name_inert_evidence_guards_refuse_before_permitted_mutation_is_trusted() {
+    for operation in ["update", "delete"] {
+        let (_directory, plan, dispatch) = fixture();
+        run_script(&plan, &dispatch, success_observation());
+        let connection = Connection::open(&plan.attempt_store).unwrap();
+        drop_evidence_triggers(&connection);
+        match operation {
+            "update" => connection
+                .execute_batch(
+                    "CREATE TRIGGER systemd_dbus_evidence_no_update
+                     BEFORE UPDATE ON systemd_dbus_evidence WHEN 0
+                     BEGIN SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only'); END;
+                     CREATE TRIGGER systemd_dbus_evidence_no_delete
+                     BEFORE DELETE ON systemd_dbus_evidence
+                     BEGIN SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only'); END;",
+                )
+                .unwrap(),
+            "delete" => connection
+                .execute_batch(
+                    "CREATE TRIGGER systemd_dbus_evidence_no_update
+                     BEFORE UPDATE ON systemd_dbus_evidence
+                     BEGIN SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only'); END;
+                     CREATE TRIGGER systemd_dbus_evidence_no_delete
+                     BEFORE DELETE ON systemd_dbus_evidence WHEN 0
+                     BEGIN SELECT RAISE(ABORT, 'systemd D-Bus evidence is append-only'); END;",
+                )
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            validate_systemd_evidence_guards(&connection).unwrap_err(),
+            format!("systemd-evidence-guard-substitution:systemd_dbus_evidence_no_{operation}")
+        );
+        match operation {
+            "update" => {
+                assert_eq!(
+                    connection
+                        .execute(
+                            "UPDATE systemd_dbus_evidence SET raw=raw WHERE attempt=?1",
+                            [dispatch.attempt.as_str()],
+                        )
+                        .unwrap(),
+                    1
+                );
+            }
+            "delete" => {
+                assert_eq!(
+                    connection
+                        .execute(
+                            "DELETE FROM systemd_dbus_evidence WHERE attempt=?1",
+                            [dispatch.attempt.as_str()],
+                        )
+                        .unwrap(),
+                    1
+                );
+            }
+            _ => unreachable!(),
+        }
     }
 }
 

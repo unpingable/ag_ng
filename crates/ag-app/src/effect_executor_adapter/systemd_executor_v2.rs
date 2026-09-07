@@ -2,7 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Read as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -553,8 +553,32 @@ fn restart_observation(reason: &str) -> DriverObservationV2 {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct StoreFileIdentityV2 {
+    device: u64,
+    inode: u64,
+}
+
+impl StoreFileIdentityV2 {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn anchor(self) -> Vec<u8> {
+        format!("{}:{}\n", self.device, self.inode).into_bytes()
+    }
+}
+
 struct ExecutionLockV2 {
-    _file: File,
+    path_lock: File,
+    _store_lock: File,
+    store_path: PathBuf,
+    lock_path: PathBuf,
+    store_identity: StoreFileIdentityV2,
+    lock_identity: StoreFileIdentityV2,
 }
 
 impl ExecutionLockV2 {
@@ -566,7 +590,28 @@ impl ExecutionLockV2 {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("systemd-store-parent:{error}"))?;
         }
-        let file = OpenOptions::new()
+
+        let lock_path = execution_lock_path(path);
+        let path_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| format!("systemd-path-lock-open:{error}"))?;
+        let lock_metadata = path_lock
+            .metadata()
+            .map_err(|error| format!("systemd-path-lock-metadata:{error}"))?;
+        if !lock_metadata.is_file() {
+            return Err("systemd-path-lock-not-regular".to_owned());
+        }
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        if !lock_file_until(&path_lock, deadline)? {
+            return Ok(None);
+        }
+
+        let store_lock = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -574,26 +619,143 @@ impl ExecutionLockV2 {
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)
             .map_err(|error| format!("systemd-store-lock-open:{error}"))?;
-        let metadata = file
+        let store_metadata = store_lock
             .metadata()
             .map_err(|error| format!("systemd-store-lock-metadata:{error}"))?;
-        if !metadata.is_file() {
+        if !store_metadata.is_file() {
             return Err("systemd-store-lock-not-regular".to_owned());
         }
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        loop {
-            match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => return Ok(Some(Self { _file: file })),
-                Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                    if Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    thread::sleep(Duration::from_millis(5));
+        if !lock_file_until(&store_lock, deadline)? {
+            return Ok(None);
+        }
+
+        let store_identity = StoreFileIdentityV2::from_metadata(&store_metadata);
+        let lock_identity = StoreFileIdentityV2::from_metadata(&lock_metadata);
+        bind_or_validate_store_anchor(&path_lock, store_identity)?;
+        let lock = Self {
+            path_lock,
+            _store_lock: store_lock,
+            store_path: path.to_path_buf(),
+            lock_path,
+            store_identity,
+            lock_identity,
+        };
+        lock.validate_current_paths()?;
+        Ok(Some(lock))
+    }
+
+    fn validate_current_paths(&self) -> Result<(), String> {
+        validate_path_identity(
+            &self.lock_path,
+            self.lock_identity,
+            "systemd-path-lock-identity-substitution",
+        )?;
+        validate_path_identity(
+            &self.store_path,
+            self.store_identity,
+            "systemd-store-identity-substitution",
+        )?;
+        let anchor = read_store_anchor(&self.path_lock)?;
+        if anchor != self.store_identity.anchor() {
+            return Err("systemd-store-anchor-substitution".to_owned());
+        }
+        Ok(())
+    }
+
+    fn validate_existing(path: &Path) -> Result<(), String> {
+        let lock_path = execution_lock_path(path);
+        let path_lock = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .map_err(|error| format!("systemd-path-lock-open-read-only:{error}"))?;
+        let anchor = read_store_anchor(&path_lock)?;
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("systemd-store-lstat:{error}"))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err("systemd-store-not-regular".to_owned());
+        }
+        if anchor != StoreFileIdentityV2::from_metadata(&metadata).anchor() {
+            return Err("systemd-store-identity-substitution".to_owned());
+        }
+        Ok(())
+    }
+}
+
+fn execution_lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".systemd-execution-lock");
+    PathBuf::from(value)
+}
+
+fn lock_file_until(file: &File, deadline: Instant) -> Result<bool, String> {
+    loop {
+        match flock(file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(true),
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                if Instant::now() >= deadline {
+                    return Ok(false);
                 }
-                Err(error) => return Err(format!("systemd-store-lock:{error}")),
+                thread::sleep(Duration::from_millis(5));
             }
+            Err(error) => return Err(format!("systemd-store-lock:{error}")),
         }
     }
+}
+
+fn bind_or_validate_store_anchor(
+    path_lock: &File,
+    identity: StoreFileIdentityV2,
+) -> Result<(), String> {
+    let expected = identity.anchor();
+    let present = read_store_anchor(path_lock)?;
+    if present.is_empty() {
+        path_lock
+            .write_all_at(&expected, 0)
+            .map_err(|error| format!("systemd-store-anchor-write:{error}"))?;
+        path_lock
+            .set_len(expected.len() as u64)
+            .map_err(|error| format!("systemd-store-anchor-truncate:{error}"))?;
+        path_lock
+            .sync_all()
+            .map_err(|error| format!("systemd-store-anchor-sync:{error}"))?;
+    } else if present != expected {
+        return Err("systemd-store-identity-substitution".to_owned());
+    }
+    Ok(())
+}
+
+fn read_store_anchor(path_lock: &File) -> Result<Vec<u8>, String> {
+    const MAX_ANCHOR_BYTES: u64 = 128;
+    let length = path_lock
+        .metadata()
+        .map_err(|error| format!("systemd-store-anchor-metadata:{error}"))?
+        .len();
+    if length > MAX_ANCHOR_BYTES {
+        return Err("systemd-store-anchor-too-large".to_owned());
+    }
+    let length =
+        usize::try_from(length).map_err(|_| "systemd-store-anchor-length-conversion".to_owned())?;
+    let mut anchor = vec![0; length];
+    path_lock
+        .read_exact_at(&mut anchor, 0)
+        .map_err(|error| format!("systemd-store-anchor-read:{error}"))?;
+    Ok(anchor)
+}
+
+fn validate_path_identity(
+    path: &Path,
+    expected: StoreFileIdentityV2,
+    error: &str,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|cause| format!("{error}:{cause}"))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || StoreFileIdentityV2::from_metadata(&metadata) != expected
+    {
+        return Err(error.to_owned());
+    }
+    Ok(())
 }
 
 /// Execute one machine-bound V2 systemd attempt.
@@ -630,13 +792,13 @@ pub fn reconcile_systemd_effect_attempt(
     dispatch: &EffectExecutorDispatchV1,
 ) -> Result<EffectExecutorOutcomeV1, String> {
     validate_dispatch(plan, dispatch)?;
-    let Some(_lock) =
-        ExecutionLockV2::acquire(&plan.attempt_store, plan.execution_lock_timeout_ms)?
+    let Some(lock) = ExecutionLockV2::acquire(&plan.attempt_store, plan.execution_lock_timeout_ms)?
     else {
         return Err("systemd_attempt_in_progress".to_owned());
     };
     let mut store = EffectAttemptStoreV1::open(&plan.attempt_store)?;
-    match store.get(&dispatch.attempt)? {
+    lock.validate_current_paths()?;
+    let result = match store.get(&dispatch.attempt)? {
         Some(record) if !record.matches(dispatch) => {
             Err("effect-executor-attempt-substitution".to_owned())
         }
@@ -656,7 +818,9 @@ pub fn reconcile_systemd_effect_attempt(
             }
         },
         None => Err("effect-executor-attempt-not-found".to_owned()),
-    }
+    };
+    lock.validate_current_paths()?;
+    result
 }
 
 /// Reopen exact canonical D-Bus evidence without invoking mechanics.
@@ -669,6 +833,7 @@ pub fn reopen_systemd_dbus_evidence(
     dispatch: &EffectExecutorDispatchV1,
 ) -> Result<Vec<u8>, String> {
     validate_dispatch(plan, dispatch)?;
+    ExecutionLockV2::validate_existing(&plan.attempt_store)?;
     let connection = rusqlite::Connection::open_with_flags(
         &plan.attempt_store,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -692,6 +857,7 @@ pub fn reopen_systemd_dbus_evidence(
         serde_json::from_slice(body).map_err(|error| format!("systemd-receipt-decode:{error}"))?;
     let (_, evidence_digest) = evidence_reference(&receipt.outcome)?;
     let (_, raw) = load_evidence(&connection, &dispatch.attempt, &evidence_digest)?;
+    ExecutionLockV2::validate_existing(&plan.attempt_store)?;
     Ok(raw)
 }
 
@@ -703,13 +869,13 @@ fn execute_with_driver(
     fail_after_evidence_insert: bool,
 ) -> Result<EffectExecutorOutcomeV1, String> {
     validate_dispatch(plan, dispatch)?;
-    let Some(_lock) =
-        ExecutionLockV2::acquire(&plan.attempt_store, plan.execution_lock_timeout_ms)?
+    let Some(lock) = ExecutionLockV2::acquire(&plan.attempt_store, plan.execution_lock_timeout_ms)?
     else {
         return Err("systemd_attempt_in_progress".to_owned());
     };
     let mut store = EffectAttemptStoreV1::open(&plan.attempt_store)?;
-    match store.reserve_v2(plan, dispatch)? {
+    lock.validate_current_paths()?;
+    let result = match store.reserve_v2(plan, dispatch)? {
         ReservationV2::Prior(outcome) => Ok(outcome),
         ReservationV2::Ambiguous => finish_observation(
             &mut store,
@@ -722,8 +888,18 @@ fn execute_with_driver(
             let CanonicalEffectV1::SystemdUnit { action, .. } = plan.effect else {
                 return Err("systemd-plan-effect-family".to_owned());
             };
-            if action != SystemdUnitActionV1::Start {
-                return finish_observation(
+            if action == SystemdUnitActionV1::Start {
+                let observation = driver.run(plan);
+                lock.validate_current_paths()?;
+                finish_observation(
+                    &mut store,
+                    plan,
+                    dispatch,
+                    observation,
+                    fail_after_evidence_insert,
+                )
+            } else {
+                finish_observation(
                     &mut store,
                     plan,
                     dispatch,
@@ -744,17 +920,12 @@ fn execute_with_driver(
                         },
                     },
                     fail_after_evidence_insert,
-                );
+                )
             }
-            finish_observation(
-                &mut store,
-                plan,
-                dispatch,
-                driver.run(plan),
-                fail_after_evidence_insert,
-            )
         }
-    }
+    };
+    lock.validate_current_paths()?;
+    result
 }
 
 #[allow(
