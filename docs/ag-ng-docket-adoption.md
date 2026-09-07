@@ -10,18 +10,26 @@ policy refusal before the effect, an exact duplicate converging on retained cust
 simulated acknowledgement loss that is visibly indeterminate before read-only
 reconciliation. It is a development integration example, not a production deployment.
 
-## Qualified source coordinates
+## Integrated validation coordinates
 
-The compatibility baseline is the pair independently exercised in Marginalia Gate 3A:
+The current operator-beta integration witness exercised this exact pair:
 
 | Component | Repository | Immutable revision |
 | --- | --- | --- |
-| AG-ng | `https://github.com/unpingable/ag_ng.git` | `cb85d363e2495a75f78c28fb8ce9b46af1f289c0` |
+| AG-ng | `https://github.com/unpingable/ag_ng.git` | `651d7178ef4a8950b9d9ac25c7d3fe496ed55f96` |
 | Docket | `https://github.com/unpingable/docket.git` | `c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b` |
 
-This guide and `docket_file_harness` are a documentation/example change on top of that
-AG-ng revision. Docket is used without source changes. Both source repositories must be
-available because neither component currently promises a published package.
+The AG-ng subject is the non-rewriting integration of the accepted operator-beta M1A result
+`92d274c299478a65121f2d8e1b93a2d00383a828` and the adoption validation result
+`549d1c446ea401456c286fba1d0885d00b72ec32`. The latter retains the original guide witness
+at `7c350012507fac4f6d8f854cd697dcdc19a4fadd`, based on
+`cb85d363e2495a75f78c28fb8ce9b46af1f289c0`. Those earlier qualifications remain attached
+to their original subjects; ancestry alone does not qualify this integrated subject. Its
+separate witness is recorded in
+`qualification/ag-ng-docket-adoption-integration-20260907.md`.
+
+Docket is used without source changes. Both source repositories must be available because
+neither component currently promises a published package.
 
 The demonstrated clean environment is Ubuntu 24.04.4 on x86-64 Linux with Rust/Cargo
 1.94.0. A C toolchain and network or pre-populated Cargo cache are needed for the locked
