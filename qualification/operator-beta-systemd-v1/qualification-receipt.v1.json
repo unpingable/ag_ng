@@ -75,7 +75,7 @@
       "kind": "final_guest_teardown_observation",
       "path": "evidence/run-004-final-guest-teardown-observation.txt",
       "length": 702,
-      "sha256": "sha256:6d9e6b7258d140e174c72aefc91253caf5b3b6f7a1bff26ad4d4f49c58fd17b7"
+      "sha256": "sha256:863401d1b3018ab556a4741d1c9a865b87fac456e1bcf5cebba85fed94fd1f90"
     },
     {
       "kind": "final_host_teardown_observation",

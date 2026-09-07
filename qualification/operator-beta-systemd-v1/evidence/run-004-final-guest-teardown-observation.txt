@@ -1,12 +1,12 @@
 schema=ag.operator-beta-systemd-m1a-final-teardown-observation/v1
 machine_identity=bb1aa44ac2984af89f6d3ac865cd0004
-boot_id=fbadccb6-1a65-46e0-acb7-4266cb90ec3a
+boot_id=6c8f7ff6-62ba-4ab1-bf45-5a0131c1a01e
 package_absent=true
 adapter_absent=true path=/usr/libexec/agent-governor-ng/ag-effectd
 unit_absent=true path=/etc/systemd/system/constellation-beta-http-fixture.service
 data_absent=true path=/var/lib/constellation-beta-http-fixture
 store_absent=true path=/var/lib/ag-effectd-m1a
-backup_absent=true path=/var/lib/ag-m1a-package-backup
+backup_absent=true path=/var/tmp/ag-m1a-package-backup
 unit_registry_absent=true
 campaign_processes_absent=true
 target_listener_absent=true port=8080

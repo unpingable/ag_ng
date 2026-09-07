@@ -108,10 +108,11 @@ class QualificationReceiptTests(unittest.TestCase):
         ).read_text()
         for fact in (
             "package_absent=true",
-            "unit_absent=true",
-            "data_absent=true",
-            "store_absent=true",
-            "backup_absent=true",
+            "adapter_absent=true path=/usr/libexec/agent-governor-ng/ag-effectd",
+            "unit_absent=true path=/etc/systemd/system/constellation-beta-http-fixture.service",
+            "data_absent=true path=/var/lib/constellation-beta-http-fixture",
+            "store_absent=true path=/var/lib/ag-effectd-m1a",
+            "backup_absent=true path=/var/tmp/ag-m1a-package-backup",
             "campaign_processes_absent=true",
             "target_listener_absent=true",
             "effect_or_mechanics_invoked=false",
