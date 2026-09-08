@@ -1747,6 +1747,88 @@ mod tests {
         assert!(read_provider_credential(directory.path(), "malformed").is_err());
     }
 
+    #[test]
+    fn every_explicit_transport_variant_is_root_routable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config: ProviderdConfigV1 =
+            toml::from_str(include_str!("../../../config/providerd.example.toml")).unwrap();
+        config.store.database = directory.path().join("provider.db");
+        config.store.object_store = directory.path().join("objects");
+        let mut local = config.endpoints[0].clone();
+        local.id = "local".to_owned();
+        local.models[0].id = "local-model".to_owned();
+        local.protocol = "opaque_json_v1".to_owned();
+        local.methods = vec!["chat.completions.create".to_owned()];
+        local.transport = ProviderTransportConfigV1::LocalHttp {
+            url: "http://orion:11434/v1/chat/completions".to_owned(),
+            allowed_origins: vec!["http://orion:11434".to_owned()],
+            redirect_policy: ag_app::config::ProviderLocalRedirectPolicyV1::Deny,
+        };
+        let mut command = config.endpoints[0].clone();
+        command.id = "command".to_owned();
+        command.models[0].id = "command-model".to_owned();
+        command.protocol = "opaque_json_v1".to_owned();
+        command.methods = vec!["command.complete".to_owned()];
+        command.transport = ProviderTransportConfigV1::Command {
+            command: ProviderCommandConfigV1 {
+                adapter: "codex".to_owned(),
+                executable: Path::new("/opt/codex/codex").to_path_buf(),
+                working_directory: Path::new("/work").to_path_buf(),
+                environment: BTreeMap::new(),
+            },
+        };
+        config.endpoints.extend([local, command]);
+        config.validate().unwrap();
+        let identity = StoreIdentityV1::current(0x4147_5052, "provider-variant-test").unwrap();
+        let writer = WriterIdentityV1 {
+            writer_id: "provider-variant-test-writer".to_owned(),
+            principal_digest: Digest::hash_bytes(b"provider-variant-test-writer"),
+            process_nonce: uuid::Uuid::new_v4().to_string(),
+            claimed_at_unix_ms: 1,
+        };
+        let store = Store::open(
+            &config.store.database,
+            &config.store.object_store,
+            identity,
+            &writer,
+        )
+        .unwrap();
+        let core = ProviderCoreV1::new(store, config).unwrap();
+        let session = SessionId::new("variant-session").unwrap();
+        for (sequence, endpoint_id) in ["primary", "local", "command"].into_iter().enumerate() {
+            let endpoint = core.endpoints.get(endpoint_id).unwrap();
+            let mut nonce = [0_u8; 16];
+            nonce[8..].copy_from_slice(&(sequence as u64).to_be_bytes());
+            let capability = InferenceCapabilityV1::new(
+                core.authority_domain.clone(),
+                core.epoch,
+                ProjectId::new("provider-tests").unwrap(),
+                session.clone(),
+                LifecycleNonce::new([0x5a; 16]),
+                PrincipalId::new(Digest::hash_bytes(b"provider-test-worker")),
+                core.provider_policy.clone(),
+                InferenceEnvelopeV1 {
+                    endpoint: ProviderEndpointId::new(endpoint.id.clone()).unwrap(),
+                    model: ModelId::new(endpoint.models[0].id.clone()).unwrap(),
+                    method: InferenceMethodId::new(endpoint.methods[0].clone()).unwrap(),
+                    protocol_digest: Digest::hash_bytes(endpoint.protocol.as_bytes()),
+                },
+                InferenceBudgetV1 {
+                    requests: 1,
+                    input_bytes: 4096,
+                    output_bytes: endpoint.models[0].max_event_stream_bytes,
+                    cost_microunits: endpoint.models[0].worst_case_cost_microunits,
+                },
+                1,
+                9_000_000_000_000,
+                LifecycleNonce::new(nonce),
+            )
+            .unwrap();
+            let (resolved, _) = core.ensure_endpoint(&capability).unwrap();
+            assert_eq!(resolved.id, endpoint_id);
+        }
+    }
+
     struct ProviderFixture {
         _directory: TempDir,
         core: ProviderCoreV1,
