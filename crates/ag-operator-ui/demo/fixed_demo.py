@@ -27,7 +27,7 @@ MAX_BYTES = 1024 * 1024
 OWNER_TIMEOUT_SECONDS = 120
 # Execute the retained bytes. A later replacement of the controller pathname
 # cannot change this source. Its __file__ remains available for owner imports.
-BOOTSTRAP = "import sys; p=sys.argv.pop(1); exec(compile(sys.stdin.buffer.read(),p,'exec'),{'__name__':'__main__','__file__':p})"
+BOOTSTRAP = "import hashlib,sys; p=sys.argv.pop(1); source=sys.stdin.buffer.read(); exec(compile(source,p,'exec'),{'__name__':'__main__','__file__':p,'__executed_source_sha256__':hashlib.sha256(source).hexdigest()})"
 
 
 class Unavailable(Exception):
@@ -200,10 +200,12 @@ def validate_projection(value: dict) -> None:
             integer(producer, "start_ticks", 1)
     if terminal is not None:
         choice(terminal, "state", {"TERMINAL", "REFUSED", "INDETERMINATE"})
-        choice(terminal, "owner", {"Docket"})
         if terminal["state"] == "INDETERMINATE":
+            choice(terminal, "owner", {"Docket"})
             string(terminal, "reason")
         else:
+            choice(terminal, "owner", {"NQ-ng"} if terminal["state"] == "REFUSED" else {"Docket"})
+            choice(terminal, "validator", {"Docket"})
             string(terminal, "disposition")
             string(terminal, "evidence")
             choice(terminal, "replay", {"check-run"} if terminal["state"] == "TERMINAL" else {"check-refusal"})
@@ -284,7 +286,7 @@ async function refresh(){if(pending)return;pending=true;try{
  text('reason',terminal&&terminal.reason||'');
  ledger(value.evidence,runner.recovery);
  text('next',runner.recovery&&runner.recovery.next_lawful_action||'Next required transition: NOT_OBSERVABLE');
- text('receipt',terminal&&terminal.evidence?{owner:terminal.owner,evidence:terminal.evidence,replay:terminal.replay}:'No validated terminal receipt observed.');
+ text('receipt',terminal&&terminal.evidence?{owner:terminal.owner,validator:terminal.validator,evidence:terminal.evidence,replay:terminal.replay}:'No validated terminal receipt observed.');
  text('sources',{disagreements:value.disagreements,live_sources:value.live_sources});text('limits',value.limitations);
  const ready=value.controller_custody.state==='NO_INTENT_RECORDED'&&value.disagreements.length===0;
  el('run').disabled=!ready;text('launch-note',ready?'Ready to request the one admitted execution.':'Docket has retained launch custody or unresolved evidence. RUN is unavailable; inspect the state below.');

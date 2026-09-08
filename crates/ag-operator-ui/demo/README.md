@@ -26,7 +26,8 @@ RUN sends the one closed operation to Docket. It accepts no run, path, port,
 model or spec selection from the browser. Startup `--port` changes only the
 loopback presentation port. The controller digest is checked once and those
 exact source bytes are retained for subsequent calls; Python executes those
-bytes with the original `__file__` for owner module resolution. Controller
+bytes with the original `__file__` for owner module resolution and supplies
+`__executed_source_sha256__` computed over those executed bytes. Controller
 custody of its runner/imported code remains Docket's responsibility.
 
 Every refresh/reconnect queries Docket `status`. A three-second browser timer
@@ -45,6 +46,8 @@ cleared to `NOT_OBSERVABLE`. A process exit
 or successful HTTP exchange never becomes a stronger terminal claim. JSON is
 rendered as text, with no arbitrary evidence-file serving or command execution.
 The terminal receipt path and owner replay verb come directly from Docket.
+Refusal records retain NQ-ng ownership while Docket is named separately as
+their validator; the composed successful record names Docket in both roles.
 
 ## Qualification boundary
 

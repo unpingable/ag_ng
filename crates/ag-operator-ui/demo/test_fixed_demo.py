@@ -138,6 +138,25 @@ class HttpBoundary(unittest.TestCase):
 
 
 class SourceAdmission(unittest.TestCase):
+    def test_refusal_owner_is_distinct_from_validator(self):
+        value = projection()
+        value["runner_durable"].update(state="REFUSED", terminal={"state": "REFUSED", "disposition": "REFUSED",
+            "owner": "NQ-ng", "validator": "Docket", "evidence": "/fixture/REFUSAL.json", "replay": "check-refusal"})
+        demo.validate_projection(value)
+        value["runner_durable"]["terminal"]["owner"] = "Docket"
+        with self.assertRaises(ValueError):
+            demo.validate_projection(value)
+
+    def test_execution_reports_retained_source_digest(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / "fixture.py"
+            raw = ("import json\nv=" + repr(projection()) + "\nv['execution']['controller_sha256']=__executed_source_sha256__\nprint(json.dumps(v))\n").encode()
+            path.write_bytes(raw)
+            admitted = hashlib.sha256(raw).hexdigest()
+            controller = demo.Controller(path, admitted)
+            path.write_text("raise RuntimeError('replacement must never execute')")
+            self.assertEqual(controller.query("status")["execution"]["controller_sha256"], admitted)
+
     def test_projection_structure_is_closed_at_consumed_fields(self):
         demo.validate_projection(projection())
         mutations = [lambda v: v.update(subject={}), lambda v: v.pop("evidence"),

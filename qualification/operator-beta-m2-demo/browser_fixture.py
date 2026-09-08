@@ -38,7 +38,8 @@ class Fixture:
             self.value["runner_durable"] = {"source": "composition owner records", "state": state, "recovery": None, "terminal": {
                 "state": state, "disposition": "ONE_SPEND_ONE_ATTEMPT_BOUNDED_EFFECT_CUSTODY_WITH_DECLARED_LIMITATIONS" if state == "TERMINAL" else "REFUSED",
                 "reason": "DISPLAY_FIXTURE: owner effect failure" if case == "failed" else "DISPLAY_FIXTURE: bounded result",
-                "owner": "Docket", "evidence": "/fixture/RESULT.json" if state == "TERMINAL" else "/fixture/REFUSAL.json",
+                "owner": "Docket" if state == "TERMINAL" else "NQ-ng", "validator": "Docket",
+                "evidence": "/fixture/RESULT.json" if state == "TERMINAL" else "/fixture/REFUSAL.json",
                 "replay": "check-run" if state == "TERMINAL" else "check-refusal",
             }}
 

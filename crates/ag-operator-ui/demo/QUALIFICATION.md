@@ -11,22 +11,30 @@ integrated acceptance record are owned by the main M2 campaign. Earlier M1
 acceptance remains attached to its original revisions.
 
 The exact `fixed_demo.py` bytes tested here have SHA-256
-`19d72bce3c0d692179286e46cfbfa36ab10dde182ef85e10f1f183c1f9cdfd1c`.
+`3509910082e38d06b3d1ac1be81c7659f651c6ba56364cf95d984f827e2bb4da`.
 
-This correction succeeds the independently rejected screen revision
-`a6eff2dcbab32a02436b50624d55a0376f00224e`. Its earlier display evidence remains
-attached to that original source; it does not establish acceptance here.
+This successor adds explicit refusal owner/validator attribution and captured
+execution-source identity to the locally accepted screen revision
+`5cec943c25e28f47069f7bf6bdf8c81be9fb6637`, which corrected the independently
+rejected `a6eff2dcbab32a02436b50624d55a0376f00224e`. Earlier evidence and
+acceptance remain attached to their original source bytes.
 
 Observed local validation:
 
 - `python3 -m unittest discover -s crates/ag-operator-ui/demo -p 'test_*.py' -v`:
-  17 passed, final correction run 5.226 seconds. HTTP cases used approved ephemeral
+  19 passed, final correction run 5.367 seconds. HTTP cases used approved ephemeral
   loopback sockets. Initial sandbox socket denial was an environment refusal,
   followed by the same test invocation with platform approval.
 - `node --check qualification/operator-beta-m2-demo/browser_exercise.cjs`:
   passed.
 - `git diff --check`: passed.
-- Actual Docket owner `FixedController.status()` with its own local fixture and
+- Current source accepted the corrected actual Docket owner status fixture
+  at controller SHA-256
+  `28b9c3604156da1a31680ba1d85b0b6d19cfad3d9017408cd448d942eea05c25`:
+  ten evidence entries, zero manager calls. This is byte-specific development
+  interoperability evidence; final controller acceptance and installation pins
+  remain primary responsibilities.
+- Prior screen source `19d72bce…` accepted actual Docket owner `FixedController.status()` with its own local fixture and
   `FakeManager` was accepted by the screen adapter: ten evidence entries, zero
   manager calls, controller source SHA-256
   `6c27354b6d50ad18e2ee49245bd50cf16c2f70d94cf43270eb3cde8949900a2d`.
@@ -38,6 +46,11 @@ execution identity, digests, enums and terminal records; a child that never
 reads controller stdin is stopped by the shared transfer/reply deadline.
 Browser qualification additionally checks an observed terminal receipt followed
 by source outage: all current-value regions become `NOT_OBSERVABLE`.
+Additional cases require NQ-ng as the refusal-record owner and Docket as its
+validator, and prove the executing controller receives the hash of its retained
+source bytes even after the source pathname changes. The bootstrap supplies
+`__executed_source_sha256__`; it does not derive that identity from a later
+pathname read.
 
 These tests establish bounded adapter behavior using explicitly labeled local
 fixtures: source admission, retained controller bytes despite pathname

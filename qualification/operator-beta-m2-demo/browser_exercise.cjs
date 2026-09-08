@@ -102,7 +102,8 @@ async function sample(label, assertRender=false) {
         && document.getElementById('run').disabled===!ready
         && expected.disagreements.every(reason=>text('notice').includes(reason))
         && (terminal ? text('terminal')===(terminal.disposition||terminal.state)
-          && (!terminal.evidence || text('receipt').includes(terminal.evidence))
+          && (!terminal.evidence || text('receipt').includes(terminal.evidence)
+            && text('receipt').includes(terminal.owner) && text('receipt').includes(terminal.validator))
           : text('terminal').includes('No validated terminal'));
     },value,{timeout:Math.min(10000,remaining())});
   }

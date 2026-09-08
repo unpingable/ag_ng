@@ -1,5 +1,25 @@
 # M2 display fixture browser evidence — 2026-09-08
 
+## Owner/validator and executed-source correction
+
+The nine cases below were rerun in
+`/data/git/.campaign-artifacts/m2-screen-CASE-fixture-004` against these bytes:
+
+| Subject | SHA-256 |
+|---|---|
+| `fixed_demo.py` | `3509910082e38d06b3d1ac1be81c7659f651c6ba56364cf95d984f827e2bb4da` |
+| `browser_exercise.cjs` | `c01d85a31e62970ec9626260a36b91ec5ef2342eafb2b5eccdd67fca5cf91143` |
+| `browser_fixture.py` | `ea0792955a467b359525607cf8c2769e18697ef3eb1cf3239ccc9daf9122936d` |
+
+The browser now checks both owner and validator in each displayed terminal
+receipt. Refusal fixtures name NQ-ng as owner and Docket as validator; successful
+composition fixtures name Docket in both roles. These remain explicitly labeled
+display fixtures, with no live integration or inherited independent acceptance.
+All nine cases passed. The uncertainty case's first `fixture-004` attempt
+failed because Chromium could not capture a screenshot; that failed capture is
+preserved. Its fresh `fixture-005` capture passed against the same source bytes.
+The other eight passing captures use `fixture-004`.
+
 ## Correction following independent rejection
 
 The corrected source passed nine bounded Chromium cases in
