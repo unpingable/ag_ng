@@ -26,12 +26,13 @@ use serde::{Deserialize, Serialize};
 
 mod systemd_executor_v2;
 
-use systemd_executor_v2::{decode_effect_executor_systemd_plan, MAX_PLAN_BYTES};
 pub use systemd_executor_v2::{
-    execute_systemd_effect_attempt, load_effect_executor_systemd_plan,
-    reconcile_systemd_effect_attempt, reopen_systemd_dbus_evidence, EffectExecutorSystemdPlanV2,
+    audit_systemd_effect_store_cut, execute_systemd_effect_attempt,
+    load_effect_executor_systemd_plan, reconcile_systemd_effect_attempt,
+    reopen_systemd_dbus_evidence, EffectExecutorSystemdPlanV2,
     EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2, EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
 };
+use systemd_executor_v2::{decode_effect_executor_systemd_plan, MAX_PLAN_BYTES};
 
 /// Exact Docket work-schema accepted by this adapter.
 pub const EFFECT_EXECUTOR_WORK_SCHEMA_V1: &str = "ag-effectd.docket-executor-work/v1";

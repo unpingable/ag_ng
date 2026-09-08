@@ -4,9 +4,9 @@ use std::io::Read as _;
 use std::path::PathBuf;
 
 use ag_app::effect_executor_adapter::{
-    DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1, EffectExecutorDispatchV1, LoadedEffectExecutorPlan,
-    execute_effect_attempt, execute_systemd_effect_attempt, load_effect_executor_plan_any,
-    reconcile_effect_attempt, reconcile_systemd_effect_attempt,
+    audit_systemd_effect_store_cut, execute_effect_attempt, execute_systemd_effect_attempt,
+    load_effect_executor_plan_any, reconcile_effect_attempt, reconcile_systemd_effect_attempt,
+    EffectExecutorDispatchV1, LoadedEffectExecutorPlan, DOCKET_EXECUTOR_MAX_DOCUMENT_BYTES_V1,
 };
 use ag_primitives::JcsDocument;
 use anyhow::Context as _;
@@ -41,6 +41,14 @@ enum Command {
         /// Canonical executor-plan JSON.
         plan: PathBuf,
     },
+    /// Validate a copied terminal Systemd V2 store without invoking mechanics.
+    AuditStore {
+        /// Canonical executor-plan JSON whose live store identity remains unchanged.
+        plan: PathBuf,
+        /// Immutable copied `SQLite` store to validate as evidence.
+        #[arg(long)]
+        store_cut: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -72,6 +80,16 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             .map_or_else(handle_adapter_error, Ok)?;
+            write_canonical(&outcome)?;
+        }
+        Command::AuditStore { plan, store_cut } => {
+            let plan = load_effect_executor_plan_any(&plan).map_err(anyhow::Error::msg)?;
+            let dispatch: EffectExecutorDispatchV1 = read_stdin_strict()?;
+            let LoadedEffectExecutorPlan::SystemdV2(plan) = &plan else {
+                anyhow::bail!("audit-store-requires-systemd-v2");
+            };
+            let outcome = audit_systemd_effect_store_cut(plan, &dispatch, &store_cut)
+                .map_err(anyhow::Error::msg)?;
             write_canonical(&outcome)?;
         }
     }

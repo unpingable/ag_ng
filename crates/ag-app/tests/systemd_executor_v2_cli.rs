@@ -8,14 +8,29 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::process::{Command, Stdio};
 
 use ag_app::effect_executor_adapter::{
-    EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2, EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
     EffectExecutorDispatchV1, EffectExecutorSystemdPlanV2, EffectFilePolicyV1,
+    EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2, EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
 };
 use ag_effect::{CanonicalEffectV1, SystemdUnitActionV1, TargetId};
 use ag_primitives::{Digest, JcsDocument};
-use rustix::fs::{FlockOperation, flock};
+use rustix::fs::{flock, FlockOperation};
 
 const EFFECTD: &str = env!("CARGO_BIN_EXE_ag-effectd");
+
+#[test]
+fn immutable_store_audit_is_an_explicit_query_only_cli_surface() {
+    let output = Command::new(EFFECTD)
+        .arg("audit-store")
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Validate a copied terminal Systemd V2 store"));
+    assert!(stdout.contains("--store-cut"));
+}
 
 #[test]
 fn lock_deadline_is_exact_exit_75_with_no_stdout_outcome() {
