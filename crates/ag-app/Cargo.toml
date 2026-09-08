@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [features]
 worker-fixture = []
 systemd-dbus = ["dep:async-io", "dep:futures-util", "dep:zbus"]
+systemd-store-qualification-fixture = []
 
 [[bin]]
 name = "agd"

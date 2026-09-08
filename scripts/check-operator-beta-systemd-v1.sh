@@ -109,7 +109,8 @@ fi
 cargo check -q -p ag-app --all-targets
 cargo check -q -p ag-app --all-targets --features systemd-dbus
 cargo test -q -p ag-app effect_executor_adapter --lib --features systemd-dbus
-cargo test -q -p ag-app --test systemd_executor_v2_cli --features systemd-dbus
+cargo test -q -p ag-app --test systemd_executor_v2_cli \
+  --features systemd-dbus,systemd-store-qualification-fixture
 python3 -m unittest discover -s qualification/operator-beta-systemd-v1 -p 'test_*.py' -q
 
 echo "operator-beta systemd boundary: PASS"

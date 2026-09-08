@@ -8,10 +8,11 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::process::{Command, Stdio};
 
 use ag_app::effect_executor_adapter::{
-    execute_systemd_effect_attempt, EffectExecutorDispatchV1, EffectExecutorSystemdPlanV2,
-    EffectFilePolicyV1, EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2,
-    EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
+    EffectExecutorDispatchV1, EffectExecutorSystemdPlanV2, EffectFilePolicyV1,
+    EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2, EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
 };
+#[cfg(feature = "systemd-store-qualification-fixture")]
+use ag_app::effect_executor_adapter::seed_terminal_systemd_store_for_qualification;
 use ag_effect::{CanonicalEffectV1, SystemdUnitActionV1, TargetId};
 use ag_primitives::{Digest, JcsDocument};
 use rustix::fs::{flock, FlockOperation};
@@ -36,6 +37,7 @@ fn immutable_store_audit_is_an_explicit_query_only_cli_surface() {
 }
 
 #[test]
+#[cfg(feature = "systemd-store-qualification-fixture")]
 fn immutable_store_audit_cli_returns_owner_outcome_and_refuses_wrong_digest() {
     let directory = tempfile::tempdir().unwrap();
     let subject = Digest::hash_bytes(b"cli-audit-subject");
@@ -71,7 +73,7 @@ fn immutable_store_audit_cli_returns_owner_outcome_and_refuses_wrong_digest() {
         subject,
         scope,
     };
-    let expected = execute_systemd_effect_attempt(&plan, &dispatch).unwrap();
+    let expected = seed_terminal_systemd_store_for_qualification(&plan, &dispatch).unwrap();
     let plan_path = directory.path().join("plan.json");
     std::fs::write(
         &plan_path,

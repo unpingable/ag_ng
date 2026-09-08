@@ -526,7 +526,11 @@ pub(super) struct DriverObservationV2 {
     pub(super) terminal: DriverTerminalV2,
 }
 
-#[cfg(any(feature = "systemd-dbus", test))]
+#[cfg(any(
+    feature = "systemd-dbus",
+    feature = "systemd-store-qualification-fixture",
+    test
+))]
 pub(super) trait SystemdOperationDriverV2 {
     fn run(&self, plan: &EffectExecutorSystemdPlanV2) -> DriverObservationV2;
 }
@@ -785,6 +789,47 @@ pub fn execute_systemd_effect_attempt(
     }
 }
 
+/// Seed one deterministic terminal store for process-bound qualification.
+///
+/// This feature-gated helper never opens the system bus or invokes systemd
+/// mechanics. It exists only so the production `audit-store` binary can be
+/// tested against owner-created receipt and evidence custody.
+///
+/// # Errors
+///
+/// Refuses any invalid plan, dispatch, or local store transition.
+#[cfg(feature = "systemd-store-qualification-fixture")]
+#[doc(hidden)]
+pub fn seed_terminal_systemd_store_for_qualification(
+    plan: &EffectExecutorSystemdPlanV2,
+    dispatch: &EffectExecutorDispatchV1,
+) -> Result<EffectExecutorOutcomeV1, String> {
+    struct QualificationDriver;
+
+    impl SystemdOperationDriverV2 for QualificationDriver {
+        fn run(&self, _plan: &EffectExecutorSystemdPlanV2) -> DriverObservationV2 {
+            DriverObservationV2 {
+                started_at_unix_ms: 1_000,
+                finished_at_unix_ms: 1_000,
+                elapsed_ms: 0,
+                live_machine_identity: None,
+                unit_object_path: None,
+                previous_active_state: None,
+                previous_unit_file_state: None,
+                job_path: None,
+                job_result: None,
+                messages: Vec::new(),
+                terminal: DriverTerminalV2::Failure {
+                    code: "system_bus_unavailable".to_owned(),
+                    detail: "qualification fixture did not contact the system bus".to_owned(),
+                },
+            }
+        }
+    }
+
+    execute_with_driver(plan, dispatch, &QualificationDriver, false)
+}
+
 /// Reopen only retained V2 evidence and terminal custody.
 ///
 /// # Errors
@@ -1003,7 +1048,11 @@ pub fn reopen_systemd_dbus_evidence(
     Ok(raw)
 }
 
-#[cfg(any(feature = "systemd-dbus", test))]
+#[cfg(any(
+    feature = "systemd-dbus",
+    feature = "systemd-store-qualification-fixture",
+    test
+))]
 fn execute_with_driver(
     plan: &EffectExecutorSystemdPlanV2,
     dispatch: &EffectExecutorDispatchV1,

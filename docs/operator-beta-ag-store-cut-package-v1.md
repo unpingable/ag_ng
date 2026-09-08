@@ -1,6 +1,6 @@
 # Operator-beta AG store-cut package V1
 
-Status: **PACKAGE CANDIDATE / INDEPENDENT REVIEW REQUIRED**
+Status: **CORRECTION CANDIDATE / INDEPENDENT RE-AUDIT REQUIRED**
 
 This bounded checkpoint packages the independently accepted AG-ng owner subject
 `837de287497942c79966aa05c083acee9c312261` so NQ-ng can later invoke the
@@ -32,6 +32,12 @@ The campaign-owned archive and staging tree are retained under
 `.campaign-local/operator-beta-store-audit/package-001/`. They are evidence,
 not a live installation or deployment source of authority.
 
+The first package checkpoint
+`5c35d24a1898ae254b335b132ac7e84d831a7590` is rejected because its
+functional CLI fixture selected the real feature-enabled driver while the
+qualification claimed D-Bus was not contacted. This non-rewriting correction
+uses a compile-time-only deterministic driver that cannot open the system bus.
+
 ## Qualification boundary
 
 The package test must reopen the archive rather than trust the staging tree. It
@@ -41,9 +47,12 @@ the executable's `audit-store` argument surface. A second archive assembled
 from the retained stage at the same source epoch must be byte-identical.
 
 The package gate also replays the accepted AG owner store-cut gate and its
-query-only functional CLI cases. It does not install the archive, contact a
-guest, call D-Bus, run systemd mechanics, reopen an NQ run, or qualify the
-future two-VM composition.
+query-only functional CLI cases. The functional test seeds its terminal owner
+store through the compile-time-only `systemd-store-qualification-fixture`
+feature, which cannot select the zbus driver. The feature is absent from the
+packaged binary. The gate does not install the archive, contact a guest, call
+D-Bus, run systemd mechanics, reopen an NQ run, or qualify the future two-VM
+composition.
 
 ## Next lawful transition
 

@@ -12,11 +12,12 @@
     "subjects": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["accepted_owner", "accepted_owner_tree", "rejected_predecessor"],
+      "required": ["accepted_owner", "accepted_owner_tree", "rejected_owner_predecessor", "rejected_package_candidate"],
       "properties": {
         "accepted_owner": {"const": "837de287497942c79966aa05c083acee9c312261"},
         "accepted_owner_tree": {"const": "20023de0b8299fa125ed5f9fcaf63383a4978e30"},
-        "rejected_predecessor": {"const": "20cca23bfe2b9bc92c9165c00a498e6db8f890b1"}
+        "rejected_owner_predecessor": {"const": "20cca23bfe2b9bc92c9165c00a498e6db8f890b1"},
+        "rejected_package_candidate": {"const": "5c35d24a1898ae254b335b132ac7e84d831a7590"}
       }
     },
     "package": {

@@ -29,6 +29,12 @@ rg -q 'Command::AuditStore' "$cli" &&
   rg -q 'store_sha256' "$cli" &&
   rg -q 'audit-store-requires-systemd-v2' "$cli" ||
   fail "query-only CLI surface is missing or not V2-bounded"
+rg -q 'systemd-store-qualification-fixture = \[\]' crates/ag-app/Cargo.toml &&
+  rg -q 'seed_terminal_systemd_store_for_qualification' \
+    crates/ag-app/tests/systemd_executor_v2_cli.rs &&
+  ! rg -q 'execute_systemd_effect_attempt' \
+    crates/ag-app/tests/systemd_executor_v2_cli.rs ||
+  fail "functional CLI audit is not seeded by the no-bus qualification fixture"
 rg -q 'does not acquire the live' "$contract" &&
   rg -q 'execution lock' "$contract" &&
   rg -q 'authoritative live attempt store' "$contract" ||
@@ -39,6 +45,8 @@ if [[ "${AG_OPERATOR_BETA_STORE_AUDIT_GATE_INJECT:-0}" == "1" ]]; then
 fi
 
 cargo test -q --locked -p ag-app --features systemd-dbus systemd_executor_v2::tests
-cargo test -q --locked -p ag-app --features systemd-dbus --test systemd_executor_v2_cli
+cargo test -q --locked -p ag-app \
+  --features systemd-dbus,systemd-store-qualification-fixture \
+  --test systemd_executor_v2_cli
 
 echo "operator-beta AG store-cut audit boundary: PASS"

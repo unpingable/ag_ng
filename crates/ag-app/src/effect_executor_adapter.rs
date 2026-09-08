@@ -32,6 +32,9 @@ pub use systemd_executor_v2::{
     reopen_systemd_dbus_evidence, EffectExecutorSystemdPlanV2,
     EFFECT_EXECUTOR_SYSTEMD_PLAN_SCHEMA_V2, EFFECT_EXECUTOR_SYSTEMD_WORK_SCHEMA_V2,
 };
+#[cfg(feature = "systemd-store-qualification-fixture")]
+#[doc(hidden)]
+pub use systemd_executor_v2::seed_terminal_systemd_store_for_qualification;
 use systemd_executor_v2::{decode_effect_executor_systemd_plan, MAX_PLAN_BYTES};
 
 /// Exact Docket work-schema accepted by this adapter.
