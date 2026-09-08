@@ -2,6 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Read as _;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -24,6 +25,8 @@ use super::{
     EffectAttemptStoreV1, EffectExecutorDispatchV1, EffectExecutorOutcomeClassV1,
     EffectExecutorOutcomeV1, EffectFilePolicyV1,
 };
+#[cfg(test)]
+use super::{SYSTEMD_EVIDENCE_DELETE_TRIGGER_SQL, SYSTEMD_EVIDENCE_UPDATE_TRIGGER_SQL};
 
 #[cfg(feature = "systemd-dbus")]
 mod zbus_driver;
@@ -841,45 +844,125 @@ pub fn audit_systemd_effect_store_cut(
     plan: &EffectExecutorSystemdPlanV2,
     dispatch: &EffectExecutorDispatchV1,
     store_cut: &Path,
+    expected_store_bytes: u64,
+    expected_store_sha256: &Digest,
+) -> Result<EffectExecutorOutcomeV1, String> {
+    audit_systemd_effect_store_cut_with_hook(
+        plan,
+        dispatch,
+        store_cut,
+        expected_store_bytes,
+        expected_store_sha256,
+        || {},
+    )
+}
+
+fn audit_systemd_effect_store_cut_with_hook(
+    plan: &EffectExecutorSystemdPlanV2,
+    dispatch: &EffectExecutorDispatchV1,
+    store_cut: &Path,
+    expected_store_bytes: u64,
+    expected_store_sha256: &Digest,
+    before_sqlite_open: impl FnOnce(),
 ) -> Result<EffectExecutorOutcomeV1, String> {
     validate_dispatch(plan, dispatch)?;
     if !store_cut.is_absolute() {
         return Err("systemd-audit-store-path-not-absolute".to_owned());
     }
-    let metadata = std::fs::symlink_metadata(store_cut)
+    reject_audit_store_wal(store_cut)?;
+    let path_metadata = std::fs::symlink_metadata(store_cut)
+        .map_err(|error| format!("systemd-audit-store-metadata:{error}"))?;
+    if !path_metadata.file_type().is_file() || path_metadata.file_type().is_symlink() {
+        return Err("systemd-audit-store-not-bounded-regular-file".to_owned());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(store_cut)
+        .map_err(|error| format!("systemd-audit-store-open:{error}"))?;
+    let metadata = file
+        .metadata()
         .map_err(|error| format!("systemd-audit-store-metadata:{error}"))?;
     if !metadata.file_type().is_file()
         || metadata.file_type().is_symlink()
         || metadata.len() > MAX_AUDIT_STORE_CUT_BYTES
+        || metadata.len() != expected_store_bytes
     {
         return Err("systemd-audit-store-not-bounded-regular-file".to_owned());
     }
+    let mut initial_bytes = Vec::with_capacity(
+        usize::try_from(metadata.len()).map_err(|_| "systemd-audit-store-size".to_owned())?,
+    );
+    file.read_to_end(&mut initial_bytes)
+        .map_err(|error| format!("systemd-audit-store-read:{error}"))?;
+    if Digest::hash_bytes(&initial_bytes) != *expected_store_sha256 {
+        return Err("systemd-audit-store-content-substitution".to_owned());
+    }
     let store_identity = StoreFileIdentityV2::from_metadata(&metadata);
-    let connection = rusqlite::Connection::open_with_flags(
+    before_sqlite_open();
+    reject_audit_store_wal(store_cut)?;
+    validate_path_identity(
         store_cut,
+        store_identity,
+        "systemd-audit-store-pathname-replacement",
+    )?;
+    let store_uri = format!("file:/proc/self/fd/{}?immutable=1", file.as_raw_fd());
+    let mut connection = rusqlite::Connection::open_with_flags(
+        store_uri,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|error| format!("systemd-audit-store-open-read-only:{error}"))?;
-    validate_systemd_evidence_guards(&connection)?;
-    let record = read_attempt(&connection, &dispatch.attempt)?
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|error| format!("systemd-audit-store-read-begin:{error}"))?;
+    validate_systemd_evidence_guards(&transaction)?;
+    let record = read_attempt(&transaction, &dispatch.attempt)?
         .ok_or_else(|| "effect-executor-attempt-not-found".to_owned())?;
     if !record.matches(dispatch) {
         return Err("effect-executor-attempt-substitution".to_owned());
     }
-    let outcome = outcome_v2_from_connection(&connection, &record, plan, dispatch)?
+    let outcome = outcome_v2_from_connection(&transaction, &record, plan, dispatch)?
         .ok_or_else(|| "effect-executor-attempt-not-terminal".to_owned())?;
+    transaction
+        .commit()
+        .map_err(|error| format!("systemd-audit-store-read-commit:{error}"))?;
+    reject_audit_store_wal(store_cut)?;
     let final_metadata = std::fs::symlink_metadata(store_cut)
         .map_err(|error| format!("systemd-audit-store-final-metadata:{error}"))?;
     if !final_metadata.file_type().is_file()
         || final_metadata.file_type().is_symlink()
-        || final_metadata.len() > MAX_AUDIT_STORE_CUT_BYTES
         || StoreFileIdentityV2::from_metadata(&final_metadata) != store_identity
     {
         return Err("systemd-audit-store-pathname-replacement".to_owned());
     }
+    if final_metadata.len() > MAX_AUDIT_STORE_CUT_BYTES
+        || final_metadata.len() != expected_store_bytes
+    {
+        return Err("systemd-audit-store-content-substitution".to_owned());
+    }
+    let mut final_bytes = vec![
+        0_u8;
+        usize::try_from(expected_store_bytes)
+            .map_err(|_| "systemd-audit-store-size".to_owned())?
+    ];
+    file.read_exact_at(&mut final_bytes, 0)
+        .map_err(|error| format!("systemd-audit-store-final-read:{error}"))?;
+    if Digest::hash_bytes(&final_bytes) != *expected_store_sha256 {
+        return Err("systemd-audit-store-content-substitution".to_owned());
+    }
     Ok(outcome)
+}
+
+fn reject_audit_store_wal(store_cut: &Path) -> Result<(), String> {
+    let mut wal = store_cut.as_os_str().to_os_string();
+    wal.push("-wal");
+    match std::fs::symlink_metadata(PathBuf::from(wal)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err("systemd-audit-store-wal-present".to_owned()),
+        Err(error) => Err(format!("systemd-audit-store-wal-metadata:{error}")),
+    }
 }
 
 /// Reopen exact canonical D-Bus evidence without invoking mechanics.
@@ -1504,6 +1587,7 @@ fn load_evidence(
 mod tests {
     use super::*;
     use ag_effect::TargetId;
+    use std::io::Write as _;
 
     struct ScriptedDriver {
         observation: DriverObservationV2,
@@ -1634,8 +1718,10 @@ mod tests {
         let cut = directory.path().join("audit-store.sqlite");
         std::fs::copy(&plan.attempt_store, &cut).unwrap();
         let before = std::fs::read(&cut).unwrap();
+        let (store_bytes, store_sha256) = cut_binding(&cut);
         assert_eq!(
-            audit_systemd_effect_store_cut(&plan, &dispatch, &cut).unwrap(),
+            audit_systemd_effect_store_cut(&plan, &dispatch, &cut, store_bytes, &store_sha256,)
+                .unwrap(),
             first
         );
         assert_eq!(std::fs::read(&cut).unwrap(), before);
@@ -1648,8 +1734,16 @@ mod tests {
         let empty_cut = directory.path().join("empty-audit-store.sqlite");
         checkpoint(&store.connection).unwrap();
         std::fs::copy(&plan.attempt_store, &empty_cut).unwrap();
+        let (empty_bytes, empty_sha256) = cut_binding(&empty_cut);
         assert_eq!(
-            audit_systemd_effect_store_cut(&plan, &dispatch, &empty_cut).unwrap_err(),
+            audit_systemd_effect_store_cut(
+                &plan,
+                &dispatch,
+                &empty_cut,
+                empty_bytes,
+                &empty_sha256,
+            )
+            .unwrap_err(),
             "effect-executor-attempt-not-found"
         );
 
@@ -1660,20 +1754,54 @@ mod tests {
         drop(store);
         let started_cut = directory.path().join("started-audit-store.sqlite");
         std::fs::copy(&plan.attempt_store, &started_cut).unwrap();
+        let (started_bytes, started_sha256) = cut_binding(&started_cut);
         assert_eq!(
-            audit_systemd_effect_store_cut(&plan, &dispatch, &started_cut).unwrap_err(),
+            audit_systemd_effect_store_cut(
+                &plan,
+                &dispatch,
+                &started_cut,
+                started_bytes,
+                &started_sha256,
+            )
+            .unwrap_err(),
             "effect-executor-attempt-not-terminal"
         );
 
         let mut substituted_dispatch = dispatch.clone();
         substituted_dispatch.marker = Digest::hash_bytes(b"substituted-marker");
         assert_eq!(
-            audit_systemd_effect_store_cut(&plan, &substituted_dispatch, &started_cut).unwrap_err(),
+            audit_systemd_effect_store_cut(
+                &plan,
+                &substituted_dispatch,
+                &started_cut,
+                started_bytes,
+                &started_sha256,
+            )
+            .unwrap_err(),
             "effect-executor-attempt-substitution"
         );
+        let mut substituted_plan = plan.clone();
+        substituted_plan.job_timeout_ms -= 1;
         assert_eq!(
-            audit_systemd_effect_store_cut(&plan, &dispatch, Path::new("relative.sqlite"))
-                .unwrap_err(),
+            audit_systemd_effect_store_cut(
+                &substituted_plan,
+                &dispatch,
+                &started_cut,
+                started_bytes,
+                &started_sha256,
+            )
+            .unwrap_err(),
+            "systemd-dispatch-plan-binding"
+        );
+        assert_eq!(
+            audit_systemd_effect_store_cut(
+                &plan,
+                &dispatch,
+                Path::new("relative.sqlite"),
+                0,
+                &Digest::hash_bytes(b""),
+            )
+            .unwrap_err(),
             "systemd-audit-store-path-not-absolute"
         );
     }
@@ -1695,14 +1823,29 @@ mod tests {
             )
             .unwrap();
         drop(connection);
+        let (substituted_bytes, substituted_sha256) = cut_binding(&cut);
         assert_eq!(
-            audit_systemd_effect_store_cut(&plan, &dispatch, &cut).unwrap_err(),
+            audit_systemd_effect_store_cut(
+                &plan,
+                &dispatch,
+                &cut,
+                substituted_bytes,
+                &substituted_sha256,
+            )
+            .unwrap_err(),
             "systemd-receipt-identity"
         );
         let alias = directory.path().join("audit-store-alias.sqlite");
         std::os::unix::fs::symlink(&plan.attempt_store, &alias).unwrap();
         assert_eq!(
-            audit_systemd_effect_store_cut(&plan, &dispatch, &alias).unwrap_err(),
+            audit_systemd_effect_store_cut(
+                &plan,
+                &dispatch,
+                &alias,
+                substituted_bytes,
+                &substituted_sha256,
+            )
+            .unwrap_err(),
             "systemd-audit-store-not-bounded-regular-file"
         );
         let oversized = directory.path().join("audit-store-oversized.sqlite");
@@ -1711,8 +1854,108 @@ mod tests {
             .set_len(MAX_AUDIT_STORE_CUT_BYTES + 1)
             .unwrap();
         assert_eq!(
-            audit_systemd_effect_store_cut(&plan, &dispatch, &oversized).unwrap_err(),
+            audit_systemd_effect_store_cut(
+                &plan,
+                &dispatch,
+                &oversized,
+                MAX_AUDIT_STORE_CUT_BYTES + 1,
+                &Digest::hash_bytes(b""),
+            )
+            .unwrap_err(),
             "systemd-audit-store-not-bounded-regular-file"
+        );
+    }
+
+    #[test]
+    fn wal_pathname_content_and_evidence_substitutions_refuse() {
+        let (directory, plan, dispatch) = fixture();
+        let driver = ScriptedDriver {
+            observation: success(),
+        };
+        execute_with_driver(&plan, &dispatch, &driver, false).unwrap();
+
+        let wal_cut = directory.path().join("audit-wal.sqlite");
+        std::fs::copy(&plan.attempt_store, &wal_cut).unwrap();
+        let (wal_bytes, wal_sha256) = cut_binding(&wal_cut);
+        File::create(sqlite_wal_path(&wal_cut)).unwrap();
+        assert_eq!(
+            audit_systemd_effect_store_cut(&plan, &dispatch, &wal_cut, wal_bytes, &wal_sha256,)
+                .unwrap_err(),
+            "systemd-audit-store-wal-present"
+        );
+
+        let path_cut = directory.path().join("audit-path.sqlite");
+        std::fs::copy(&plan.attempt_store, &path_cut).unwrap();
+        let (path_bytes, path_sha256) = cut_binding(&path_cut);
+        let displaced = directory.path().join("audit-path-displaced.sqlite");
+        assert_eq!(
+            audit_systemd_effect_store_cut_with_hook(
+                &plan,
+                &dispatch,
+                &path_cut,
+                path_bytes,
+                &path_sha256,
+                || {
+                    std::fs::rename(&path_cut, &displaced).unwrap();
+                    std::fs::copy(&displaced, &path_cut).unwrap();
+                },
+            )
+            .unwrap_err(),
+            "systemd-audit-store-pathname-replacement"
+        );
+
+        let content_cut = directory.path().join("audit-content.sqlite");
+        std::fs::copy(&plan.attempt_store, &content_cut).unwrap();
+        let (content_bytes, content_sha256) = cut_binding(&content_cut);
+        assert_eq!(
+            audit_systemd_effect_store_cut_with_hook(
+                &plan,
+                &dispatch,
+                &content_cut,
+                content_bytes,
+                &content_sha256,
+                || {
+                    OpenOptions::new()
+                        .append(true)
+                        .open(&content_cut)
+                        .unwrap()
+                        .write_all(b"x")
+                        .unwrap();
+                },
+            )
+            .unwrap_err(),
+            "systemd-audit-store-content-substitution"
+        );
+
+        let evidence_cut = directory.path().join("audit-evidence.sqlite");
+        std::fs::copy(&plan.attempt_store, &evidence_cut).unwrap();
+        let connection = rusqlite::Connection::open(&evidence_cut).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER systemd_dbus_evidence_no_update;
+                 DROP TRIGGER systemd_dbus_evidence_no_delete;
+                 UPDATE systemd_dbus_evidence SET raw=zeroblob(raw_len);",
+            )
+            .unwrap();
+        connection
+            .execute_batch(SYSTEMD_EVIDENCE_UPDATE_TRIGGER_SQL)
+            .unwrap();
+        connection
+            .execute_batch(SYSTEMD_EVIDENCE_DELETE_TRIGGER_SQL)
+            .unwrap();
+        drop(connection);
+        let (evidence_bytes, evidence_sha256) = cut_binding(&evidence_cut);
+        let evidence_error = audit_systemd_effect_store_cut(
+            &plan,
+            &dispatch,
+            &evidence_cut,
+            evidence_bytes,
+            &evidence_sha256,
+        )
+        .unwrap_err();
+        assert!(
+            evidence_error.starts_with("systemd-evidence-"),
+            "unexpected refusal: {evidence_error}"
         );
     }
 
@@ -1767,5 +2010,19 @@ mod tests {
                 "systemd-dispatch-plan-binding"
             );
         }
+    }
+
+    fn cut_binding(path: &Path) -> (u64, Digest) {
+        let bytes = std::fs::read(path).unwrap();
+        (
+            u64::try_from(bytes.len()).unwrap(),
+            Digest::hash_bytes(&bytes),
+        )
+    }
+
+    fn sqlite_wal_path(path: &Path) -> PathBuf {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        PathBuf::from(wal)
     }
 }

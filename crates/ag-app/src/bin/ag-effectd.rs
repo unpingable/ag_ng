@@ -48,6 +48,12 @@ enum Command {
         /// Immutable copied `SQLite` store to validate as evidence.
         #[arg(long)]
         store_cut: PathBuf,
+        /// Exact expected main-store byte length.
+        #[arg(long)]
+        store_bytes: u64,
+        /// Exact expected raw main-store SHA-256.
+        #[arg(long)]
+        store_sha256: ag_primitives::Digest,
     },
 }
 
@@ -82,14 +88,25 @@ fn main() -> anyhow::Result<()> {
             .map_or_else(handle_adapter_error, Ok)?;
             write_canonical(&outcome)?;
         }
-        Command::AuditStore { plan, store_cut } => {
+        Command::AuditStore {
+            plan,
+            store_cut,
+            store_bytes,
+            store_sha256,
+        } => {
             let plan = load_effect_executor_plan_any(&plan).map_err(anyhow::Error::msg)?;
             let dispatch: EffectExecutorDispatchV1 = read_stdin_strict()?;
             let LoadedEffectExecutorPlan::SystemdV2(plan) = &plan else {
                 anyhow::bail!("audit-store-requires-systemd-v2");
             };
-            let outcome = audit_systemd_effect_store_cut(plan, &dispatch, &store_cut)
-                .map_err(anyhow::Error::msg)?;
+            let outcome = audit_systemd_effect_store_cut(
+                plan,
+                &dispatch,
+                &store_cut,
+                store_bytes,
+                &store_sha256,
+            )
+            .map_err(anyhow::Error::msg)?;
             write_canonical(&outcome)?;
         }
     }
