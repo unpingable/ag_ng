@@ -930,7 +930,7 @@ dependencies = [
 [[package]]
 name = "model-execution"
 version = "0.1.0"
-source = "git+ssh://git@github.com/unpingable/model-execution.git?rev=992a0a37c8bad627d466559776855ea10c60272a#992a0a37c8bad627d466559776855ea10c60272a"
+source = "git+ssh://git@github.com/unpingable/model-execution.git?rev=d19b08f71fbba8383cd6ef9d3a007a40bd998c32#d19b08f71fbba8383cd6ef9d3a007a40bd998c32"
 dependencies = [
  "nix",
  "serde",
