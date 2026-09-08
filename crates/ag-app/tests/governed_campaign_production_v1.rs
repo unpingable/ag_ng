@@ -34,11 +34,18 @@ fn git(character: char) -> GitObjectV1 {
     }
 }
 
-fn frozen_packet() -> CampaignPacketV1 {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../../qualification/governed-campaign-loop-v1/velvet-pigeon/evidence/glass-heron-packet.v1.json",
-    );
-    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+fn modern_packet() -> CampaignPacketV1 {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/modern-glass-heron-packet.v1.json");
+    let packet: CampaignPacketV1 = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    packet.validate().unwrap();
+    for stage in &packet.stages {
+        assert_eq!(
+            stage.nq_profile_template["runtime_schema"],
+            "nq-ng.campaign-stage-realization-profile/v2"
+        );
+    }
+    packet
 }
 
 fn production_contract(packet: &CampaignPacketV1) -> ProductionCampaignLifecycleV1 {
@@ -338,7 +345,7 @@ fn catalog(
 
 #[test]
 fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal() {
-    let packet = frozen_packet();
+    let packet = modern_packet();
     let contract = production_contract(&packet);
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("ag.sqlite3");
@@ -667,8 +674,8 @@ fn production_chain_has_three_antecedent_issuances_and_non_authorizing_terminal(
 }
 
 #[test]
-fn lifecycle_contract_has_no_preissued_successors_and_v0_source_is_unchanged() {
-    let packet = frozen_packet();
+fn lifecycle_contract_has_no_preissued_successors_and_v0_native_boundary_is_pinned() {
+    let packet = modern_packet();
     let contract = production_contract(&packet);
     let encoded = serde_json::to_string(&contract).unwrap();
     assert!(!encoded.contains("porter_run"));
@@ -683,15 +690,18 @@ fn lifecycle_contract_has_no_preissued_successors_and_v0_source_is_unchanged() {
         contract.stages[2].antecedent,
         AntecedentObservationV1::CurrentReservationRealization { .. }
     ));
+    // CLASSIC-RETIREMENT changed only the accepted native profile schema
+    // constant in V0. Preserve the original source at its original commit; pin
+    // this explicitly reviewed migration instead of claiming V0 is unchanged.
     let frozen_v0 = include_bytes!("../src/governed_campaign_v0.rs");
     assert_eq!(
         Digest::hash_bytes(frozen_v0).to_string(),
-        "sha256:f33864aa36f52069ce25fd5edeeeb0428e82fcdd27e10d7ea421d3edfc45f1de"
+        "sha256:b4f712253bf5703d8c6bb605bc833dbbc37e181e12d2badfe9a75cc120c4831f"
     );
 }
 #[test]
 fn authority_hostile_ordering_and_root_substitution_refuse() {
-    let packet = frozen_packet();
+    let packet = modern_packet();
     let contract = production_contract(&packet);
     let directory = tempfile::tempdir().unwrap();
     let journal =
