@@ -7,6 +7,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const assert = require('node:assert/strict');
 const os = require('node:os');
+const coherence = require('./response_dom_match.cjs');
 const {parseArgs} = require('node:util');
 const {values: opts} = parseArgs({options: {
   url: {type:'string'}, out: {type:'string'}, mode: {type:'string'},
@@ -39,6 +40,7 @@ function event(kind, fields={}) {
 }
 function sha(bytes) {return crypto.createHash('sha256').update(bytes).digest('hex');}
 let browser, context, page, count=0, subject, boundProducer, last, lastMotion;
+let pageObservations=[];
 const started = Date.now();
 function remaining() {
   const ms = seconds*1000-(Date.now()-started);
@@ -48,6 +50,21 @@ function remaining() {
 async function open() {
   context = await browser.newContext({viewport:{width:1280,height:1100}});
   page = await context.newPage();
+  const observations=[];
+  pageObservations=observations;
+  page.on('response',async response=>{
+    if(response.url()!==new URL('/api/v1/status',url).href || response.request().method()!=='GET')return;
+    try {
+      const bytes=await response.body();
+      assert(bytes.length<=1024*1024,'bounded browser status response');
+      const item={status:response.status(),bytes,value:JSON.parse(bytes.toString('utf8')),
+        observed_at:new Date().toISOString()};
+      observations.push(item);
+      if(observations.length>8)observations.shift();
+    } catch(error) {
+      event('PageResponseCaptureFailed',{reason:error.message});
+    }
+  });
   // Fixture pages carry an unmistakable observer label in every screenshot.
   await page.addInitScript(mode => document.addEventListener('DOMContentLoaded',()=>{
     if(mode==='DISPLAY_FIXTURE') {
@@ -60,24 +77,33 @@ async function open() {
 }
 async function sample(label, assertRender=false) {
   remaining();
-  const response = await context.request.get(new URL('/api/v1/status',url).href,{timeout:remaining()});
-  const bytes = await response.body();
-  assert(bytes.length <= 1024*1024,'bounded status response');
-  let value;
-  try {value=JSON.parse(bytes.toString('utf8'));}
-  catch(error) {write('unparseable-status.raw',bytes); throw Error('Owner HTTP projection is not parseable JSON; raw bytes retained');}
+  // Use the responses the page actually consumed. Independent GET snapshots
+  // can be stale before rendering and cannot demand the page move backwards.
+  const deadline=Date.now()+Math.min(10000,remaining());
+  let observation, domSnapshot;
+  while(Date.now()<deadline) {
+    domSnapshot=await page.evaluate(()=>({observed_at:new Date().toISOString(),
+      texts:Object.fromEntries(['durable','live','custody','notice','terminal','receipt'].map(id=>[id,document.getElementById(id).textContent])),
+      extra:{liveDetail:document.getElementById('live-detail').textContent,execution:document.getElementById('execution-detail').textContent,
+        limits:document.getElementById('limits').textContent,sources:document.getElementById('sources').textContent},
+      evidenceRows:[...document.querySelectorAll('.evidence-row')].map(row=>({label:row.querySelector('strong').textContent,
+        source:row.querySelector('small').textContent,reference:row.querySelector('pre').textContent})),
+      runDisabled:document.getElementById('run').disabled,body:document.body.innerText}));
+    observation=coherence.select(pageObservations,domSnapshot);
+    if(observation)break;
+    await page.waitForTimeout(50);
+  }
+  if(!observation)throw Error('No browser response matches an atomic rendered observation within the capture bound');
+  const {bytes,value,status}=observation;
   const motion=JSON.stringify([value.subject,value.runner_durable,value.controller_custody,value.liveness?.state,
     value.liveness?.main_pid,value.liveness?.start_ticks,value.disagreements]);
-  if(label==='progress' && response.status()===200 && motion===lastMotion) {last=value; return value;}
+  if(label==='progress' && status===200 && motion===lastMotion) {last=value; return value;}
   lastMotion=motion;
   const index=String(count++).padStart(4,'0');
   write(`${index}-${label}.status.json`,bytes);
-  if(response.status() !== 200) {
-    await page.waitForFunction(()=>document.querySelector('#notice').textContent.includes('NOT_OBSERVABLE')
-      && document.querySelector('#live').textContent==='NOT_OBSERVABLE'
-      && document.querySelector('#run').disabled,null,{timeout:Math.min(10000,remaining())});
+  if(status !== 200) {
     await page.screenshot({path:path.join(opts.out,`${index}-${label}.png`),fullPage:true,timeout:remaining()});
-    event('SourceUnavailable',{http_status:response.status(),status_sha256:sha(bytes)});
+    event('SourceUnavailable',{http_status:status,status_sha256:sha(bytes)});
     throw Error('Owner projection unavailable; raw response retained, no campaign outcome inferred');
   }
   assert.equal(value.schema,'constellation.operator_beta.fixed_demo_status.v1');
@@ -92,25 +118,13 @@ async function sample(label, assertRender=false) {
     if(boundProducer) assert.equal(identity,boundProducer,'reconnect or repeated RUN changed producer occurrence');
     boundProducer=identity;
   }
-  if(assertRender) {
-    await page.waitForFunction(expected=>{
-      const text=id=>document.getElementById(id).textContent;
-      const terminal=expected.runner_durable.terminal;
-      const ready=expected.controller_custody.state==='NO_INTENT_RECORDED' && expected.disagreements.length===0;
-      return text('durable')===expected.runner_durable.state && text('live').includes(expected.liveness.state)
-        && text('custody').includes(expected.controller_custody.state)
-        && document.getElementById('run').disabled===!ready
-        && expected.disagreements.every(reason=>text('notice').includes(reason))
-        && (terminal ? text('terminal')===(terminal.disposition||terminal.state)
-          && (!terminal.evidence || text('receipt').includes(terminal.evidence)
-            && text('receipt').includes(terminal.owner) && text('receipt').includes(terminal.validator))
-          : text('terminal').includes('No validated terminal'));
-    },value,{timeout:Math.min(10000,remaining())});
-  }
-  const dom=await page.locator('body').innerText({timeout:remaining()});
-  write(`${index}-${label}.rendered.txt`,dom);
+  write(`${index}-${label}.rendered.txt`,domSnapshot.body);
+  write(`${index}-${label}.coherence.json`,JSON.stringify({source:'browser qualification observer',
+    response_observed_at:observation.observed_at,dom_observed_at:domSnapshot.observed_at,
+    status_sha256:sha(bytes),matched_dom:domSnapshot.texts,
+    screenshot_semantics:'subsequent visual observation; state may advance after the atomic DOM capture'},null,2)+'\n');
   await page.screenshot({path:path.join(opts.out,`${index}-${label}.png`),fullPage:true,timeout:remaining()});
-  event('ProjectionObserved',{label,http_status:response.status(),status_sha256:sha(bytes),run_id:value.subject.run_id,
+  event('ProjectionObserved',{label,http_status:status,status_sha256:sha(bytes),run_id:value.subject.run_id,
     durable:value.runner_durable.state,liveness:value.liveness.state,custody:value.controller_custody.state});
   last=value;
   return value;
@@ -122,6 +136,7 @@ async function main() {
     invocation_id:process.env.INVOCATION_ID || 'NOT_OBSERVABLE',
     max_seconds:seconds,repeat_run:opts['repeat-run'],wait_terminal:opts['wait-terminal'],node:process.version,
     driver_sha256:sha(fs.readFileSync(__filename)),playwright_module:opts.playwright,
+    coherence_sha256:sha(fs.readFileSync(path.join(__dirname,'response_dom_match.cjs'))),
     browser_launcher:opts.browser,browser_launcher_sha256:sha(fs.readFileSync(opts.browser)),
     authority_effect:'NONE; explicit RUN delegates to existing Docket owner'},null,2)+'\n');
   browser=await chromium.launch({executablePath:opts.browser,headless:true,chromiumSandbox:true,timeout:remaining()});

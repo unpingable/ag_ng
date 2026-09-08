@@ -53,6 +53,13 @@ not replace domain evidence. A bound expiring, query error, missing terminal or
 assertion failure writes `CAPTURE-FAILED.json` and returns nonzero without
 stopping, resetting or restarting the producer.
 
+The source bytes now come from the page's own observed responses and are paired
+with a matching atomic DOM observation; independent queries cannot demand that
+an advancing page return to an older phase. Screenshot timing is recorded as a
+subsequent visual observation. See `RECORDER-CORRECTION.md` for the retained
+first-live-capture failure, bounded transition/mismatch controls and the
+observe-only continuation boundary.
+
 Cases covered: real RUN when explicitly selected, deliberate duplicate requests,
 refresh, new browser context/reconnect, stable run/spec/observed producer identity,
 independent durable/live rendering, and exact optional expected terminal result.
