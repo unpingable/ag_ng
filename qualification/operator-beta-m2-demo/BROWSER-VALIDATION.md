@@ -1,5 +1,16 @@
 # M2 display fixture browser evidence — 2026-09-08
 
+## Returned controller identity correction
+
+The affected refusal browser case was checked against UI source SHA-256
+`63a43bff807849ca8e35048899ab5385ba72fef84cb4daeb3f1a38d0c140ba18` in
+`/data/git/.campaign-artifacts/m2-screen-refused-fixture-006`.
+It checks the ordinary refusal display, explicit NQ-ng owner / Docket validator,
+refresh and reconnect. Browser driver and helper bytes remain unchanged from
+the identities in the following section. Broader prior display evidence stays
+attached to its original source: this correction changes the subprocess reply
+digest check and test fixture, with no HTML/rendering change.
+
 ## Owner/validator and executed-source correction
 
 The nine cases below were rerun in

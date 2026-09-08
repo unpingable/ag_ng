@@ -112,6 +112,8 @@ class Controller:
             value = json.loads(raw, object_pairs_hook=unique_object,
                                parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
             validate_projection(value)
+            if not hmac.compare_digest(value["execution"]["controller_sha256"], self.digest):
+                raise ValueError("returned controller identity differs from admitted execution")
         except (ValueError, TypeError) as error:
             raise Unavailable("Docket projection is unavailable or incompatible") from error
         return value

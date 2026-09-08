@@ -94,7 +94,10 @@ class HttpBoundary(unittest.TestCase):
 
     def test_refused_is_normal_authoritative_response(self):
         self.controller.value["runner_durable"] = {
-            "state": "REFUSED", "terminal": {"state": "REFUSED", "owner": "Docket", "evidence": "/fixture/REFUSAL.json"}}
+            "source": "composition owner records", "state": "REFUSED", "recovery": None,
+            "terminal": {"state": "REFUSED", "owner": "NQ-ng", "validator": "Docket",
+                         "disposition": "REFUSED", "replay": "check-refusal", "evidence": "/fixture/REFUSAL.json"}}
+        demo.validate_projection(self.controller.value)
         status, _, raw = self.request("GET", "/api/v1/status")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(raw), self.controller.value)
@@ -187,11 +190,22 @@ class SourceAdmission(unittest.TestCase):
     def test_retained_controller_bytes_survive_path_replacement(self):
         with tempfile.TemporaryDirectory() as root:
             path = pathlib.Path(root) / "fixture.py"
-            raw = ("import json\nprint(" + repr(json.dumps(projection())) + ")\n").encode()
+            raw = ("import json\nv=" + repr(projection()) + "\nv['execution']['controller_sha256']=__executed_source_sha256__\nprint(json.dumps(v))\n").encode()
             path.write_bytes(raw)
             controller = demo.Controller(path, hashlib.sha256(raw).hexdigest())
             path.write_text("raise RuntimeError('replacement must never execute')")
-            self.assertEqual(controller.query("status"), projection())
+            expected = projection()
+            expected["execution"]["controller_sha256"] = hashlib.sha256(raw).hexdigest()
+            self.assertEqual(controller.query("status"), expected)
+
+    def test_well_formed_but_wrong_returned_controller_digest_refuses(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / "fixture.py"
+            raw = ("print(" + repr(json.dumps(projection())) + ")\n").encode()
+            path.write_bytes(raw)
+            controller = demo.Controller(path, hashlib.sha256(raw).hexdigest())
+            with self.assertRaises(demo.Unavailable):
+                controller.query("status")
 
     def test_wrong_digest_and_symlink_refuse(self):
         with tempfile.TemporaryDirectory() as root:

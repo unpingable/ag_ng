@@ -11,7 +11,13 @@ integrated acceptance record are owned by the main M2 campaign. Earlier M1
 acceptance remains attached to its original revisions.
 
 The exact `fixed_demo.py` bytes tested here have SHA-256
-`3509910082e38d06b3d1ac1be81c7659f651c6ba56364cf95d984f827e2bb4da`.
+`63a43bff807849ca8e35048899ab5385ba72fef84cb4daeb3f1a38d0c140ba18`.
+
+The current bounded correction succeeds independently rejected
+`215a1955a4bf6771408cc1d4aaf5222b92f8b47c`. It constant-time compares the returned
+controller digest with the digest admitted by this adapter, rejects a
+well-formed wrong digest, and corrects the remaining HTTP refusal fixture to
+the same NQ-ng owner / Docket validator shape already required by the adapter.
 
 This successor adds explicit refusal owner/validator attribution and captured
 execution-source identity to the locally accepted screen revision
@@ -22,13 +28,18 @@ acceptance remain attached to their original source bytes.
 Observed local validation:
 
 - `python3 -m unittest discover -s crates/ag-operator-ui/demo -p 'test_*.py' -v`:
-  19 passed, final correction run 5.367 seconds. HTTP cases used approved ephemeral
+  20 passed, final correction run 5.322 seconds. HTTP cases used approved ephemeral
   loopback sockets. Initial sandbox socket denial was an environment refusal,
   followed by the same test invocation with platform approval.
 - `node --check qualification/operator-beta-m2-demo/browser_exercise.cjs`:
   passed.
 - `git diff --check`: passed.
-- Current source accepted the corrected actual Docket owner status fixture
+- Current source accepted the frozen Docket `d3ff31c…` status fixture at
+  controller SHA-256
+  `181b2aabe12e10f519004d2ed3fb55f7d908f4cfa1475079d164a49380d48b09`:
+  ten evidence entries, zero manager calls. No dependency worktree bytecode
+  writes were permitted.
+- Prior screen source `35099100…` accepted the corrected actual Docket owner status fixture
   at controller SHA-256
   `28b9c3604156da1a31680ba1d85b0b6d19cfad3d9017408cd448d942eea05c25`:
   ten evidence entries, zero manager calls. This is byte-specific development
