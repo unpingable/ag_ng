@@ -1,7 +1,7 @@
 # Production-shaped example. Replace the peer enrollment, endpoint policy,
 # model set, and systemd credential name before installation. Secrets are
 # never stored in this file.
-schema = "ag.config.providerd.v1"
+schema = "ag.config.providerd.v2"
 security_profile = "production"
 authority_domain = "example-host.production"
 epoch = "1"
@@ -78,12 +78,14 @@ provider_deadline_ms = 25000
 # LoadCredential= entry in a local ag-providerd.service drop-in.
 [[endpoints]]
 id = "primary"
+protocol = "provider-json-v1"
+methods = ["responses.create"]
+[endpoints.transport]
+kind = "credentialed_https_api"
 url = "https://provider.example.invalid/v1/inference"
 credential_name = "provider-api-key"
 credential_header = "authorization"
 credential_prefix = "Bearer "
-protocol = "provider-json-v1"
-methods = ["responses.create"]
 
 [[endpoints.models]]
 id = "production-model"

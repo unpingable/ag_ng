@@ -508,29 +508,64 @@ pub struct ProviderCommandConfigV1 {
     pub environment: BTreeMap<String, String>,
 }
 
+/// Redirect handling for an enrolled cleartext-local endpoint.
+///
+/// V1 deliberately admits only refusal. A redirect is returned as provider
+/// evidence and is never followed to a target outside the enrolled origin.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderLocalRedirectPolicyV1 {
+    /// Do not follow redirects.
+    Deny,
+}
+
+/// Explicit provider transport and authentication policy.
+///
+/// The tagged shape prevents an omitted credential from silently turning a
+/// remote API into an unauthenticated route, and prevents a request from
+/// selecting an executable or network destination.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderTransportConfigV1 {
+    /// Credentialed remote HTTPS API. The credential is a protected filename,
+    /// never secret material embedded in configuration.
+    CredentialedHttpsApi {
+        /// Exact root-owned HTTPS endpoint.
+        url: String,
+        /// Credential filename beneath the daemon credential directory.
+        credential_name: String,
+        /// Closed header receiving the credential.
+        credential_header: String,
+        /// Constant non-secret prefix prepended to the credential.
+        credential_prefix: String,
+    },
+    /// Credentialless cleartext endpoint on an operator-enrolled local origin.
+    LocalHttp {
+        /// Exact root-owned HTTP endpoint.
+        url: String,
+        /// Closed origins which may receive this request.
+        allowed_origins: Vec<String>,
+        /// Explicit redirect disposition.
+        redirect_policy: ProviderLocalRedirectPolicyV1,
+    },
+    /// Fixed command route using the executable's separately mounted login.
+    Command {
+        /// Closed executable/adapter/environment policy.
+        command: ProviderCommandConfigV1,
+    },
+}
+
 /// One closed provider backend.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderEndpointConfigV1 {
     /// Root-owned endpoint ID referenced by capabilities.
     pub id: String,
-    /// Exact HTTPS origin and path.
-    pub url: String,
-    /// Permit root-configured cleartext HTTP, intended for a private local model network.
-    #[serde(default)]
-    pub allow_plaintext_http: bool,
-    /// systemd credential filename, not secret contents.
-    pub credential_name: String,
-    /// Header receiving the credential (for example `authorization`).
-    pub credential_header: String,
-    /// Constant prefix prepended to the credential (for example `Bearer `).
-    pub credential_prefix: String,
+    /// Exact transport and authentication variant.
+    pub transport: ProviderTransportConfigV1,
     /// Root-owned constant non-secret headers required by the protocol adapter.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    /// Fixed command transport. Present only when `url` and credential fields are empty.
-    #[serde(default)]
-    pub command: Option<ProviderCommandConfigV1>,
     /// Closed model/deployment policies, including broker-owned reservations.
     pub models: Vec<ProviderModelPolicyConfigV1>,
     /// Exact protocol adapter.
@@ -611,6 +646,14 @@ pub enum ConfigError {
     /// Bounds are zero or internally inconsistent.
     #[error("invalid configured resource limit: {0}")]
     InvalidLimit(&'static str),
+    /// One provider entry is unsupported or internally inconsistent.
+    #[error("invalid provider {provider}: {reason}")]
+    InvalidProvider {
+        /// Non-secret root-owned provider identifier.
+        provider: String,
+        /// Closed diagnostic reason which never includes credentials.
+        reason: &'static str,
+    },
     /// A filesystem custody policy is internally unsafe.
     #[error("invalid filesystem custody policy: {0}")]
     InvalidCustody(&'static str),
@@ -1265,7 +1308,7 @@ impl ProviderdConfigV1 {
     /// Returns an error for schema, path, signing, peer, frame/response limit,
     /// endpoint, credential-header, model, method, or adapter violations.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema != "ag.config.providerd.v1" {
+        if self.schema != "ag.config.providerd.v2" {
             return Err(ConfigError::Schema(self.schema.clone()));
         }
         validate_security_profile(&self.security_profile)?;
@@ -1313,26 +1356,85 @@ impl ProviderdConfigV1 {
         }
         let mut endpoint_ids = BTreeSet::new();
         for endpoint in &self.endpoints {
-            let command_transport = endpoint.command.is_some();
-            let http_transport = !command_transport;
-            let valid_http_url = endpoint.url.starts_with("https://")
-                || (endpoint.allow_plaintext_http && endpoint.url.starts_with("http://"));
-            let credential_free = endpoint.credential_name.is_empty()
-                && endpoint.credential_header.is_empty()
-                && endpoint.credential_prefix.is_empty();
-            let credential_configured = valid_credential_name(&endpoint.credential_name)
-                && matches!(
-                    endpoint.credential_header.as_str(),
-                    "authorization" | "x-api-key"
-                );
-            if endpoint.id.is_empty()
-                || (http_transport
-                    && (!valid_http_url || !(credential_free || credential_configured)))
-                || (command_transport && (!endpoint.url.is_empty() || !credential_free))
-                || endpoint.models.is_empty()
-                || endpoint.methods.is_empty()
-            {
-                return Err(ConfigError::InvalidLimit("provider endpoint"));
+            let provider = if endpoint.id.is_empty() {
+                "<empty>".to_owned()
+            } else {
+                endpoint.id.clone()
+            };
+            if endpoint.id.is_empty() {
+                return Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "provider id is empty",
+                });
+            }
+            match &endpoint.transport {
+                ProviderTransportConfigV1::CredentialedHttpsApi {
+                    url,
+                    credential_name,
+                    credential_header,
+                    ..
+                } => {
+                    if !valid_https_url(url) {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "remote API requires an exact HTTPS URL",
+                        });
+                    }
+                    if !valid_credential_name(credential_name)
+                        || !matches!(credential_header.as_str(), "authorization" | "x-api-key")
+                    {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "remote API requires an enrolled credential and supported header",
+                        });
+                    }
+                }
+                ProviderTransportConfigV1::LocalHttp {
+                    url,
+                    allowed_origins,
+                    redirect_policy: ProviderLocalRedirectPolicyV1::Deny,
+                } => {
+                    let Some(origin) = local_http_origin(url) else {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "local HTTP route requires an exact cleartext HTTP URL",
+                        });
+                    };
+                    let origins_valid = !allowed_origins.is_empty()
+                        && allowed_origins.iter().all(|candidate| {
+                            local_http_origin(candidate).is_some_and(|value| value == candidate)
+                        })
+                        && allowed_origins.iter().collect::<BTreeSet<_>>().len()
+                            == allowed_origins.len();
+                    if !origins_valid || !allowed_origins.iter().any(|item| item == origin) {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "local HTTP endpoint origin is not in its operator allowlist",
+                        });
+                    }
+                }
+                ProviderTransportConfigV1::Command { command } => {
+                    if !valid_provider_command(command) {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "command route is not a supported fixed executable policy",
+                        });
+                    }
+                    if endpoint.protocol != "opaque_json_v1"
+                        || endpoint.methods.as_slice() != ["command.complete"]
+                    {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "command route requires the fixed command.complete protocol",
+                        });
+                    }
+                }
+            }
+            if endpoint.models.is_empty() || endpoint.methods.is_empty() {
+                return Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "provider requires at least one model and method",
+                });
             }
             if endpoint.headers.iter().any(|(name, value)| {
                 !matches!(name.as_str(), "anthropic-version")
@@ -1340,25 +1442,39 @@ impl ProviderdConfigV1 {
                     || value.len() > 512
                     || value.contains(['\r', '\n', '\0'])
             }) {
-                return Err(ConfigError::InvalidLimit("provider headers"));
-            }
-            if let Some(command) = &endpoint.command
-                && !valid_provider_command(command)
-            {
-                return Err(ConfigError::InvalidLimit("provider command"));
+                return Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "provider headers are outside the closed non-secret allowlist",
+                });
             }
             if !endpoint_ids.insert(&endpoint.id) {
-                return Err(ConfigError::InvalidLimit("duplicate provider endpoint"));
+                return Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "duplicate provider id",
+                });
             }
             let mut models = BTreeSet::new();
             for model in &endpoint.models {
-                if model.id.is_empty()
-                    || !models.insert(&model.id)
-                    || model.max_event_stream_bytes < PROVIDER_MIN_EVENT_STREAM_BYTES
+                if model.id.is_empty() {
+                    return Err(ConfigError::InvalidProvider {
+                        provider,
+                        reason: "model id is empty",
+                    });
+                }
+                if !models.insert(&model.id) {
+                    return Err(ConfigError::InvalidProvider {
+                        provider,
+                        reason: "duplicate backend model id",
+                    });
+                }
+                if model.max_event_stream_bytes < PROVIDER_MIN_EVENT_STREAM_BYTES
                     || model.max_event_stream_bytes > self.limits.max_response_bytes
                     || model.worst_case_cost_microunits == 0
                 {
-                    return Err(ConfigError::InvalidLimit("provider model policy"));
+                    return Err(ConfigError::InvalidProvider {
+                        provider,
+                        reason: "model resource policy is outside configured bounds",
+                    });
                 }
             }
         }
@@ -1377,6 +1493,31 @@ fn valid_credential_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn authority_end(value: &str) -> usize {
+    value.find(['/', '?', '#']).unwrap_or(value.len())
+}
+
+fn valid_authority(authority: &str) -> bool {
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !authority
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+}
+
+fn valid_https_url(url: &str) -> bool {
+    let Some(remainder) = url.strip_prefix("https://") else {
+        return false;
+    };
+    valid_authority(&remainder[..authority_end(remainder)])
+}
+
+fn local_http_origin(url: &str) -> Option<&str> {
+    let remainder = url.strip_prefix("http://")?;
+    let end = authority_end(remainder);
+    valid_authority(&remainder[..end]).then_some(&url[.."http://".len() + end])
 }
 
 fn valid_provider_command(command: &ProviderCommandConfigV1) -> bool {
@@ -1499,7 +1640,10 @@ mod tests {
         config.endpoints[0].models[0].worst_case_cost_microunits = 0;
         assert!(matches!(
             config.validate(),
-            Err(ConfigError::InvalidLimit("provider model policy"))
+            Err(ConfigError::InvalidProvider {
+                provider,
+                reason: "model resource policy is outside configured bounds"
+            }) if provider == "primary"
         ));
     }
 
@@ -1526,37 +1670,52 @@ mod tests {
             toml::from_str(include_str!("../../../config/providerd.example.toml"))
                 .expect("strict provider example");
         let endpoint = &mut local.endpoints[0];
-        endpoint.url = "http://ollama:11434/api/chat".to_owned();
-        endpoint.allow_plaintext_http = true;
-        endpoint.credential_name.clear();
-        endpoint.credential_header.clear();
-        endpoint.credential_prefix.clear();
+        endpoint.transport = ProviderTransportConfigV1::LocalHttp {
+            url: "http://ollama:11434/api/chat".to_owned(),
+            allowed_origins: vec!["http://ollama:11434".to_owned()],
+            redirect_policy: ProviderLocalRedirectPolicyV1::Deny,
+        };
         local.validate().expect("explicit local HTTP endpoint");
-        local.endpoints[0].allow_plaintext_http = false;
+        local.endpoints[0].transport = ProviderTransportConfigV1::LocalHttp {
+            url: "http://other:11434/api/chat".to_owned(),
+            allowed_origins: vec!["http://ollama:11434".to_owned()],
+            redirect_policy: ProviderLocalRedirectPolicyV1::Deny,
+        };
         assert!(matches!(
             local.validate(),
-            Err(ConfigError::InvalidLimit("provider endpoint"))
+            Err(ConfigError::InvalidProvider {
+                provider,
+                reason: "local HTTP endpoint origin is not in its operator allowlist"
+            }) if provider == "primary"
         ));
 
         let mut command: ProviderdConfigV1 =
             toml::from_str(include_str!("../../../config/providerd.example.toml"))
                 .expect("strict provider example");
         let endpoint = &mut command.endpoints[0];
-        endpoint.url.clear();
-        endpoint.credential_name.clear();
-        endpoint.credential_header.clear();
-        endpoint.credential_prefix.clear();
-        endpoint.command = Some(ProviderCommandConfigV1 {
-            adapter: "claude-code".to_owned(),
-            executable: PathBuf::from("/opt/claude/claude"),
-            working_directory: PathBuf::from("/var/empty"),
-            environment: BTreeMap::new(),
-        });
+        endpoint.protocol = "opaque_json_v1".to_owned();
+        endpoint.methods = vec!["command.complete".to_owned()];
+        endpoint.transport = ProviderTransportConfigV1::Command {
+            command: ProviderCommandConfigV1 {
+                adapter: "claude-code".to_owned(),
+                executable: PathBuf::from("/opt/claude/claude"),
+                working_directory: PathBuf::from("/var/empty"),
+                environment: BTreeMap::new(),
+            },
+        };
         command.validate().expect("fixed command endpoint");
-        command.endpoints[0].command.as_mut().unwrap().executable = PathBuf::from("relative");
+        let ProviderTransportConfigV1::Command { command: route } =
+            &mut command.endpoints[0].transport
+        else {
+            unreachable!()
+        };
+        route.executable = PathBuf::from("relative");
         assert!(matches!(
             command.validate(),
-            Err(ConfigError::InvalidLimit("provider command"))
+            Err(ConfigError::InvalidProvider {
+                provider,
+                reason: "command route is not a supported fixed executable policy"
+            }) if provider == "primary"
         ));
     }
 
@@ -1566,10 +1725,19 @@ mod tests {
             toml::from_str(include_str!("../../../config/providerd.example.toml"))
                 .expect("strict provider example");
         for hostile in ["", ".", "..", "nested/key", "key\nname"] {
-            config.endpoints[0].credential_name = hostile.to_owned();
+            let ProviderTransportConfigV1::CredentialedHttpsApi {
+                credential_name, ..
+            } = &mut config.endpoints[0].transport
+            else {
+                unreachable!()
+            };
+            *credential_name = hostile.to_owned();
             assert!(matches!(
                 config.validate(),
-                Err(ConfigError::InvalidLimit("provider endpoint"))
+                Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "remote API requires an enrolled credential and supported header"
+                }) if provider == "primary"
             ));
         }
     }

@@ -31,7 +31,7 @@ use ag_app::api::{
 };
 use ag_app::config::{
     ProviderCommandConfigV1, ProviderEndpointConfigV1, ProviderModelPolicyConfigV1,
-    ProviderdConfigV1,
+    ProviderTransportConfigV1, ProviderdConfigV1,
 };
 use ag_app::descriptor_path::open_beneath;
 use ag_app::rpc_auth::VerifiedRpcPrincipalV1;
@@ -701,10 +701,6 @@ impl ProviderCoreV1 {
         request_bytes: Vec<u8>,
         maximum_event_stream_bytes: u64,
     ) -> Result<ProviderEventStreamV1, ProviderError> {
-        if let Some(command) = &endpoint.command {
-            return self.dispatch_command(command, request_bytes, maximum_event_stream_bytes);
-        }
-
         let mut headers = HeaderMap::new();
         for (name, value) in &endpoint.headers {
             headers.insert(
@@ -718,33 +714,48 @@ impl ProviderCoreV1 {
                 HeaderValue::from_str(value)?,
             );
         }
-        if !endpoint.credential_name.is_empty() {
-            let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY")
-                .ok_or(ProviderError::CredentialUnavailable)?;
-            let mut credential = read_provider_credential(
-                Path::new(&credential_directory),
-                &endpoint.credential_name,
-            )?;
-            while credential.ends_with(['\n', '\r']) {
-                credential.pop();
+        let url = match &endpoint.transport {
+            ProviderTransportConfigV1::Command { command } => {
+                return self.dispatch_command(command, request_bytes, maximum_event_stream_bytes);
             }
-            if credential.is_empty() || credential.contains(['\n', '\r', '\0']) {
-                return Err(ProviderError::CredentialUnavailable);
+            ProviderTransportConfigV1::LocalHttp { url, .. } => url,
+            ProviderTransportConfigV1::CredentialedHttpsApi {
+                url,
+                credential_name,
+                credential_header,
+                credential_prefix,
+            } => {
+                let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+                    .ok_or(ProviderError::CredentialUnavailable)?;
+                let mut credential =
+                    read_provider_credential(Path::new(&credential_directory), credential_name)?;
+                while credential.ends_with(['\n', '\r']) {
+                    credential.pop();
+                }
+                if credential.is_empty() || credential.contains(['\n', '\r', '\0']) {
+                    return Err(ProviderError::CredentialUnavailable);
+                }
+                let header = HeaderName::from_bytes(credential_header.as_bytes())?;
+                let value = HeaderValue::from_str(&format!("{credential_prefix}{credential}"))?;
+                headers.insert(header, value);
+                url
             }
-            let credential_header = HeaderName::from_bytes(endpoint.credential_header.as_bytes())?;
-            let credential_value =
-                HeaderValue::from_str(&format!("{}{}", endpoint.credential_prefix, credential))?;
-            headers.insert(credential_header, credential_value);
-        }
+        };
 
         let response = match self
             .client
-            .post(&endpoint.url)
+            .post(url)
             .headers(headers)
             .body(request_bytes)
             .send()
         {
             Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                // Once a request may have reached a provider, a timeout cannot
+                // prove non-execution or non-billing. Leave the durable
+                // reservation unresolved for reconciliation; never redispatch.
+                return Err(ProviderError::DispatchOutcomeIndeterminate);
+            }
             Err(error) => {
                 return Ok(ProviderEventStreamV1::TransportFailure {
                     class: classify_transport(&error),
@@ -881,24 +892,16 @@ impl ProviderCoreV1 {
         if uses_stdin {
             let mut stdin = child.stdin.take().ok_or(ProviderError::CommandPipe)?;
             if std::io::Write::write_all(&mut stdin, prompt.as_bytes()).is_err() {
-                let _ = child.kill();
+                terminate_process_group(&mut child);
                 let _ = child.wait();
-                return Ok(ProviderEventStreamV1::TransportFailure {
-                    class: ProviderTransportFailureV1::Body,
-                });
+                return Err(ProviderError::DispatchOutcomeIndeterminate);
             }
         }
         let stdout = child.stdout.take().ok_or(ProviderError::CommandPipe)?;
         let stderr = child.stderr.take().ok_or(ProviderError::CommandPipe)?;
-        let bound = maximum_event_stream_bytes.saturating_add(1);
-        let stdout_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout.take(bound).read_to_end(&mut bytes).map(|_| bytes)
-        });
-        let stderr_reader = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr.take(8193).read_to_end(&mut bytes).map(|_| bytes)
-        });
+        let stdout_reader =
+            thread::spawn(move || drain_bounded(stdout, maximum_event_stream_bytes));
+        let stderr_reader = thread::spawn(move || drain_bounded(stderr, 8192));
         let started = std::time::Instant::now();
         let deadline = Duration::from_millis(self.config.limits.provider_deadline_ms);
         let status = loop {
@@ -908,12 +911,7 @@ impl ProviderCoreV1 {
                     thread::sleep(Duration::from_millis(25));
                 }
                 Ok(None) => {
-                    if let Ok(pid) = i32::try_from(child.id()) {
-                        let _ = nix::sys::signal::killpg(
-                            nix::unistd::Pid::from_raw(pid),
-                            nix::sys::signal::Signal::SIGTERM,
-                        );
-                    }
+                    terminate_process_group(&mut child);
                     let grace = std::time::Instant::now();
                     while grace.elapsed() < Duration::from_secs(5) {
                         if child.try_wait().ok().flatten().is_some() {
@@ -922,25 +920,28 @@ impl ProviderCoreV1 {
                         thread::sleep(Duration::from_millis(25));
                     }
                     if child.try_wait().ok().flatten().is_none() {
-                        let _ = child.kill();
+                        kill_process_group(&mut child);
                     }
                     let _ = child.wait();
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
-                    return Ok(ProviderEventStreamV1::TransportFailure {
-                        class: ProviderTransportFailureV1::Timeout,
-                    });
+                    return Err(ProviderError::DispatchOutcomeIndeterminate);
                 }
-                Err(_) => return Err(ProviderError::CommandWait),
+                Err(_) => {
+                    terminate_process_group(&mut child);
+                    kill_process_group(&mut child);
+                    let _ = child.wait();
+                    return Err(ProviderError::DispatchOutcomeIndeterminate);
+                }
             }
         };
-        let stdout = stdout_reader
+        let (stdout, stdout_exceeded) = stdout_reader
             .join()
             .map_err(|_| ProviderError::CommandPipe)??;
         let _stderr = stderr_reader
             .join()
             .map_err(|_| ProviderError::CommandPipe)??;
-        if stdout.len() as u64 > maximum_event_stream_bytes {
+        if stdout_exceeded {
             return Ok(ProviderEventStreamV1::ResponseLimitExceeded {
                 status: 200,
                 headers: BTreeMap::new(),
@@ -1181,6 +1182,46 @@ impl ProviderCoreV1 {
         )?;
         Ok(ProviderResponseV1::SessionTerminated { receipt })
     }
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+}
+
+fn kill_process_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+}
+
+fn drain_bounded(
+    mut reader: impl Read,
+    maximum_retained_bytes: u64,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let retained_limit = maximum_retained_bytes.saturating_add(1);
+    let mut retained = Vec::new();
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let available = retained_limit.saturating_sub(retained.len() as u64);
+        let keep = usize::try_from(available.min(count as u64)).unwrap_or(0);
+        retained.extend_from_slice(&buffer[..keep]);
+        exceeded |= count > keep;
+    }
+    let exceeded = exceeded || retained.len() as u64 > maximum_retained_bytes;
+    Ok((retained, exceeded))
 }
 
 fn read_provider_credential(
@@ -1518,9 +1559,10 @@ fn provider_api_error<T>(error: &ProviderError) -> ApiResultV1<T> {
         | ProviderError::UnsafeHeader
         | ProviderError::AdapterRequestMismatch
         | ProviderError::EndpointNotAllowed => ApiErrorCodeV1::InvalidRequest,
-        ProviderError::CredentialUnavailable | ProviderError::DispatchOutcomeIndeterminate => {
-            ApiErrorCodeV1::Indeterminate
-        }
+        ProviderError::CredentialUnavailable
+        | ProviderError::CommandPipe
+        | ProviderError::CommandWait
+        | ProviderError::DispatchOutcomeIndeterminate => ApiErrorCodeV1::Indeterminate,
         _ => ApiErrorCodeV1::Internal,
     };
     ApiResultV1::error(code, error.to_string())
@@ -1640,7 +1682,11 @@ pub enum ProviderError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write as _;
+    use std::net::TcpListener;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ag_primitives::{
         InferenceBudgetV1, InferenceEnvelopeV1, InferenceMethodId, LifecycleNonce, ModelId,
@@ -1713,10 +1759,14 @@ mod tests {
         }
 
         fn with_caller_kind(kind: ag_primitives::PrincipalKindV1) -> Self {
+            Self::with_config(|config| config.caller_peer.principal_kind = kind)
+        }
+
+        fn with_config(configure: impl FnOnce(&mut ProviderdConfigV1)) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let mut config: ProviderdConfigV1 =
                 toml::from_str(include_str!("../../../config/providerd.example.toml")).unwrap();
-            config.caller_peer.principal_kind = kind;
+            configure(&mut config);
             config.store.database = directory.path().join("provider.db");
             config.store.object_store = directory.path().join("objects");
             let peer = VerifiedRpcPrincipalV1 {
@@ -1960,6 +2010,169 @@ mod tests {
         let text = String::from_utf8(body.into_vec()).unwrap();
         assert!(text.contains("command_refused"));
         assert!(!text.contains("super-secret"));
+    }
+
+    #[test]
+    fn local_http_redirect_is_captured_and_never_followed() {
+        let escaped = TcpListener::bind("127.0.0.1:0").unwrap();
+        escaped.set_nonblocking(true).unwrap();
+        let escaped_origin = format!("http://{}", escaped.local_addr().unwrap());
+        let escaped_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&escaped_hits);
+        let escaped_thread = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(500) {
+                match escaped.accept() {
+                    Ok((_stream, _)) => {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_origin = format!("http://{}", redirect.local_addr().unwrap());
+        let redirect_url = format!("{redirect_origin}/v1/chat/completions");
+        let location = format!("{escaped_origin}/credential-escape");
+        let redirect_thread = thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let mut fixture = ProviderFixture::with_config(|config| {
+            config.endpoints[0].transport = ProviderTransportConfigV1::LocalHttp {
+                url: redirect_url,
+                allowed_origins: vec![redirect_origin],
+                redirect_policy: ag_app::config::ProviderLocalRedirectPolicyV1::Deny,
+            };
+        });
+        let capability = fixture.capability(&SessionId::new("redirect-session").unwrap(), 1);
+        let endpoint = fixture.core.endpoints.remove("primary").unwrap();
+        let event = fixture
+            .core
+            .dispatch(
+                &endpoint,
+                &request_custody(
+                    &capability,
+                    br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#,
+                ),
+                br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#.to_vec(),
+                16 * 1024,
+            )
+            .unwrap();
+        assert!(matches!(
+            event,
+            ProviderEventStreamV1::HttpResponse { status: 302, .. }
+        ));
+        redirect_thread.join().unwrap();
+        escaped_thread.join().unwrap();
+        assert_eq!(escaped_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn http_timeout_stays_reserved_and_replay_never_redispatches() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{origin}/v1/chat/completions");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        let server = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(750) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        thread::sleep(Duration::from_millis(250));
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let mut fixture = ProviderFixture::with_config(|config| {
+            config.limits.provider_deadline_ms = 50;
+            config.endpoints[0].transport = ProviderTransportConfigV1::LocalHttp {
+                url,
+                allowed_origins: vec![origin],
+                redirect_policy: ag_app::config::ProviderLocalRedirectPolicyV1::Deny,
+            };
+        });
+        let session = SessionId::new("timeout-session").unwrap();
+        let capability = fixture.capability(&session, 1);
+        fixture.register(&capability);
+        let bytes =
+            br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#;
+        let request = request_custody(&capability, bytes);
+        let infer = || ProviderRequestV1::Infer {
+            capability: Box::new(capability.clone()),
+            request: Box::new(request.clone()),
+            request_bytes: OpaqueBytesV1::new(bytes.to_vec()),
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                fixture.core.handle(infer(), &fixture.peer),
+                ApiResultV1::Error {
+                    code: ApiErrorCodeV1::Indeterminate,
+                    ..
+                }
+            ));
+        }
+        server.join().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn timed_out_command_kills_the_process_group_and_is_indeterminate() {
+        let mut fixture = ProviderFixture::new();
+        fixture.core.config.limits.provider_deadline_ms = 50;
+        let executable = fixture._directory.path().join("slow-command");
+        let marker = fixture._directory.path().join("survived");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n(sleep 1; printf survived > '{}') &\nwait\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let command = ProviderCommandConfigV1 {
+            adapter: "claude-code".to_owned(),
+            executable,
+            working_directory: fixture._directory.path().to_path_buf(),
+            environment: BTreeMap::new(),
+        };
+        let request =
+            br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#;
+        assert!(matches!(
+            fixture
+                .core
+                .dispatch_command(&command, request.to_vec(), 16 * 1024),
+            Err(ProviderError::DispatchOutcomeIndeterminate)
+        ));
+        thread::sleep(Duration::from_millis(1100));
+        assert!(
+            !marker.exists(),
+            "the timed-out command process tree survived"
+        );
     }
 
     #[test]

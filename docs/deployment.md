@@ -321,9 +321,24 @@ agd, effectd, providerd, or an operator. A packaged generation/rotation command
 does not exist yet and is a release gate; ad hoc key conversion is not an
 enrollment procedure.
 
-Each provider endpoint is an exact HTTPS URL, endpoint ID, protocol adapter,
-closed method/model set, credential header/prefix, and systemd credential
-filename. Install the API secret outside the repository and map it with a
+Every provider endpoint selects exactly one tagged transport/authentication
+variant in root-owned policy:
+
+- `credentialed_https_api` requires an exact HTTPS URL, a protected
+  credential filename, and one closed credential header. Credentials are not
+  optional for this variant.
+- `local_http` requires an exact cleartext HTTP URL, an operator-owned origin
+  allowlist containing that URL's origin, and `redirect_policy = "deny"`.
+  Providerd never follows a redirect, so a local endpoint cannot redirect a
+  request to an unenrolled origin.
+- `command` requires one absolute executable, fixed working directory,
+  closed environment, and a built-in `codex`, `claude-code`, or `kimi-code`
+  structured-argument adapter. Provider request bytes can supply only the
+  already capability-bound model and prompt; they cannot supply argv or a
+  shell command.
+
+The endpoint ID, protocol adapter, and method/model set remain closed for all
+variants. Install an HTTPS API secret outside the repository and map it with a
 root-owned unit drop-in:
 
 ```ini
@@ -350,6 +365,14 @@ single-link regular file owned by root or its own effective UID. Group/other
 permissions, empty or non-UTF-8 content, a read race, and content above 64 KiB
 all fail closed.
 
+Credentialless local HTTP and command routes never load the provider credential
+directory. Command-provider authentication is the enrolled executable's
+separately mounted login state; its child environment is cleared before the
+closed root-owned environment is installed. Output and diagnostics are drained
+without unbounded retention. Timeout or ambiguous pipe/wait failure kills and
+reaps the process group but remains operationally indeterminate: cleanup does
+not prove that provider execution or billing did not occur.
+
 Before acknowledging a provider result, the complete credential-free request,
 sanitized transport headers, and complete response event stream must have
 crossed into agd custody. Digest-only custody is explicitly weaker and cannot
@@ -359,10 +382,10 @@ admission, effect authority, or execution success. Providerd deletes plaintext
 after confirmed delivery and burns the peer/session-bound capability when the
 session ends.
 
-The current v1 provider socket enrolls only agd's signed proxy identity. The
-implemented generic-worker slice is explicitly offline and cannot select a
-provider route. The session ingress/proxy path still does not prove the live
-`WorkerSessionPrincipal` before spending its committed provider capability.
+The provider socket enrolls one exact signed daemon or fixed-service proxy
+identity. Dynamic workers and humans remain inadmissible. Every dispatch is
+bound to the authenticated caller, capability, provider/model/method/protocol,
+exact request custody, and root policy digest.
 Provider inference is therefore a release blocker; do not substitute “request
 came from agd” for the missing worker/session/peer relation or expose the
 provider socket directly to a group.

@@ -277,8 +277,14 @@ sandbox/host attestation, provider relation, and full qualification matrix.
 - [ ] Providerd retains no plaintext after acknowledged custody transfer; agd
   holds exact credential-free request, sanitized headers, and complete response
   stream. Digest-only custody is visibly weaker.
-- [ ] Redirects, arbitrary CONNECT, endpoint/model drift, secret logging,
-  environment/argv secrets, and peer/capability replay are denied and tested.
+- [ ] Remote routes require credentialed HTTPS; credentialless local HTTP uses
+  an exact operator allowlist and denied redirects; command routes use only
+  enrolled executables with structured arguments and cleared environments.
+  Arbitrary CONNECT, endpoint/model drift, secret logging, environment/argv
+  secrets, and peer/capability replay are denied and tested.
+- [ ] Timeout and ambiguous command cleanup leave the dispatch reserved and
+  indeterminate. Reconciliation and replay do not create a second physical
+  dispatch.
 
 ## Storage, backup, and recovery gates
 
