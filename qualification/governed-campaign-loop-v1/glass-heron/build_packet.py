@@ -21,13 +21,14 @@ HERE = AG / "qualification/governed-campaign-loop-v1/glass-heron"
 OUT = Path(os.environ["RETIREMENT_PACKET_OUT"])
 if not OUT.is_absolute() or OUT.exists():
     raise ValueError("RETIREMENT_PACKET_OUT must be a new absolute artifact directory")
-FIXTURE = ROOT / "gcl-v1-glass-heron-fixture"
-LOCAL = AG / ".campaign-local/gcl-v1/glass-heron"
-SESSION_ID = "gcl-v1-20260829-009"
-SESSION = AG / ".campaign-local/gcl-v1/sessions" / SESSION_ID
-MANIFEST = SESSION / "session-manifest.json"
-PROFILE = SESSION / "porter-exact-profile.json"
-PRODUCER = AG / "target/debug/ag-gcl-v1-glass-heron"
+FIXTURE = OUT / "fixture"
+LOCAL = OUT / "local-custody"
+MANIFEST = Path(os.environ["RETIREMENT_SESSION_MANIFEST"])
+MANIFEST_SHA256 = os.environ["RETIREMENT_SESSION_MANIFEST_SHA256"]
+PROFILE = Path(os.environ["RETIREMENT_PORTER_PROFILE"])
+PRODUCER = Path(os.environ["RETIREMENT_AG_PRODUCER_BIN"])
+if not all(path.is_absolute() for path in (MANIFEST, PROFILE, PRODUCER)):
+    raise ValueError("explicit absolute frozen input paths required")
 EXECUTOR = ROOT / "campaign-driver-ng/qualification/gcl-v1/worker_vm_executor.py"
 CUSTODY = ROOT / "campaign-driver-ng/qualification/gcl-v1/worker_vm_custody.py"
 PORTER = ROOT / "porter/porter"
@@ -114,13 +115,16 @@ def main() -> None:
         if not path.is_file():
             raise RuntimeError(f"missing frozen input: {path}")
     manifest_sha = sha_file(MANIFEST)
-    if manifest_sha != "sha256:aca67fd05f2b88e06294ea55a8fe3fdbe501d308e421bafe505c610fdd52d985":
+    if manifest_sha != MANIFEST_SHA256:
         raise RuntimeError("session manifest substitution")
     manifest = json.loads(MANIFEST.read_bytes())
-    if manifest.get("session_id") != SESSION_ID or manifest.get("capacity") != 3:
+    session_id = manifest.get("session_id")
+    if not isinstance(session_id, str) or not session_id or manifest.get("capacity") != 3:
         raise RuntimeError("session identity/capacity mismatch")
-    initial_head, initial_tree = create_fixture()
+    # All generated state is new and campaign-owned. Frozen source sessions and
+    # prior qualification fixtures are inputs only; never reuse their custody.
     OUT.mkdir(mode=0o700, parents=True)
+    initial_head, initial_tree = create_fixture()
     LOCAL.mkdir(mode=0o700, parents=True)
 
     prompts = [
@@ -172,7 +176,7 @@ def main() -> None:
             "attempt_store": str(LOCAL / "executor-attempts.sqlite3"),
             "subject": subject, "scope": scope, "ordinal": ordinal,
             "evidence_reservation": "", "predecessor": predecessor,
-            "session_id": SESSION_ID, "session_manifest": str(MANIFEST),
+            "session_id": session_id, "session_manifest": str(MANIFEST),
             "session_manifest_sha256": manifest_sha[7:],
             "porter_program": str(PORTER), "porter_program_sha256": sha_file(PORTER)[7:],
             "porter_repository": str(ROOT / "porter"), "porter_commit": manifest["porter"]["commit"],
@@ -237,16 +241,17 @@ def main() -> None:
     }
     packet["packet_id"] = domain("ag.governed-campaign.packet/v1", packet)
     write(OUT / "packet.v1.json", packet)
-    start = {
-        "schema": "ag.glass-heron.verified-human-start-record/v1",
+    preparation = {
+        "schema": "ag.glass-heron.packet-preparation/v1",
         "campaign": "GLASS-HERON", "slug": "gcl-v1-w7-w8-real-codex-specimen-reconcile",
-        "decision": "explicitly start GLASS-HERON after BRASS-RABBIT green gate",
-        "source": "controlling workspace user request in this run",
-        "brass_rabbit_classification": "PRODUCTION-ANTECEDENT-ISSUANCE-LIFECYCLE-QUALIFIED",
+        "decision": "packet prepared; execution not started",
+        "does_not_establish": ["human start verification", "session availability", "authority", "execution", "qualification"],
         "campaign_packet_id": packet["packet_id"], "stage_1_work": works[0],
         "session_manifest_sha256": manifest_sha,
     }
-    write(OUT / "verified-human-start-record.v1.json", start)
+    # GH_START must come from the actual separately verified operator decision.
+    # Regeneration must not mint a new human-start claim from an old campaign.
+    write(OUT / "packet-preparation.v1.json", preparation)
     custody = {
         "schema": "ag.glass-heron.pre-stage1-custody/v1", "packet_id": packet["packet_id"],
         "packet_sha256": sha_file(OUT / "packet.v1.json"),
@@ -255,7 +260,7 @@ def main() -> None:
         "future_docket_settlements": None, "future_nq_receipts": None,
         "future_result_heads": None, "fixture_initial_head": initial_head,
         "fixture_initial_tree": initial_tree, "producer_executable_sha256": sha_file(PRODUCER),
-        "worker_session": SESSION_ID, "worker_session_manifest_sha256": manifest_sha,
+        "worker_session": session_id, "worker_session_manifest_sha256": manifest_sha,
     }
     write(OUT / "pre-execution-custody.v1.json", custody)
     print(json.dumps(custody, indent=2, sort_keys=True))
