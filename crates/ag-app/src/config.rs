@@ -498,6 +498,9 @@ pub struct ProviderModelPolicyConfigV1 {
 pub struct ProviderCommandConfigV1 {
     /// Closed argument/output adapter (`codex`, `claude-code`, or `kimi-code`).
     pub adapter: String,
+    /// Whether the fixed adapter must pass the capability model as an explicit
+    /// command argument or invoke the operator-enrolled provider default.
+    pub model_argument: ProviderCommandModelArgumentV1,
     /// Absolute executable path measured by deployment qualification.
     pub executable: PathBuf,
     /// Absolute fixed working directory; never selected by a request.
@@ -506,6 +509,16 @@ pub struct ProviderCommandConfigV1 {
     /// environment (including its credential directory) is never inherited.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+}
+
+/// Root-owned model-selection behavior for a command-backed provider.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCommandModelArgumentV1 {
+    /// Pass the exact capability model through the adapter's fixed model flag.
+    Required,
+    /// Omit a model flag and use the operator-enrolled command default.
+    Omit,
 }
 
 /// Redirect handling for an enrolled cleartext-local endpoint.
@@ -1385,7 +1398,8 @@ impl ProviderdConfigV1 {
                     {
                         return Err(ConfigError::InvalidProvider {
                             provider,
-                            reason: "remote API requires an enrolled credential and supported header",
+                            reason:
+                                "remote API requires an enrolled credential and supported header",
                         });
                     }
                 }
@@ -1525,6 +1539,8 @@ fn valid_provider_command(command: &ProviderCommandConfigV1) -> bool {
         command.adapter.as_str(),
         "codex" | "claude-code" | "kimi-code"
     ) && command.executable.is_absolute()
+        && (command.model_argument == ProviderCommandModelArgumentV1::Required
+            || command.adapter == "codex")
         && command.working_directory.is_absolute()
         && command.executable.components().collect::<PathBuf>() == command.executable
         && command.working_directory.components().collect::<PathBuf>() == command.working_directory
@@ -1698,17 +1714,31 @@ mod tests {
         endpoint.transport = ProviderTransportConfigV1::Command {
             command: ProviderCommandConfigV1 {
                 adapter: "claude-code".to_owned(),
+                model_argument: ProviderCommandModelArgumentV1::Required,
                 executable: PathBuf::from("/opt/claude/claude"),
                 working_directory: PathBuf::from("/var/empty"),
                 environment: BTreeMap::new(),
             },
         };
         command.validate().expect("fixed command endpoint");
+        if let ProviderTransportConfigV1::Command { command: route } =
+            &mut command.endpoints[0].transport
+        {
+            route.model_argument = ProviderCommandModelArgumentV1::Omit;
+        }
+        assert!(matches!(
+            command.validate(),
+            Err(ConfigError::InvalidProvider {
+                provider,
+                reason: "command route is not a supported fixed executable policy"
+            }) if provider == "primary"
+        ));
         let ProviderTransportConfigV1::Command { command: route } =
             &mut command.endpoints[0].transport
         else {
             unreachable!()
         };
+        route.model_argument = ProviderCommandModelArgumentV1::Required;
         route.executable = PathBuf::from("relative");
         assert!(matches!(
             command.validate(),

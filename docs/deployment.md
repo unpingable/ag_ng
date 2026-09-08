@@ -373,6 +373,11 @@ without unbounded retention. Timeout or ambiguous pipe/wait failure kills and
 reaps the process group but remains operationally indeterminate: cleanup does
 not prove that provider execution or billing did not occur.
 
+Each command route also declares `model_argument = "required"` or `"omit"`.
+Omission is admitted only for Codex and means the operator-enrolled provider
+default; it is not a request-selected fallback. Claude and Kimi always receive
+the exact capability model through their fixed adapter arguments.
+
 Before acknowledging a provider result, the complete credential-free request,
 sanitized transport headers, and complete response event stream must have
 crossed into agd custody. Digest-only custody is explicitly weaker and cannot

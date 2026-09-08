@@ -280,6 +280,8 @@ sandbox/host attestation, provider relation, and full qualification matrix.
 - [ ] Remote routes require credentialed HTTPS; credentialless local HTTP uses
   an exact operator allowlist and denied redirects; command routes use only
   enrolled executables with structured arguments and cleared environments.
+  Model-argument behavior is explicit; omission is limited to an enrolled
+  Codex provider-default route and never selects a fallback.
   Arbitrary CONNECT, endpoint/model drift, secret logging, environment/argv
   secrets, and peer/capability replay are denied and tested.
 - [ ] Timeout and ambiguous command cleanup leave the dispatch reserved and

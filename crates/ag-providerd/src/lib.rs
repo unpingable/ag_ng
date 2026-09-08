@@ -30,8 +30,8 @@ use ag_app::api::{
     ApiErrorCodeV1, ApiResultV1, HealthV1, OpaqueBytesV1, ProviderRequestV1, ProviderResponseV1,
 };
 use ag_app::config::{
-    ProviderCommandConfigV1, ProviderEndpointConfigV1, ProviderModelPolicyConfigV1,
-    ProviderTransportConfigV1, ProviderdConfigV1,
+    ProviderCommandConfigV1, ProviderCommandModelArgumentV1, ProviderEndpointConfigV1,
+    ProviderModelPolicyConfigV1, ProviderTransportConfigV1, ProviderdConfigV1,
 };
 use ag_app::descriptor_path::open_beneath;
 use ag_app::rpc_auth::VerifiedRpcPrincipalV1;
@@ -843,7 +843,11 @@ impl ProviderCoreV1 {
             .process_group(0);
         match command.adapter.as_str() {
             "codex" => {
-                process.args(["exec", "--json", "-m", model, "-"]);
+                process.args(["exec", "--json"]);
+                if command.model_argument == ProviderCommandModelArgumentV1::Required {
+                    process.args(["-m", model]);
+                }
+                process.arg("-");
             }
             "claude-code" => {
                 process.args([
@@ -1684,9 +1688,9 @@ mod tests {
     use std::fs;
     use std::io::Write as _;
     use std::net::TcpListener;
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
-    use std::sync::Arc;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use ag_primitives::{
         InferenceBudgetV1, InferenceEnvelopeV1, InferenceMethodId, LifecycleNonce, ModelId,
@@ -1772,6 +1776,7 @@ mod tests {
         command.transport = ProviderTransportConfigV1::Command {
             command: ProviderCommandConfigV1 {
                 adapter: "codex".to_owned(),
+                model_argument: ProviderCommandModelArgumentV1::Required,
                 executable: Path::new("/opt/codex/codex").to_path_buf(),
                 working_directory: Path::new("/work").to_path_buf(),
                 environment: BTreeMap::new(),
@@ -2060,6 +2065,7 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let command = ProviderCommandConfigV1 {
             adapter: "claude-code".to_owned(),
+            model_argument: ProviderCommandModelArgumentV1::Required,
             executable: executable.clone(),
             working_directory: fixture._directory.path().to_path_buf(),
             environment: BTreeMap::new(),
@@ -2079,7 +2085,11 @@ mod tests {
             }
         ));
 
-        fs::write(&executable, "#!/bin/sh\necho super-secret >&2\nexit 7\n").unwrap();
+        fs::write(
+            &executable,
+            "#!/bin/sh\ncat >/dev/null\necho super-secret >&2\nexit 7\n",
+        )
+        .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let event = fixture
             .core
@@ -2092,6 +2102,33 @@ mod tests {
         let text = String::from_utf8(body.into_vec()).unwrap();
         assert!(text.contains("command_refused"));
         assert!(!text.contains("super-secret"));
+    }
+
+    #[test]
+    fn codex_provider_default_omits_the_model_flag() {
+        let fixture = ProviderFixture::new();
+        let executable = fixture._directory.path().join("fake-codex");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = -m ] && exit 9; done\ncat >/dev/null\nprintf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"READY\"}}\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let command = ProviderCommandConfigV1 {
+            adapter: "codex".to_owned(),
+            model_argument: ProviderCommandModelArgumentV1::Omit,
+            executable,
+            working_directory: fixture._directory.path().to_path_buf(),
+            environment: BTreeMap::new(),
+        };
+        let request =
+            br#"{"messages":[{"content":"hello","role":"user"}],"model":"provider-default"}"#;
+        assert!(matches!(
+            fixture
+                .core
+                .dispatch_command(&command, request.to_vec(), 16 * 1024),
+            Ok(ProviderEventStreamV1::HttpResponse { status: 200, .. })
+        ));
     }
 
     #[test]
@@ -2238,6 +2275,7 @@ mod tests {
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
         let command = ProviderCommandConfigV1 {
             adapter: "claude-code".to_owned(),
+            model_argument: ProviderCommandModelArgumentV1::Required,
             executable,
             working_directory: fixture._directory.path().to_path_buf(),
             environment: BTreeMap::new(),
