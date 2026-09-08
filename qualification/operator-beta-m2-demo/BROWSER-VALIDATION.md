@@ -1,5 +1,33 @@
 # M2 display fixture browser evidence — 2026-09-08
 
+## Correction following independent rejection
+
+The corrected source passed nine bounded Chromium cases in
+`/data/git/.campaign-artifacts/m2-screen-CASE-fixture-003`, where CASE is
+`launch`, `refused`, `failed`, `success`, `uncertain`, `unavailable`,
+`no-process`, `active`, or `outage`. Each helper returned zero.
+The unavailable case deliberately retains `CAPTURE-FAILED.json` and verifies
+its reason. The new outage case starts with a validated fixture receipt, then
+loses its source and checks that all thirteen current-value regions clear to
+`NOT_OBSERVABLE`, with RUN disabled. Its terminal record is
+`GOOD_TO_OUTAGE_ASSERTIONS_PASSED`.
+
+Exact tested correction bytes:
+
+| Subject | SHA-256 |
+|---|---|
+| `fixed_demo.py` | `19d72bce3c0d692179286e46cfbfa36ab10dde182ef85e10f1f183c1f9cdfd1c` |
+| `browser_exercise.cjs` | `37e71092fb9646ae8fbc8451b078e16676b2098c985f1cf7efe2a2a1099ecea5` |
+| `browser_fixture.py` | `9dab32ee88ff619b016fb1df561702dfa6d25503ebbde66041faf284d599095d` |
+
+Fixture shapes now pass the actual adapter validator before display. They use
+the allowed owner field vocabulary while every browser capture is explicitly
+labeled `DISPLAY_FIXTURE`. These results do not establish live integration or
+independent acceptance. The earlier evidence below remains attached to the
+rejected original source and transfers no acceptance to this correction.
+
+## Prior candidate display evidence (retained history)
+
 **Disposition:** `DISPLAY_FIXTURES_PASSED / LIVE_INTEGRATION_NOT_RUN`.
 This record is evidence for the UI candidate, not independent acceptance or a
 composed campaign result. Tests used the actual AG demo HTTP handler and system

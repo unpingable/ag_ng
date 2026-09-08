@@ -8,6 +8,8 @@ import tempfile
 import threading
 import unittest
 import urllib.parse
+import time
+from unittest import mock
 
 import fixed_demo as demo
 
@@ -15,12 +17,18 @@ import fixed_demo as demo
 def projection():
     return {
         "schema": demo.SCHEMA, "scenario": demo.SCENARIO,
-        "subject": {"run_id": "LABELED_LOCAL_FIXTURE"},
-        "controller_custody": {"state": "NO_INTENT_RECORDED"},
-        "runner_durable": {"state": "NOT_OBSERVABLE", "terminal": None, "recovery": None},
-        "liveness": {"state": "PROCESS_EXITED", "source": "LOCAL_FIXTURE"},
-        "execution": {"identity": "LABELED_LOCAL_FIXTURE"},
-        "live_sources": {}, "limitations": {"integration": "NOT_RUN"},
+        "subject": {"run_id": "LABELED_LOCAL_FIXTURE", "spec_sha256": "0" * 64},
+        "controller_custody": {"source": "Docket fixed controller", "state": "NO_INTENT_RECORDED"},
+        "runner_durable": {"source": "composition owner records", "state": "NOT_OBSERVABLE", "terminal": None, "recovery": None},
+        "liveness": {"state": "PROCESS_EXITED", "source": "user-systemd", "main_pid": 0},
+        "execution": {"identity": "BOUNDED_COMPOSITION_RUNNER", "model_provider": "NOT_APPLICABLE",
+                      "producer_subject": "0" * 40, **{key: "0" * 64 for key in
+                      ("producer_sha256", "checker_sha256", "controller_sha256", "code_capsule_sha256")}},
+        "live_sources": {key: {"state": "NOT_OBSERVABLE", "source": source, "reason": "LABELED_LOCAL_FIXTURE"}
+                         for key, source in (("manager", "user-systemd"), ("os", "OS process table"))},
+        "limitations": {"aggregate_postcondition": "NOT_RECORDED", "literal_distributed_exactly_once": "NOT_CLAIMED",
+                        "signed_upstream_checksum": "NOT_QUALIFIED", "deployment": "NOT_RUN", "production": "NOT_RUN"},
+        "evidence": [{"source": "Docket", "label": "LABELED_LOCAL_FIXTURE evidence", "evidence": "/fixture/RESULT.json", "state": "MISSING"}],
         "disagreements": [],
     }
 
@@ -130,6 +138,33 @@ class HttpBoundary(unittest.TestCase):
 
 
 class SourceAdmission(unittest.TestCase):
+    def test_projection_structure_is_closed_at_consumed_fields(self):
+        demo.validate_projection(projection())
+        mutations = [lambda v: v.update(subject={}), lambda v: v.pop("evidence"),
+                     lambda v: v.update(execution={}), lambda v: v["controller_custody"].update(state="READY_BUT_INVENTED"),
+                     lambda v: v["runner_durable"].update(state="TERMINAL", terminal={"state": "TERMINAL"}),
+                     lambda v: v["liveness"].update(state="PROCESS_ACTIVE"),
+                     lambda v: v["live_sources"].clear(), lambda v: v["evidence"][0].update(state="ACCEPTED_BY_UI"),
+                     lambda v: v["runner_durable"].update(state="made_up"), lambda v: v.update(limitations={})]
+        for change in mutations:
+            with self.subTest(change=change):
+                value = projection()
+                change(value)
+                with self.assertRaises(ValueError):
+                    demo.validate_projection(value)
+
+    def test_child_not_reading_input_is_bounded(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / "fixture.py"
+            raw = b"#" + b"x" * (256 * 1024)
+            path.write_bytes(raw)
+            controller = demo.Controller(path, hashlib.sha256(raw).hexdigest())
+            started = time.monotonic()
+            with mock.patch.object(demo, "BOOTSTRAP", "import time; time.sleep(60)"), mock.patch.object(demo, "OWNER_TIMEOUT_SECONDS", 0.15):
+                with self.assertRaises(demo.Unavailable):
+                    controller.query("status")
+            self.assertLess(time.monotonic() - started, 2)
+
     def test_retained_controller_bytes_survive_path_replacement(self):
         with tempfile.TemporaryDirectory() as root:
             path = pathlib.Path(root) / "fixture.py"

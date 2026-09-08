@@ -11,18 +11,33 @@ integrated acceptance record are owned by the main M2 campaign. Earlier M1
 acceptance remains attached to its original revisions.
 
 The exact `fixed_demo.py` bytes tested here have SHA-256
-`769c92939a7668140e3f2c835f2c0d7d0115748e408de9ae7d2af735a3b4f8bc`.
+`19d72bce3c0d692179286e46cfbfa36ab10dde182ef85e10f1f183c1f9cdfd1c`.
+
+This correction succeeds the independently rejected screen revision
+`a6eff2dcbab32a02436b50624d55a0376f00224e`. Its earlier display evidence remains
+attached to that original source; it does not establish acceptance here.
 
 Observed local validation:
 
 - `python3 -m unittest discover -s crates/ag-operator-ui/demo -p 'test_*.py' -v`:
-  15 passed, final run 4.662 seconds. HTTP cases used approved ephemeral
+  17 passed, final correction run 5.226 seconds. HTTP cases used approved ephemeral
   loopback sockets. Initial sandbox socket denial was an environment refusal,
   followed by the same test invocation with platform approval.
 - `node --check qualification/operator-beta-m2-demo/browser_exercise.cjs`:
   passed.
-- `git diff --check`: passed for tracked changes; final staged check is required
-  before committing these new files.
+- `git diff --check`: passed.
+- Actual Docket owner `FixedController.status()` with its own local fixture and
+  `FakeManager` was accepted by the screen adapter: ten evidence entries, zero
+  manager calls, controller source SHA-256
+  `6c27354b6d50ad18e2ee49245bd50cf16c2f70d94cf43270eb3cde8949900a2d`.
+  Reproduce with `qualification/operator-beta-m2-demo/check_owner_projection.py
+  --docket-fixture ABSOLUTE_DOCKET_TEST_FIXED_DEMO_CONTROLLER_PATH` using Python.
+
+Correction coverage includes missing/incompatible source shapes, evidence,
+execution identity, digests, enums and terminal records; a child that never
+reads controller stdin is stopped by the shared transfer/reply deadline.
+Browser qualification additionally checks an observed terminal receipt followed
+by source outage: all current-value regions become `NOT_OBSERVABLE`.
 
 These tests establish bounded adapter behavior using explicitly labeled local
 fixtures: source admission, retained controller bytes despite pathname

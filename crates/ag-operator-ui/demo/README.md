@@ -4,7 +4,9 @@ This separate Python-standard-library executable hosts the fixed local M2
 screen beside Phosphor-ng. The ordinary `ag-operator-ui` binary retains its
 GET/HEAD-only contract. This screen owns no campaign records or execution
 decisions. Docket owns `start`, `status`, the single retained launch intent,
-terminal checks and evidence. NQ-ng supplies the existing observation harness;
+terminal composition checks and joined evidence projection. AG-ng and NQ-ng
+retain ownership of their respective authorization/effect and observation facts.
+NQ-ng supplies the existing observation harness;
 AG-ng supplies authorization/spend/effect behavior. Classic implementations
 are not dependencies.
 
@@ -38,7 +40,8 @@ uncertainty notice and are never automatically retried.
 Investigation position, controller custody, current process testimony, terminal
 owner disposition, evidence and limitations remain separate. Refusal is an
 ordinary 200 response from the owner projection. Adapter failure is 503 /
-`NOT_OBSERVABLE`; previously rendered data is explicitly stale. A process exit
+`NOT_OBSERVABLE`; all current-value regions from the previous snapshot are
+cleared to `NOT_OBSERVABLE`. A process exit
 or successful HTTP exchange never becomes a stronger terminal claim. JSON is
 rendered as text, with no arbitrary evidence-file serving or command execution.
 The terminal receipt path and owner replay verb come directly from Docket.
@@ -61,7 +64,8 @@ The trusted environment is the local operator account, host Python and standard
 library, and admitted Docket implementation/dependencies. Browser requests are
 bounded (256-byte RUN form), require the exact loopback Host/Origin and an
 ephemeral form token. Owner calls serialize locally and use a 120-second reply
-bound. A reply timeout ends only the adapter's controller invocation; it does
+bound across nonblocking source transfer, output collection and process wait.
+A reply timeout ends only the adapter's controller invocation; it does
 not stop or restart the durable producer. Reopening Docket status is the next
 step. No production deployment, provider/model use, handoff, retry, reset,
 arbitrary configuration, new daemon, database or orchestration is introduced.

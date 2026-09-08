@@ -15,6 +15,7 @@ const {values: opts} = parseArgs({options: {
   'expect-state': {type:'string'}, 'expect-live': {type:'string'},
   'expect-disposition': {type:'string'}, 'repeat-run': {type:'boolean', default:false},
   'wait-terminal': {type:'boolean', default:false},
+  'expect-outage-after-good': {type:'boolean', default:false},
   browser: {type:'string', default:process.env.M2_BROWSER_EXECUTABLE || '/snap/bin/chromium'},
   playwright: {type:'string', default:process.env.M2_PLAYWRIGHT_MODULE || '/data/git/agent_gov_ui/marginalia/node_modules/playwright'},
 }});
@@ -126,6 +127,22 @@ async function main() {
   event('BrowserStarted',{version:browser.version()});
   await open();
   await sample('initial',true);
+  if(opts['expect-outage-after-good']) {
+    assert.equal(opts.mode,'DISPLAY_FIXTURE','outage transition is display qualification only');
+    assert(last.runner_durable.terminal?.evidence,'start from an observed receipt');
+    await page.waitForFunction(()=>['durable','live','live-detail','terminal','reason','custody','worker','execution-detail','evidence','next','receipt','sources','limits']
+      .every(id=>document.getElementById(id).textContent==='NOT_OBSERVABLE') && document.getElementById('run').disabled,
+      null,{timeout:Math.min(12000,remaining())});
+    const response=await context.request.get(new URL('/api/v1/status',url).href,{timeout:remaining()});
+    assert.equal(response.status(),503);
+    write('outage.status.json',await response.body());
+    write('outage.rendered.txt',await page.locator('body').innerText());
+    await page.screenshot({path:path.join(opts.out,'outage.png'),fullPage:true});
+    write('CAPTURE-COMPLETED.json',JSON.stringify({state:'GOOD_TO_OUTAGE_ASSERTIONS_PASSED',mode:opts.mode,
+      current_regions:'ALL_NOT_OBSERVABLE',qualification:'NOT_GRANTED_BY_BROWSER_DRIVER'},null,2)+'\n');
+    event('GoodToOutageValidated');
+    return;
+  }
   if(opts.action==='launch') {
     assert.equal(last.controller_custody.state,'NO_INTENT_RECORDED','launch only from owner ready state');
     assert.equal(last.disagreements.length,0);

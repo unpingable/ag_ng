@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Loopback M2 showing; Docket owns every execution and evidence decision."""
+"""Loopback M2 showing; Docket owns launch custody and the joined projection."""
 
 from __future__ import annotations
 
@@ -12,15 +12,19 @@ import json
 import os
 import pathlib
 import secrets
+import selectors
 import stat
 import subprocess
 import sys
 import threading
+import time
+import re
 import urllib.parse
 
 SCHEMA = "constellation.operator_beta.fixed_demo_status.v1"
 SCENARIO = "operator-beta-systemd-http-recovery"
 MAX_BYTES = 1024 * 1024
+OWNER_TIMEOUT_SECONDS = 120
 # Execute the retained bytes. A later replacement of the controller pathname
 # cannot change this source. Its __file__ remains available for owner imports.
 BOOTSTRAP = "import sys; p=sys.argv.pop(1); exec(compile(sys.stdin.buffer.read(),p,'exec'),{'__name__':'__main__','__file__':p})"
@@ -62,30 +66,46 @@ class Controller:
             )
         except OSError as error:
             raise Unavailable("Docket execution interface is unavailable") from error
-        streams = [b"", b""]
-        def drain(index, pipe):
-            streams[index] = pipe.read(MAX_BYTES + 1)
-            if len(streams[index]) > MAX_BYTES:
-                process.kill()
-            pipe.close()
-        readers = [threading.Thread(target=drain, args=(index, pipe), daemon=True)
-                   for index, pipe in enumerate((process.stdout, process.stderr))]
-        for reader in readers:
-            reader.start()
+        streams = [bytearray(), bytearray()]
+        deadline = time.monotonic() + OWNER_TIMEOUT_SECONDS
+        selector = selectors.DefaultSelector()
+        offset = 0
+        for pipe, kind in ((process.stdin, "input"), (process.stdout, 0), (process.stderr, 1)):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_WRITE if kind == "input" else selectors.EVENT_READ, kind)
         try:
-            process.stdin.write(self.source)
-            process.stdin.close()
-            process.wait(timeout=120)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired("Docket owner reply", OWNER_TIMEOUT_SECONDS)
+                for key, _ in selector.select(remaining):
+                    pipe, kind = key.fileobj, key.data
+                    if kind == "input":
+                        offset += os.write(pipe.fileno(), self.source[offset:offset + 8192])
+                        if offset == len(self.source):
+                            selector.unregister(pipe)
+                            pipe.close()
+                    else:
+                        chunk = os.read(pipe.fileno(), 8192)
+                        streams[kind].extend(chunk)
+                        if len(streams[kind]) > MAX_BYTES:
+                            raise Unavailable("Docket reply exceeds the bounded projection size")
+                        if not chunk:
+                            selector.unregister(pipe)
+                            pipe.close()
+            process.wait(timeout=max(0, deadline - time.monotonic()))
         except (OSError, subprocess.TimeoutExpired) as error:
-            process.kill()
-            process.wait()
             raise Unavailable("Docket reply unavailable; launch outcome is uncertain. Inspect status; do not retry a producer.") from error
         finally:
-            for reader in readers:
-                reader.join(timeout=1)
+            selector.close()
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                pipe.close()
         if process.returncode != 0:
             raise Unavailable("Docket did not return a validated projection. This does not establish whether execution started or finished.")
-        raw = streams[0]
+        raw = bytes(streams[0])
         if len(raw) > MAX_BYTES:
             raise Unavailable("Docket reply exceeds the bounded projection size")
         try:
@@ -122,6 +142,106 @@ def validate_projection(value: dict) -> None:
     for field in ("terminal", "recovery"):
         if value["runner_durable"].get(field) is not None and not isinstance(value["runner_durable"][field], dict):
             raise ValueError("invalid runner record")
+    def string(item, key):
+        result = item.get(key)
+        if not isinstance(result, str) or not result:
+            raise ValueError("missing string: " + key)
+        return result
+    def digest(item, key, length=64):
+        if not re.fullmatch("[0-9a-f]{" + str(length) + "}", string(item, key)):
+            raise ValueError("invalid digest: " + key)
+    def choice(item, key, options):
+        if string(item, key) not in options:
+            raise ValueError("invalid owner enum: " + key)
+    def integer(item, key, minimum=0):
+        if type(item.get(key)) is not int or item[key] < minimum:
+            raise ValueError("invalid integer: " + key)
+    def live(item):
+        if not isinstance(item, dict):
+            raise ValueError("missing live source")
+        choice(item, "source", {"user-systemd", "OS process table", "OS process table plus retained Docket launch acceptance"})
+        choice(item, "state", {"PROCESS_ACTIVE", "PROCESS_EXITED", "NOT_OBSERVABLE"})
+        if item["state"] == "NOT_OBSERVABLE":
+            string(item, "reason")
+        else:
+            integer(item, "main_pid", 1 if item["state"] == "PROCESS_ACTIVE" else 0)
+        if item["state"] == "PROCESS_ACTIVE":
+            integer(item, "start_ticks", 1)
+            digest(item, "invocation_id", 32)
+            digest(item, "execution_sha256")
+            if type(item.get("execution_matches")) is not bool:
+                raise ValueError("missing execution comparison")
+        if "manager_testimony" in item:
+            live(item["manager_testimony"])
+
+    string(value["subject"], "run_id")
+    digest(value["subject"], "spec_sha256")
+    custody = value["controller_custody"]
+    choice(custody, "source", {"Docket fixed controller"})
+    choice(custody, "state", {"NO_INTENT_RECORDED", "ACCEPTANCE_VALIDATED", "INDETERMINATE"})
+    runner = value["runner_durable"]
+    choice(runner, "source", {"composition owner records"})
+    if not {"terminal", "recovery"} <= runner.keys():
+        raise ValueError("missing retained runner regions")
+    terminal, recovery = runner["terminal"], runner["recovery"]
+    if recovery is not None:
+        choice(recovery, "state", {"REOPENED", "INDETERMINATE"})
+        if recovery["state"] == "INDETERMINATE":
+            string(recovery, "reason")
+        else:
+            for key in ("phase", "last_completed_phase", "next_lawful_action", "effect_outcome"):
+                string(recovery, key)
+            producer = recovery.get("producer")
+            if not isinstance(producer, dict):
+                raise ValueError("missing retained producer")
+            string(producer, "systemd_unit")
+            digest(producer, "invocation_id", 32)
+            integer(producer, "main_pid", 1)
+            integer(producer, "start_ticks", 1)
+    if terminal is not None:
+        choice(terminal, "state", {"TERMINAL", "REFUSED", "INDETERMINATE"})
+        choice(terminal, "owner", {"Docket"})
+        if terminal["state"] == "INDETERMINATE":
+            string(terminal, "reason")
+        else:
+            string(terminal, "disposition")
+            string(terminal, "evidence")
+            choice(terminal, "replay", {"check-run"} if terminal["state"] == "TERMINAL" else {"check-refusal"})
+            if terminal["state"] == "REFUSED" and terminal["disposition"] != "REFUSED":
+                raise ValueError("invalid refusal disposition")
+            if terminal["state"] == "TERMINAL" and terminal["disposition"] != "ONE_SPEND_ONE_ATTEMPT_BOUNDED_EFFECT_CUSTODY_WITH_DECLARED_LIMITATIONS":
+                raise ValueError("incompatible fixed terminal disposition")
+    # The owner supplies its phase; the adapter checks correspondence only and
+    # carries no list of workflow phases or lawful transition implementation.
+    expected = terminal["state"] if terminal else recovery.get("phase", recovery["state"]) if recovery else "NOT_OBSERVABLE"
+    if runner["state"] != expected:
+        raise ValueError("runner state has no matching retained owner region")
+    live(value["liveness"])
+    if set(value["live_sources"]) != {"manager", "os"}:
+        raise ValueError("missing live source axes")
+    for item in value["live_sources"].values():
+        live(item)
+    execution = value["execution"]
+    choice(execution, "identity", {"BOUNDED_COMPOSITION_RUNNER"})
+    choice(execution, "model_provider", {"NOT_APPLICABLE"})
+    digest(execution, "producer_subject", 40)
+    for key in ("producer_sha256", "checker_sha256", "controller_sha256", "code_capsule_sha256"):
+        digest(execution, key)
+    if not isinstance(value.get("evidence"), list) or not value["evidence"]:
+        raise ValueError("missing evidence ledger")
+    for entry in value["evidence"]:
+        if not isinstance(entry, dict):
+            raise ValueError("invalid evidence entry")
+        for key in ("source", "label", "evidence"):
+            string(entry, key)
+        choice(entry, "source", {"AG-ng", "NQ-ng", "Docket", "NQ-ng / OS"})
+        choice(entry, "state", {"MISSING", "RECORDED_UNVERIFIED", "OWNER_VALIDATED", "NOT_OBSERVABLE"})
+        if "detail" in entry:
+            string(entry, "detail")
+    expected_limits = {"aggregate_postcondition": "NOT_RECORDED", "literal_distributed_exactly_once": "NOT_CLAIMED",
+                       "signed_upstream_checksum": "NOT_QUALIFIED", "deployment": "NOT_RUN", "production": "NOT_RUN"}
+    if value["limitations"] != expected_limits:
+        raise ValueError("incompatible fixed scenario limitations")
 
 
 PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8">
@@ -169,7 +289,9 @@ async function refresh(){if(pending)return;pending=true;try{
  const ready=value.controller_custody.state==='NO_INTENT_RECORDED'&&value.disagreements.length===0;
  el('run').disabled=!ready;text('launch-note',ready?'Ready to request the one admitted execution.':'Docket has retained launch custody or unresolved evidence. RUN is unavailable; inspect the state below.');
  el('notice').hidden=value.disagreements.length===0;text('notice',value.disagreements.join('\n'));
- }catch(error){el('run').disabled=true;el('notice').hidden=false;text('notice','Current state NOT_OBSERVABLE: '+error.message);text('live','NOT_OBSERVABLE');text('launch-note','Current owner query unavailable. Previously displayed evidence, if any, is stale.');}
+ }catch(error){el('run').disabled=true;el('notice').hidden=false;text('notice','Current state NOT_OBSERVABLE: '+error.message);
+ for(const id of ['durable','live','live-detail','terminal','reason','custody','worker','execution-detail','evidence','next','receipt','sources','limits'])text(id,'NOT_OBSERVABLE');
+ text('launch-note','Current owner query unavailable. Previous snapshot cleared; refresh will query the owner again.');}
  finally{pending=false;setTimeout(refresh,3000);}}
 refresh();
 </script></html>'''

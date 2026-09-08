@@ -64,7 +64,9 @@ and reviewer evidence separately, bound to the same run and exact dependencies.
 `browser_fixture.py CASE --out ABSOLUTE_NEW_DIRECTORY` runs one local display
 fixture through the actual demo HTTP server and browser driver, bounded to
 45 seconds. Available cases are launch, active, no-process, uncertain, refused,
-failed, success and unavailable. It never loads the real controller or starts
+failed, success, unavailable and outage. The outage case starts with a valid
+terminal receipt, then loses its source and asserts that every current-value
+region clears to `NOT_OBSERVABLE`. It never loads the real controller or starts
 VMs. The unavailable case expects `CAPTURE-FAILED.json`, verifies the explicit
 unavailable reason, and reports that negative check as passed. The launch case
 asserts three deliberate start requests resolve to one fixture occurrence;
