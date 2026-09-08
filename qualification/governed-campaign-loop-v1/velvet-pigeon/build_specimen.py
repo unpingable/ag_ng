@@ -6,20 +6,24 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 
 ROOT = Path("/data/git")
-AG = ROOT / "ag_ng"
+AG = Path(__file__).resolve().parents[3]
 PORTER = ROOT / "porter"
-NQ = ROOT / "nq-root/nq"
-NIGHTSHIFT = ROOT / "nightshift"
-OUT = AG / "qualification/governed-campaign-loop-v1/velvet-pigeon/evidence"
-NQ_BIN = NQ / "target/debug/nq-monitor"
-NS_BIN = NIGHTSHIFT / "target/debug/nightshift"
-RESOLVER_BIN = NIGHTSHIFT / "target/debug/nightshift-observation-resolver"
+# Explicit modern dependencies: no default classic checkout or fallback.
+OUT = Path(os.environ["RETIREMENT_SPECIMEN_OUT"])
+NQ_BIN = Path(os.environ["NQ_NG_BIN"])
+NS_BIN = Path(os.environ["NIGHTSHIFT_BIN"])
+RESOLVER_BIN = Path(os.environ["NIGHTSHIFT_RESOLVER_BIN"])
+if not OUT.is_absolute() or OUT.exists():
+    raise ValueError("RETIREMENT_SPECIMEN_OUT must be a new absolute artifact directory")
+if NQ_BIN.name != "nq" or not all(p.is_absolute() for p in (NQ_BIN, NS_BIN, RESOLVER_BIN)):
+    raise ValueError("explicit absolute modern nq and Nightshift binary paths required")
 
 CAMPAIGN = "sha256:606605c73dcea732c7b937c27dd6d9c19f2b4e37109ecec7cbdb8d85d0f60466"
 SUBJECT = "sha256:3dbab9cb9e27fa0a039a75c275834d633b658c25db6a252c5924999d5bc4989c"
@@ -111,7 +115,7 @@ def nq_template(ordinal: int, predecessor: dict[str, object], executor_template:
     }
     return {
         "schema": "ag.nq-campaign-stage-realization-profile-template/v1",
-        "runtime_schema": "nq.campaign-stage-realization-profile/v2",
+        "runtime_schema": "nq-ng.campaign-stage-realization-profile/v2",
         "profile_id": f"glass-heron.stage-{ordinal}.reservation/v2",
         "evidence_reservation": "",
         "campaign_packet_sha256": "",
@@ -226,7 +230,7 @@ def main() -> None:
              "executor_plan": plan_identity, "docket_settlement": settlement, "porter_run_id": run_id, "porter_record_sha256": record_sha,
              "executor_receipt": executor_receipt, "predecessor_head": profile["predecessor_head"], "predecessor_tree": profile["predecessor_tree"],
              "result_head": {"object_format": "sha1", "digest": "4" * 40}, "result_tree": {"object_format": "sha1", "digest": "d" * 40}}
-    evidence = {"schema": "nq.campaign-stage-realization-evidence/v2", "evidence_id": "velvet-pigeon.synthetic-realization-1", "profile_id": profile["profile_id"],
+    evidence = {"schema": "nq-ng.campaign-stage-realization-evidence/v2", "evidence_id": "velvet-pigeon.synthetic-realization-1", "profile_id": profile["profile_id"],
                 "profile_sha256": profile_sha, "evidence_reservation": reservation, "campaign_packet_sha256": packet["packet_id"], "stage_id": profile["stage_id"],
                 "repository_id": profile["repository_id"], "repository_ref": profile["repository_ref"], "realizations": [chain], "producer": profile["expected_evidence_producer"],
                 "predecessor_qualification": None,
@@ -251,7 +255,7 @@ def main() -> None:
     applicability["profile_id"] = digest({key: value for key, value in applicability.items() if key != "profile_id"})
     applicability_path = write("nightshift-applicability.v1.json", applicability)
     store = OUT / "nightshift-realizations.sqlite3"
-    ingest = run([str(NS_BIN), "--store", str(store), "reservation-qualification", "ingest", "--applicability", str(applicability_path), "--nq-profile", str(profile_path), "--nq-evidence", str(evidence_path), "--nq-receipt", str(receipt_path), "--nq-monitor", str(NQ_BIN)])
+    ingest = run([str(NS_BIN), "--store", str(store), "reservation-qualification", "ingest", "--applicability", str(applicability_path), "--nq-profile", str(profile_path), "--nq-evidence", str(evidence_path), "--nq-receipt", str(receipt_path), "--nq-executable", str(NQ_BIN)])
     (OUT / "nightshift-ingest.json").write_bytes(ingest.stdout)
 
     snapshot = {"schema": "ag.governed-loop.snapshot/v1", "reservation": reservation, "attempt": attempt, "settlement": settlement}
@@ -276,7 +280,7 @@ def main() -> None:
     run([str(NQ_BIN), "campaign-stage-realization", "evaluate", "--profile", str(profile_path), "--evidence", str(conflicting_path), "--evaluated-at-unix-ms", "1001", "--output", str(conflicting_receipt)])
     conflict_store = OUT / "nightshift-conflict.sqlite3"
     shutil.copyfile(store, conflict_store)
-    conflict_ingest = run([str(NS_BIN), "--store", str(conflict_store), "reservation-qualification", "ingest", "--applicability", str(applicability_path), "--nq-profile", str(profile_path), "--nq-evidence", str(conflicting_path), "--nq-receipt", str(conflicting_receipt), "--nq-monitor", str(NQ_BIN)])
+    conflict_ingest = run([str(NS_BIN), "--store", str(conflict_store), "reservation-qualification", "ingest", "--applicability", str(applicability_path), "--nq-profile", str(profile_path), "--nq-evidence", str(conflicting_path), "--nq-receipt", str(conflicting_receipt), "--nq-executable", str(NQ_BIN)])
     (OUT / "nightshift-conflict-ingest.json").write_bytes(conflict_ingest.stdout)
     conflict_resolution = run([str(RESOLVER_BIN), "--store", str(conflict_store), "--resolver-id", applicability["resolver_id"], "--default-ttl-ms", "100000", "--reservation-qualification-binding", str(binding_path)], stdin=jcs(request), expect=1)
     write("conflict-resolution-refusal.json", {"returncode": conflict_resolution.returncode, "stderr": conflict_resolution.stderr.decode().strip()})

@@ -16,9 +16,11 @@ import sys
 
 
 ROOT = Path("/data/git")
-AG = ROOT / "ag_ng"
+AG = Path(__file__).resolve().parents[3]
 HERE = AG / "qualification/governed-campaign-loop-v1/glass-heron"
-OUT = HERE / "pre-stage1"
+OUT = Path(os.environ["RETIREMENT_PACKET_OUT"])
+if not OUT.is_absolute() or OUT.exists():
+    raise ValueError("RETIREMENT_PACKET_OUT must be a new absolute artifact directory")
 FIXTURE = ROOT / "gcl-v1-glass-heron-fixture"
 LOCAL = AG / ".campaign-local/gcl-v1/glass-heron"
 SESSION_ID = "gcl-v1-20260829-009"
@@ -185,7 +187,7 @@ def main() -> None:
         plan_sha = sha_bytes(jcs(plan))
         nq = {
             "schema": "ag.nq-campaign-stage-realization-profile-template/v1",
-            "runtime_schema": "nq.campaign-stage-realization-profile/v2",
+            "runtime_schema": "nq-ng.campaign-stage-realization-profile/v2",
             "profile_id": f"glass-heron.stage-{ordinal}.real/v2",
             "evidence_reservation": "", "campaign_packet_sha256": "",
             "stage_id": f"stage-{ordinal}", "repository_id": repository_id,

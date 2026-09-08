@@ -26,7 +26,7 @@ fn plan_template(stage: usize, predecessor: &PredecessorBindingV1) -> serde_json
 fn nq_template(stage: usize, predecessor: &PredecessorBindingV1) -> serde_json::Value {
     serde_json::json!({
         "schema": "ag.nq-campaign-stage-realization-profile-template/v1",
-        "runtime_schema": "nq.campaign-stage-realization-profile/v2",
+        "runtime_schema": "nq-ng.campaign-stage-realization-profile/v2",
         "stage_id": format!("stage-{stage}"),
         "evidence_reservation": "",
         "campaign_packet_sha256": "",

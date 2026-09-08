@@ -449,7 +449,7 @@ pub fn materialize_nq_profile_template(
         .remove("runtime_schema")
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or("NQ template has no runtime schema")?;
-    if runtime_schema != "nq.campaign-stage-realization-profile/v2" {
+    if runtime_schema != "nq-ng.campaign-stage-realization-profile/v2" {
         return Err("NQ runtime schema mismatch".into());
     }
     object.insert("schema".into(), runtime_schema.into());

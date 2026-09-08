@@ -3149,7 +3149,7 @@ fn repository_qualification_basis_authorizes_only_the_predeclared_exact_successo
     assert_eq!(engine.replay().unwrap().ag_spends, 0);
 
     for source in [include_str!("../src/governed_loop.rs"), include_str!("../../ag-campaign/src/governed.rs")] {
-        for forbidden in ["nq.campaign-stage-qualification", "NqQualificationStatus", "ordered_gates"] {
+        for forbidden in ["nq-ng.campaign-stage-qualification", "NqQualificationStatus", "ordered_gates"] {
             assert!(!source.contains(forbidden));
         }
     }

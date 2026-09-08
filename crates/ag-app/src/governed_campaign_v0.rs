@@ -25,7 +25,7 @@ pub const CAMPAIGN_PACKET_SCHEMA_V0: &str = "ag.governed-campaign.packet/v0";
 /// Frozen V0 coordination snapshot schema.
 pub const CAMPAIGN_SNAPSHOT_SCHEMA_V0: &str = "ag.governed-campaign.snapshot/v0";
 /// Frozen NQ qualification profile required for every stage.
-pub const NQ_QUALIFICATION_PROFILE_SCHEMA_V1: &str = "nq.campaign-stage-qualification-profile/v1";
+pub const NQ_QUALIFICATION_PROFILE_SCHEMA_V1: &str = "nq-ng.campaign-stage-qualification-profile/v1";
 /// The sole qualification basis type accepted from Nightshift.
 pub const REPOSITORY_QUALIFICATION_BASIS_TYPE_V1: &str =
     "nightshift.repository-qualification-applicability/v1";

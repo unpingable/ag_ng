@@ -631,7 +631,7 @@ fn main() -> Result<()> {
         write_jcs(&profile_path, &profile)?;
         let profile_sha = sha(&serde_jcs::to_vec(&profile)?);
         let evidence = json!({
-            "schema":"nq.campaign-stage-realization-evidence/v2",
+            "schema":"nq-ng.campaign-stage-realization-evidence/v2",
             "evidence_id":format!("glass-heron.real-stage-{}",index+1),
             "profile_id":profile["profile_id"],"profile_sha256":profile_sha,
             "evidence_reservation":frozen.reservation.reservation_id,
@@ -729,7 +729,7 @@ fn main() -> Result<()> {
                 evidence_path.to_str().unwrap(),
                 "--nq-receipt",
                 receipt_path.to_str().unwrap(),
-                "--nq-monitor",
+                "--nq-executable",
                 nq.to_str().unwrap(),
             ]),
             "Nightshift reservation ingest",
