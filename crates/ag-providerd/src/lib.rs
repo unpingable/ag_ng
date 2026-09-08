@@ -7,9 +7,8 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
-use std::os::unix::process::CommandExt as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
+#[cfg(test)]
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +19,7 @@ use ag_primitives::{
 };
 use ag_session::ProviderRequestCustodyV1;
 use ag_store::{NewEventV1, Store};
+use model_execution::process::{CommandOutcome, CommandSpec};
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rustix::fs::{FileType, Mode, OFlags};
@@ -835,132 +835,90 @@ impl ProviderCoreV1 {
             prompt.push_str(">\n");
         }
 
-        let mut process = Command::new(&command.executable);
-        process
-            .env_clear()
-            .envs(&command.environment)
-            .current_dir(&command.working_directory)
-            .process_group(0);
+        let mut arguments = Vec::new();
         match command.adapter.as_str() {
             "codex" => {
-                process.args(["exec", "--json", "--skip-git-repo-check"]);
+                arguments.extend(["exec", "--json", "--skip-git-repo-check"].map(str::to_owned));
                 if command.model_argument == ProviderCommandModelArgumentV1::Required {
-                    process.args(["-m", model]);
+                    arguments.extend(["-m".to_owned(), model.to_owned()]);
                 }
-                process.arg("-");
+                arguments.push("-".to_owned());
             }
             "claude-code" => {
-                process.args([
-                    "--print",
-                    "--output-format",
-                    "json",
-                    "--verbose",
-                    "--model",
-                    model,
-                    "--tools",
-                    "",
-                    "--no-session-persistence",
-                    "--disable-slash-commands",
-                    "--safe-mode",
-                ]);
+                arguments.extend(
+                    [
+                        "--print",
+                        "--output-format",
+                        "json",
+                        "--verbose",
+                        "--model",
+                        model,
+                        "--tools",
+                        "",
+                        "--no-session-persistence",
+                        "--disable-slash-commands",
+                        "--safe-mode",
+                    ]
+                    .map(str::to_owned),
+                );
             }
             "kimi-code" => {
-                process.args([
-                    "--model",
-                    model,
-                    "--prompt",
-                    &prompt,
-                    "--output-format",
-                    "stream-json",
+                arguments.extend([
+                    "--model".to_owned(),
+                    model.to_owned(),
+                    "--prompt".to_owned(),
+                    prompt.clone(),
+                    "--output-format".to_owned(),
+                    "stream-json".to_owned(),
                 ]);
             }
             _ => return Err(ProviderError::EndpointNotAllowed),
         }
         let uses_stdin = command.adapter != "kimi-code";
-        process
-            .stdin(if uses_stdin {
-                Stdio::piped()
+        let outcome = match model_execution::process::execute(&CommandSpec {
+            executable: command.executable.clone(),
+            arguments,
+            working_directory: command.working_directory.clone(),
+            environment: command.environment.clone(),
+            create_process_group: true,
+            stdin: if uses_stdin {
+                prompt.into_bytes()
             } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = match process.spawn() {
-            Ok(child) => child,
-            Err(_) => {
+                Vec::new()
+            },
+            deadline: Duration::from_millis(self.config.limits.provider_deadline_ms),
+            termination_grace: Duration::from_secs(5),
+            maximum_stdout_bytes: maximum_event_stream_bytes,
+            maximum_stderr_bytes: 8192,
+        }) {
+            Ok(outcome) => outcome,
+            Err(model_execution::process::ProcessError::Spawn(_)) => {
                 return Ok(ProviderEventStreamV1::TransportFailure {
                     class: ProviderTransportFailureV1::Connect,
                 });
             }
+            Err(_) => return Err(ProviderError::CommandPipe),
         };
-        if uses_stdin {
-            let mut stdin = child.stdin.take().ok_or(ProviderError::CommandPipe)?;
-            if std::io::Write::write_all(&mut stdin, prompt.as_bytes()).is_err() {
-                terminate_process_group(&mut child);
-                let _ = child.wait();
+        let (status, body) = match outcome {
+            CommandOutcome::Completed { stdout, .. } => (200, stdout),
+            CommandOutcome::FailedTerminal { exit_code, .. } => {
+                let body = serde_jcs::to_vec(&serde_json::json!({
+                    "error": "command_refused",
+                    "exit_code": exit_code,
+                }))
+                .map_err(|error| ProviderError::Canonical(error.to_string()))?;
+                (502, body)
+            }
+            CommandOutcome::ResponseLimitExceeded => {
+                return Ok(ProviderEventStreamV1::ResponseLimitExceeded {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                    maximum_bytes: maximum_event_stream_bytes,
+                });
+            }
+            CommandOutcome::Indeterminate => {
                 return Err(ProviderError::DispatchOutcomeIndeterminate);
             }
-        }
-        let stdout = child.stdout.take().ok_or(ProviderError::CommandPipe)?;
-        let stderr = child.stderr.take().ok_or(ProviderError::CommandPipe)?;
-        let stdout_reader =
-            thread::spawn(move || drain_bounded(stdout, maximum_event_stream_bytes));
-        let stderr_reader = thread::spawn(move || drain_bounded(stderr, 8192));
-        let started = std::time::Instant::now();
-        let deadline = Duration::from_millis(self.config.limits.provider_deadline_ms);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() < deadline => {
-                    thread::sleep(Duration::from_millis(25));
-                }
-                Ok(None) => {
-                    terminate_process_group(&mut child);
-                    let grace = std::time::Instant::now();
-                    while grace.elapsed() < Duration::from_secs(5) {
-                        if child.try_wait().ok().flatten().is_some() {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(25));
-                    }
-                    if child.try_wait().ok().flatten().is_none() {
-                        kill_process_group(&mut child);
-                    }
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    return Err(ProviderError::DispatchOutcomeIndeterminate);
-                }
-                Err(_) => {
-                    terminate_process_group(&mut child);
-                    kill_process_group(&mut child);
-                    let _ = child.wait();
-                    return Err(ProviderError::DispatchOutcomeIndeterminate);
-                }
-            }
-        };
-        let (stdout, stdout_exceeded) = stdout_reader
-            .join()
-            .map_err(|_| ProviderError::CommandPipe)??;
-        let _stderr = stderr_reader
-            .join()
-            .map_err(|_| ProviderError::CommandPipe)??;
-        if stdout_exceeded {
-            return Ok(ProviderEventStreamV1::ResponseLimitExceeded {
-                status: 200,
-                headers: BTreeMap::new(),
-                maximum_bytes: maximum_event_stream_bytes,
-            });
-        }
-        let (status, body) = if status.success() {
-            (200, stdout)
-        } else {
-            let body = serde_jcs::to_vec(&serde_json::json!({
-                "error": "command_refused",
-                "exit_code": status.code(),
-            }))
-            .map_err(|error| ProviderError::Canonical(error.to_string()))?;
-            (502, body)
         };
         Ok(ProviderEventStreamV1::HttpResponse {
             status,
@@ -1186,46 +1144,6 @@ impl ProviderCoreV1 {
         )?;
         Ok(ProviderResponseV1::SessionTerminated { receipt })
     }
-}
-
-fn terminate_process_group(child: &mut std::process::Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGTERM,
-        );
-    }
-}
-
-fn kill_process_group(child: &mut std::process::Child) {
-    if let Ok(pid) = i32::try_from(child.id()) {
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(pid),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-    }
-}
-
-fn drain_bounded(
-    mut reader: impl Read,
-    maximum_retained_bytes: u64,
-) -> std::io::Result<(Vec<u8>, bool)> {
-    let retained_limit = maximum_retained_bytes.saturating_add(1);
-    let mut retained = Vec::new();
-    let mut exceeded = false;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        let available = retained_limit.saturating_sub(retained.len() as u64);
-        let keep = usize::try_from(available.min(count as u64)).unwrap_or(0);
-        retained.extend_from_slice(&buffer[..keep]);
-        exceeded |= count > keep;
-    }
-    let exceeded = exceeded || retained.len() as u64 > maximum_retained_bytes;
-    Ok((retained, exceeded))
 }
 
 fn read_provider_credential(
@@ -1688,9 +1606,9 @@ mod tests {
     use std::fs;
     use std::io::Write as _;
     use std::net::TcpListener;
-    use std::os::unix::fs::{symlink, PermissionsExt as _};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ag_primitives::{
         InferenceBudgetV1, InferenceEnvelopeV1, InferenceMethodId, LifecycleNonce, ModelId,

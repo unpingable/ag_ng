@@ -28,6 +28,7 @@ ag-store = { path = "../ag-store" }
 anyhow.workspace = true
 clap.workspace = true
 nix.workspace = true
+model-execution = { git = "ssh://git@github.com/unpingable/model-execution.git", rev = "992a0a37c8bad627d466559776855ea10c60272a" }
 reqwest.workspace = true
 rustix.workspace = true
 serde.workspace = true
