@@ -1,0 +1,50 @@
+{
+  "schema": "ag.operator-beta-store-cut-package-qualification/v1",
+  "campaign": "operator-beta-ag-receipt-store-package-v1",
+  "classification": "CANDIDATE_FOR_INDEPENDENT_REVIEW",
+  "recorded_at": "2026-09-08T01:42:52Z",
+  "subjects": {
+    "accepted_owner": "837de287497942c79966aa05c083acee9c312261",
+    "accepted_owner_tree": "20023de0b8299fa125ed5f9fcaf63383a4978e30",
+    "rejected_predecessor": "20cca23bfe2b9bc92c9165c00a498e6db8f890b1"
+  },
+  "package": {
+    "name": "agent-governor-ng-systemd-executor",
+    "version": "0.1.0-1+m1a4",
+    "architecture": "amd64",
+    "archive_path": ".campaign-local/operator-beta-store-audit/package-001/agent-governor-ng-systemd-executor_0.1.0-1+m1a4_amd64.deb",
+    "archive_length": 2649438,
+    "archive_sha256": "sha256:98a4f31f0b6c13653ae95ce55586dbac6d0826b649cd7612882f3716b80e2279",
+    "source_date_epoch": 1788830784,
+    "executable_path": "usr/libexec/agent-governor-ng/ag-effectd",
+    "executable_length": 8489480,
+    "executable_sha256": "sha256:668bdd26646ef6a5ba5502b64984844b84c1f70024a76eb5236af2b17702d068",
+    "installed_mode": "root:root:755",
+    "payload_directories_mode": "root:root:755"
+  },
+  "qualification": {
+    "owner_store_cut_gate": "PASS_7_OWNER_3_CLI",
+    "archive_inventory": "PASS",
+    "control_metadata": "PASS",
+    "embedded_executable": "PASS",
+    "audit_store_help": "PASS",
+    "archive_reconstruction": "BYTE_IDENTICAL"
+  },
+  "not_run": [
+    "PACKAGE_INSTALLATION",
+    "PACKAGE_REMOVAL_OR_REINSTALL",
+    "LOCAL_VM",
+    "SYSTEMD_OR_DBUS_MECHANICS",
+    "NQ_NG_M1B_INTEGRATION",
+    "PRODUCTION_DEPLOYMENT"
+  ],
+  "authority": {
+    "installs_service": false,
+    "installs_configuration": false,
+    "creates_mutable_store": false,
+    "creates_authorization": false,
+    "creates_docket_standing": false,
+    "invokes_effect": false,
+    "qualifies_nq_integration": false
+  }
+}

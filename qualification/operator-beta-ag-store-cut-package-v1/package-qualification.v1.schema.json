@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ag.operator-beta-store-cut-package-qualification/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "campaign", "classification", "recorded_at", "subjects", "package", "qualification", "not_run", "authority"],
+  "properties": {
+    "schema": {"const": "ag.operator-beta-store-cut-package-qualification/v1"},
+    "campaign": {"const": "operator-beta-ag-receipt-store-package-v1"},
+    "classification": {"const": "CANDIDATE_FOR_INDEPENDENT_REVIEW"},
+    "recorded_at": {"const": "2026-09-08T01:42:52Z"},
+    "subjects": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accepted_owner", "accepted_owner_tree", "rejected_predecessor"],
+      "properties": {
+        "accepted_owner": {"const": "837de287497942c79966aa05c083acee9c312261"},
+        "accepted_owner_tree": {"const": "20023de0b8299fa125ed5f9fcaf63383a4978e30"},
+        "rejected_predecessor": {"const": "20cca23bfe2b9bc92c9165c00a498e6db8f890b1"}
+      }
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "architecture", "archive_path", "archive_length", "archive_sha256", "source_date_epoch", "executable_path", "executable_length", "executable_sha256", "installed_mode", "payload_directories_mode"],
+      "properties": {
+        "name": {"const": "agent-governor-ng-systemd-executor"},
+        "version": {"const": "0.1.0-1+m1a4"},
+        "architecture": {"const": "amd64"},
+        "archive_path": {"const": ".campaign-local/operator-beta-store-audit/package-001/agent-governor-ng-systemd-executor_0.1.0-1+m1a4_amd64.deb"},
+        "archive_length": {"const": 2649438},
+        "archive_sha256": {"const": "sha256:98a4f31f0b6c13653ae95ce55586dbac6d0826b649cd7612882f3716b80e2279"},
+        "source_date_epoch": {"const": 1788830784},
+        "executable_path": {"const": "usr/libexec/agent-governor-ng/ag-effectd"},
+        "executable_length": {"const": 8489480},
+        "executable_sha256": {"const": "sha256:668bdd26646ef6a5ba5502b64984844b84c1f70024a76eb5236af2b17702d068"},
+        "installed_mode": {"const": "root:root:755"},
+        "payload_directories_mode": {"const": "root:root:755"}
+      }
+    },
+    "qualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner_store_cut_gate", "archive_inventory", "control_metadata", "embedded_executable", "audit_store_help", "archive_reconstruction"],
+      "properties": {
+        "owner_store_cut_gate": {"const": "PASS_7_OWNER_3_CLI"},
+        "archive_inventory": {"const": "PASS"},
+        "control_metadata": {"const": "PASS"},
+        "embedded_executable": {"const": "PASS"},
+        "audit_store_help": {"const": "PASS"},
+        "archive_reconstruction": {"const": "BYTE_IDENTICAL"}
+      }
+    },
+    "not_run": {
+      "const": ["PACKAGE_INSTALLATION", "PACKAGE_REMOVAL_OR_REINSTALL", "LOCAL_VM", "SYSTEMD_OR_DBUS_MECHANICS", "NQ_NG_M1B_INTEGRATION", "PRODUCTION_DEPLOYMENT"]
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["installs_service", "installs_configuration", "creates_mutable_store", "creates_authorization", "creates_docket_standing", "invokes_effect", "qualifies_nq_integration"],
+      "properties": {
+        "installs_service": {"const": false},
+        "installs_configuration": {"const": false},
+        "creates_mutable_store": {"const": false},
+        "creates_authorization": {"const": false},
+        "creates_docket_standing": {"const": false},
+        "invokes_effect": {"const": false},
+        "qualifies_nq_integration": {"const": false}
+      }
+    }
+  }
+}
