@@ -376,7 +376,9 @@ not prove that provider execution or billing did not occur.
 Each command route also declares `model_argument = "required"` or `"omit"`.
 Omission is admitted only for Codex and means the operator-enrolled provider
 default; it is not a request-selected fallback. Claude and Kimi always receive
-the exact capability model through their fixed adapter arguments.
+the exact capability model through their fixed adapter arguments. The Codex
+adapter also fixes `--skip-git-repo-check` because the enrolled provider work
+directory is intentionally isolated rather than a source checkout.
 
 Before acknowledging a provider result, the complete credential-free request,
 sanitized transport headers, and complete response event stream must have

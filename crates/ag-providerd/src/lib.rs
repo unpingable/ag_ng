@@ -843,7 +843,7 @@ impl ProviderCoreV1 {
             .process_group(0);
         match command.adapter.as_str() {
             "codex" => {
-                process.args(["exec", "--json"]);
+                process.args(["exec", "--json", "--skip-git-repo-check"]);
                 if command.model_argument == ProviderCommandModelArgumentV1::Required {
                     process.args(["-m", model]);
                 }
@@ -2110,7 +2110,7 @@ mod tests {
         let executable = fixture._directory.path().join("fake-codex");
         fs::write(
             &executable,
-            "#!/bin/sh\nfor arg in \"$@\"; do [ \"$arg\" = -m ] && exit 9; done\ncat >/dev/null\nprintf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"READY\"}}\\n'\n",
+            "#!/bin/sh\nseen_skip=0\nfor arg in \"$@\"; do\n  [ \"$arg\" = -m ] && exit 9\n  [ \"$arg\" = --skip-git-repo-check ] && seen_skip=1\ndone\n[ \"$seen_skip\" = 1 ] || exit 8\ncat >/dev/null\nprintf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"READY\"}}\\n'\n",
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
