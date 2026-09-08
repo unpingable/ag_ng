@@ -220,9 +220,50 @@ where
     Req: Serialize,
     Resp: DeserializeOwned + Serialize,
 {
+    call_signed_with_timeout(
+        path,
+        request_id,
+        body,
+        maximum,
+        local_signer,
+        server,
+        replay_guard,
+        clock,
+        socket_check,
+        Duration::from_millis(SIGNED_RPC_RESPONSE_TIMEOUT_MS),
+    )
+}
+
+/// Client side signed exchange with an explicit response wait.
+///
+/// This is reserved for a service whose root-owned policy admits a longer
+/// operation than the ordinary control-plane bound, such as inference. The
+/// caller remains responsible for supplying a finite deployment bound.
+///
+/// # Errors
+///
+/// Returns an error when the socket, frame, signature, peer, replay, clock, or
+/// explicit response-deadline contract is not satisfied.
+#[allow(clippy::too_many_arguments)]
+pub fn call_signed_with_timeout<Req, Resp>(
+    path: &Path,
+    request_id: RequestId,
+    body: Req,
+    maximum: u32,
+    local_signer: &RpcSignerV1,
+    server: &RpcPeerEnrollmentV1,
+    replay_guard: &RpcReplayGuardV1,
+    clock: &dyn RpcClockV1,
+    socket_check: SocketPeerCheckV1,
+    response_timeout: Duration,
+) -> Result<Resp, SignedTransportError>
+where
+    Req: Serialize,
+    Resp: DeserializeOwned + Serialize,
+{
     let mut stream = UnixStream::connect(path)?;
     let codec = FrameCodec::new(maximum)?;
-    call_signed_on_stream(
+    call_signed_on_stream_with_timeout(
         &mut stream,
         codec,
         request_id,
@@ -232,6 +273,7 @@ where
         replay_guard,
         clock,
         socket_check,
+        response_timeout,
     )
 }
 
@@ -260,7 +302,44 @@ where
     Req: Serialize,
     Resp: DeserializeOwned + Serialize,
 {
-    stream.set_read_timeout(Some(Duration::from_millis(SIGNED_RPC_RESPONSE_TIMEOUT_MS)))?;
+    call_signed_on_stream_with_timeout(
+        stream,
+        codec,
+        request_id,
+        body,
+        local_signer,
+        server,
+        replay_guard,
+        clock,
+        socket_check,
+        Duration::from_millis(SIGNED_RPC_RESPONSE_TIMEOUT_MS),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_signed_on_stream_with_timeout<Req, Resp>(
+    stream: &mut UnixStream,
+    codec: FrameCodec,
+    request_id: RequestId,
+    body: Req,
+    local_signer: &RpcSignerV1,
+    server: &RpcPeerEnrollmentV1,
+    replay_guard: &RpcReplayGuardV1,
+    clock: &dyn RpcClockV1,
+    socket_check: SocketPeerCheckV1,
+    response_timeout: Duration,
+) -> Result<Resp, SignedTransportError>
+where
+    Req: Serialize,
+    Resp: DeserializeOwned + Serialize,
+{
+    if response_timeout.is_zero() {
+        return Err(SignedTransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "signed RPC response timeout must be nonzero",
+        )));
+    }
+    stream.set_read_timeout(Some(response_timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let _socket_peer = observe_and_check(stream, socket_check)?;
 

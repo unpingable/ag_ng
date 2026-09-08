@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "ag-providerd"
 path = "src/bin/ag-providerd.rs"
 
+[[bin]]
+name = "ag-providerctl"
+path = "src/bin/ag-providerctl.rs"
+
 [dependencies]
 ag-app = { path = "../ag-app" }
 ag-primitives = { path = "../ag-primitives" }

@@ -1,6 +1,6 @@
 //! Root-owned daemon configuration and startup validation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -17,7 +17,6 @@ use thiserror::Error;
 use crate::rpc_auth::{
     RpcAuthError, RpcPeerEnrollmentV1, RpcPeerKeyPolicyV1, RpcSigningIdentityConfigV1,
 };
-use crate::signed_transport::SIGNED_RPC_RESPONSE_TIMEOUT_MS;
 
 /// Maximum exact bytes accepted by every TOML configuration loader.
 pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -26,7 +25,7 @@ const PROVIDER_RPC_STRUCTURAL_RESERVE_BYTES: u64 = 128 * 1024;
 // reserve covers the complete signed principal/session/intent envelopes around
 // that one canonical base64 value.
 const WORKER_RPC_STRUCTURAL_RESERVE_BYTES: u64 = 128 * 1024;
-const PROVIDER_RPC_COMPLETION_MARGIN_MS: u64 = 5_000;
+const PROVIDER_MAX_DEADLINE_MS: u64 = 1_800_000;
 const PROVIDER_MIN_EVENT_STREAM_BYTES: u64 = 4 * 1024;
 const MAX_PROMOTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const MANAGED_FILE_CANDIDATE_SEMANTIC_V1: &str = "managed_file_content_v1";
@@ -493,6 +492,22 @@ pub struct ProviderModelPolicyConfigV1 {
     pub worst_case_cost_microunits: u64,
 }
 
+/// One fixed local command transport owned by `ag-providerd`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCommandConfigV1 {
+    /// Closed argument/output adapter (`codex`, `claude-code`, or `kimi-code`).
+    pub adapter: String,
+    /// Absolute executable path measured by deployment qualification.
+    pub executable: PathBuf,
+    /// Absolute fixed working directory; never selected by a request.
+    pub working_directory: PathBuf,
+    /// Closed, root-owned child environment. The provider daemon's own
+    /// environment (including its credential directory) is never inherited.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+}
+
 /// One closed provider backend.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -501,12 +516,21 @@ pub struct ProviderEndpointConfigV1 {
     pub id: String,
     /// Exact HTTPS origin and path.
     pub url: String,
+    /// Permit root-configured cleartext HTTP, intended for a private local model network.
+    #[serde(default)]
+    pub allow_plaintext_http: bool,
     /// systemd credential filename, not secret contents.
     pub credential_name: String,
     /// Header receiving the credential (for example `authorization`).
     pub credential_header: String,
     /// Constant prefix prepended to the credential (for example `Bearer `).
     pub credential_prefix: String,
+    /// Root-owned constant non-secret headers required by the protocol adapter.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Fixed command transport. Present only when `url` and credential fields are empty.
+    #[serde(default)]
+    pub command: Option<ProviderCommandConfigV1>,
     /// Closed model/deployment policies, including broker-owned reservations.
     pub models: Vec<ProviderModelPolicyConfigV1>,
     /// Exact protocol adapter.
@@ -1251,7 +1275,15 @@ impl ProviderdConfigV1 {
         validate_socket_custody(&self.socket_custody)?;
         validate_signer(&self.rpc_signing_identity)?;
         validate_peer(&self.caller_peer)?;
-        validate_peer_kind(&self.caller_peer, &[PrincipalKindV1::Daemon])?;
+        // The original v1 path admitted only the governor daemon. A fixed,
+        // independently enrolled service is also a valid terminal ingress:
+        // it remains pinned by UID/GID and signed-RPC identity, and providerd
+        // binds every capability use to that authenticated principal.
+        // Dynamic worker sessions remain excluded.
+        validate_peer_kind(
+            &self.caller_peer,
+            &[PrincipalKindV1::Daemon, PrincipalKindV1::Service],
+        )?;
         validate_separate_roles(&self.rpc_signing_identity, &[&self.caller_peer])?;
         if self.limits.max_control_frame_bytes == 0
             || self.limits.max_rpc_replay_entries == 0
@@ -1262,14 +1294,9 @@ impl ProviderdConfigV1 {
         {
             return Err(ConfigError::InvalidLimit("providerd limits"));
         }
-        if self
-            .limits
-            .provider_deadline_ms
-            .checked_add(PROVIDER_RPC_COMPLETION_MARGIN_MS)
-            .is_none_or(|deadline| deadline > SIGNED_RPC_RESPONSE_TIMEOUT_MS)
-        {
+        if self.limits.provider_deadline_ms > PROVIDER_MAX_DEADLINE_MS {
             return Err(ConfigError::InvalidLimit(
-                "provider deadline must leave signed-RPC completion margin",
+                "provider deadline exceeds the bounded inference maximum",
             ));
         }
         let request_wire = canonical_base64_encoded_length(self.limits.max_request_bytes)
@@ -1286,17 +1313,39 @@ impl ProviderdConfigV1 {
         }
         let mut endpoint_ids = BTreeSet::new();
         for endpoint in &self.endpoints {
-            if endpoint.id.is_empty()
-                || !endpoint.url.starts_with("https://")
-                || !valid_credential_name(&endpoint.credential_name)
-                || endpoint.models.is_empty()
-                || endpoint.methods.is_empty()
-                || !matches!(
+            let command_transport = endpoint.command.is_some();
+            let http_transport = !command_transport;
+            let valid_http_url = endpoint.url.starts_with("https://")
+                || (endpoint.allow_plaintext_http && endpoint.url.starts_with("http://"));
+            let credential_free = endpoint.credential_name.is_empty()
+                && endpoint.credential_header.is_empty()
+                && endpoint.credential_prefix.is_empty();
+            let credential_configured = valid_credential_name(&endpoint.credential_name)
+                && matches!(
                     endpoint.credential_header.as_str(),
                     "authorization" | "x-api-key"
-                )
+                );
+            if endpoint.id.is_empty()
+                || (http_transport
+                    && (!valid_http_url || !(credential_free || credential_configured)))
+                || (command_transport && (!endpoint.url.is_empty() || !credential_free))
+                || endpoint.models.is_empty()
+                || endpoint.methods.is_empty()
             {
                 return Err(ConfigError::InvalidLimit("provider endpoint"));
+            }
+            if endpoint.headers.iter().any(|(name, value)| {
+                !matches!(name.as_str(), "anthropic-version")
+                    || value.is_empty()
+                    || value.len() > 512
+                    || value.contains(['\r', '\n', '\0'])
+            }) {
+                return Err(ConfigError::InvalidLimit("provider headers"));
+            }
+            if let Some(command) = &endpoint.command
+                && !valid_provider_command(command)
+            {
+                return Err(ConfigError::InvalidLimit("provider command"));
             }
             if !endpoint_ids.insert(&endpoint.id) {
                 return Err(ConfigError::InvalidLimit("duplicate provider endpoint"));
@@ -1328,6 +1377,32 @@ fn valid_credential_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_provider_command(command: &ProviderCommandConfigV1) -> bool {
+    matches!(
+        command.adapter.as_str(),
+        "codex" | "claude-code" | "kimi-code"
+    ) && command.executable.is_absolute()
+        && command.working_directory.is_absolute()
+        && command.executable.components().collect::<PathBuf>() == command.executable
+        && command.working_directory.components().collect::<PathBuf>() == command.working_directory
+        && command.environment.iter().all(|(name, value)| {
+            matches!(
+                name.as_str(),
+                "HOME"
+                    | "PATH"
+                    | "TMPDIR"
+                    | "LANG"
+                    | "LC_ALL"
+                    | "XDG_CONFIG_HOME"
+                    | "CODEX_HOME"
+                    | "CLAUDE_CONFIG_DIR"
+                    | "KIMI_CONFIG_DIR"
+            ) && !value.is_empty()
+                && value.len() <= 4096
+                && !value.contains(['\r', '\n', '\0'])
+        })
 }
 
 fn valid_unit(unit: &str) -> bool {
@@ -1407,11 +1482,11 @@ mod tests {
         let mut config: ProviderdConfigV1 =
             toml::from_str(include_str!("../../../config/providerd.example.toml"))
                 .expect("strict provider example");
-        config.limits.provider_deadline_ms = SIGNED_RPC_RESPONSE_TIMEOUT_MS;
+        config.limits.provider_deadline_ms = PROVIDER_MAX_DEADLINE_MS + 1;
         assert!(matches!(
             config.validate(),
             Err(ConfigError::InvalidLimit(
-                "provider deadline must leave signed-RPC completion margin"
+                "provider deadline exceeds the bounded inference maximum"
             ))
         ));
     }
@@ -1425,6 +1500,63 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(ConfigError::InvalidLimit("provider model policy"))
+        ));
+    }
+
+    #[test]
+    fn provider_caller_may_be_a_fixed_service_but_not_a_dynamic_or_human_principal() {
+        let mut config: ProviderdConfigV1 =
+            toml::from_str(include_str!("../../../config/providerd.example.toml"))
+                .expect("strict provider example");
+        config.caller_peer.principal_kind = PrincipalKindV1::Service;
+        config.validate().expect("fixed service caller");
+
+        for rejected in [PrincipalKindV1::WorkerSession, PrincipalKindV1::Operator] {
+            config.caller_peer.principal_kind = rejected;
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::UnexpectedPrincipalKind(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_transport_policy_is_explicit_for_local_http_and_commands() {
+        let mut local: ProviderdConfigV1 =
+            toml::from_str(include_str!("../../../config/providerd.example.toml"))
+                .expect("strict provider example");
+        let endpoint = &mut local.endpoints[0];
+        endpoint.url = "http://ollama:11434/api/chat".to_owned();
+        endpoint.allow_plaintext_http = true;
+        endpoint.credential_name.clear();
+        endpoint.credential_header.clear();
+        endpoint.credential_prefix.clear();
+        local.validate().expect("explicit local HTTP endpoint");
+        local.endpoints[0].allow_plaintext_http = false;
+        assert!(matches!(
+            local.validate(),
+            Err(ConfigError::InvalidLimit("provider endpoint"))
+        ));
+
+        let mut command: ProviderdConfigV1 =
+            toml::from_str(include_str!("../../../config/providerd.example.toml"))
+                .expect("strict provider example");
+        let endpoint = &mut command.endpoints[0];
+        endpoint.url.clear();
+        endpoint.credential_name.clear();
+        endpoint.credential_header.clear();
+        endpoint.credential_prefix.clear();
+        endpoint.command = Some(ProviderCommandConfigV1 {
+            adapter: "claude-code".to_owned(),
+            executable: PathBuf::from("/opt/claude/claude"),
+            working_directory: PathBuf::from("/var/empty"),
+            environment: BTreeMap::new(),
+        });
+        command.validate().expect("fixed command endpoint");
+        command.endpoints[0].command.as_mut().unwrap().executable = PathBuf::from("relative");
+        assert!(matches!(
+            command.validate(),
+            Err(ConfigError::InvalidLimit("provider command"))
         ));
     }
 

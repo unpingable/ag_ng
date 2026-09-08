@@ -7,12 +7,16 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ag_primitives::{
     AuthorityDomain, CapabilityUseContextV1, Digest, Epoch, InferenceCapabilityId,
-    InferenceCapabilityV1, InferenceUsageV1, RevocationStateV1, SessionLifecycleStateV1,
+    InferenceCapabilityV1, InferenceUsageV1, PrincipalId, RevocationStateV1,
+    SessionLifecycleStateV1,
 };
 use ag_session::ProviderRequestCustodyV1;
 use ag_store::{NewEventV1, Store};
@@ -25,7 +29,10 @@ use thiserror::Error;
 use ag_app::api::{
     ApiErrorCodeV1, ApiResultV1, HealthV1, OpaqueBytesV1, ProviderRequestV1, ProviderResponseV1,
 };
-use ag_app::config::{ProviderEndpointConfigV1, ProviderModelPolicyConfigV1, ProviderdConfigV1};
+use ag_app::config::{
+    ProviderCommandConfigV1, ProviderEndpointConfigV1, ProviderModelPolicyConfigV1,
+    ProviderdConfigV1,
+};
 use ag_app::descriptor_path::open_beneath;
 use ag_app::rpc_auth::VerifiedRpcPrincipalV1;
 
@@ -218,7 +225,6 @@ impl ProviderCoreV1 {
         let authority_domain = AuthorityDomain::parse(&config.authority_domain)?;
         let epoch = Epoch::parse(&config.epoch)?;
         let client = Client::builder()
-            .https_only(true)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -235,11 +241,12 @@ impl ProviderCoreV1 {
         })
     }
 
-    /// Handles one request from the signed, enrolled `agd` proxy.
+    /// Handles one request from the single signed, enrolled caller.
     ///
-    /// Direct dynamic-worker presentation is deliberately absent in v1. The
-    /// worker binding remains in the committed capability and must be proven
-    /// by governor session ingress before the governor invokes this proxy.
+    /// The caller may be `agd` or one independently enrolled fixed service.
+    /// Dynamic-worker presentation remains absent. Every capability is bound
+    /// to the authenticated caller principal, so serialized capability data
+    /// cannot be replayed by another local peer.
     pub fn handle(
         &mut self,
         request: ProviderRequestV1,
@@ -267,9 +274,11 @@ impl ProviderCoreV1 {
                     schema: "ag.health/v1".to_owned(),
                     service: "ag-providerd".to_owned(),
                     build: env!("CARGO_PKG_VERSION").to_owned(),
-                    // Signed governor ingress exists, but the live
-                    // WorkerSessionPrincipal proof path is not implemented.
-                    ready: false,
+                    // A fixed service ingress is complete at this boundary.
+                    // The daemon-proxy profile remains non-ready until agd
+                    // proves its dynamic WorkerSessionPrincipal relation.
+                    ready: self.config.caller_peer.principal_kind
+                        == ag_primitives::PrincipalKindV1::Service,
                     quiesced: self.store.active_backup_cut()?.is_some(),
                 },
             }),
@@ -278,6 +287,9 @@ impl ProviderCoreV1 {
                 worker_principal,
             } => {
                 if capability.worker_principal != worker_principal
+                    || (self.config.caller_peer.principal_kind
+                        == ag_primitives::PrincipalKindV1::Service
+                        && worker_principal != PrincipalId::new(peer.principal.clone()))
                     || capability.provider_policy_digest != self.provider_policy
                     || capability.authority_domain != self.authority_domain
                     || capability.epoch != self.epoch
@@ -331,7 +343,7 @@ impl ProviderCoreV1 {
                 capability,
                 request,
                 request_bytes,
-            } => self.infer(&capability, &request, request_bytes.into_vec()),
+            } => self.infer(peer, &capability, &request, request_bytes.into_vec()),
             ProviderRequestV1::FetchInference { dispatch } => self.fetch_inference(&dispatch),
             ProviderRequestV1::AcknowledgeInferenceCustody {
                 dispatch,
@@ -349,10 +361,16 @@ impl ProviderCoreV1 {
     #[allow(clippy::too_many_lines)]
     fn infer(
         &mut self,
+        peer: &VerifiedRpcPrincipalV1,
         capability: &InferenceCapabilityV1,
         request: &ProviderRequestCustodyV1,
         request_bytes: Vec<u8>,
     ) -> Result<ProviderResponseV1, ProviderError> {
+        if self.config.caller_peer.principal_kind == ag_primitives::PrincipalKindV1::Service
+            && capability.worker_principal != PrincipalId::new(peer.principal.clone())
+        {
+            return Err(ProviderError::CapabilityBindingMismatch);
+        }
         if self.store.active_backup_cut()?.is_some() {
             return Err(ProviderError::Quiesced);
         }
@@ -683,29 +701,41 @@ impl ProviderCoreV1 {
         request_bytes: Vec<u8>,
         maximum_event_stream_bytes: u64,
     ) -> Result<ProviderEventStreamV1, ProviderError> {
-        let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY")
-            .ok_or(ProviderError::CredentialUnavailable)?;
-        let mut credential =
-            read_provider_credential(Path::new(&credential_directory), &endpoint.credential_name)?;
-        while credential.ends_with(['\n', '\r']) {
-            credential.pop();
-        }
-        if credential.is_empty() || credential.contains(['\n', '\r', '\0']) {
-            return Err(ProviderError::CredentialUnavailable);
+        if let Some(command) = &endpoint.command {
+            return self.dispatch_command(command, request_bytes, maximum_event_stream_bytes);
         }
 
         let mut headers = HeaderMap::new();
+        for (name, value) in &endpoint.headers {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
+            );
+        }
         for (name, value) in &request.sanitized_headers {
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes())?,
                 HeaderValue::from_str(value)?,
             );
         }
-        let credential_header = HeaderName::from_bytes(endpoint.credential_header.as_bytes())?;
-        let credential_value =
-            HeaderValue::from_str(&format!("{}{}", endpoint.credential_prefix, credential))?;
-        headers.insert(credential_header, credential_value);
-        drop(credential);
+        if !endpoint.credential_name.is_empty() {
+            let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+                .ok_or(ProviderError::CredentialUnavailable)?;
+            let mut credential = read_provider_credential(
+                Path::new(&credential_directory),
+                &endpoint.credential_name,
+            )?;
+            while credential.ends_with(['\n', '\r']) {
+                credential.pop();
+            }
+            if credential.is_empty() || credential.contains(['\n', '\r', '\0']) {
+                return Err(ProviderError::CredentialUnavailable);
+            }
+            let credential_header = HeaderName::from_bytes(endpoint.credential_header.as_bytes())?;
+            let credential_value =
+                HeaderValue::from_str(&format!("{}{}", endpoint.credential_prefix, credential))?;
+            headers.insert(credential_header, credential_value);
+        }
 
         let response = match self
             .client
@@ -753,6 +783,185 @@ impl ProviderCoreV1 {
             headers: sanitized,
             body: OpaqueBytesV1::new(body),
             protocol_terminal: terminal,
+        })
+    }
+
+    fn dispatch_command(
+        &self,
+        command: &ProviderCommandConfigV1,
+        request_bytes: Vec<u8>,
+        maximum_event_stream_bytes: u64,
+    ) -> Result<ProviderEventStreamV1, ProviderError> {
+        let request: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|_| ProviderError::AdapterRequestMismatch)?;
+        let model = request
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProviderError::AdapterRequestMismatch)?;
+        let messages = request
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(ProviderError::AdapterRequestMismatch)?;
+        let mut prompt = String::new();
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProviderError::AdapterRequestMismatch)?;
+            let content = message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProviderError::AdapterRequestMismatch)?;
+            if !matches!(role, "system" | "user" | "assistant") {
+                return Err(ProviderError::AdapterRequestMismatch);
+            }
+            prompt.push('<');
+            prompt.push_str(role);
+            prompt.push_str(">\n");
+            prompt.push_str(content);
+            prompt.push_str("\n</");
+            prompt.push_str(role);
+            prompt.push_str(">\n");
+        }
+
+        let mut process = Command::new(&command.executable);
+        process
+            .env_clear()
+            .envs(&command.environment)
+            .current_dir(&command.working_directory)
+            .process_group(0);
+        match command.adapter.as_str() {
+            "codex" => {
+                process.args(["exec", "--json", "-m", model, "-"]);
+            }
+            "claude-code" => {
+                process.args([
+                    "--print",
+                    "--output-format",
+                    "json",
+                    "--verbose",
+                    "--model",
+                    model,
+                    "--tools",
+                    "",
+                    "--no-session-persistence",
+                    "--disable-slash-commands",
+                    "--safe-mode",
+                ]);
+            }
+            "kimi-code" => {
+                process.args([
+                    "--model",
+                    model,
+                    "--prompt",
+                    &prompt,
+                    "--output-format",
+                    "stream-json",
+                ]);
+            }
+            _ => return Err(ProviderError::EndpointNotAllowed),
+        }
+        let uses_stdin = command.adapter != "kimi-code";
+        process
+            .stdin(if uses_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match process.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                return Ok(ProviderEventStreamV1::TransportFailure {
+                    class: ProviderTransportFailureV1::Connect,
+                });
+            }
+        };
+        if uses_stdin {
+            let mut stdin = child.stdin.take().ok_or(ProviderError::CommandPipe)?;
+            if std::io::Write::write_all(&mut stdin, prompt.as_bytes()).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(ProviderEventStreamV1::TransportFailure {
+                    class: ProviderTransportFailureV1::Body,
+                });
+            }
+        }
+        let stdout = child.stdout.take().ok_or(ProviderError::CommandPipe)?;
+        let stderr = child.stderr.take().ok_or(ProviderError::CommandPipe)?;
+        let bound = maximum_event_stream_bytes.saturating_add(1);
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.take(bound).read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.take(8193).read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let started = std::time::Instant::now();
+        let deadline = Duration::from_millis(self.config.limits.provider_deadline_ms);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    if let Ok(pid) = i32::try_from(child.id()) {
+                        let _ = nix::sys::signal::killpg(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGTERM,
+                        );
+                    }
+                    let grace = std::time::Instant::now();
+                    while grace.elapsed() < Duration::from_secs(5) {
+                        if child.try_wait().ok().flatten().is_some() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    if child.try_wait().ok().flatten().is_none() {
+                        let _ = child.kill();
+                    }
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Ok(ProviderEventStreamV1::TransportFailure {
+                        class: ProviderTransportFailureV1::Timeout,
+                    });
+                }
+                Err(_) => return Err(ProviderError::CommandWait),
+            }
+        };
+        let stdout = stdout_reader
+            .join()
+            .map_err(|_| ProviderError::CommandPipe)??;
+        let _stderr = stderr_reader
+            .join()
+            .map_err(|_| ProviderError::CommandPipe)??;
+        if stdout.len() as u64 > maximum_event_stream_bytes {
+            return Ok(ProviderEventStreamV1::ResponseLimitExceeded {
+                status: 200,
+                headers: BTreeMap::new(),
+                maximum_bytes: maximum_event_stream_bytes,
+            });
+        }
+        let (status, body) = if status.success() {
+            (200, stdout)
+        } else {
+            let body = serde_jcs::to_vec(&serde_json::json!({
+                "error": "command_refused",
+                "exit_code": status.code(),
+            }))
+            .map_err(|error| ProviderError::Canonical(error.to_string()))?;
+            (502, body)
+        };
+        Ok(ProviderEventStreamV1::HttpResponse {
+            status,
+            headers: BTreeMap::new(),
+            body: OpaqueBytesV1::new(body),
+            protocol_terminal: true,
         })
     }
 
@@ -1350,6 +1559,12 @@ pub enum ProviderError {
     /// Credential file read failed.
     #[error("provider credential cannot be read")]
     Io(#[from] std::io::Error),
+    /// A fixed command transport pipe could not be established or drained.
+    #[error("provider command pipe failed")]
+    CommandPipe,
+    /// A fixed command transport could not be observed to completion.
+    #[error("provider command wait failed")]
+    CommandWait,
     /// Endpoint IDs are duplicated.
     #[error("duplicate provider endpoint: {0}")]
     DuplicateEndpoint(String),
@@ -1494,9 +1709,14 @@ mod tests {
 
     impl ProviderFixture {
         fn new() -> Self {
+            Self::with_caller_kind(ag_primitives::PrincipalKindV1::Daemon)
+        }
+
+        fn with_caller_kind(kind: ag_primitives::PrincipalKindV1) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let mut config: ProviderdConfigV1 =
                 toml::from_str(include_str!("../../../config/providerd.example.toml")).unwrap();
+            config.caller_peer.principal_kind = kind;
             config.store.database = directory.path().join("provider.db");
             config.store.object_store = directory.path().join("objects");
             let peer = VerifiedRpcPrincipalV1 {
@@ -1694,6 +1914,52 @@ mod tests {
             200,
             b"event: response.completed\ndata: {}\n\n"
         ));
+    }
+
+    #[test]
+    fn fixed_command_transport_captures_success_and_sanitizes_failure() {
+        let fixture = ProviderFixture::new();
+        let executable = fixture._directory.path().join("fake-claude");
+        fs::write(
+            &executable,
+            "#!/bin/sh\ninput=$(cat)\nprintf '{\"result\":\"ok\",\"input\":\"%s\"}' \"$input\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let command = ProviderCommandConfigV1 {
+            adapter: "claude-code".to_owned(),
+            executable: executable.clone(),
+            working_directory: fixture._directory.path().to_path_buf(),
+            environment: BTreeMap::new(),
+        };
+        let request =
+            br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#;
+        let event = fixture
+            .core
+            .dispatch_command(&command, request.to_vec(), 16 * 1024)
+            .unwrap();
+        assert!(matches!(
+            event,
+            ProviderEventStreamV1::HttpResponse {
+                status: 200,
+                protocol_terminal: true,
+                ..
+            }
+        ));
+
+        fs::write(&executable, "#!/bin/sh\necho super-secret >&2\nexit 7\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let event = fixture
+            .core
+            .dispatch_command(&command, request.to_vec(), 16 * 1024)
+            .unwrap();
+        let ProviderEventStreamV1::HttpResponse { status, body, .. } = event else {
+            panic!("expected terminal sanitized command refusal")
+        };
+        assert_eq!(status, 502);
+        let text = String::from_utf8(body.into_vec()).unwrap();
+        assert!(text.contains("command_refused"));
+        assert!(!text.contains("super-secret"));
     }
 
     #[test]
@@ -1957,6 +2223,53 @@ mod tests {
                 response: ProviderResponseV1::Health {
                     health: HealthV1 { ready: false, .. }
                 }
+            }
+        ));
+    }
+
+    #[test]
+    fn fixed_service_health_is_ready_and_capabilities_are_bound_to_its_signed_identity() {
+        let mut fixture =
+            ProviderFixture::with_caller_kind(ag_primitives::PrincipalKindV1::Service);
+        let response = fixture
+            .core
+            .handle(ProviderRequestV1::Health {}, &fixture.peer);
+        assert!(matches!(
+            response,
+            ApiResultV1::Ok {
+                response: ProviderResponseV1::Health {
+                    health: HealthV1 { ready: true, .. }
+                }
+            }
+        ));
+
+        let session = SessionId::new("fixed-service-session").unwrap();
+        let mut rejected = fixture.capability(&session, 1);
+        assert!(matches!(
+            fixture.core.handle(
+                ProviderRequestV1::RegisterCapability {
+                    capability: Box::new(rejected.clone()),
+                    worker_principal: rejected.worker_principal.clone(),
+                },
+                &fixture.peer,
+            ),
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::Unauthenticated,
+                ..
+            }
+        ));
+
+        rejected.worker_principal = PrincipalId::new(fixture.peer.principal.clone());
+        assert!(matches!(
+            fixture.core.handle(
+                ProviderRequestV1::RegisterCapability {
+                    capability: Box::new(rejected.clone()),
+                    worker_principal: rejected.worker_principal.clone(),
+                },
+                &fixture.peer,
+            ),
+            ApiResultV1::Ok {
+                response: ProviderResponseV1::CapabilityRegistered { .. }
             }
         ));
     }
