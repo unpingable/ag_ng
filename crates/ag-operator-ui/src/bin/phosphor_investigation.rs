@@ -18,6 +18,9 @@ struct Args {
     bind: SocketAddr,
     #[arg(long)]
     terminal: Option<String>,
+    /// Open the interactive read-only terminal inspector for one investigation.
+    #[arg(long, conflicts_with = "terminal")]
+    tui: Option<String>,
     #[arg(long, default_value_t = 100)]
     width: u16,
     #[arg(long, default_value_t = 30)]
@@ -34,6 +37,11 @@ fn main() -> Result<()> {
         .root
         .canonicalize()
         .context("resolve investigation root")?;
+    if let Some(id) = args.tui {
+        let item = investigation::load(&root, &id).map_err(anyhow::Error::msg)?;
+        investigation::run_tui(&item, args.ascii, args.monochrome).map_err(anyhow::Error::msg)?;
+        return Ok(());
+    }
     if let Some(id) = args.terminal {
         let item = investigation::load(&root, &id).map_err(anyhow::Error::msg)?;
         print!(
