@@ -18,11 +18,39 @@ from browser_fixture import demo, Fixture, UI_SOURCE
 
 
 def retain(path, value):
-    with path.open('x') as stream:
+    pending = path.with_name(path.name + '.writing')
+    with pending.open('x') as stream:
         json.dump(value, stream, sort_keys=True)
         stream.write('\n')
         stream.flush()
         os.fsync(stream.fileno())
+    os.link(pending, path)  # Atomic complete publication; never overwrite.
+    pending.unlink()
+    directory = os.open(path.parent, os.O_DIRECTORY | os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def stop_child(child, record):
+    if child.poll() is None:
+        child.terminate()
+    exceeded = False
+    try:
+        code = child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        exceeded = True
+        child.kill()
+        try:
+            code = child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            retain(record, {'pid': child.pid, 'exit': 'NOT_OBSERVABLE',
+                            'stop': 'KILL_SENT_TERMINATION_NOT_ESTABLISHED'})
+            raise
+    retain(record, {'pid': child.pid, 'exit': code, 'stop_bound_exceeded': exceeded})
+    if exceeded:
+        raise RuntimeError('observer stop exceeded bound; exact child killed')
 
 
 class ReadOnlyFixture:
@@ -90,15 +118,7 @@ def run(root):
                         '--expect-state', 'TERMINAL', '--expect-live', 'PROCESS_EXITED']
                     subprocess.run(command, check=True, timeout=45)
                 finally:
-                    if child.poll() is None:
-                        child.terminate()
-                    try:
-                        code = child.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        child.kill()
-                        child.wait(timeout=5)
-                        raise RuntimeError('observer stop exceeded bound; exact child killed')
-                    retain(root / f'stop-{ordinal}.json', {'pid': child.pid, 'exit': code})
+                    stop_child(child, root / f'stop-{ordinal}.json')
             if (root / 'projection.json').read_bytes() != original:
                 raise RuntimeError('observer altered fixed fixture state')
             calls = (root / f'calls-{ordinal}.txt').read_text().splitlines()
