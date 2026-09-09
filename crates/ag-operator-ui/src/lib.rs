@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod investigation;
 pub mod links;
 pub mod model;
 pub mod render;
