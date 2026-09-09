@@ -200,7 +200,7 @@ fn raw(label: &str, value: &Value) -> String {
 /// Shared browser style for the operational investigation surface.
 #[must_use]
 pub fn style() -> &'static str {
-    r":root{color-scheme:dark;--bg:#0b0c0c;--panel:#151614;--line:#555248;--text:#e2dece;--muted:#9e9a8d;--amber:#d7a53b;--oxide:#b66b52}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,monospace}a{color:#e6bd65}.top{padding:.7rem 1rem;border-bottom:3px double var(--line);display:flex;gap:1rem}.top span{margin-left:auto;color:var(--muted)}main{max-width:1500px;margin:auto;padding:1rem}.rail{border-left:2px solid var(--line);padding:.25rem 0 1rem 1rem;margin-left:.4rem}.seam{border-top:3px double var(--line);padding-top:.7rem}.open{border-left:2px dashed var(--amber)}.stop{border-right:5px double var(--oxide);padding:.6rem;background:#211711}.grid{display:grid;grid-template-columns:1fr 1.4fr 1fr;gap:.8rem}.panel{border:1px solid var(--line);background:var(--panel);padding:.8rem;min-width:0}.wide{grid-column:1/-1}.muted{color:var(--muted)}.tag{border:1px solid var(--line);padding:.1rem .35rem;text-transform:uppercase;font-size:.7rem}.raw{margin-top:.5rem}.raw pre{overflow:auto;max-height:30rem;background:#070808;padding:.7rem}.finding{border-left:2px solid var(--amber);padding-left:.7rem;margin:.7rem 0}@media(max-width:900px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}"
+    r":root{color-scheme:dark;--bg:#0b0c0c;--panel:#151614;--line:#555248;--text:#e2dece;--muted:#9e9a8d;--amber:#d7a53b;--oxide:#b66b52}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,monospace}a{color:#e6bd65}.top{padding:.7rem 1rem;border-bottom:3px double var(--line);display:flex;gap:1rem}.top span{margin-left:auto;color:var(--muted)}main{max-width:1500px;margin:auto;padding:1rem}.rail{border-left:2px solid var(--line);padding:.25rem 0 1rem 1rem;margin-left:.4rem;overflow-wrap:anywhere}.seam{border-top:3px double var(--line);padding-top:.7rem}.open{border-left:2px dashed var(--amber)}.stop{border-right:5px double var(--oxide);padding:.6rem;background:#211711}.grid{display:grid;grid-template-columns:1fr 1.4fr 1fr;gap:.8rem}.panel{border:1px solid var(--line);background:var(--panel);padding:.8rem;min-width:0}.wide{grid-column:1/-1}.muted{color:var(--muted);overflow-wrap:anywhere}.tag{border:1px solid var(--line);padding:.1rem .35rem;text-transform:uppercase;font-size:.7rem}.raw{margin-top:.5rem}.raw pre{overflow:auto;max-height:30rem;background:#070808;padding:.7rem}.finding{border-left:2px solid var(--amber);padding-left:.7rem;margin:.7rem 0}@media(max-width:900px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}"
 }
 
 fn page(title: &str, body: &str) -> String {
@@ -593,6 +593,7 @@ mod tests {
         let browser = render_detail(&loaded);
         assert!(browser.contains("no aggregate verdict"));
         assert!(browser.contains("Standing admission attached"));
+        assert!(style().contains("overflow-wrap:anywhere"));
         let wide = render_terminal(&loaded, 140, 40, false, false).unwrap();
         assert!(wide.contains("OPERATIONS") && wide.contains("REASONING"));
         let narrow = render_terminal(&loaded, 80, 24, true, true).unwrap();
