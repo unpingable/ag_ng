@@ -133,3 +133,10 @@ separate from the packaged test step because it needs host prerequisites a
 package builder cannot guarantee. It qualifies the **ingress substrate**, not a
 production worker; production worker qualification remains pending as stated
 above.
+
+## Operational ECAD composition
+
+Phosphor-ng is the read-only browser and terminal renderer for retained
+investigations. It renders posture, evidence, boundaries, and custody without
+granting authority or replacing owner interpretation. See the local
+[Operational ECAD journey](/data/git/operational-ecad/README.md).
