@@ -348,7 +348,12 @@ pub fn render_terminal(
         let state = item.state.get("state").and_then(Value::as_str).unwrap_or("unknown");
         let label = item.handoff.pointer("/profile/subject_label").and_then(Value::as_str).unwrap_or("unnamed subject");
         let border = if monochrome { Style::default() } else { Style::default().fg(Color::DarkGray) };
-        frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(" NIGHTSHIFT / PHOSPHOR-NG ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(format!("subject:{label}  state:{state}"))])).block(Block::default().borders(Borders::ALL).border_style(border)), areas[0]);
+        let header = if width < 90 {
+            format!("state:{state}")
+        } else {
+            format!("subject:{label}  state:{state}")
+        };
+        frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(" NIGHTSHIFT / PHOSPHOR-NG ", Style::default().add_modifier(Modifier::BOLD)), Span::raw(header)])).block(Block::default().borders(Borders::ALL).border_style(border)), areas[0]);
         frame.render_widget(Paragraph::new(format!("SUBJECT RAIL\n{} Standing boundary\n{line} {label}\n{line} revision\n{line} Nightshift {state}", if ascii { "|-" } else { "├─" })).wrap(Wrap { trim: false }).block(Block::default().title(" OPERATIONS ").borders(Borders::ALL)), columns[0]);
         let reason = item.record.as_ref().and_then(|v| v.get("findings")).and_then(Value::as_array).map_or_else(|| format!("findings {line}\u{2574}\nunknown / open edge"), |v| v.iter().map(|x| format!("{}  {}", x.get("profile").and_then(Value::as_str).unwrap_or("unknown"), x.pointer("/outcome/condition").and_then(Value::as_str).unwrap_or("unknown"))).collect::<Vec<_>>().join("\n"));
         frame.render_widget(Paragraph::new(reason).wrap(Wrap { trim: false }).block(Block::default().title(" REASONING ").borders(Borders::ALL)), columns[1]);
@@ -591,8 +596,10 @@ mod tests {
         let wide = render_terminal(&loaded, 140, 40, false, false).unwrap();
         assert!(wide.contains("OPERATIONS") && wide.contains("REASONING"));
         let narrow = render_terminal(&loaded, 80, 24, true, true).unwrap();
+        assert!(narrow.contains("state:completed"));
         assert!(narrow.contains("Standing boundary") && narrow.contains("no aggregate verdict"));
         let serial = render_terminal(&loaded, 79, 24, true, true).unwrap();
+        assert!(serial.contains("state:completed"));
         assert!(serial.contains("Standing boundary") && serial.contains("no aggregate verdict"));
     }
 
