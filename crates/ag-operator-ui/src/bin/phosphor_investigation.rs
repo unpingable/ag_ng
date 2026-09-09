@@ -1,6 +1,5 @@
 //! Loopback-only browser and terminal service-investigation inspector.
 use std::{
-    io::{Read as _, Write as _},
     net::{SocketAddr, TcpListener},
     path::PathBuf,
 };
@@ -62,28 +61,37 @@ fn main() -> Result<()> {
     }
     let listener = TcpListener::bind(args.bind)?;
     for stream in listener.incoming() {
-        let mut stream = stream?;
-        let mut bytes = [0_u8; 16 * 1024];
-        let size = stream.read(&mut bytes)?;
-        let request = String::from_utf8_lossy(&bytes[..size]);
-        let line = request.lines().next().unwrap_or("");
-        let mut parts = line.split_whitespace();
-        let method = parts.next().unwrap_or("");
-        let path = parts.next().unwrap_or("");
-        if !matches!(method, "GET" | "HEAD") {
-            write_response(
-                &mut stream,
-                405,
-                "text/plain",
-                b"read only",
-                method == "HEAD",
-            )?;
-            continue;
+        match stream {
+            Ok(mut stream) => {
+                if let Err(error) = handle_connection(&root, &mut stream) {
+                    eprintln!("investigation request failed: {error:#}");
+                }
+            }
+            Err(error) => eprintln!("investigation connection failed: {error}"),
         }
-        let (status, kind, body) = route(&root, path);
-        write_response(&mut stream, status, kind, body.as_bytes(), method == "HEAD")?;
     }
     Ok(())
+}
+
+fn handle_connection(
+    root: &std::path::Path,
+    stream: &mut (impl std::io::Read + std::io::Write),
+) -> Result<()> {
+    let mut bytes = [0_u8; 16 * 1024];
+    let size = stream.read(&mut bytes)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let request = String::from_utf8_lossy(&bytes[..size]);
+    let line = request.lines().next().unwrap_or("");
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+    if !matches!(method, "GET" | "HEAD") {
+        return write_response(stream, 405, "text/plain", b"read only", method == "HEAD");
+    }
+    let (status, kind, body) = route(root, path);
+    write_response(stream, status, kind, body.as_bytes(), method == "HEAD")
 }
 
 fn route(root: &std::path::Path, path: &str) -> (u16, &'static str, String) {
@@ -117,7 +125,7 @@ fn route(root: &std::path::Path, path: &str) -> (u16, &'static str, String) {
 }
 
 fn write_response(
-    stream: &mut std::net::TcpStream,
+    stream: &mut impl std::io::Write,
     status: u16,
     kind: &str,
     body: &[u8],
@@ -141,4 +149,20 @@ fn write_response(
         stream.write_all(body)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::handle_connection;
+
+    #[test]
+    fn empty_reachability_connection_is_not_a_server_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut stream = Cursor::new(Vec::new());
+
+        handle_connection(root.path(), &mut stream).unwrap();
+        assert!(stream.into_inner().is_empty());
+    }
 }
