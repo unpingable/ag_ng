@@ -39,7 +39,8 @@ use crate::api::{
     EffectProposalRequestV1, EffectProposalResponseV1, GovernedProposalIngressV1, HealthV1,
     OpaqueBytesV1, ProposalIngressProofV1, ProviderRequestV1, ProviderResponseV1,
     WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1, WorkerCandidateRequestV1,
-    WorkerCandidateSourceProofV1, worker_candidate_ingress_proof_digest,
+    WorkerCandidateSourceProofV1, WorkerProviderRequestV1, WorkerProviderResponseV1,
+    worker_candidate_ingress_proof_digest,
 };
 use crate::config::{AgdConfigV1, WorkerCandidateEffectV1, WorkerProfileConfigV1};
 use crate::peer::signed_principal_chain;
@@ -52,7 +53,7 @@ use crate::rpc_auth::{
 use crate::signed_transport::{AcceptedSignedRequestV1, SocketPeerCheckV1, call_signed};
 use crate::worker::{
     AdmittedWorkerInputV1, PreparedWorkerLaunchV1, WorkerLaunchError, WorkerLaunchReleaseV1,
-    WorkerProcessV1, prepare_worker_launch,
+    WorkerProcessV1, WorkerProviderChannelV1, prepare_worker_launch,
 };
 use crate::worker_protocol::{
     CANDIDATE_BOOTSTRAP_PURPOSE, CANDIDATE_INGRESS_CREDENTIAL_PURPOSE, WorkerProtocolError,
@@ -485,6 +486,7 @@ struct ActiveWorkerRuntimeV1 {
     worker_enrollment: RpcPeerKeyPolicyV1,
     server_challenge: SignedServerChallengeV1,
     ingress: WorkerRuntimeIngressBindingsV1,
+    provider_channel: Option<WorkerProviderChannelV1>,
 }
 
 /// Launcher-retained facts used to revalidate live candidate ingress.
@@ -965,6 +967,7 @@ impl AgdCoreV1 {
                 worker_enrollment,
                 server_challenge,
                 ingress,
+                provider_channel: prepared.provider_channel,
             },
         );
         debug_assert!(replaced.is_none());
@@ -1011,6 +1014,56 @@ impl AgdCoreV1 {
             cleanup_receipt,
             now_u64()?,
         )?;
+        Ok(())
+    }
+
+    /// Nonblockingly collects complete canonical provider requests from live
+    /// retained worker channels. No request is interpreted as authority.
+    pub fn poll_worker_provider_frames(
+        &mut self,
+    ) -> Result<Vec<(SessionId, WorkerProviderRequestV1)>, AgdError> {
+        let maximum = self.config.limits.max_control_frame_bytes;
+        let mut requests = Vec::new();
+        for (session, runtime) in &mut self.active_workers {
+            let Some(channel) = runtime.provider_channel.as_mut() else {
+                continue;
+            };
+            let Some(bytes) = channel.try_receive_frame(maximum)? else {
+                continue;
+            };
+            let request: WorkerProviderRequestV1 = ag_protocol::strict_json_from_slice(&bytes)?;
+            if ag_protocol::canonical_json(&request)? != bytes {
+                return Err(AgdError::WorkerProviderNoncanonicalRequest);
+            }
+            requests.push((session.clone(), request));
+        }
+        Ok(requests)
+    }
+
+    /// Queues one exact worker-facing provider result on the retained fd6.
+    pub fn queue_worker_provider_response(
+        &mut self,
+        session: &SessionId,
+        response: &ApiResultV1<WorkerProviderResponseV1>,
+    ) -> Result<(), AgdError> {
+        let maximum = self.config.limits.max_control_frame_bytes;
+        let bytes = ag_protocol::canonical_json(response)?;
+        let channel = self
+            .active_workers
+            .get_mut(session)
+            .and_then(|runtime| runtime.provider_channel.as_mut())
+            .ok_or(AgdError::WorkerRuntimeMissing)?;
+        channel.queue_response_frame(maximum, &bytes)?;
+        Ok(())
+    }
+
+    /// Nonblockingly advances every queued fd6 response.
+    pub fn flush_worker_provider_responses(&mut self) -> Result<(), AgdError> {
+        for runtime in self.active_workers.values_mut() {
+            if let Some(channel) = runtime.provider_channel.as_mut() {
+                let _ = channel.flush_response_frame()?;
+            }
+        }
         Ok(())
     }
 
@@ -2923,6 +2976,9 @@ pub enum AgdError {
     /// Provider I/O queue has no bounded capacity.
     #[error("worker provider I/O queue capacity is invalid")]
     WorkerProviderQueueInvalid,
+    /// Worker provider request was strict JSON but not canonical JCS bytes.
+    #[error("worker provider request is not canonical")]
+    WorkerProviderNoncanonicalRequest,
     /// Provider I/O worker could not start.
     #[error("worker provider I/O thread could not start: {0}")]
     ProviderIoThread(#[source] std::io::Error),
