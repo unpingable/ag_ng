@@ -961,6 +961,30 @@ impl WorkerSessionRecordV1 {
         Ok(())
     }
 
+    /// Reloads and validates the provider capability for one launcher-bound
+    /// active ingress transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same exact live-binding refusals as
+    /// [`Self::validate_active_ingress`], or a provider-route refusal when the
+    /// session is offline or the capability is not yet effective.
+    pub fn active_provider_capability(
+        &self,
+        context: &WorkerIngressContextV1,
+    ) -> Result<&ProviderCapabilityV1, SessionError> {
+        self.validate_active_ingress(context)?;
+        let capability = self
+            .spec
+            .provider_capability
+            .as_ref()
+            .ok_or(SessionError::ProviderRouteMismatch)?;
+        if context.now_unix_ms < capability.not_before_unix_ms {
+            return Err(SessionError::ProviderCapabilityNotYetValid);
+        }
+        Ok(capability)
+    }
+
     /// Applies one legal durable worker lifecycle transition.
     ///
     /// # Errors
@@ -1238,6 +1262,9 @@ pub enum SessionError {
     /// Offline/constrained provider policy disagrees with capability or FDs.
     #[error("worker provider route does not match capability and descriptor policy")]
     ProviderRouteMismatch,
+    /// Provider ingress preceded the capability's inclusive start time.
+    #[error("worker provider capability is not yet valid")]
+    ProviderCapabilityNotYetValid,
     /// Worker principal belongs to a different authority domain.
     #[error("worker principal authority domain does not match session")]
     PrincipalAuthorityDomainMismatch,
@@ -1707,6 +1734,23 @@ mod tests {
             },
         ]);
         spec.validate().unwrap();
+        let context = ingress_context(&spec, 150);
+        let record = WorkerSessionRecordV1::new(spec.clone())
+            .unwrap()
+            .apply(WorkerSessionEventV1::Activate {
+                launch_receipt: digest("provider-launch"),
+            })
+            .unwrap();
+        assert_eq!(
+            record.active_provider_capability(&context).unwrap().id(),
+            spec.provider_capability.as_ref().unwrap().id()
+        );
+        let mut early = context;
+        early.now_unix_ms = 99;
+        assert_eq!(
+            record.active_provider_capability(&early),
+            Err(SessionError::ProviderCapabilityNotYetValid)
+        );
 
         spec.provider_capability.as_mut().unwrap().project =
             ProjectId::new("other-project").unwrap();
