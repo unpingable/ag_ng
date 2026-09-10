@@ -105,11 +105,15 @@ Known blockers in the current tree include:
   The first source prerequisite now exists: `WorkerProfileConfigV1` can enroll
   one exact provider-policy digest, envelope and budget; the session constructors
   derive the matching constrained principal, capability and provider-channel
-  descriptor identities. Launch deliberately refuses that profile before
-  process preparation. No provider-channel pipes are handed to the worker and
+  descriptor identities. The launcher now has a separately invoked primitive
+  that installs directionally constrained pipes on exact worker fds 5 and 6,
+  binds them into launch evidence, and retains the opposite endpoints for the
+  governor. The ordinary agd launch still deliberately refuses that profile
+  before process preparation: no daemon path consumes those endpoints, and
   `AgdRequestV1` still has no worker-bound infer/fetch/acknowledge operations.
-  The remaining order is live descriptor handoff plus durable agd proxy
-  operations that reload and verify the active session -> session termination
+  The remaining order is a bounded framed channel plus durable agd proxy
+  operations that reload and verify the active session on every transition ->
+  session termination
   coupled to provider capability burn -> installed worker/session/peer
   qualification. Strict decoding refuses a provider-looking field outside the
   enrolled shape, and focused tests cover the exact route/capability/descriptor
