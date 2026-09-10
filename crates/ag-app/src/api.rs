@@ -249,6 +249,56 @@ pub enum WorkerCandidateRequestV1 {
     },
 }
 
+/// Credential-free requests accepted only on a retained worker provider fd.
+/// Session, principal, capability, provider and model are resolved by agd.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerProviderRequestV1 {
+    /// Begin one non-reusable bounded inference attempt.
+    Infer {
+        /// Stable worker-local attempt identity for duplicate reconciliation.
+        attempt: ag_protocol::RequestId,
+        /// Complete non-secret headers; credential fields are inexpressible.
+        sanitized_headers: BTreeMap<String, String>,
+        /// Exact credential-free provider request bytes.
+        request_bytes: OpaqueBytesV1,
+    },
+    /// Inspect an existing attempt without dispatching again.
+    Reconcile {
+        /// Previously submitted worker-local attempt identity.
+        attempt: ag_protocol::RequestId,
+    },
+}
+
+/// Worker-facing projection of governor-owned provider attempt state.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerProviderResponseV1 {
+    /// Request is durable but no provider completion is established.
+    Pending {
+        /// Stable worker-local attempt identity.
+        attempt: ag_protocol::RequestId,
+    },
+    /// Complete response bytes are in governor custody.
+    Available {
+        /// Stable worker-local attempt identity.
+        attempt: ag_protocol::RequestId,
+        /// Digest of the exact complete event stream.
+        exact_event_stream: Digest,
+        /// Exact complete event stream bytes.
+        event_stream: OpaqueBytesV1,
+        /// True only when the configured adapter observed a terminal event.
+        protocol_terminal: bool,
+    },
+    /// Attempt cannot safely be repeated and requires reconciliation.
+    Uncertain {
+        /// Stable worker-local attempt identity.
+        attempt: ag_protocol::RequestId,
+        /// Exact bounded uncertainty evidence.
+        evidence: Digest,
+    },
+}
+
 /// Public, credential-free bootstrap delivered through one admitted worker
 /// descriptor. The PKCS#8 candidate-ingress key is carried on a separate
 /// read-only descriptor and is never serialized into this object.

@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ag_primitives::{Digest, ExecutableIdentityV1};
+use ag_protocol::FrameCodec;
 use ag_session::SecurityProfileV1;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::signal::{Signal, kill};
@@ -40,6 +41,10 @@ const MAX_CANDIDATE_WIRE_BYTES: u64 = 64 * 1024 * 1024;
 const WORKER_PATH: &str = "/run/ag/worker";
 const WORKSPACE_PATH: &str = "/work";
 const ACTIVATION_PROTOCOL_MAGIC: &[u8; 8] = b"AGNGFD1\0";
+const PROVIDER_REQUEST_DESCRIPTOR: u32 = 5;
+const PROVIDER_RESPONSE_DESCRIPTOR: u32 = 6;
+const PROVIDER_REQUEST_PURPOSE: &str = "provider-request-v1";
+const PROVIDER_RESPONSE_PURPOSE: &str = "provider-response-v1";
 
 /// First descriptor number installed by the worker activation protocol.
 ///
@@ -410,8 +415,155 @@ pub struct PreparedWorkerLaunchV1 {
     pub evidence: WorkerLaunchEvidenceV1,
     /// Fresh descriptor-bound proposal workspace.
     pub workspace: ProposalWorkspaceV1,
-    /// Parent write ends corresponding to `evidence.admitted_inputs`.
+    /// Parent write ends for the read-only bootstrap entries in
+    /// `evidence.admitted_inputs`; provider endpoints have separate custody.
     pub admitted_inputs: Vec<AdmittedWorkerInputPipeV1>,
+    /// Parent endpoints for the optional session-scoped provider channel.
+    /// The worker receives only fd 5 (write) and fd 6 (read).
+    pub provider_channel: Option<WorkerProviderChannelV1>,
+}
+
+/// Governor custody of one worker's descriptor-only provider channel.
+#[derive(Debug)]
+pub struct WorkerProviderChannelV1 {
+    request: OwnedFd,
+    response: OwnedFd,
+    request_frame: Vec<u8>,
+    response_frame: Vec<u8>,
+    response_offset: usize,
+}
+
+impl WorkerProviderChannelV1 {
+    /// Nonblockingly receives one complete strict length-prefixed frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal for an empty/oversized frame, endpoint failure,
+    /// or invalid framing. Partial bytes remain in this channel for the next
+    /// bounded poll.
+    pub fn try_receive_frame(
+        &mut self,
+        maximum: u32,
+    ) -> Result<Option<Vec<u8>>, WorkerLaunchError> {
+        let codec = FrameCodec::new(maximum).map_err(WorkerLaunchError::ProviderProtocol)?;
+        loop {
+            let wanted = if self.request_frame.len() < 4 {
+                4 - self.request_frame.len()
+            } else {
+                let declared = u32::from_be_bytes(
+                    self.request_frame[..4]
+                        .try_into()
+                        .map_err(|_| WorkerLaunchError::ProviderChannelFrame)?,
+                );
+                if declared == 0 || declared > maximum {
+                    return Err(WorkerLaunchError::ProviderChannelFrame);
+                }
+                let total = 4_usize
+                    .checked_add(
+                        usize::try_from(declared)
+                            .map_err(|_| WorkerLaunchError::ProviderChannelFrame)?,
+                    )
+                    .ok_or(WorkerLaunchError::ProviderChannelFrame)?;
+                if self.request_frame.len() == total {
+                    let framed = std::mem::take(&mut self.request_frame);
+                    return codec
+                        .decode_frame(&framed)
+                        .map(|payload| Some(payload.to_vec()))
+                        .map_err(WorkerLaunchError::ProviderProtocol);
+                }
+                total
+                    .checked_sub(self.request_frame.len())
+                    .ok_or(WorkerLaunchError::ProviderChannelFrame)?
+            };
+            let mut buffer = [0_u8; 4096];
+            let limit = wanted.min(buffer.len());
+            match nix::unistd::read(self.request.as_raw_fd(), &mut buffer[..limit]) {
+                Ok(0) => return Err(WorkerLaunchError::ProviderChannelFrame),
+                Ok(read) => self.request_frame.extend_from_slice(&buffer[..read]),
+                Err(nix::errno::Errno::EAGAIN) => return Ok(None),
+                Err(error) => {
+                    return Err(WorkerLaunchError::Io {
+                        operation: "receive framed worker provider request",
+                        source: nix_errno_to_io(error),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Queues one canonical response frame without overwriting an incomplete
+    /// prior response.
+    pub fn queue_response_frame(
+        &mut self,
+        maximum: u32,
+        payload: &[u8],
+    ) -> Result<(), WorkerLaunchError> {
+        if self.response_offset != self.response_frame.len() {
+            return Err(WorkerLaunchError::ProviderChannelBusy);
+        }
+        self.response_frame = FrameCodec::new(maximum)
+            .and_then(|codec| codec.encode_frame(payload))
+            .map_err(WorkerLaunchError::ProviderProtocol)?;
+        self.response_offset = 0;
+        Ok(())
+    }
+
+    /// Nonblockingly advances the queued response frame.
+    pub fn flush_response_frame(&mut self) -> Result<bool, WorkerLaunchError> {
+        while self.response_offset < self.response_frame.len() {
+            match nix::unistd::write(&self.response, &self.response_frame[self.response_offset..]) {
+                Ok(0) => return Err(WorkerLaunchError::ProviderChannelFrame),
+                Ok(written) => self.response_offset += written,
+                Err(nix::errno::Errno::EAGAIN) => return Ok(false),
+                Err(error) => {
+                    return Err(WorkerLaunchError::Io {
+                        operation: "send framed worker provider response",
+                        source: nix_errno_to_io(error),
+                    });
+                }
+            }
+        }
+        self.response_frame.clear();
+        self.response_offset = 0;
+        Ok(true)
+    }
+
+    /// Receives one bounded credential-free worker request chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the worker endpoint closed. The caller owns
+    /// complete framing, size enforcement, and durability.
+    pub fn receive_request(&self, buffer: &mut [u8]) -> Result<usize, WorkerLaunchError> {
+        let received = nix::unistd::read(self.request.as_raw_fd(), buffer).map_err(|error| {
+            WorkerLaunchError::Io {
+                operation: "receive worker provider request",
+                source: nix_errno_to_io(error),
+            }
+        })?;
+        if received == 0 || received > buffer.len() {
+            return Err(WorkerLaunchError::ProviderChannelFrame);
+        }
+        Ok(received)
+    }
+
+    /// Sends one bounded governor response chunk to the worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error or a short-write refusal. Provider content and
+    /// credentials are not interpreted by this transport primitive.
+    pub fn send_response(&self, bytes: &[u8]) -> Result<(), WorkerLaunchError> {
+        let sent =
+            nix::unistd::write(&self.response, bytes).map_err(|error| WorkerLaunchError::Io {
+                operation: "send worker provider response",
+                source: nix_errno_to_io(error),
+            })?;
+        if sent != bytes.len() {
+            return Err(WorkerLaunchError::ProviderChannelFrame);
+        }
+        Ok(())
+    }
 }
 
 /// Completed worker status and its bounded candidate bytes.
@@ -672,6 +824,15 @@ pub enum WorkerLaunchError {
     /// The worker activation descriptor protocol could not be established.
     #[error("worker activation descriptor handoff failed")]
     DescriptorHandoff,
+    /// One provider-channel transfer was empty or only partly sent.
+    #[error("worker provider channel transfer is incomplete")]
+    ProviderChannelFrame,
+    /// A response frame is already awaiting complete delivery.
+    #[error("worker provider response channel is busy")]
+    ProviderChannelBusy,
+    /// Strict provider channel framing failed.
+    #[error("worker provider channel protocol failed: {0}")]
+    ProviderProtocol(#[source] ag_protocol::ProtocolError),
     /// A parent attempted to exceed an admitted input bound.
     #[error("worker input descriptor {0} exceeded its reviewed bound")]
     InputBudgetExceeded(u32),
@@ -735,6 +896,34 @@ pub fn prepare_worker_launch(
         workspace_name,
         maximum_candidate_wire_bytes,
         admitted_inputs,
+        false,
+        || {},
+    )
+}
+
+/// Prepares a reviewed worker with the session-scoped provider channel on
+/// exact descriptors 5 and 6.
+///
+/// # Errors
+///
+/// Returns the same bounded launch refusals as [`prepare_worker_launch`], plus
+/// provider-channel construction or descriptor-handoff failures.
+pub fn prepare_worker_launch_with_provider(
+    security_profile: SecurityProfileV1,
+    launcher: &WorkerLauncherConfigV1,
+    profile_id: &str,
+    workspace_name: &str,
+    maximum_candidate_wire_bytes: u64,
+    admitted_inputs: &[AdmittedWorkerInputV1],
+) -> Result<PreparedWorkerLaunchV1, WorkerLaunchError> {
+    prepare_worker_launch_inner(
+        security_profile,
+        launcher,
+        profile_id,
+        workspace_name,
+        maximum_candidate_wire_bytes,
+        admitted_inputs,
+        true,
         || {},
     )
 }
@@ -747,6 +936,7 @@ fn prepare_worker_launch_inner<F>(
     workspace_name: &str,
     maximum_candidate_wire_bytes: u64,
     admitted_inputs: &[AdmittedWorkerInputV1],
+    provider_channel: bool,
     before_revalidation: F,
 ) -> Result<PreparedWorkerLaunchV1, WorkerLaunchError>
 where
@@ -763,6 +953,15 @@ where
         maximum_candidate_wire_bytes,
         admitted_inputs,
     )?;
+    if provider_channel
+        && (admitted_inputs.len() != 2
+            || admitted_inputs[0].descriptor != FIRST_WORKER_INPUT_DESCRIPTOR
+            || admitted_inputs[1].descriptor != FIRST_WORKER_INPUT_DESCRIPTOR + 1)
+    {
+        return Err(WorkerLaunchError::InvalidReview(
+            "provider channel requires exact fd 3/4 bootstrap inputs",
+        ));
+    }
 
     let root = open_root()?;
     let mut sandbox = pin_executable(
@@ -789,13 +988,28 @@ where
     let argv = std::iter::once(WORKER_PATH.to_owned())
         .chain(worker_profile.fixed_arguments.iter().cloned())
         .collect::<Vec<_>>();
+    let mut activation_manifest = admitted_inputs.to_vec();
+    if provider_channel {
+        activation_manifest.extend([
+            AdmittedWorkerInputV1 {
+                descriptor: PROVIDER_REQUEST_DESCRIPTOR,
+                purpose: PROVIDER_REQUEST_PURPOSE.to_owned(),
+                maximum_bytes: maximum_candidate_wire_bytes,
+            },
+            AdmittedWorkerInputV1 {
+                descriptor: PROVIDER_RESPONSE_DESCRIPTOR,
+                purpose: PROVIDER_RESPONSE_PURPOSE.to_owned(),
+                maximum_bytes: maximum_candidate_wire_bytes,
+            },
+        ]);
+    }
     let launch_profile = launch_profile_digest(
         security_profile,
         launcher,
         worker_profile,
         &argv,
         maximum_candidate_wire_bytes,
-        admitted_inputs,
+        &activation_manifest,
         &workspace,
         &runtime,
     )?;
@@ -816,8 +1030,8 @@ where
         })?;
     drop(gate_read);
 
-    let (input_transport, input_child, input_readers, input_writers) =
-        prepare_input_transport(admitted_inputs)?;
+    let (input_transport, input_child, input_readers, input_writers, provider_channel) =
+        prepare_input_transport(admitted_inputs, provider_channel)?;
     let worker_mount = rustix::io::dup(&worker.file).map_err(|error| WorkerLaunchError::Io {
         operation: "duplicate retained worker descriptor",
         source: errno_to_io(error),
@@ -915,7 +1129,7 @@ where
     drop(runtime_mounts);
 
     if let Some(transport) = input_transport.as_ref()
-        && let Err(error) = send_input_descriptors(transport, admitted_inputs, &input_readers)
+        && let Err(error) = send_input_descriptors(transport, &activation_manifest, &input_readers)
     {
         let _ = child.kill();
         let _ = child.wait();
@@ -950,12 +1164,12 @@ where
         worker_executable: worker.identity.clone(),
         argv,
         workspace: workspace.identity.clone(),
-        admitted_inputs: admitted_inputs.to_vec(),
+        admitted_inputs: activation_manifest,
         maximum_candidate_wire_bytes,
         sandbox_pid,
         observed_uid: nix::unistd::geteuid().as_raw(),
         observed_gid: nix::unistd::getegid().as_raw(),
-        offline: true,
+        offline: provider_channel.is_none(),
     };
     Ok(PreparedWorkerLaunchV1 {
         process,
@@ -967,6 +1181,7 @@ where
             released: false,
         },
         admitted_inputs: input_writers,
+        provider_channel,
     })
 }
 
@@ -1470,13 +1685,15 @@ type InputTransport = (
     Option<OwnedFd>,
     Vec<OwnedFd>,
     Vec<AdmittedWorkerInputPipeV1>,
+    Option<WorkerProviderChannelV1>,
 );
 
 fn prepare_input_transport(
     admitted: &[AdmittedWorkerInputV1],
+    provider_channel: bool,
 ) -> Result<InputTransport, WorkerLaunchError> {
-    if admitted.is_empty() {
-        return Ok((None, None, Vec::new(), Vec::new()));
+    if admitted.is_empty() && !provider_channel {
+        return Ok((None, None, Vec::new(), Vec::new(), None));
     }
     let (parent, child) = socketpair(
         AddressFamily::Unix,
@@ -1504,7 +1721,38 @@ fn prepare_input_transport(
             writer: Some(File::from(writer)),
         });
     }
-    Ok((Some(parent), Some(child), readers, writers))
+    let provider = if provider_channel {
+        let (request_parent, request_child) =
+            pipe2(OFlag::O_CLOEXEC).map_err(|error| WorkerLaunchError::Io {
+                operation: "create worker provider request channel",
+                source: nix_errno_to_io(error),
+            })?;
+        let (response_child, response_parent) =
+            pipe2(OFlag::O_CLOEXEC).map_err(|error| WorkerLaunchError::Io {
+                operation: "create worker provider response channel",
+                source: nix_errno_to_io(error),
+            })?;
+        set_raw_nonblocking(
+            request_parent.as_raw_fd(),
+            "bound governor provider request endpoint",
+        )?;
+        set_raw_nonblocking(
+            response_parent.as_raw_fd(),
+            "bound governor provider response endpoint",
+        )?;
+        readers.push(request_child);
+        readers.push(response_child);
+        Some(WorkerProviderChannelV1 {
+            request: request_parent,
+            response: response_parent,
+            request_frame: Vec::new(),
+            response_frame: Vec::new(),
+            response_offset: 0,
+        })
+    } else {
+        None
+    };
+    Ok((Some(parent), Some(child), readers, writers, provider))
 }
 
 fn send_input_descriptors(
@@ -1578,9 +1826,15 @@ fn parse_activation_payload(
         cursor = purpose_end;
         let expected = FIRST_WORKER_INPUT_DESCRIPTOR
             + u32::try_from(index).map_err(|_| WorkerActivationError::InvalidEnvelope)?;
+        let maximum_for_purpose =
+            if purpose == PROVIDER_REQUEST_PURPOSE || purpose == PROVIDER_RESPONSE_PURPOSE {
+                MAX_CANDIDATE_WIRE_BYTES
+            } else {
+                MAX_ADMITTED_INPUT_BYTES
+            };
         if descriptor != expected
             || maximum_bytes == 0
-            || maximum_bytes > MAX_ADMITTED_INPUT_BYTES
+            || maximum_bytes > maximum_for_purpose
             || !valid_token(&purpose, MAX_INPUT_PURPOSE_BYTES)
         {
             return Err(WorkerActivationError::InvalidEnvelope);
@@ -1640,14 +1894,20 @@ fn close_raw_descriptors(descriptors: &[RawFd]) {
 }
 
 fn set_nonblocking(stdout: &ChildStdout) -> Result<(), WorkerLaunchError> {
-    let current =
-        fcntl(stdout.as_raw_fd(), FcntlArg::F_GETFL).map_err(|error| WorkerLaunchError::Io {
-            operation: "inspect worker stdout flags",
-            source: nix_errno_to_io(error),
-        })?;
+    set_raw_nonblocking(stdout.as_raw_fd(), "bound worker stdout")
+}
+
+fn set_raw_nonblocking(
+    descriptor: RawFd,
+    operation: &'static str,
+) -> Result<(), WorkerLaunchError> {
+    let current = fcntl(descriptor, FcntlArg::F_GETFL).map_err(|error| WorkerLaunchError::Io {
+        operation,
+        source: nix_errno_to_io(error),
+    })?;
     let flags = OFlag::from_bits_truncate(current) | OFlag::O_NONBLOCK;
-    fcntl(stdout.as_raw_fd(), FcntlArg::F_SETFL(flags)).map_err(|error| WorkerLaunchError::Io {
-        operation: "bound worker stdout",
+    fcntl(descriptor, FcntlArg::F_SETFL(flags)).map_err(|error| WorkerLaunchError::Io {
+        operation,
         source: nix_errno_to_io(error),
     })?;
     Ok(())
@@ -1814,6 +2074,7 @@ mod tests {
                 candidate_semantic_type: "managed_file_content_v1".to_owned(),
                 timeout_ms: 2_000,
                 output_budget_bytes: 1024,
+                provider_access: None,
             }],
         };
         Fixture {
@@ -1869,6 +2130,7 @@ mod tests {
             "rename-substitution",
             4096,
             &[],
+            false,
             || fs::rename(&replacement, &worker).expect("replace worker path"),
         )
         .expect_err("renamed executable must refuse");
@@ -1892,6 +2154,7 @@ mod tests {
             "same-inode-overwrite",
             4096,
             &[],
+            false,
             || {
                 fs::set_permissions(&worker, fs::Permissions::from_mode(0o755))
                     .expect("temporarily enable fixture mutation");
@@ -2124,6 +2387,104 @@ mod tests {
         let completed = prepared.process.wait().expect("wait activation worker");
         assert!(completed.status.success());
         assert_eq!(completed.candidate, b"credential|challenge");
+    }
+
+    #[test]
+    fn provider_channel_arrives_on_exact_directional_descriptors() {
+        let admitted = [
+            AdmittedWorkerInputV1 {
+                descriptor: 3,
+                purpose: "session-credential".to_owned(),
+                maximum_bytes: 64,
+            },
+            AdmittedWorkerInputV1 {
+                descriptor: 4,
+                purpose: "activation-challenge".to_owned(),
+                maximum_bytes: 64,
+            },
+        ];
+        let (_, _, mut child_endpoints, _, channel) =
+            prepare_input_transport(&admitted, true).expect("prepare provider channel");
+        assert_eq!(child_endpoints.len(), 4);
+        let mut manifest = admitted.to_vec();
+        manifest.extend([
+            AdmittedWorkerInputV1 {
+                descriptor: PROVIDER_REQUEST_DESCRIPTOR,
+                purpose: PROVIDER_REQUEST_PURPOSE.to_owned(),
+                maximum_bytes: 4096,
+            },
+            AdmittedWorkerInputV1 {
+                descriptor: PROVIDER_RESPONSE_DESCRIPTOR,
+                purpose: PROVIDER_RESPONSE_PURPOSE.to_owned(),
+                maximum_bytes: 4096,
+            },
+        ]);
+        assert_eq!(
+            parse_activation_payload(&activation_payload(&manifest).expect("activation payload"))
+                .expect("exact provider descriptor manifest"),
+            manifest
+        );
+        let response_child = child_endpoints.pop().expect("response child");
+        let request_child = child_endpoints.pop().expect("request child");
+        let mut channel = channel.expect("provider channel");
+        let sent = nix::unistd::write(&request_child, b"provider-request")
+            .expect("worker sends provider request");
+        assert_eq!(sent, b"provider-request".len());
+        let mut request = [0_u8; 64];
+        let request_length = channel
+            .receive_request(&mut request)
+            .expect("receive provider request");
+        assert_eq!(&request[..request_length], b"provider-request");
+        channel
+            .send_response(b"provider-response")
+            .expect("send provider response");
+        let mut response = [0_u8; 64];
+        let response_length = nix::unistd::read(response_child.as_raw_fd(), &mut response)
+            .expect("worker receives provider response");
+        assert_eq!(&response[..response_length], b"provider-response");
+        assert!(nix::unistd::read(request_child.as_raw_fd(), &mut response).is_err());
+        assert!(nix::unistd::write(&response_child, b"wrong-direction").is_err());
+
+        let framed = FrameCodec::new(64)
+            .unwrap()
+            .encode_frame(b"framed-request")
+            .unwrap();
+        nix::unistd::write(&request_child, &framed[..2]).unwrap();
+        assert_eq!(channel.try_receive_frame(64).unwrap(), None);
+        nix::unistd::write(&request_child, &framed[2..]).unwrap();
+        assert_eq!(
+            channel.try_receive_frame(64).unwrap(),
+            Some(b"framed-request".to_vec())
+        );
+        channel
+            .queue_response_frame(64, b"framed-response")
+            .unwrap();
+        assert!(channel.flush_response_frame().unwrap());
+        let framed_response = FrameCodec::new(64)
+            .unwrap()
+            .read_frame(&mut File::from(response_child))
+            .unwrap();
+        assert_eq!(framed_response, b"framed-response");
+    }
+
+    #[test]
+    fn provider_channel_requires_exact_bootstrap_descriptors() {
+        let fixture = fixture(Path::new("/usr/bin/true"), &[]);
+        let error = prepare_worker_launch_with_provider(
+            SecurityProfileV1::Development,
+            &fixture.launcher,
+            "fixture",
+            "provider-channel-refusal",
+            4096,
+            &[],
+        )
+        .expect_err("provider launch without exact bootstrap must refuse");
+        assert!(matches!(
+            error,
+            WorkerLaunchError::InvalidReview(
+                "provider channel requires exact fd 3/4 bootstrap inputs"
+            )
+        ));
     }
 
     #[test]

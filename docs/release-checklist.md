@@ -97,10 +97,34 @@ Known blockers in the current tree include:
   production/high-assurance configuration; the packaged agd unit cannot host
   it, and production worker/check wrappers, sandbox attestation, and one-shot
   launch-record consumption do not exist, so both templates remain withheld;
-- providerd is signed-agd-proxy-only, while the session ingress/proxy path does
-  not yet prove the live `WorkerSessionPrincipal` before spending its committed
-  provider capability; the implemented worker slice is offline rather than a
-  provider-capability workaround;
+- providerd is signed-agd-proxy-only. Provider-enabled worker launch is
+  available only when the daemon has attached its enrolled bounded provider
+  I/O worker; library callers without that runtime still refuse before process
+  preparation.
+  The first source prerequisite now exists: `WorkerProfileConfigV1` can enroll
+  one exact provider-policy digest, envelope and budget; the session constructors
+  derive the matching constrained principal, capability and provider-channel
+  descriptor identities. The launcher now has a separately invoked primitive
+  that installs directionally constrained pipes on exact worker fds 5 and 6,
+  binds them into launch evidence, and retains the opposite endpoints for the
+  governor.
+  Exact nonblocking bounded framing, canonical request/response custody,
+  per-attempt request-before-dispatch state, closed dispatch/fetch/ack
+  reconciliation, and mandatory per-transition active-session/capability
+  reload now exist as source primitives. A capacity-one I/O queue, signed
+  Register/Infer/Fetch worker, canonical fd frame pump, and main-thread exact
+  response/ack custody commit are wired into the daemon. Terminal lifecycle
+  composition durably records process cleanup separately, submits an exact
+  session/principal/capability-bound `TerminateSession`, retains indeterminate
+  testimony without completing cleanup, and completes the aggregate cleanup
+  only after the provider's terminal receipt. Startup recovery resumes the same
+  termination record, and late inference results are recorded as fenced rather
+  than admitted. This keeps provider I/O from suspending worker deadline polling ->
+  session termination
+  coupled to provider capability burn -> installed worker/session/peer
+  qualification. Strict decoding refuses a provider-looking field outside the
+  enrolled shape, and focused tests cover the exact route/capability/descriptor
+  derivation without contacting a provider;
 - `agctl doctor` implements a fail-closed configuration/custody/effective-unit
   audit and effectd independently reconstructs non-serializable live readiness
   from store, process, unit, mount, helper and target evidence; broader kernel
@@ -277,8 +301,16 @@ sandbox/host attestation, provider relation, and full qualification matrix.
 - [ ] Providerd retains no plaintext after acknowledged custody transfer; agd
   holds exact credential-free request, sanitized headers, and complete response
   stream. Digest-only custody is visibly weaker.
-- [ ] Redirects, arbitrary CONNECT, endpoint/model drift, secret logging,
-  environment/argv secrets, and peer/capability replay are denied and tested.
+- [ ] Remote routes require credentialed HTTPS; credentialless local HTTP uses
+  an exact operator allowlist and denied redirects; command routes use only
+  enrolled executables with structured arguments and cleared environments.
+  Model-argument behavior is explicit; omission is limited to an enrolled
+  Codex provider-default route and never selects a fallback.
+  Arbitrary CONNECT, endpoint/model drift, secret logging, environment/argv
+  secrets, and peer/capability replay are denied and tested.
+- [ ] Timeout and ambiguous command cleanup leave the dispatch reserved and
+  indeterminate. Reconciliation and replay do not create a second physical
+  dispatch.
 
 ## Storage, backup, and recovery gates
 

@@ -1,6 +1,6 @@
 //! Root-owned daemon configuration and startup validation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use ag_effect::{SystemdUnitActionV1, TargetId};
 use ag_primitives::{
-    AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, PrincipalKindV1, ProjectId,
+    AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, InferenceBudgetV1, InferenceEnvelopeV1,
+    PrincipalKindV1, ProjectId,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,6 @@ use thiserror::Error;
 use crate::rpc_auth::{
     RpcAuthError, RpcPeerEnrollmentV1, RpcPeerKeyPolicyV1, RpcSigningIdentityConfigV1,
 };
-use crate::signed_transport::SIGNED_RPC_RESPONSE_TIMEOUT_MS;
 
 /// Maximum exact bytes accepted by every TOML configuration loader.
 pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
@@ -26,7 +26,7 @@ const PROVIDER_RPC_STRUCTURAL_RESERVE_BYTES: u64 = 128 * 1024;
 // reserve covers the complete signed principal/session/intent envelopes around
 // that one canonical base64 value.
 const WORKER_RPC_STRUCTURAL_RESERVE_BYTES: u64 = 128 * 1024;
-const PROVIDER_RPC_COMPLETION_MARGIN_MS: u64 = 5_000;
+const PROVIDER_MAX_DEADLINE_MS: u64 = 1_800_000;
 const PROVIDER_MIN_EVENT_STREAM_BYTES: u64 = 4 * 1024;
 const MAX_PROMOTION_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const MANAGED_FILE_CANDIDATE_SEMANTIC_V1: &str = "managed_file_content_v1";
@@ -221,8 +221,9 @@ pub struct AgdLimitsV1 {
 /// Root-reviewed launch substrate for contained generic workers.
 ///
 /// This configuration names exact executable bytes and fixed argument vectors;
-/// it is not a command runner. Provider routes are intentionally absent from
-/// this first slice, which supports offline workers only.
+/// it is not a command runner. The optional provider policy is credential-free
+/// and remains fail-closed at
+/// launch until the separate live request/response proxy is implemented.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLauncherConfigV1 {
@@ -276,6 +277,24 @@ pub struct WorkerProfileConfigV1 {
     pub timeout_ms: u64,
     /// Exact cumulative candidate-output bound.
     pub output_budget_bytes: u64,
+    /// Optional root-enrolled provider policy. This is inert until the
+    /// governor's worker/session proxy contract is available; launch refuses
+    /// rather than silently treating this as an offline profile.
+    #[serde(default)]
+    pub provider_access: Option<WorkerProviderProfileConfigV1>,
+}
+
+/// Credential-free provider envelope and cumulative budget enrolled for one
+/// fixed worker profile.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerProviderProfileConfigV1 {
+    /// Exact digest of the independently enrolled providerd policy.
+    pub provider_policy_digest: Digest,
+    /// Closed endpoint/model/method/protocol selection.
+    pub envelope: InferenceEnvelopeV1,
+    /// Maximum cumulative provider use for the worker session.
+    pub budget: InferenceBudgetV1,
 }
 
 /// Closed interpretation of one worker candidate selected by reviewed policy.
@@ -323,6 +342,10 @@ pub struct AgdConfigV1 {
     pub effectd_proposal_socket: PathBuf,
     /// Provider broker socket.
     pub providerd_socket: PathBuf,
+    /// Authenticated provider-broker policy for outbound worker inference.
+    /// Required whenever an enrolled worker profile has provider access.
+    #[serde(default)]
+    pub providerd_peer: Option<PeerPolicyV1>,
     /// Local Ed25519 identity loaded from a systemd credential.
     pub rpc_signing_identity: RpcSigningIdentityConfigV1,
     /// Exact original proposal signer accepted on the governor ingress.
@@ -493,20 +516,93 @@ pub struct ProviderModelPolicyConfigV1 {
     pub worst_case_cost_microunits: u64,
 }
 
+/// One fixed local command transport owned by `ag-providerd`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCommandConfigV1 {
+    /// Closed argument/output adapter (`codex`, `claude-code`, or `kimi-code`).
+    pub adapter: String,
+    /// Whether the fixed adapter must pass the capability model as an explicit
+    /// command argument or invoke the operator-enrolled provider default.
+    pub model_argument: ProviderCommandModelArgumentV1,
+    /// Absolute executable path measured by deployment qualification.
+    pub executable: PathBuf,
+    /// Absolute fixed working directory; never selected by a request.
+    pub working_directory: PathBuf,
+    /// Closed, root-owned child environment. The provider daemon's own
+    /// environment (including its credential directory) is never inherited.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+}
+
+/// Root-owned model-selection behavior for a command-backed provider.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCommandModelArgumentV1 {
+    /// Pass the exact capability model through the adapter's fixed model flag.
+    Required,
+    /// Omit a model flag and use the operator-enrolled command default.
+    Omit,
+}
+
+/// Redirect handling for an enrolled cleartext-local endpoint.
+///
+/// V1 deliberately admits only refusal. A redirect is returned as provider
+/// evidence and is never followed to a target outside the enrolled origin.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderLocalRedirectPolicyV1 {
+    /// Do not follow redirects.
+    Deny,
+}
+
+/// Explicit provider transport and authentication policy.
+///
+/// The tagged shape prevents an omitted credential from silently turning a
+/// remote API into an unauthenticated route, and prevents a request from
+/// selecting an executable or network destination.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderTransportConfigV1 {
+    /// Credentialed remote HTTPS API. The credential is a protected filename,
+    /// never secret material embedded in configuration.
+    CredentialedHttpsApi {
+        /// Exact root-owned HTTPS endpoint.
+        url: String,
+        /// Credential filename beneath the daemon credential directory.
+        credential_name: String,
+        /// Closed header receiving the credential.
+        credential_header: String,
+        /// Constant non-secret prefix prepended to the credential.
+        credential_prefix: String,
+    },
+    /// Credentialless cleartext endpoint on an operator-enrolled local origin.
+    LocalHttp {
+        /// Exact root-owned HTTP endpoint.
+        url: String,
+        /// Closed origins which may receive this request.
+        allowed_origins: Vec<String>,
+        /// Explicit redirect disposition.
+        redirect_policy: ProviderLocalRedirectPolicyV1,
+    },
+    /// Fixed command route using the executable's separately mounted login.
+    Command {
+        /// Closed executable/adapter/environment policy.
+        command: ProviderCommandConfigV1,
+    },
+}
+
 /// One closed provider backend.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderEndpointConfigV1 {
     /// Root-owned endpoint ID referenced by capabilities.
     pub id: String,
-    /// Exact HTTPS origin and path.
-    pub url: String,
-    /// systemd credential filename, not secret contents.
-    pub credential_name: String,
-    /// Header receiving the credential (for example `authorization`).
-    pub credential_header: String,
-    /// Constant prefix prepended to the credential (for example `Bearer `).
-    pub credential_prefix: String,
+    /// Exact transport and authentication variant.
+    pub transport: ProviderTransportConfigV1,
+    /// Root-owned constant non-secret headers required by the protocol adapter.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     /// Closed model/deployment policies, including broker-owned reservations.
     pub models: Vec<ProviderModelPolicyConfigV1>,
     /// Exact protocol adapter.
@@ -587,6 +683,14 @@ pub enum ConfigError {
     /// Bounds are zero or internally inconsistent.
     #[error("invalid configured resource limit: {0}")]
     InvalidLimit(&'static str),
+    /// One provider entry is unsupported or internally inconsistent.
+    #[error("invalid provider {provider}: {reason}")]
+    InvalidProvider {
+        /// Non-secret root-owned provider identifier.
+        provider: String,
+        /// Closed diagnostic reason which never includes credentials.
+        reason: &'static str,
+    },
     /// A filesystem custody policy is internally unsafe.
     #[error("invalid filesystem custody policy: {0}")]
     InvalidCustody(&'static str),
@@ -908,6 +1012,10 @@ fn validate_worker_launcher(
             || profile.output_budget_bytes == 0
             || profile.output_budget_bytes > limits.max_artifact_bytes
             || profile
+                .provider_access
+                .as_ref()
+                .is_some_and(|provider| !valid_worker_provider_profile(provider))
+            || profile
                 .output_budget_bytes
                 .div_ceil(3)
                 .checked_mul(4)
@@ -918,6 +1026,10 @@ fn validate_worker_launcher(
         }
     }
     Ok(())
+}
+
+fn valid_worker_provider_profile(profile: &WorkerProviderProfileConfigV1) -> bool {
+    profile.budget.requests > 0
 }
 
 fn valid_policy_token(value: &str) -> bool {
@@ -1107,15 +1219,31 @@ impl AgdConfigV1 {
         validate_signer(&self.rpc_signing_identity)?;
         validate_peer(&self.proposer_peer)?;
         validate_peer(&self.effectd_peer)?;
+        if let Some(providerd_peer) = &self.providerd_peer {
+            validate_peer(providerd_peer)?;
+            validate_peer_kind(providerd_peer, &[PrincipalKindV1::Daemon])?;
+        }
         validate_peer_kind(
             &self.proposer_peer,
             &[PrincipalKindV1::Operator, PrincipalKindV1::Service],
         )?;
         validate_peer_kind(&self.effectd_peer, &[PrincipalKindV1::Daemon])?;
-        validate_separate_roles(
-            &self.rpc_signing_identity,
-            &[&self.proposer_peer, &self.effectd_peer],
-        )?;
+        let mut remote_peers = vec![&self.proposer_peer, &self.effectd_peer];
+        if let Some(providerd_peer) = &self.providerd_peer {
+            remote_peers.push(providerd_peer);
+        }
+        validate_separate_roles(&self.rpc_signing_identity, &remote_peers)?;
+        if self.worker_launcher.as_ref().is_some_and(|launcher| {
+            launcher
+                .profiles
+                .iter()
+                .any(|profile| profile.provider_access.is_some())
+        }) && self.providerd_peer.is_none()
+        {
+            return Err(ConfigError::InvalidLimit(
+                "provider-enabled worker has no providerd peer",
+            ));
+        }
         if self.limits.max_control_frame_bytes == 0
             || self.limits.max_rpc_replay_entries == 0
             || self.limits.max_active_sessions == 0
@@ -1241,7 +1369,7 @@ impl ProviderdConfigV1 {
     /// Returns an error for schema, path, signing, peer, frame/response limit,
     /// endpoint, credential-header, model, method, or adapter violations.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema != "ag.config.providerd.v1" {
+        if self.schema != "ag.config.providerd.v2" {
             return Err(ConfigError::Schema(self.schema.clone()));
         }
         validate_security_profile(&self.security_profile)?;
@@ -1251,7 +1379,15 @@ impl ProviderdConfigV1 {
         validate_socket_custody(&self.socket_custody)?;
         validate_signer(&self.rpc_signing_identity)?;
         validate_peer(&self.caller_peer)?;
-        validate_peer_kind(&self.caller_peer, &[PrincipalKindV1::Daemon])?;
+        // The original v1 path admitted only the governor daemon. A fixed,
+        // independently enrolled service is also a valid terminal ingress:
+        // it remains pinned by UID/GID and signed-RPC identity, and providerd
+        // binds every capability use to that authenticated principal.
+        // Dynamic worker sessions remain excluded.
+        validate_peer_kind(
+            &self.caller_peer,
+            &[PrincipalKindV1::Daemon, PrincipalKindV1::Service],
+        )?;
         validate_separate_roles(&self.rpc_signing_identity, &[&self.caller_peer])?;
         if self.limits.max_control_frame_bytes == 0
             || self.limits.max_rpc_replay_entries == 0
@@ -1262,14 +1398,9 @@ impl ProviderdConfigV1 {
         {
             return Err(ConfigError::InvalidLimit("providerd limits"));
         }
-        if self
-            .limits
-            .provider_deadline_ms
-            .checked_add(PROVIDER_RPC_COMPLETION_MARGIN_MS)
-            .is_none_or(|deadline| deadline > SIGNED_RPC_RESPONSE_TIMEOUT_MS)
-        {
+        if self.limits.provider_deadline_ms > PROVIDER_MAX_DEADLINE_MS {
             return Err(ConfigError::InvalidLimit(
-                "provider deadline must leave signed-RPC completion margin",
+                "provider deadline exceeds the bounded inference maximum",
             ));
         }
         let request_wire = canonical_base64_encoded_length(self.limits.max_request_bytes)
@@ -1286,30 +1417,125 @@ impl ProviderdConfigV1 {
         }
         let mut endpoint_ids = BTreeSet::new();
         for endpoint in &self.endpoints {
-            if endpoint.id.is_empty()
-                || !endpoint.url.starts_with("https://")
-                || !valid_credential_name(&endpoint.credential_name)
-                || endpoint.models.is_empty()
-                || endpoint.methods.is_empty()
-                || !matches!(
-                    endpoint.credential_header.as_str(),
-                    "authorization" | "x-api-key"
-                )
-            {
-                return Err(ConfigError::InvalidLimit("provider endpoint"));
+            let provider = if endpoint.id.is_empty() {
+                "<empty>".to_owned()
+            } else {
+                endpoint.id.clone()
+            };
+            if endpoint.id.is_empty() {
+                return Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "provider id is empty",
+                });
+            }
+            match &endpoint.transport {
+                ProviderTransportConfigV1::CredentialedHttpsApi {
+                    url,
+                    credential_name,
+                    credential_header,
+                    ..
+                } => {
+                    if !valid_https_url(url) {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "remote API requires an exact HTTPS URL",
+                        });
+                    }
+                    if !valid_credential_name(credential_name)
+                        || !matches!(credential_header.as_str(), "authorization" | "x-api-key")
+                    {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "remote API requires an enrolled credential and supported header",
+                        });
+                    }
+                }
+                ProviderTransportConfigV1::LocalHttp {
+                    url,
+                    allowed_origins,
+                    redirect_policy: ProviderLocalRedirectPolicyV1::Deny,
+                } => {
+                    let Some(origin) = local_http_origin(url) else {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "local HTTP route requires an exact cleartext HTTP URL",
+                        });
+                    };
+                    let origins_valid = !allowed_origins.is_empty()
+                        && allowed_origins.iter().all(|candidate| {
+                            local_http_origin(candidate).is_some_and(|value| value == candidate)
+                        })
+                        && allowed_origins.iter().collect::<BTreeSet<_>>().len()
+                            == allowed_origins.len();
+                    if !origins_valid || !allowed_origins.iter().any(|item| item == origin) {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "local HTTP endpoint origin is not in its operator allowlist",
+                        });
+                    }
+                }
+                ProviderTransportConfigV1::Command { command } => {
+                    if !valid_provider_command(command) {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "command route is not a supported fixed executable policy",
+                        });
+                    }
+                    if endpoint.protocol != "opaque_json_v1"
+                        || endpoint.methods.as_slice() != ["command.complete"]
+                    {
+                        return Err(ConfigError::InvalidProvider {
+                            provider,
+                            reason: "command route requires the fixed command.complete protocol",
+                        });
+                    }
+                }
+            }
+            if endpoint.models.is_empty() || endpoint.methods.is_empty() {
+                return Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "provider requires at least one model and method",
+                });
+            }
+            if endpoint.headers.iter().any(|(name, value)| {
+                !matches!(name.as_str(), "anthropic-version")
+                    || value.is_empty()
+                    || value.len() > 512
+                    || value.contains(['\r', '\n', '\0'])
+            }) {
+                return Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "provider headers are outside the closed non-secret allowlist",
+                });
             }
             if !endpoint_ids.insert(&endpoint.id) {
-                return Err(ConfigError::InvalidLimit("duplicate provider endpoint"));
+                return Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "duplicate provider id",
+                });
             }
             let mut models = BTreeSet::new();
             for model in &endpoint.models {
-                if model.id.is_empty()
-                    || !models.insert(&model.id)
-                    || model.max_event_stream_bytes < PROVIDER_MIN_EVENT_STREAM_BYTES
+                if model.id.is_empty() {
+                    return Err(ConfigError::InvalidProvider {
+                        provider,
+                        reason: "model id is empty",
+                    });
+                }
+                if !models.insert(&model.id) {
+                    return Err(ConfigError::InvalidProvider {
+                        provider,
+                        reason: "duplicate backend model id",
+                    });
+                }
+                if model.max_event_stream_bytes < PROVIDER_MIN_EVENT_STREAM_BYTES
                     || model.max_event_stream_bytes > self.limits.max_response_bytes
                     || model.worst_case_cost_microunits == 0
                 {
-                    return Err(ConfigError::InvalidLimit("provider model policy"));
+                    return Err(ConfigError::InvalidProvider {
+                        provider,
+                        reason: "model resource policy is outside configured bounds",
+                    });
                 }
             }
         }
@@ -1328,6 +1554,59 @@ fn valid_credential_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn authority_end(value: &str) -> usize {
+    value.find(['/', '?', '#']).unwrap_or(value.len())
+}
+
+fn valid_authority(authority: &str) -> bool {
+    !authority.is_empty()
+        && !authority.contains('@')
+        && !authority
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+}
+
+fn valid_https_url(url: &str) -> bool {
+    let Some(remainder) = url.strip_prefix("https://") else {
+        return false;
+    };
+    valid_authority(&remainder[..authority_end(remainder)])
+}
+
+fn local_http_origin(url: &str) -> Option<&str> {
+    let remainder = url.strip_prefix("http://")?;
+    let end = authority_end(remainder);
+    valid_authority(&remainder[..end]).then_some(&url[.."http://".len() + end])
+}
+
+fn valid_provider_command(command: &ProviderCommandConfigV1) -> bool {
+    matches!(
+        command.adapter.as_str(),
+        "codex" | "claude-code" | "kimi-code"
+    ) && command.executable.is_absolute()
+        && (command.model_argument == ProviderCommandModelArgumentV1::Required
+            || command.adapter == "codex")
+        && command.working_directory.is_absolute()
+        && command.executable.components().collect::<PathBuf>() == command.executable
+        && command.working_directory.components().collect::<PathBuf>() == command.working_directory
+        && command.environment.iter().all(|(name, value)| {
+            matches!(
+                name.as_str(),
+                "HOME"
+                    | "PATH"
+                    | "TMPDIR"
+                    | "LANG"
+                    | "LC_ALL"
+                    | "XDG_CONFIG_HOME"
+                    | "CODEX_HOME"
+                    | "CLAUDE_CONFIG_DIR"
+                    | "KIMI_CONFIG_DIR"
+            ) && !value.is_empty()
+                && value.len() <= 4096
+                && !value.contains(['\r', '\n', '\0'])
+        })
 }
 
 fn valid_unit(unit: &str) -> bool {
@@ -1407,11 +1686,11 @@ mod tests {
         let mut config: ProviderdConfigV1 =
             toml::from_str(include_str!("../../../config/providerd.example.toml"))
                 .expect("strict provider example");
-        config.limits.provider_deadline_ms = SIGNED_RPC_RESPONSE_TIMEOUT_MS;
+        config.limits.provider_deadline_ms = PROVIDER_MAX_DEADLINE_MS + 1;
         assert!(matches!(
             config.validate(),
             Err(ConfigError::InvalidLimit(
-                "provider deadline must leave signed-RPC completion margin"
+                "provider deadline exceeds the bounded inference maximum"
             ))
         ));
     }
@@ -1424,7 +1703,158 @@ mod tests {
         config.endpoints[0].models[0].worst_case_cost_microunits = 0;
         assert!(matches!(
             config.validate(),
-            Err(ConfigError::InvalidLimit("provider model policy"))
+            Err(ConfigError::InvalidProvider {
+                provider,
+                reason: "model resource policy is outside configured bounds"
+            }) if provider == "primary"
+        ));
+    }
+
+    #[test]
+    fn provider_caller_may_be_a_fixed_service_but_not_a_dynamic_or_human_principal() {
+        let mut config: ProviderdConfigV1 =
+            toml::from_str(include_str!("../../../config/providerd.example.toml"))
+                .expect("strict provider example");
+        config.caller_peer.principal_kind = PrincipalKindV1::Service;
+        config.validate().expect("fixed service caller");
+
+        for rejected in [PrincipalKindV1::WorkerSession, PrincipalKindV1::Operator] {
+            config.caller_peer.principal_kind = rejected;
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::UnexpectedPrincipalKind(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn worker_provider_profile_is_closed_and_requires_a_request_budget() {
+        let mut profile = serde_json::json!({
+            "profile_id": "fixture",
+            "project": "fixture",
+            "executable": "/usr/bin/fixture-worker",
+            "executable_identity": {
+                "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 1,
+                "build_identity": null
+            },
+            "fixed_arguments": [],
+            "candidate_effect": "managed_file_put",
+            "candidate_target": "fixture.target",
+            "candidate_semantic_type": "managed_file_content_v1",
+            "timeout_ms": 1000,
+            "output_budget_bytes": 1024,
+            "provider_access": null
+        });
+        serde_json::from_value::<WorkerProfileConfigV1>(profile.clone())
+            .expect("the documented offline worker profile must decode");
+
+        profile.as_object_mut().expect("profile object").insert(
+            "provider_route".to_owned(),
+            serde_json::json!({
+                "endpoint": "primary",
+                "model": "production-model",
+                "method": "responses.create"
+            }),
+        );
+        assert!(
+            serde_json::from_value::<WorkerProfileConfigV1>(profile.clone()).is_err(),
+            "a provider-looking profile field must refuse until the live worker/session contract exists"
+        );
+
+        profile
+            .as_object_mut()
+            .expect("profile object")
+            .remove("provider_route");
+        profile.as_object_mut().expect("profile object").insert(
+            "provider_access".to_owned(),
+            serde_json::json!({
+                "provider_policy_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "envelope": {
+                    "endpoint": "primary", "model": "production-model",
+                    "method": "responses.create",
+                    "protocol_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+                },
+                "budget": {"requests": 1, "input_bytes": 4096,
+                    "output_bytes": 4096, "cost_microunits": 1000}
+            }),
+        );
+        serde_json::from_value::<WorkerProfileConfigV1>(profile.clone())
+            .expect("closed provider policy must decode");
+        profile["provider_access"]["budget"]["requests"] = serde_json::json!(0);
+        let profile: WorkerProfileConfigV1 =
+            serde_json::from_value(profile).expect("zero budget is a semantic validation failure");
+        assert!(!valid_worker_provider_profile(
+            profile.provider_access.as_ref().expect("provider policy")
+        ));
+    }
+
+    #[test]
+    fn provider_transport_policy_is_explicit_for_local_http_and_commands() {
+        let mut local: ProviderdConfigV1 =
+            toml::from_str(include_str!("../../../config/providerd.example.toml"))
+                .expect("strict provider example");
+        let endpoint = &mut local.endpoints[0];
+        endpoint.transport = ProviderTransportConfigV1::LocalHttp {
+            url: "http://ollama:11434/api/chat".to_owned(),
+            allowed_origins: vec!["http://ollama:11434".to_owned()],
+            redirect_policy: ProviderLocalRedirectPolicyV1::Deny,
+        };
+        local.validate().expect("explicit local HTTP endpoint");
+        local.endpoints[0].transport = ProviderTransportConfigV1::LocalHttp {
+            url: "http://other:11434/api/chat".to_owned(),
+            allowed_origins: vec!["http://ollama:11434".to_owned()],
+            redirect_policy: ProviderLocalRedirectPolicyV1::Deny,
+        };
+        assert!(matches!(
+            local.validate(),
+            Err(ConfigError::InvalidProvider {
+                provider,
+                reason: "local HTTP endpoint origin is not in its operator allowlist"
+            }) if provider == "primary"
+        ));
+
+        let mut command: ProviderdConfigV1 =
+            toml::from_str(include_str!("../../../config/providerd.example.toml"))
+                .expect("strict provider example");
+        let endpoint = &mut command.endpoints[0];
+        endpoint.protocol = "opaque_json_v1".to_owned();
+        endpoint.methods = vec!["command.complete".to_owned()];
+        endpoint.transport = ProviderTransportConfigV1::Command {
+            command: ProviderCommandConfigV1 {
+                adapter: "claude-code".to_owned(),
+                model_argument: ProviderCommandModelArgumentV1::Required,
+                executable: PathBuf::from("/opt/claude/claude"),
+                working_directory: PathBuf::from("/var/empty"),
+                environment: BTreeMap::new(),
+            },
+        };
+        command.validate().expect("fixed command endpoint");
+        if let ProviderTransportConfigV1::Command { command: route } =
+            &mut command.endpoints[0].transport
+        {
+            route.model_argument = ProviderCommandModelArgumentV1::Omit;
+        }
+        assert!(matches!(
+            command.validate(),
+            Err(ConfigError::InvalidProvider {
+                provider,
+                reason: "command route is not a supported fixed executable policy"
+            }) if provider == "primary"
+        ));
+        let ProviderTransportConfigV1::Command { command: route } =
+            &mut command.endpoints[0].transport
+        else {
+            unreachable!()
+        };
+        route.model_argument = ProviderCommandModelArgumentV1::Required;
+        route.executable = PathBuf::from("relative");
+        assert!(matches!(
+            command.validate(),
+            Err(ConfigError::InvalidProvider {
+                provider,
+                reason: "command route is not a supported fixed executable policy"
+            }) if provider == "primary"
         ));
     }
 
@@ -1434,10 +1864,19 @@ mod tests {
             toml::from_str(include_str!("../../../config/providerd.example.toml"))
                 .expect("strict provider example");
         for hostile in ["", ".", "..", "nested/key", "key\nname"] {
-            config.endpoints[0].credential_name = hostile.to_owned();
+            let ProviderTransportConfigV1::CredentialedHttpsApi {
+                credential_name, ..
+            } = &mut config.endpoints[0].transport
+            else {
+                unreachable!()
+            };
+            *credential_name = hostile.to_owned();
             assert!(matches!(
                 config.validate(),
-                Err(ConfigError::InvalidLimit("provider endpoint"))
+                Err(ConfigError::InvalidProvider {
+                    provider,
+                    reason: "remote API requires an enrolled credential and supported header"
+                }) if provider == "primary"
             ));
         }
     }

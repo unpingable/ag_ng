@@ -7,12 +7,16 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ag_primitives::{
     AuthorityDomain, CapabilityUseContextV1, Digest, Epoch, InferenceCapabilityId,
-    InferenceCapabilityV1, InferenceUsageV1, RevocationStateV1, SessionLifecycleStateV1,
+    InferenceCapabilityV1, InferenceUsageV1, PrincipalId, RevocationStateV1,
+    SessionLifecycleStateV1,
 };
 use ag_session::ProviderRequestCustodyV1;
 use ag_store::{NewEventV1, Store};
@@ -25,7 +29,10 @@ use thiserror::Error;
 use ag_app::api::{
     ApiErrorCodeV1, ApiResultV1, HealthV1, OpaqueBytesV1, ProviderRequestV1, ProviderResponseV1,
 };
-use ag_app::config::{ProviderEndpointConfigV1, ProviderModelPolicyConfigV1, ProviderdConfigV1};
+use ag_app::config::{
+    ProviderCommandConfigV1, ProviderCommandModelArgumentV1, ProviderEndpointConfigV1,
+    ProviderModelPolicyConfigV1, ProviderTransportConfigV1, ProviderdConfigV1,
+};
 use ag_app::descriptor_path::open_beneath;
 use ag_app::rpc_auth::VerifiedRpcPrincipalV1;
 
@@ -218,7 +225,6 @@ impl ProviderCoreV1 {
         let authority_domain = AuthorityDomain::parse(&config.authority_domain)?;
         let epoch = Epoch::parse(&config.epoch)?;
         let client = Client::builder()
-            .https_only(true)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
@@ -235,11 +241,12 @@ impl ProviderCoreV1 {
         })
     }
 
-    /// Handles one request from the signed, enrolled `agd` proxy.
+    /// Handles one request from the single signed, enrolled caller.
     ///
-    /// Direct dynamic-worker presentation is deliberately absent in v1. The
-    /// worker binding remains in the committed capability and must be proven
-    /// by governor session ingress before the governor invokes this proxy.
+    /// The caller may be `agd` or one independently enrolled fixed service.
+    /// Dynamic-worker presentation remains absent. Every capability is bound
+    /// to the authenticated caller principal, so serialized capability data
+    /// cannot be replayed by another local peer.
     pub fn handle(
         &mut self,
         request: ProviderRequestV1,
@@ -267,9 +274,11 @@ impl ProviderCoreV1 {
                     schema: "ag.health/v1".to_owned(),
                     service: "ag-providerd".to_owned(),
                     build: env!("CARGO_PKG_VERSION").to_owned(),
-                    // Signed governor ingress exists, but the live
-                    // WorkerSessionPrincipal proof path is not implemented.
-                    ready: false,
+                    // A fixed service ingress is complete at this boundary.
+                    // The daemon-proxy profile remains non-ready until agd
+                    // proves its dynamic WorkerSessionPrincipal relation.
+                    ready: self.config.caller_peer.principal_kind
+                        == ag_primitives::PrincipalKindV1::Service,
                     quiesced: self.store.active_backup_cut()?.is_some(),
                 },
             }),
@@ -278,6 +287,9 @@ impl ProviderCoreV1 {
                 worker_principal,
             } => {
                 if capability.worker_principal != worker_principal
+                    || (self.config.caller_peer.principal_kind
+                        == ag_primitives::PrincipalKindV1::Service
+                        && worker_principal != PrincipalId::new(peer.principal.clone()))
                     || capability.provider_policy_digest != self.provider_policy
                     || capability.authority_domain != self.authority_domain
                     || capability.epoch != self.epoch
@@ -331,7 +343,7 @@ impl ProviderCoreV1 {
                 capability,
                 request,
                 request_bytes,
-            } => self.infer(&capability, &request, request_bytes.into_vec()),
+            } => self.infer(peer, &capability, &request, request_bytes.into_vec()),
             ProviderRequestV1::FetchInference { dispatch } => self.fetch_inference(&dispatch),
             ProviderRequestV1::AcknowledgeInferenceCustody {
                 dispatch,
@@ -349,10 +361,16 @@ impl ProviderCoreV1 {
     #[allow(clippy::too_many_lines)]
     fn infer(
         &mut self,
+        peer: &VerifiedRpcPrincipalV1,
         capability: &InferenceCapabilityV1,
         request: &ProviderRequestCustodyV1,
         request_bytes: Vec<u8>,
     ) -> Result<ProviderResponseV1, ProviderError> {
+        if self.config.caller_peer.principal_kind == ag_primitives::PrincipalKindV1::Service
+            && capability.worker_principal != PrincipalId::new(peer.principal.clone())
+        {
+            return Err(ProviderError::CapabilityBindingMismatch);
+        }
         if self.store.active_backup_cut()?.is_some() {
             return Err(ProviderError::Quiesced);
         }
@@ -683,38 +701,61 @@ impl ProviderCoreV1 {
         request_bytes: Vec<u8>,
         maximum_event_stream_bytes: u64,
     ) -> Result<ProviderEventStreamV1, ProviderError> {
-        let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY")
-            .ok_or(ProviderError::CredentialUnavailable)?;
-        let mut credential =
-            read_provider_credential(Path::new(&credential_directory), &endpoint.credential_name)?;
-        while credential.ends_with(['\n', '\r']) {
-            credential.pop();
-        }
-        if credential.is_empty() || credential.contains(['\n', '\r', '\0']) {
-            return Err(ProviderError::CredentialUnavailable);
-        }
-
         let mut headers = HeaderMap::new();
+        for (name, value) in &endpoint.headers {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())?,
+                HeaderValue::from_str(value)?,
+            );
+        }
         for (name, value) in &request.sanitized_headers {
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes())?,
                 HeaderValue::from_str(value)?,
             );
         }
-        let credential_header = HeaderName::from_bytes(endpoint.credential_header.as_bytes())?;
-        let credential_value =
-            HeaderValue::from_str(&format!("{}{}", endpoint.credential_prefix, credential))?;
-        headers.insert(credential_header, credential_value);
-        drop(credential);
+        let url = match &endpoint.transport {
+            ProviderTransportConfigV1::Command { command } => {
+                return self.dispatch_command(command, request_bytes, maximum_event_stream_bytes);
+            }
+            ProviderTransportConfigV1::LocalHttp { url, .. } => url,
+            ProviderTransportConfigV1::CredentialedHttpsApi {
+                url,
+                credential_name,
+                credential_header,
+                credential_prefix,
+            } => {
+                let credential_directory = std::env::var_os("CREDENTIALS_DIRECTORY")
+                    .ok_or(ProviderError::CredentialUnavailable)?;
+                let mut credential =
+                    read_provider_credential(Path::new(&credential_directory), credential_name)?;
+                while credential.ends_with(['\n', '\r']) {
+                    credential.pop();
+                }
+                if credential.is_empty() || credential.contains(['\n', '\r', '\0']) {
+                    return Err(ProviderError::CredentialUnavailable);
+                }
+                let header = HeaderName::from_bytes(credential_header.as_bytes())?;
+                let value = HeaderValue::from_str(&format!("{credential_prefix}{credential}"))?;
+                headers.insert(header, value);
+                url
+            }
+        };
 
         let response = match self
             .client
-            .post(&endpoint.url)
+            .post(url)
             .headers(headers)
             .body(request_bytes)
             .send()
         {
             Ok(response) => response,
+            Err(error) if error.is_timeout() => {
+                // Once a request may have reached a provider, a timeout cannot
+                // prove non-execution or non-billing. Leave the durable
+                // reservation unresolved for reconciliation; never redispatch.
+                return Err(ProviderError::DispatchOutcomeIndeterminate);
+            }
             Err(error) => {
                 return Ok(ProviderEventStreamV1::TransportFailure {
                     class: classify_transport(&error),
@@ -753,6 +794,179 @@ impl ProviderCoreV1 {
             headers: sanitized,
             body: OpaqueBytesV1::new(body),
             protocol_terminal: terminal,
+        })
+    }
+
+    fn dispatch_command(
+        &self,
+        command: &ProviderCommandConfigV1,
+        request_bytes: Vec<u8>,
+        maximum_event_stream_bytes: u64,
+    ) -> Result<ProviderEventStreamV1, ProviderError> {
+        let request: serde_json::Value = serde_json::from_slice(&request_bytes)
+            .map_err(|_| ProviderError::AdapterRequestMismatch)?;
+        let model = request
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ProviderError::AdapterRequestMismatch)?;
+        let messages = request
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(ProviderError::AdapterRequestMismatch)?;
+        let mut prompt = String::new();
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProviderError::AdapterRequestMismatch)?;
+            let content = message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ProviderError::AdapterRequestMismatch)?;
+            if !matches!(role, "system" | "user" | "assistant") {
+                return Err(ProviderError::AdapterRequestMismatch);
+            }
+            prompt.push('<');
+            prompt.push_str(role);
+            prompt.push_str(">\n");
+            prompt.push_str(content);
+            prompt.push_str("\n</");
+            prompt.push_str(role);
+            prompt.push_str(">\n");
+        }
+
+        let mut process = Command::new(&command.executable);
+        process
+            .env_clear()
+            .envs(&command.environment)
+            .current_dir(&command.working_directory)
+            .process_group(0);
+        match command.adapter.as_str() {
+            "codex" => {
+                process.args(["exec", "--json", "--skip-git-repo-check"]);
+                if command.model_argument == ProviderCommandModelArgumentV1::Required {
+                    process.args(["-m", model]);
+                }
+                process.arg("-");
+            }
+            "claude-code" => {
+                process.args([
+                    "--print",
+                    "--output-format",
+                    "json",
+                    "--verbose",
+                    "--model",
+                    model,
+                    "--tools",
+                    "",
+                    "--no-session-persistence",
+                    "--disable-slash-commands",
+                    "--safe-mode",
+                ]);
+            }
+            "kimi-code" => {
+                process.args([
+                    "--model",
+                    model,
+                    "--prompt",
+                    &prompt,
+                    "--output-format",
+                    "stream-json",
+                ]);
+            }
+            _ => return Err(ProviderError::EndpointNotAllowed),
+        }
+        let uses_stdin = command.adapter != "kimi-code";
+        process
+            .stdin(if uses_stdin {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match process.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                return Ok(ProviderEventStreamV1::TransportFailure {
+                    class: ProviderTransportFailureV1::Connect,
+                });
+            }
+        };
+        if uses_stdin {
+            let mut stdin = child.stdin.take().ok_or(ProviderError::CommandPipe)?;
+            if std::io::Write::write_all(&mut stdin, prompt.as_bytes()).is_err() {
+                terminate_process_group(&mut child);
+                let _ = child.wait();
+                return Err(ProviderError::DispatchOutcomeIndeterminate);
+            }
+        }
+        let stdout = child.stdout.take().ok_or(ProviderError::CommandPipe)?;
+        let stderr = child.stderr.take().ok_or(ProviderError::CommandPipe)?;
+        let stdout_reader =
+            thread::spawn(move || drain_bounded(stdout, maximum_event_stream_bytes));
+        let stderr_reader = thread::spawn(move || drain_bounded(stderr, 8192));
+        let started = std::time::Instant::now();
+        let deadline = Duration::from_millis(self.config.limits.provider_deadline_ms);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < deadline => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    terminate_process_group(&mut child);
+                    let grace = std::time::Instant::now();
+                    while grace.elapsed() < Duration::from_secs(5) {
+                        if child.try_wait().ok().flatten().is_some() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    if child.try_wait().ok().flatten().is_none() {
+                        kill_process_group(&mut child);
+                    }
+                    let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(ProviderError::DispatchOutcomeIndeterminate);
+                }
+                Err(_) => {
+                    terminate_process_group(&mut child);
+                    kill_process_group(&mut child);
+                    let _ = child.wait();
+                    return Err(ProviderError::DispatchOutcomeIndeterminate);
+                }
+            }
+        };
+        let (stdout, stdout_exceeded) = stdout_reader
+            .join()
+            .map_err(|_| ProviderError::CommandPipe)??;
+        let _stderr = stderr_reader
+            .join()
+            .map_err(|_| ProviderError::CommandPipe)??;
+        if stdout_exceeded {
+            return Ok(ProviderEventStreamV1::ResponseLimitExceeded {
+                status: 200,
+                headers: BTreeMap::new(),
+                maximum_bytes: maximum_event_stream_bytes,
+            });
+        }
+        let (status, body) = if status.success() {
+            (200, stdout)
+        } else {
+            let body = serde_jcs::to_vec(&serde_json::json!({
+                "error": "command_refused",
+                "exit_code": status.code(),
+            }))
+            .map_err(|error| ProviderError::Canonical(error.to_string()))?;
+            (502, body)
+        };
+        Ok(ProviderEventStreamV1::HttpResponse {
+            status,
+            headers: BTreeMap::new(),
+            body: OpaqueBytesV1::new(body),
+            protocol_terminal: true,
         })
     }
 
@@ -972,6 +1186,46 @@ impl ProviderCoreV1 {
         )?;
         Ok(ProviderResponseV1::SessionTerminated { receipt })
     }
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+}
+
+fn kill_process_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+}
+
+fn drain_bounded(
+    mut reader: impl Read,
+    maximum_retained_bytes: u64,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let retained_limit = maximum_retained_bytes.saturating_add(1);
+    let mut retained = Vec::new();
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        let available = retained_limit.saturating_sub(retained.len() as u64);
+        let keep = usize::try_from(available.min(count as u64)).unwrap_or(0);
+        retained.extend_from_slice(&buffer[..keep]);
+        exceeded |= count > keep;
+    }
+    let exceeded = exceeded || retained.len() as u64 > maximum_retained_bytes;
+    Ok((retained, exceeded))
 }
 
 fn read_provider_credential(
@@ -1309,9 +1563,10 @@ fn provider_api_error<T>(error: &ProviderError) -> ApiResultV1<T> {
         | ProviderError::UnsafeHeader
         | ProviderError::AdapterRequestMismatch
         | ProviderError::EndpointNotAllowed => ApiErrorCodeV1::InvalidRequest,
-        ProviderError::CredentialUnavailable | ProviderError::DispatchOutcomeIndeterminate => {
-            ApiErrorCodeV1::Indeterminate
-        }
+        ProviderError::CredentialUnavailable
+        | ProviderError::CommandPipe
+        | ProviderError::CommandWait
+        | ProviderError::DispatchOutcomeIndeterminate => ApiErrorCodeV1::Indeterminate,
         _ => ApiErrorCodeV1::Internal,
     };
     ApiResultV1::error(code, error.to_string())
@@ -1350,6 +1605,12 @@ pub enum ProviderError {
     /// Credential file read failed.
     #[error("provider credential cannot be read")]
     Io(#[from] std::io::Error),
+    /// A fixed command transport pipe could not be established or drained.
+    #[error("provider command pipe failed")]
+    CommandPipe,
+    /// A fixed command transport could not be observed to completion.
+    #[error("provider command wait failed")]
+    CommandWait,
     /// Endpoint IDs are duplicated.
     #[error("duplicate provider endpoint: {0}")]
     DuplicateEndpoint(String),
@@ -1425,7 +1686,11 @@ pub enum ProviderError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::{PermissionsExt as _, symlink};
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use ag_primitives::{
         InferenceBudgetV1, InferenceEnvelopeV1, InferenceMethodId, LifecycleNonce, ModelId,
@@ -1486,6 +1751,89 @@ mod tests {
         assert!(read_provider_credential(directory.path(), "malformed").is_err());
     }
 
+    #[test]
+    fn every_explicit_transport_variant_is_root_routable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config: ProviderdConfigV1 =
+            toml::from_str(include_str!("../../../config/providerd.example.toml")).unwrap();
+        config.store.database = directory.path().join("provider.db");
+        config.store.object_store = directory.path().join("objects");
+        let mut local = config.endpoints[0].clone();
+        local.id = "local".to_owned();
+        local.models[0].id = "local-model".to_owned();
+        local.protocol = "opaque_json_v1".to_owned();
+        local.methods = vec!["chat.completions.create".to_owned()];
+        local.transport = ProviderTransportConfigV1::LocalHttp {
+            url: "http://orion:11434/v1/chat/completions".to_owned(),
+            allowed_origins: vec!["http://orion:11434".to_owned()],
+            redirect_policy: ag_app::config::ProviderLocalRedirectPolicyV1::Deny,
+        };
+        let mut command = config.endpoints[0].clone();
+        command.id = "command".to_owned();
+        command.models[0].id = "command-model".to_owned();
+        command.protocol = "opaque_json_v1".to_owned();
+        command.methods = vec!["command.complete".to_owned()];
+        command.transport = ProviderTransportConfigV1::Command {
+            command: ProviderCommandConfigV1 {
+                adapter: "codex".to_owned(),
+                model_argument: ProviderCommandModelArgumentV1::Required,
+                executable: Path::new("/opt/codex/codex").to_path_buf(),
+                working_directory: Path::new("/work").to_path_buf(),
+                environment: BTreeMap::new(),
+            },
+        };
+        config.endpoints.extend([local, command]);
+        config.validate().unwrap();
+        let identity = StoreIdentityV1::current(0x4147_5052, "provider-variant-test").unwrap();
+        let writer = WriterIdentityV1 {
+            writer_id: "provider-variant-test-writer".to_owned(),
+            principal_digest: Digest::hash_bytes(b"provider-variant-test-writer"),
+            process_nonce: uuid::Uuid::new_v4().to_string(),
+            claimed_at_unix_ms: 1,
+        };
+        let store = Store::open(
+            &config.store.database,
+            &config.store.object_store,
+            identity,
+            &writer,
+        )
+        .unwrap();
+        let core = ProviderCoreV1::new(store, config).unwrap();
+        let session = SessionId::new("variant-session").unwrap();
+        for (sequence, endpoint_id) in ["primary", "local", "command"].into_iter().enumerate() {
+            let endpoint = core.endpoints.get(endpoint_id).unwrap();
+            let mut nonce = [0_u8; 16];
+            nonce[8..].copy_from_slice(&(sequence as u64).to_be_bytes());
+            let capability = InferenceCapabilityV1::new(
+                core.authority_domain.clone(),
+                core.epoch,
+                ProjectId::new("provider-tests").unwrap(),
+                session.clone(),
+                LifecycleNonce::new([0x5a; 16]),
+                PrincipalId::new(Digest::hash_bytes(b"provider-test-worker")),
+                core.provider_policy.clone(),
+                InferenceEnvelopeV1 {
+                    endpoint: ProviderEndpointId::new(endpoint.id.clone()).unwrap(),
+                    model: ModelId::new(endpoint.models[0].id.clone()).unwrap(),
+                    method: InferenceMethodId::new(endpoint.methods[0].clone()).unwrap(),
+                    protocol_digest: Digest::hash_bytes(endpoint.protocol.as_bytes()),
+                },
+                InferenceBudgetV1 {
+                    requests: 1,
+                    input_bytes: 4096,
+                    output_bytes: endpoint.models[0].max_event_stream_bytes,
+                    cost_microunits: endpoint.models[0].worst_case_cost_microunits,
+                },
+                1,
+                9_000_000_000_000,
+                LifecycleNonce::new(nonce),
+            )
+            .unwrap();
+            let (resolved, _) = core.ensure_endpoint(&capability).unwrap();
+            assert_eq!(resolved.id, endpoint_id);
+        }
+    }
+
     struct ProviderFixture {
         _directory: TempDir,
         core: ProviderCoreV1,
@@ -1494,9 +1842,18 @@ mod tests {
 
     impl ProviderFixture {
         fn new() -> Self {
+            Self::with_caller_kind(ag_primitives::PrincipalKindV1::Daemon)
+        }
+
+        fn with_caller_kind(kind: ag_primitives::PrincipalKindV1) -> Self {
+            Self::with_config(|config| config.caller_peer.principal_kind = kind)
+        }
+
+        fn with_config(configure: impl FnOnce(&mut ProviderdConfigV1)) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let mut config: ProviderdConfigV1 =
                 toml::from_str(include_str!("../../../config/providerd.example.toml")).unwrap();
+            configure(&mut config);
             config.store.database = directory.path().join("provider.db");
             config.store.object_store = directory.path().join("objects");
             let peer = VerifiedRpcPrincipalV1 {
@@ -1694,6 +2051,248 @@ mod tests {
             200,
             b"event: response.completed\ndata: {}\n\n"
         ));
+    }
+
+    #[test]
+    fn fixed_command_transport_captures_success_and_sanitizes_failure() {
+        let fixture = ProviderFixture::new();
+        let executable = fixture._directory.path().join("fake-claude");
+        fs::write(
+            &executable,
+            "#!/bin/sh\ninput=$(cat)\nprintf '{\"result\":\"ok\",\"input\":\"%s\"}' \"$input\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let command = ProviderCommandConfigV1 {
+            adapter: "claude-code".to_owned(),
+            model_argument: ProviderCommandModelArgumentV1::Required,
+            executable: executable.clone(),
+            working_directory: fixture._directory.path().to_path_buf(),
+            environment: BTreeMap::new(),
+        };
+        let request =
+            br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#;
+        let event = fixture
+            .core
+            .dispatch_command(&command, request.to_vec(), 16 * 1024)
+            .unwrap();
+        assert!(matches!(
+            event,
+            ProviderEventStreamV1::HttpResponse {
+                status: 200,
+                protocol_terminal: true,
+                ..
+            }
+        ));
+
+        fs::write(
+            &executable,
+            "#!/bin/sh\ncat >/dev/null\necho super-secret >&2\nexit 7\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let event = fixture
+            .core
+            .dispatch_command(&command, request.to_vec(), 16 * 1024)
+            .unwrap();
+        let ProviderEventStreamV1::HttpResponse { status, body, .. } = event else {
+            panic!("expected terminal sanitized command refusal")
+        };
+        assert_eq!(status, 502);
+        let text = String::from_utf8(body.into_vec()).unwrap();
+        assert!(text.contains("command_refused"));
+        assert!(!text.contains("super-secret"));
+    }
+
+    #[test]
+    fn codex_provider_default_omits_the_model_flag() {
+        let fixture = ProviderFixture::new();
+        let executable = fixture._directory.path().join("fake-codex");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nseen_skip=0\nfor arg in \"$@\"; do\n  [ \"$arg\" = -m ] && exit 9\n  [ \"$arg\" = --skip-git-repo-check ] && seen_skip=1\ndone\n[ \"$seen_skip\" = 1 ] || exit 8\ncat >/dev/null\nprintf '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"READY\"}}\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let command = ProviderCommandConfigV1 {
+            adapter: "codex".to_owned(),
+            model_argument: ProviderCommandModelArgumentV1::Omit,
+            executable,
+            working_directory: fixture._directory.path().to_path_buf(),
+            environment: BTreeMap::new(),
+        };
+        let request =
+            br#"{"messages":[{"content":"hello","role":"user"}],"model":"provider-default"}"#;
+        assert!(matches!(
+            fixture
+                .core
+                .dispatch_command(&command, request.to_vec(), 16 * 1024),
+            Ok(ProviderEventStreamV1::HttpResponse { status: 200, .. })
+        ));
+    }
+
+    #[test]
+    fn local_http_redirect_is_captured_and_never_followed() {
+        let escaped = TcpListener::bind("127.0.0.1:0").unwrap();
+        escaped.set_nonblocking(true).unwrap();
+        let escaped_origin = format!("http://{}", escaped.local_addr().unwrap());
+        let escaped_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&escaped_hits);
+        let escaped_thread = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(500) {
+                match escaped.accept() {
+                    Ok((_stream, _)) => {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let redirect = TcpListener::bind("127.0.0.1:0").unwrap();
+        let redirect_origin = format!("http://{}", redirect.local_addr().unwrap());
+        let redirect_url = format!("{redirect_origin}/v1/chat/completions");
+        let location = format!("{escaped_origin}/credential-escape");
+        let redirect_thread = thread::spawn(move || {
+            let (mut stream, _) = redirect.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let mut fixture = ProviderFixture::with_config(|config| {
+            config.endpoints[0].transport = ProviderTransportConfigV1::LocalHttp {
+                url: redirect_url,
+                allowed_origins: vec![redirect_origin],
+                redirect_policy: ag_app::config::ProviderLocalRedirectPolicyV1::Deny,
+            };
+        });
+        let capability = fixture.capability(&SessionId::new("redirect-session").unwrap(), 1);
+        let endpoint = fixture.core.endpoints.remove("primary").unwrap();
+        let event = fixture
+            .core
+            .dispatch(
+                &endpoint,
+                &request_custody(
+                    &capability,
+                    br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#,
+                ),
+                br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#.to_vec(),
+                16 * 1024,
+            )
+            .unwrap();
+        assert!(matches!(
+            event,
+            ProviderEventStreamV1::HttpResponse { status: 302, .. }
+        ));
+        redirect_thread.join().unwrap();
+        escaped_thread.join().unwrap();
+        assert_eq!(escaped_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn http_timeout_stays_reserved_and_replay_never_redispatches() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let url = format!("{origin}/v1/chat/completions");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hits);
+        let server = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(750) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0_u8; 4096];
+                        let _ = stream.read(&mut request);
+                        thread::sleep(Duration::from_millis(250));
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let mut fixture = ProviderFixture::with_config(|config| {
+            config.limits.provider_deadline_ms = 50;
+            config.endpoints[0].transport = ProviderTransportConfigV1::LocalHttp {
+                url,
+                allowed_origins: vec![origin],
+                redirect_policy: ag_app::config::ProviderLocalRedirectPolicyV1::Deny,
+            };
+        });
+        let session = SessionId::new("timeout-session").unwrap();
+        let capability = fixture.capability(&session, 1);
+        fixture.register(&capability);
+        let bytes =
+            br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#;
+        let request = request_custody(&capability, bytes);
+        let infer = || ProviderRequestV1::Infer {
+            capability: Box::new(capability.clone()),
+            request: Box::new(request.clone()),
+            request_bytes: OpaqueBytesV1::new(bytes.to_vec()),
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                fixture.core.handle(infer(), &fixture.peer),
+                ApiResultV1::Error {
+                    code: ApiErrorCodeV1::Indeterminate,
+                    ..
+                }
+            ));
+        }
+        server.join().unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn timed_out_command_kills_the_process_group_and_is_indeterminate() {
+        let mut fixture = ProviderFixture::new();
+        fixture.core.config.limits.provider_deadline_ms = 50;
+        let executable = fixture._directory.path().join("slow-command");
+        let marker = fixture._directory.path().join("survived");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\n(sleep 1; printf survived > '{}') &\nwait\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let command = ProviderCommandConfigV1 {
+            adapter: "claude-code".to_owned(),
+            model_argument: ProviderCommandModelArgumentV1::Required,
+            executable,
+            working_directory: fixture._directory.path().to_path_buf(),
+            environment: BTreeMap::new(),
+        };
+        let request =
+            br#"{"messages":[{"content":"hello","role":"user"}],"model":"production-model"}"#;
+        assert!(matches!(
+            fixture
+                .core
+                .dispatch_command(&command, request.to_vec(), 16 * 1024),
+            Err(ProviderError::DispatchOutcomeIndeterminate)
+        ));
+        thread::sleep(Duration::from_millis(1100));
+        assert!(
+            !marker.exists(),
+            "the timed-out command process tree survived"
+        );
     }
 
     #[test]
@@ -1957,6 +2556,53 @@ mod tests {
                 response: ProviderResponseV1::Health {
                     health: HealthV1 { ready: false, .. }
                 }
+            }
+        ));
+    }
+
+    #[test]
+    fn fixed_service_health_is_ready_and_capabilities_are_bound_to_its_signed_identity() {
+        let mut fixture =
+            ProviderFixture::with_caller_kind(ag_primitives::PrincipalKindV1::Service);
+        let response = fixture
+            .core
+            .handle(ProviderRequestV1::Health {}, &fixture.peer);
+        assert!(matches!(
+            response,
+            ApiResultV1::Ok {
+                response: ProviderResponseV1::Health {
+                    health: HealthV1 { ready: true, .. }
+                }
+            }
+        ));
+
+        let session = SessionId::new("fixed-service-session").unwrap();
+        let mut rejected = fixture.capability(&session, 1);
+        assert!(matches!(
+            fixture.core.handle(
+                ProviderRequestV1::RegisterCapability {
+                    capability: Box::new(rejected.clone()),
+                    worker_principal: rejected.worker_principal.clone(),
+                },
+                &fixture.peer,
+            ),
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::Unauthenticated,
+                ..
+            }
+        ));
+
+        rejected.worker_principal = PrincipalId::new(fixture.peer.principal.clone());
+        assert!(matches!(
+            fixture.core.handle(
+                ProviderRequestV1::RegisterCapability {
+                    capability: Box::new(rejected.clone()),
+                    worker_principal: rejected.worker_principal.clone(),
+                },
+                &fixture.peer,
+            ),
+            ApiResultV1::Ok {
+                response: ProviderResponseV1::CapabilityRegistered { .. }
             }
         ));
     }
