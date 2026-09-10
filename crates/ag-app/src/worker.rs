@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ag_primitives::{Digest, ExecutableIdentityV1};
+use ag_protocol::FrameCodec;
 use ag_session::SecurityProfileV1;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::sys::signal::{Signal, kill};
@@ -427,9 +428,106 @@ pub struct PreparedWorkerLaunchV1 {
 pub struct WorkerProviderChannelV1 {
     request: OwnedFd,
     response: OwnedFd,
+    request_frame: Vec<u8>,
+    response_frame: Vec<u8>,
+    response_offset: usize,
 }
 
 impl WorkerProviderChannelV1 {
+    /// Nonblockingly receives one complete strict length-prefixed frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal for an empty/oversized frame, endpoint failure,
+    /// or invalid framing. Partial bytes remain in this channel for the next
+    /// bounded poll.
+    pub fn try_receive_frame(
+        &mut self,
+        maximum: u32,
+    ) -> Result<Option<Vec<u8>>, WorkerLaunchError> {
+        let codec = FrameCodec::new(maximum).map_err(WorkerLaunchError::ProviderProtocol)?;
+        loop {
+            let wanted = if self.request_frame.len() < 4 {
+                4 - self.request_frame.len()
+            } else {
+                let declared = u32::from_be_bytes(
+                    self.request_frame[..4]
+                        .try_into()
+                        .map_err(|_| WorkerLaunchError::ProviderChannelFrame)?,
+                );
+                if declared == 0 || declared > maximum {
+                    return Err(WorkerLaunchError::ProviderChannelFrame);
+                }
+                let total = 4_usize
+                    .checked_add(
+                        usize::try_from(declared)
+                            .map_err(|_| WorkerLaunchError::ProviderChannelFrame)?,
+                    )
+                    .ok_or(WorkerLaunchError::ProviderChannelFrame)?;
+                if self.request_frame.len() == total {
+                    let framed = std::mem::take(&mut self.request_frame);
+                    return codec
+                        .decode_frame(&framed)
+                        .map(|payload| Some(payload.to_vec()))
+                        .map_err(WorkerLaunchError::ProviderProtocol);
+                }
+                total
+                    .checked_sub(self.request_frame.len())
+                    .ok_or(WorkerLaunchError::ProviderChannelFrame)?
+            };
+            let mut buffer = [0_u8; 4096];
+            let limit = wanted.min(buffer.len());
+            match nix::unistd::read(self.request.as_raw_fd(), &mut buffer[..limit]) {
+                Ok(0) => return Err(WorkerLaunchError::ProviderChannelFrame),
+                Ok(read) => self.request_frame.extend_from_slice(&buffer[..read]),
+                Err(nix::errno::Errno::EAGAIN) => return Ok(None),
+                Err(error) => {
+                    return Err(WorkerLaunchError::Io {
+                        operation: "receive framed worker provider request",
+                        source: nix_errno_to_io(error),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Queues one canonical response frame without overwriting an incomplete
+    /// prior response.
+    pub fn queue_response_frame(
+        &mut self,
+        maximum: u32,
+        payload: &[u8],
+    ) -> Result<(), WorkerLaunchError> {
+        if self.response_offset != self.response_frame.len() {
+            return Err(WorkerLaunchError::ProviderChannelBusy);
+        }
+        self.response_frame = FrameCodec::new(maximum)
+            .and_then(|codec| codec.encode_frame(payload))
+            .map_err(WorkerLaunchError::ProviderProtocol)?;
+        self.response_offset = 0;
+        Ok(())
+    }
+
+    /// Nonblockingly advances the queued response frame.
+    pub fn flush_response_frame(&mut self) -> Result<bool, WorkerLaunchError> {
+        while self.response_offset < self.response_frame.len() {
+            match nix::unistd::write(&self.response, &self.response_frame[self.response_offset..]) {
+                Ok(0) => return Err(WorkerLaunchError::ProviderChannelFrame),
+                Ok(written) => self.response_offset += written,
+                Err(nix::errno::Errno::EAGAIN) => return Ok(false),
+                Err(error) => {
+                    return Err(WorkerLaunchError::Io {
+                        operation: "send framed worker provider response",
+                        source: nix_errno_to_io(error),
+                    });
+                }
+            }
+        }
+        self.response_frame.clear();
+        self.response_offset = 0;
+        Ok(true)
+    }
+
     /// Receives one bounded credential-free worker request chunk.
     ///
     /// # Errors
@@ -729,6 +827,12 @@ pub enum WorkerLaunchError {
     /// One provider-channel transfer was empty or only partly sent.
     #[error("worker provider channel transfer is incomplete")]
     ProviderChannelFrame,
+    /// A response frame is already awaiting complete delivery.
+    #[error("worker provider response channel is busy")]
+    ProviderChannelBusy,
+    /// Strict provider channel framing failed.
+    #[error("worker provider channel protocol failed: {0}")]
+    ProviderProtocol(#[source] ag_protocol::ProtocolError),
     /// A parent attempted to exceed an admitted input bound.
     #[error("worker input descriptor {0} exceeded its reviewed bound")]
     InputBudgetExceeded(u32),
@@ -1628,11 +1732,22 @@ fn prepare_input_transport(
                 operation: "create worker provider response channel",
                 source: nix_errno_to_io(error),
             })?;
+        set_raw_nonblocking(
+            request_parent.as_raw_fd(),
+            "bound governor provider request endpoint",
+        )?;
+        set_raw_nonblocking(
+            response_parent.as_raw_fd(),
+            "bound governor provider response endpoint",
+        )?;
         readers.push(request_child);
         readers.push(response_child);
         Some(WorkerProviderChannelV1 {
             request: request_parent,
             response: response_parent,
+            request_frame: Vec::new(),
+            response_frame: Vec::new(),
+            response_offset: 0,
         })
     } else {
         None
@@ -1779,14 +1894,20 @@ fn close_raw_descriptors(descriptors: &[RawFd]) {
 }
 
 fn set_nonblocking(stdout: &ChildStdout) -> Result<(), WorkerLaunchError> {
-    let current =
-        fcntl(stdout.as_raw_fd(), FcntlArg::F_GETFL).map_err(|error| WorkerLaunchError::Io {
-            operation: "inspect worker stdout flags",
-            source: nix_errno_to_io(error),
-        })?;
+    set_raw_nonblocking(stdout.as_raw_fd(), "bound worker stdout")
+}
+
+fn set_raw_nonblocking(
+    descriptor: RawFd,
+    operation: &'static str,
+) -> Result<(), WorkerLaunchError> {
+    let current = fcntl(descriptor, FcntlArg::F_GETFL).map_err(|error| WorkerLaunchError::Io {
+        operation,
+        source: nix_errno_to_io(error),
+    })?;
     let flags = OFlag::from_bits_truncate(current) | OFlag::O_NONBLOCK;
-    fcntl(stdout.as_raw_fd(), FcntlArg::F_SETFL(flags)).map_err(|error| WorkerLaunchError::Io {
-        operation: "bound worker stdout",
+    fcntl(descriptor, FcntlArg::F_SETFL(flags)).map_err(|error| WorkerLaunchError::Io {
+        operation,
         source: nix_errno_to_io(error),
     })?;
     Ok(())
@@ -2305,7 +2426,7 @@ mod tests {
         );
         let response_child = child_endpoints.pop().expect("response child");
         let request_child = child_endpoints.pop().expect("request child");
-        let channel = channel.expect("provider channel");
+        let mut channel = channel.expect("provider channel");
         let sent = nix::unistd::write(&request_child, b"provider-request")
             .expect("worker sends provider request");
         assert_eq!(sent, b"provider-request".len());
@@ -2323,6 +2444,27 @@ mod tests {
         assert_eq!(&response[..response_length], b"provider-response");
         assert!(nix::unistd::read(request_child.as_raw_fd(), &mut response).is_err());
         assert!(nix::unistd::write(&response_child, b"wrong-direction").is_err());
+
+        let framed = FrameCodec::new(64)
+            .unwrap()
+            .encode_frame(b"framed-request")
+            .unwrap();
+        nix::unistd::write(&request_child, &framed[..2]).unwrap();
+        assert_eq!(channel.try_receive_frame(64).unwrap(), None);
+        nix::unistd::write(&request_child, &framed[2..]).unwrap();
+        assert_eq!(
+            channel.try_receive_frame(64).unwrap(),
+            Some(b"framed-request".to_vec())
+        );
+        channel
+            .queue_response_frame(64, b"framed-response")
+            .unwrap();
+        assert!(channel.flush_response_frame().unwrap());
+        let framed_response = FrameCodec::new(64)
+            .unwrap()
+            .read_frame(&mut File::from(response_child))
+            .unwrap();
+        assert_eq!(framed_response, b"framed-response");
     }
 
     #[test]
