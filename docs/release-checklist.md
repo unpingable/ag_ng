@@ -101,6 +101,19 @@ Known blockers in the current tree include:
   not yet prove the live `WorkerSessionPrincipal` before spending its committed
   provider capability; the implemented worker slice is offline rather than a
   provider-capability workaround;
+  this is a concrete multi-boundary prerequisite, not an endpoint-adapter gap.
+  The first source prerequisite now exists: `WorkerProfileConfigV1` can enroll
+  one exact provider-policy digest, envelope and budget; the session constructors
+  derive the matching constrained principal, capability and provider-channel
+  descriptor identities. Launch deliberately refuses that profile before
+  process preparation. No provider-channel pipes are handed to the worker and
+  `AgdRequestV1` still has no worker-bound infer/fetch/acknowledge operations.
+  The remaining order is live descriptor handoff plus durable agd proxy
+  operations that reload and verify the active session -> session termination
+  coupled to provider capability burn -> installed worker/session/peer
+  qualification. Strict decoding refuses a provider-looking field outside the
+  enrolled shape, and focused tests cover the exact route/capability/descriptor
+  derivation without contacting a provider;
 - `agctl doctor` implements a fail-closed configuration/custody/effective-unit
   audit and effectd independently reconstructs non-serializable live readiness
   from store, process, unit, mount, helper and target evidence; broader kernel

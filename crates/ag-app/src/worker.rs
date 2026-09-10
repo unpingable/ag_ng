@@ -1814,6 +1814,7 @@ mod tests {
                 candidate_semantic_type: "managed_file_content_v1".to_owned(),
                 timeout_ms: 2_000,
                 output_budget_bytes: 1024,
+                provider_access: None,
             }],
         };
         Fixture {

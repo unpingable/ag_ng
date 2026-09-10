@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use ag_effect::{SystemdUnitActionV1, TargetId};
 use ag_primitives::{
-    AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, PrincipalKindV1, ProjectId,
+    AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, InferenceBudgetV1,
+    InferenceEnvelopeV1, PrincipalKindV1, ProjectId,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -220,8 +221,9 @@ pub struct AgdLimitsV1 {
 /// Root-reviewed launch substrate for contained generic workers.
 ///
 /// This configuration names exact executable bytes and fixed argument vectors;
-/// it is not a command runner. Provider routes are intentionally absent from
-/// this first slice, which supports offline workers only.
+/// it is not a command runner. The optional provider policy is credential-free
+/// and remains fail-closed at
+/// launch until the separate live request/response proxy is implemented.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerLauncherConfigV1 {
@@ -275,6 +277,24 @@ pub struct WorkerProfileConfigV1 {
     pub timeout_ms: u64,
     /// Exact cumulative candidate-output bound.
     pub output_budget_bytes: u64,
+    /// Optional root-enrolled provider policy. This is inert until the
+    /// governor's worker/session proxy contract is available; launch refuses
+    /// rather than silently treating this as an offline profile.
+    #[serde(default)]
+    pub provider_access: Option<WorkerProviderProfileConfigV1>,
+}
+
+/// Credential-free provider envelope and cumulative budget enrolled for one
+/// fixed worker profile.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerProviderProfileConfigV1 {
+    /// Exact digest of the independently enrolled providerd policy.
+    pub provider_policy_digest: Digest,
+    /// Closed endpoint/model/method/protocol selection.
+    pub envelope: InferenceEnvelopeV1,
+    /// Maximum cumulative provider use for the worker session.
+    pub budget: InferenceBudgetV1,
 }
 
 /// Closed interpretation of one worker candidate selected by reviewed policy.
@@ -988,6 +1008,10 @@ fn validate_worker_launcher(
             || profile.output_budget_bytes == 0
             || profile.output_budget_bytes > limits.max_artifact_bytes
             || profile
+                .provider_access
+                .as_ref()
+                .is_some_and(|provider| !valid_worker_provider_profile(provider))
+            || profile
                 .output_budget_bytes
                 .div_ceil(3)
                 .checked_mul(4)
@@ -998,6 +1022,10 @@ fn validate_worker_launcher(
         }
     }
     Ok(())
+}
+
+fn valid_worker_provider_profile(profile: &WorkerProviderProfileConfigV1) -> bool {
+    profile.budget.requests > 0
 }
 
 fn valid_policy_token(value: &str) -> bool {
@@ -1678,6 +1706,65 @@ mod tests {
                 Err(ConfigError::UnexpectedPrincipalKind(_))
             ));
         }
+    }
+
+    #[test]
+    fn worker_provider_profile_is_closed_and_requires_a_request_budget() {
+        let mut profile = serde_json::json!({
+            "profile_id": "fixture",
+            "project": "fixture",
+            "executable": "/usr/bin/fixture-worker",
+            "executable_identity": {
+                "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 1,
+                "build_identity": null
+            },
+            "fixed_arguments": [],
+            "candidate_effect": "managed_file_put",
+            "candidate_target": "fixture.target",
+            "candidate_semantic_type": "managed_file_content_v1",
+            "timeout_ms": 1000,
+            "output_budget_bytes": 1024,
+            "provider_access": null
+        });
+        serde_json::from_value::<WorkerProfileConfigV1>(profile.clone())
+            .expect("the documented offline worker profile must decode");
+
+        profile.as_object_mut().expect("profile object").insert(
+            "provider_route".to_owned(),
+            serde_json::json!({
+                "endpoint": "primary",
+                "model": "production-model",
+                "method": "responses.create"
+            }),
+        );
+        assert!(
+            serde_json::from_value::<WorkerProfileConfigV1>(profile.clone()).is_err(),
+            "a provider-looking profile field must refuse until the live worker/session contract exists"
+        );
+
+        profile.as_object_mut().expect("profile object").remove("provider_route");
+        profile.as_object_mut().expect("profile object").insert(
+            "provider_access".to_owned(),
+            serde_json::json!({
+                "provider_policy_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "envelope": {
+                    "endpoint": "primary", "model": "production-model",
+                    "method": "responses.create",
+                    "protocol_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+                },
+                "budget": {"requests": 1, "input_bytes": 4096,
+                    "output_bytes": 4096, "cost_microunits": 1000}
+            }),
+        );
+        serde_json::from_value::<WorkerProfileConfigV1>(profile.clone())
+            .expect("closed provider policy must decode");
+        profile["provider_access"]["budget"]["requests"] = serde_json::json!(0);
+        let profile: WorkerProfileConfigV1 = serde_json::from_value(profile)
+            .expect("zero budget is a semantic validation failure");
+        assert!(!valid_worker_provider_profile(
+            profile.provider_access.as_ref().expect("provider policy")
+        ));
     }
 
     #[test]

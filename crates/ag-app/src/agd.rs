@@ -14,9 +14,9 @@ use ag_kernel::{
 };
 use ag_primitives::{
     AuthorityDomain, BookLocalId, CgroupIdentity, Digest, Epoch, HostCredentialObservationV1,
-    LaunchProfileIdentityV1, LifecycleNonce, LifecycleOrigin, PrincipalChainNodeV1,
-    PrincipalChainV1, PrincipalId, PrincipalKindV1, PrincipalNameError, ProjectId, SessionId,
-    WorkerProviderRouteV1, WorkerSessionPrincipalV1,
+    InferenceCapabilityV1, LaunchProfileIdentityV1, LifecycleNonce, LifecycleOrigin,
+    PrincipalChainNodeV1, PrincipalChainV1, PrincipalId, PrincipalKindV1, PrincipalNameError,
+    ProjectId, SessionId, WorkerProviderRouteV1, WorkerSessionPrincipalV1,
 };
 use ag_protocol::{FrameCodec, RequestId};
 use ag_session::{
@@ -36,7 +36,7 @@ use crate::api::{
     ProposalIngressProofV1, WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1,
     WorkerCandidateRequestV1, WorkerCandidateSourceProofV1, worker_candidate_ingress_proof_digest,
 };
-use crate::config::{AgdConfigV1, WorkerCandidateEffectV1};
+use crate::config::{AgdConfigV1, WorkerCandidateEffectV1, WorkerProfileConfigV1};
 use crate::peer::signed_principal_chain;
 use crate::rpc_auth::{
     EphemeralRpcPrivateKeyV1, RpcKeyIdV1, RpcPeerEnrollmentV1, RpcPeerKeyPolicyV1,
@@ -363,6 +363,13 @@ impl AgdCoreV1 {
             .find(|profile| profile.profile_id == profile_id)
             .cloned()
             .ok_or_else(|| WorkerLaunchError::UnknownProfile(profile_id.to_owned()))?;
+        if profile.provider_access.is_some() {
+            // The policy and session capability can be constructed, but the
+            // live worker request/response proxy is a separate custody
+            // boundary. Refuse before process preparation until that proxy
+            // can reload and prove the exact active session on every call.
+            return Err(AgdError::WorkerProviderRuntimeUnavailable);
+        }
         let security_profile = configured_worker_security_profile(&self.config.security_profile)?;
         let governor_enrollment = self
             .rpc_signer
@@ -457,6 +464,7 @@ impl AgdCoreV1 {
             worker,
             worker_chain,
             &prepared,
+            prepared_at,
             expires_at,
         )?;
         let ingress = WorkerRuntimeIngressBindingsV1 {
@@ -1891,13 +1899,14 @@ fn worker_session_inputs(
     session: &SessionId,
     candidate_key_identity: &Digest,
     workspace: &Digest,
+    profile: &WorkerProfileConfigV1,
 ) -> Result<(SourceSnapshotV1, Vec<AdmittedDescriptorV1>, Digest), AgdError> {
     let source = SourceSnapshotV1 {
         content: Digest::hash_domain("ag-ng/worker-empty-source/v1", session.as_str().as_bytes()),
         format: "empty_snapshot_v1".to_owned(),
         source_object: None,
     };
-    let descriptors = vec![
+    let mut descriptors = vec![
         AdmittedDescriptorV1 {
             descriptor: 1,
             purpose: DescriptorPurposeV1::CandidateSink,
@@ -1925,6 +1934,32 @@ fn worker_session_inputs(
             ))?,
         },
     ];
+    if let Some(provider) = &profile.provider_access {
+        descriptors.extend([
+            AdmittedDescriptorV1 {
+                descriptor: 5,
+                purpose: DescriptorPurposeV1::ProviderRequest,
+                access: DescriptorAccessV1::WriteOnly,
+                object_identity: Digest::from_serializable(&(
+                    "ag.worker-provider-request-channel/v1",
+                    session,
+                    &provider.provider_policy_digest,
+                    &provider.envelope,
+                ))?,
+            },
+            AdmittedDescriptorV1 {
+                descriptor: 6,
+                purpose: DescriptorPurposeV1::ProviderResponse,
+                access: DescriptorAccessV1::ReadOnly,
+                object_identity: Digest::from_serializable(&(
+                    "ag.worker-provider-response-channel/v1",
+                    session,
+                    &provider.provider_policy_digest,
+                    &provider.envelope,
+                ))?,
+            },
+        ]);
+    }
     let input_set =
         Digest::from_serializable(&("ag.worker-admitted-input-set/v1", &source, &descriptors))?;
     Ok((source, descriptors, input_set))
@@ -1946,7 +1981,9 @@ fn worker_principal_from_launch(
         session,
         &candidate_key_identity,
         &prepared.workspace.identity,
+        profile,
     )?;
+    let provider_route = worker_provider_route(profile);
     Ok(WorkerSessionPrincipalV1 {
         authority_domain: authority_domain.clone(),
         epoch,
@@ -1967,7 +2004,7 @@ fn worker_principal_from_launch(
         candidate_ingress_key_identity: candidate_key_identity,
         expires_at_unix_ms,
         output_budget_bytes: profile.output_budget_bytes,
-        provider_route: WorkerProviderRouteV1::Offline,
+        provider_route,
         input_set_digest,
         observed_credentials: HostCredentialObservationV1 {
             uid: prepared.evidence.observed_uid,
@@ -1976,6 +2013,53 @@ fn worker_principal_from_launch(
             cgroup: CgroupIdentity::parse("development-unattested")?,
         },
     })
+}
+
+fn worker_provider_route(profile: &WorkerProfileConfigV1) -> WorkerProviderRouteV1 {
+    profile
+        .provider_access
+        .as_ref()
+        .map_or(WorkerProviderRouteV1::Offline, |provider| {
+            WorkerProviderRouteV1::Constrained {
+                provider_policy_digest: provider.provider_policy_digest.clone(),
+                envelope: provider.envelope.clone(),
+                budget: provider.budget,
+            }
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn worker_provider_capability(
+    profile: &WorkerProfileConfigV1,
+    authority_domain: &AuthorityDomain,
+    epoch: Epoch,
+    project: &ProjectId,
+    session: &SessionId,
+    session_nonce: LifecycleNonce,
+    worker_principal: PrincipalId,
+    not_before_unix_ms: u64,
+    expires_at_unix_ms: u64,
+) -> Result<Option<InferenceCapabilityV1>, AgdError> {
+    let Some(provider) = &profile.provider_access else {
+        return Ok(None);
+    };
+    Ok(Some(
+        InferenceCapabilityV1::new(
+            authority_domain.clone(),
+            epoch,
+            project.clone(),
+            session.clone(),
+            session_nonce,
+            worker_principal,
+            provider.provider_policy_digest.clone(),
+            provider.envelope.clone(),
+            provider.budget,
+            not_before_unix_ms,
+            expires_at_unix_ms,
+            session_nonce,
+        )
+        .map_err(ag_session::SessionError::ProviderCapabilityDefinition)?,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1989,12 +2073,14 @@ fn worker_session_spec(
     worker: WorkerSessionPrincipalV1,
     worker_chain: PrincipalChainV1,
     prepared: &PreparedWorkerLaunchV1,
+    not_before_unix_ms: u64,
     expires_at_unix_ms: u64,
 ) -> Result<BatchSessionSpecV1, AgdError> {
     let (source, admitted_descriptors, input_set_digest) = worker_session_inputs(
         session,
         &candidate_key_identity,
         &prepared.workspace.identity,
+        profile,
     )?;
     if worker.input_set_digest != input_set_digest {
         return Err(AgdError::WorkerProfileBindingMismatch);
@@ -2034,6 +2120,17 @@ fn worker_session_spec(
         observed_pid: prepared.evidence.sandbox_pid,
         observed_executable: prepared.evidence.worker_executable.clone(),
     };
+    let provider_capability = worker_provider_capability(
+        profile,
+        authority_domain,
+        epoch,
+        &worker.project,
+        session,
+        worker.session_nonce,
+        worker.id(),
+        not_before_unix_ms,
+        expires_at_unix_ms,
+    )?;
     Ok(BatchSessionSpecV1 {
         schema: ag_session::SESSION_SCHEMA_V1.to_owned(),
         session: session.clone(),
@@ -2051,7 +2148,7 @@ fn worker_session_spec(
         proposal_workspace_identity: prepared.workspace.identity.clone(),
         source,
         admitted_descriptors,
-        provider_capability: None,
+        provider_capability,
         deadline_unix_ms: expires_at_unix_ms,
         output_budget_bytes: profile.output_budget_bytes,
     })
@@ -2285,6 +2382,7 @@ fn agd_api_error<T>(error: &AgdError) -> ApiResultV1<T> {
         AgdError::WorkerSupervisorBusy | AgdError::WorkerCapacityExhausted => {
             ApiErrorCodeV1::Conflict
         }
+        AgdError::WorkerProviderRuntimeUnavailable => ApiErrorCodeV1::Conflict,
         _ => ApiErrorCodeV1::Internal,
     };
     ApiResultV1::error(code, error.to_string())
@@ -2376,6 +2474,10 @@ pub enum AgdError {
     /// not been attached to this governor core.
     #[error("worker launch runtime is unavailable")]
     WorkerRuntimeUnavailable,
+    /// A profile enrolled provider access, but the live worker/session proxy
+    /// and request/response descriptor handoff are not yet implemented.
+    #[error("worker provider runtime is unavailable")]
+    WorkerProviderRuntimeUnavailable,
     /// Configured maximum live-worker count has been reached.
     #[error("worker launch capacity is exhausted")]
     WorkerCapacityExhausted,
@@ -2503,5 +2605,94 @@ mod tests {
             worker_candidate_refusal_reason(&AgdError::WorkerRecoveryRequired),
             None
         );
+    }
+
+    #[test]
+    fn provider_profile_builds_exact_route_capability_and_descriptor_contract() {
+        let profile: WorkerProfileConfigV1 = serde_json::from_value(serde_json::json!({
+            "profile_id": "fixture",
+            "project": "fixture",
+            "executable": "/usr/bin/fixture-worker",
+            "executable_identity": {
+                "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "size": 1,
+                "build_identity": null
+            },
+            "fixed_arguments": [],
+            "candidate_effect": "managed_file_put",
+            "candidate_target": "fixture.target",
+            "candidate_semantic_type": "managed_file_content_v1",
+            "timeout_ms": 1000,
+            "output_budget_bytes": 1024,
+            "provider_access": {
+                "provider_policy_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "envelope": {
+                    "endpoint": "primary", "model": "production-model",
+                    "method": "responses.create",
+                    "protocol_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+                },
+                "budget": {"requests": 1, "input_bytes": 4096,
+                    "output_bytes": 4096, "cost_microunits": 1000}
+            }
+        }))
+        .expect("closed provider profile");
+        let provider = profile.provider_access.as_ref().expect("provider policy");
+        assert_eq!(
+            worker_provider_route(&profile),
+            WorkerProviderRouteV1::Constrained {
+                provider_policy_digest: provider.provider_policy_digest.clone(),
+                envelope: provider.envelope.clone(),
+                budget: provider.budget,
+            }
+        );
+
+        let domain = AuthorityDomain::parse("test-host").expect("domain");
+        let epoch = Epoch::parse("1").expect("epoch");
+        let session = SessionId::new("provider-session").expect("session");
+        let session_nonce = LifecycleNonce::new([7; 16]);
+        let principal = PrincipalId::new(Digest::hash_bytes(b"worker"));
+        let capability = worker_provider_capability(
+            &profile,
+            &domain,
+            epoch,
+            &ProjectId::parse("fixture").expect("project"),
+            &session,
+            session_nonce,
+            principal.clone(),
+            100,
+            200,
+        )
+        .expect("capability construction")
+        .expect("provider capability");
+        assert_eq!(capability.worker_principal, principal);
+        assert_eq!(capability.envelope, provider.envelope);
+        assert_eq!(capability.budget, provider.budget);
+        assert_eq!(capability.not_before_unix_ms, 100);
+        assert_eq!(capability.expires_at_unix_ms, 200);
+
+        let (_, descriptors, _) = worker_session_inputs(
+            &session,
+            &Digest::hash_bytes(b"candidate-key"),
+            &Digest::hash_bytes(b"workspace"),
+            &profile,
+        )
+        .expect("provider descriptor contract");
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.descriptor == 5
+                && descriptor.purpose == DescriptorPurposeV1::ProviderRequest
+                && descriptor.access == DescriptorAccessV1::WriteOnly
+        }));
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.descriptor == 6
+                && descriptor.purpose == DescriptorPurposeV1::ProviderResponse
+                && descriptor.access == DescriptorAccessV1::ReadOnly
+        }));
+        assert!(matches!(
+            agd_api_error::<()>(&AgdError::WorkerProviderRuntimeUnavailable),
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::Conflict,
+                ..
+            }
+        ));
     }
 }
