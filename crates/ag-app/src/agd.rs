@@ -1,6 +1,7 @@
 //! Governor-side calculus replay and broker forwarding.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -21,11 +22,12 @@ use ag_primitives::{
 use ag_protocol::{FrameCodec, RequestId};
 use ag_session::{
     AdmittedDescriptorV1, BatchSessionSpecV1, DescriptorAccessV1, DescriptorPurposeV1,
-    IsolationEvidenceV1, SecurityProfileV1, SessionError, SourceSnapshotV1, WorkerBindingV1,
-    WorkerCandidateBrokerOutcomeV1, WorkerCandidateCustodyStateV1, WorkerCandidateRefusalCodeV1,
-    WorkerIngressContextV1, WorkerSessionRecordV1, WorkerTerminationReasonV1, WorkspaceModeV1,
+    IsolationEvidenceV1, ProviderRequestCustodyV1, ProviderResponseCustodyV1, SecurityProfileV1,
+    SessionError, SourceSnapshotV1, WorkerBindingV1, WorkerCandidateBrokerOutcomeV1,
+    WorkerCandidateCustodyStateV1, WorkerCandidateRefusalCodeV1, WorkerIngressContextV1,
+    WorkerSessionRecordV1, WorkerTerminationReasonV1, WorkspaceModeV1,
 };
-use ag_store::{NewEventV1, Store};
+use ag_store::{BlobDescriptorV1, NewEventV1, Store};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -165,6 +167,57 @@ pub struct ForwardOutboxRecordV1 {
     pub ingress: GovernedProposalIngressV1,
     /// Durable dispatch lifecycle.
     pub state: ForwardOutboxStateV1,
+}
+
+/// Durable governor custody for one worker-selected inference attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerProviderAttemptRecordV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Active session from retained descriptor custody.
+    pub session: SessionId,
+    /// Exact live worker principal resolved by the governor.
+    pub worker_principal: PrincipalId,
+    /// Worker-local stable attempt identity.
+    pub attempt: RequestId,
+    /// Exact credential-free request custody.
+    pub request: ProviderRequestCustodyV1,
+    /// Dispatch and response custody lifecycle.
+    pub state: WorkerProviderAttemptStateV1,
+}
+
+/// Crash-reconcilable lifecycle for one provider attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerProviderAttemptStateV1 {
+    /// Exact request bytes are durable; no provider outcome is asserted.
+    RequestInCustody,
+    /// Provider daemon reports a durable dispatch available for fetch.
+    DispatchAvailable {
+        /// Provider-owned deterministic dispatch identity.
+        dispatch: Digest,
+        /// Exact complete stream digest reported by provider custody.
+        exact_event_stream: Digest,
+        /// True only when the provider adapter observed its terminal marker.
+        protocol_terminal: bool,
+    },
+    /// Complete response bytes are durable in the governor store.
+    ResponseInCustody {
+        /// Provider-owned dispatch identity.
+        dispatch: Digest,
+        /// Exact governor response custody.
+        response: ProviderResponseCustodyV1,
+    },
+    /// Provider daemon durably acknowledged governor custody.
+    Acknowledged {
+        /// Provider-owned dispatch identity.
+        dispatch: Digest,
+        /// Exact governor response custody.
+        response: ProviderResponseCustodyV1,
+        /// Provider-owned acknowledgment receipt.
+        provider_receipt: Digest,
+    },
 }
 
 /// Result of one bounded startup pass over the durable forwarding outbox.
@@ -355,6 +408,80 @@ impl AgdCoreV1 {
             .active_provider_capability(&runtime.ingress.context(now_unix_ms))
             .cloned()
             .map_err(AgdError::from)
+    }
+
+    /// Commits one exact credential-free worker inference request before any
+    /// provider-daemon dispatch. Repeating the same session/attempt returns
+    /// the existing record; changing its bytes or headers refuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal for stale worker custody, an offline session,
+    /// a request outside the enrolled bound, a duplicate binding mismatch, or
+    /// a failed durable blob/event commit.
+    pub fn prepare_worker_provider_attempt(
+        &mut self,
+        session: &SessionId,
+        attempt: RequestId,
+        sanitized_headers: BTreeMap<String, String>,
+        request_bytes: &[u8],
+        now_unix_ms: u64,
+    ) -> Result<WorkerProviderAttemptRecordV1, AgdError> {
+        let capability = self.reload_active_worker_provider_capability(session, now_unix_ms)?;
+        let byte_length =
+            u64::try_from(request_bytes.len()).map_err(|_| AgdError::ArtifactTransferTooLarge)?;
+        if byte_length == 0 || byte_length > capability.budget.input_bytes {
+            return Err(AgdError::WorkerProviderRequestTooLarge);
+        }
+        let exact_request = Digest::hash_bytes(request_bytes);
+        let request = ProviderRequestCustodyV1::new(
+            capability.id(),
+            exact_request.clone(),
+            sanitized_headers,
+            capability.envelope.clone(),
+        )?;
+        let entity = worker_provider_attempt_entity(session, &attempt)?;
+        if let Some(existing) = self
+            .store
+            .materialized_state::<WorkerProviderAttemptRecordV1>(&entity)?
+        {
+            validate_worker_provider_attempt_record(&entity, &existing.state)?;
+            if existing.state.request != request
+                || existing.state.worker_principal != capability.worker_principal
+            {
+                return Err(AgdError::WorkerProviderAttemptMismatch);
+            }
+            return Ok(existing.state);
+        }
+        self.store.install_blob(
+            &BlobDescriptorV1 {
+                digest: exact_request,
+                byte_length,
+            },
+            &mut Cursor::new(request_bytes),
+            i64::try_from(now_unix_ms).map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
+        )?;
+        let record = WorkerProviderAttemptRecordV1 {
+            schema: "ag.worker-provider-attempt/v1".to_owned(),
+            session: session.clone(),
+            worker_principal: capability.worker_principal,
+            attempt,
+            request,
+            state: WorkerProviderAttemptStateV1::RequestInCustody,
+        };
+        self.store.append_event(
+            NewEventV1 {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                entity_id: entity,
+                event_kind: "worker-provider.request-custodied.v1".to_owned(),
+                occurred_at_unix_ms: i64::try_from(now_unix_ms)
+                    .map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
+                payload: (&record.session, &record.attempt, &record.request),
+            },
+            &record,
+            0,
+        )?;
+        Ok(record)
     }
 
     /// Launches one configured offline worker behind a durable principal fence.
@@ -2062,6 +2189,38 @@ fn worker_provider_route(profile: &WorkerProfileConfigV1) -> WorkerProviderRoute
         })
 }
 
+fn worker_provider_attempt_entity(
+    session: &SessionId,
+    attempt: &RequestId,
+) -> Result<String, AgdError> {
+    Ok(format!(
+        "worker-provider-attempt:{}",
+        Digest::from_serializable(&("ag.worker-provider-attempt-identity/v1", session, attempt))?
+            .as_str()
+    ))
+}
+
+fn validate_worker_provider_attempt_record(
+    entity: &str,
+    record: &WorkerProviderAttemptRecordV1,
+) -> Result<(), AgdError> {
+    record.request.verify()?;
+    if record.schema != "ag.worker-provider-attempt/v1"
+        || entity != worker_provider_attempt_entity(&record.session, &record.attempt)?
+    {
+        return Err(AgdError::WorkerProviderAttemptMismatch);
+    }
+    if let WorkerProviderAttemptStateV1::ResponseInCustody { response, .. }
+    | WorkerProviderAttemptStateV1::Acknowledged { response, .. } = &record.state
+    {
+        response.verify()?;
+        if response.request_custody != record.request.custody_record {
+            return Err(AgdError::WorkerProviderAttemptMismatch);
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_provider_capability(
     profile: &WorkerProfileConfigV1,
@@ -2417,6 +2576,8 @@ fn agd_api_error<T>(error: &AgdError) -> ApiResultV1<T> {
             ApiErrorCodeV1::Conflict
         }
         AgdError::WorkerProviderRuntimeUnavailable => ApiErrorCodeV1::Conflict,
+        AgdError::WorkerProviderRequestTooLarge => ApiErrorCodeV1::InvalidRequest,
+        AgdError::WorkerProviderAttemptMismatch => ApiErrorCodeV1::Conflict,
         _ => ApiErrorCodeV1::Internal,
     };
     ApiResultV1::error(code, error.to_string())
@@ -2512,6 +2673,12 @@ pub enum AgdError {
     /// and request/response descriptor handoff are not yet implemented.
     #[error("worker provider runtime is unavailable")]
     WorkerProviderRuntimeUnavailable,
+    /// Credential-free request bytes exceeded the enrolled session budget.
+    #[error("worker provider request exceeds the enrolled bound")]
+    WorkerProviderRequestTooLarge,
+    /// A repeated attempt identity disagreed with its durable request/state.
+    #[error("worker provider attempt does not match durable custody")]
+    WorkerProviderAttemptMismatch,
     /// Configured maximum live-worker count has been reached.
     #[error("worker launch capacity is exhausted")]
     WorkerCapacityExhausted,
@@ -2728,5 +2895,27 @@ mod tests {
                 ..
             }
         ));
+
+        let request = ProviderRequestCustodyV1::new(
+            capability.id(),
+            Digest::hash_bytes(b"request"),
+            BTreeMap::new(),
+            capability.envelope,
+        )
+        .expect("request custody");
+        let attempt = RequestId::new("attempt-1").expect("attempt identity");
+        let entity = worker_provider_attempt_entity(&session, &attempt).expect("entity");
+        let record = WorkerProviderAttemptRecordV1 {
+            schema: "ag.worker-provider-attempt/v1".to_owned(),
+            session,
+            worker_principal: principal,
+            attempt,
+            request,
+            state: WorkerProviderAttemptStateV1::RequestInCustody,
+        };
+        validate_worker_provider_attempt_record(&entity, &record).expect("valid attempt");
+        let mut mismatched = record;
+        mismatched.request.exact_request = Digest::hash_bytes(b"changed");
+        assert!(validate_worker_provider_attempt_record(&entity, &mismatched).is_err());
     }
 }
