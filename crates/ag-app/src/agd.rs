@@ -331,10 +331,13 @@ pub struct ProviderIoCompletionV1 {
 
 fn enqueue_provider_job_bounded(
     queue: &mut VecDeque<ProviderIoJobV1>,
+    submitted: &[ProviderIoJobV1],
     job: ProviderIoJobV1,
     limit: usize,
 ) -> bool {
-    if queue.iter().any(|existing| *existing == job) {
+    if queue.iter().any(|existing| *existing == job)
+        || submitted.iter().any(|existing| *existing == job)
+    {
         return true;
     }
     if queue.len() >= limit {
@@ -880,7 +883,12 @@ impl AgdCoreV1 {
         } else {
             PROVIDER_JOB_SCHEDULER_CAPACITY
         };
-        if !enqueue_provider_job_bounded(&mut self.pending_provider_jobs, job, limit) && termination
+        if !enqueue_provider_job_bounded(
+            &mut self.pending_provider_jobs,
+            &self.submitted_provider_jobs,
+            job,
+            limit,
+        ) && termination
         {
             self.provider_termination_scan_cursor = None;
             self.provider_termination_scan_complete = false;
@@ -894,6 +902,7 @@ impl AgdCoreV1 {
         debug_assert!(!matches!(job.operation, ProviderIoOperationV1::Terminate));
         enqueue_provider_job_bounded(
             &mut self.pending_provider_jobs,
+            &self.submitted_provider_jobs,
             job,
             PROVIDER_JOB_SCHEDULER_CAPACITY,
         )
@@ -4239,16 +4248,55 @@ mod tests {
         second.attempt = RequestId::new("attempt-2").expect("second attempt");
         let mut retained = io_job.clone();
         retained.attempt = RequestId::new("attempt-retained").expect("retained attempt");
-        assert!(enqueue_provider_job_bounded(&mut bounded, first.clone(), 2));
-        assert!(enqueue_provider_job_bounded(&mut bounded, first, 2));
-        assert!(enqueue_provider_job_bounded(&mut bounded, second, 2));
+        assert!(enqueue_provider_job_bounded(
+            &mut bounded,
+            &[],
+            first.clone(),
+            2
+        ));
+        assert!(enqueue_provider_job_bounded(
+            &mut bounded,
+            &[],
+            first.clone(),
+            2
+        ));
+        assert!(enqueue_provider_job_bounded(&mut bounded, &[], second, 2));
         assert!(!enqueue_provider_job_bounded(
             &mut bounded,
+            &[],
             retained.clone(),
             2
         ));
         assert_eq!(bounded.len(), 2);
         assert!(!bounded.contains(&retained));
+
+        // An identical Begin that is already submitted remains in flight; a
+        // duplicate Infer must not place another physical Begin behind it.
+        let mut after_submission = VecDeque::new();
+        assert!(enqueue_provider_job_bounded(
+            &mut after_submission,
+            std::slice::from_ref(&first),
+            first.clone(),
+            2
+        ));
+        assert!(after_submission.is_empty());
+
+        // Once the submitted Begin completes, its distinct acknowledgement is
+        // the next scheduled operation rather than a duplicated Begin.
+        let mut acknowledgment = first;
+        acknowledgment.operation = ProviderIoOperationV1::Acknowledge {
+            dispatch: Digest::hash_bytes(b"dispatch"),
+            exact_event_stream: Digest::hash_bytes(b"stream"),
+            governor_custody_record: Digest::hash_bytes(b"governor-custody"),
+        };
+        assert!(enqueue_provider_job_bounded(
+            &mut after_submission,
+            &[],
+            acknowledgment.clone(),
+            2
+        ));
+        assert_eq!(after_submission.pop_front(), Some(acknowledgment));
+        assert!(after_submission.is_empty());
         assert_eq!(PROVIDER_TERMINATION_QUEUE_LIMIT, 126);
         assert_eq!(PROVIDER_JOB_SCHEDULER_CAPACITY, 128);
         let mut phase = 0;
