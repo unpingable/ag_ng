@@ -112,10 +112,15 @@ Known blockers in the current tree include:
   Exact nonblocking bounded framing, canonical request/response custody,
   per-attempt request-before-dispatch state, closed dispatch/fetch/ack
   reconciliation, and mandatory per-transition active-session/capability
-  reload now exist as source primitives. They are not yet wired into the agd
-  event loop. The remaining order is a bounded provider I/O queue whose
-  completions return to agd's single durable writer without suspending worker
-  deadline polling -> live infer/fetch/ack channel dispatch -> session termination
+  reload now exist as source primitives. A capacity-one I/O queue, signed
+  Register/Infer/Fetch worker, canonical fd frame pump, and main-thread exact
+  response/ack custody commit are wired into the daemon while launch remains
+  refused. The remaining release edge is terminal lifecycle composition:
+  timeout, cancellation, normal exit, and restart recovery must all submit and
+  reconcile `TerminateSession` before worker cleanup becomes complete. Only
+  after that edge has deterministic controls may provider-enabled launch be
+  released. This keeps provider I/O from suspending worker deadline polling ->
+  session termination
   coupled to provider capability burn -> installed worker/session/peer
   qualification. Strict decoding refuses a provider-looking field outside the
   enrolled shape, and focused tests cover the exact route/capability/descriptor

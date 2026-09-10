@@ -303,8 +303,40 @@ pub fn execute_provider_io_job(
                 });
                 match inferred {
                     ApiResultV1::Ok {
-                        response: ProviderResponseV1::InferenceAvailable { dispatch, .. },
-                    } => call(ProviderRequestV1::FetchInference { dispatch }),
+                        response:
+                            ProviderResponseV1::InferenceAvailable {
+                                dispatch,
+                                exact_event_stream,
+                                byte_length,
+                                protocol_terminal,
+                            },
+                    } => {
+                        let fetched = call(ProviderRequestV1::FetchInference {
+                            dispatch: dispatch.clone(),
+                        });
+                        match &fetched {
+                            ApiResultV1::Ok {
+                                response:
+                                    ProviderResponseV1::Inference {
+                                        dispatch: returned_dispatch,
+                                        exact_event_stream: returned_stream,
+                                        event_stream,
+                                        protocol_terminal: returned_terminal,
+                                        ..
+                                    },
+                            } if *returned_dispatch == dispatch
+                                && *returned_stream == exact_event_stream
+                                && u64::try_from(event_stream.len()) == Ok(byte_length)
+                                && *returned_terminal == protocol_terminal =>
+                            {
+                                fetched
+                            }
+                            _ => ApiResultV1::error(
+                                ApiErrorCodeV1::Indeterminate,
+                                "provider fetch did not match available custody",
+                            ),
+                        }
+                    }
                     other => other,
                 }
             }
@@ -3459,6 +3491,43 @@ mod tests {
             }
         ));
         assert_eq!(calls.len(), 3);
+        let mut phase = 0;
+        let mismatched_fetch = execute_provider_io_job(io_job.clone(), |request| {
+            phase += 1;
+            match request {
+                ProviderRequestV1::RegisterCapability { capability, .. } => ApiResultV1::Ok {
+                    response: ProviderResponseV1::CapabilityRegistered {
+                        capability: capability.id(),
+                    },
+                },
+                ProviderRequestV1::Infer { .. } => ApiResultV1::Ok {
+                    response: ProviderResponseV1::InferenceAvailable {
+                        dispatch: Digest::hash_bytes(b"dispatch"),
+                        exact_event_stream: Digest::hash_bytes(b"stream"),
+                        byte_length: 6,
+                        protocol_terminal: true,
+                    },
+                },
+                ProviderRequestV1::FetchInference { dispatch } => ApiResultV1::Ok {
+                    response: ProviderResponseV1::Inference {
+                        dispatch,
+                        exact_event_stream: Digest::hash_bytes(b"different-stream"),
+                        event_stream: OpaqueBytesV1::new(b"different-stream".to_vec()),
+                        sanitized_headers: Vec::new(),
+                        protocol_terminal: true,
+                    },
+                },
+                _ => panic!("unexpected provider request"),
+            }
+        });
+        assert_eq!(phase, 3);
+        assert!(matches!(
+            mismatched_fetch.result,
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::Indeterminate,
+                ..
+            }
+        ));
         let ProviderIoWorkerV1 {
             jobs,
             completions,
