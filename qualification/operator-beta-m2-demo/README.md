@@ -78,3 +78,15 @@ VMs. The unavailable case expects `CAPTURE-FAILED.json`, verifies the explicit
 unavailable reason, and reports that negative check as passed. The launch case
 asserts three deliberate start requests resolve to one fixture occurrence;
 real one-intent custody still requires the Docket owner qualification.
+
+For a human review of the same explicitly synthetic projection, keep one
+bounded loopback fixture visible instead of invoking the headless capture:
+
+```bash
+python3 -B qualification/operator-beta-m2-demo/display_fixture_server.py refused \
+  --port 8767 --max-seconds 7200
+```
+
+Open `http://127.0.0.1:8767/`. Stop that exact process before selecting another
+case. This server is labeled `DISPLAY_FIXTURE`, never loads Docket, and cannot
+establish integration or human-usability acceptance by itself.
