@@ -26,7 +26,12 @@ def main() -> None:
     timer = threading.Timer(args.max_seconds, server.shutdown)
     timer.daemon = True
     timer.start()
-    signal.signal(signal.SIGTERM, lambda _signum, _frame: server.shutdown())
+    # BaseServer.shutdown must run outside the serve_forever thread. A signal
+    # handler executes on the main thread here, so delegate the bounded stop.
+    signal.signal(
+        signal.SIGTERM,
+        lambda _signum, _frame: threading.Thread(target=server.shutdown, daemon=True).start(),
+    )
     print(
         f"DISPLAY_FIXTURE case={args.case} url={server.origin}/ "
         f"max_seconds={args.max_seconds}",
