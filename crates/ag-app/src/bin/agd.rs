@@ -3,23 +3,25 @@
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{
-    Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
+    sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError,
 };
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ag_app::agd::{AgdCoreV1, ProviderIoWorkerV1, spawn_provider_io_worker};
+use ag_app::agd::{
+    spawn_provider_io_worker, AgdCoreV1, AgdError, ProviderIoOperationV1, ProviderIoWorkerV1,
+};
 use ag_app::api::{
     AgdRequestV1, AgdResponseV1, ApiErrorCodeV1, ApiResultV1, ProviderRequestV1,
     ProviderResponseV1, WorkerProviderRequestV1, WorkerProviderResponseV1,
 };
-use ag_app::config::{AgdConfigV1, LoadedConfigV1, load_config_with_identity};
+use ag_app::config::{load_config_with_identity, AgdConfigV1, LoadedConfigV1};
 use ag_app::rpc_auth::{RpcPeerEnrollmentV1, RpcReplayGuardV1, RpcSignerV1, SystemRpcClockV1};
-use ag_app::runtime::{ComponentActivationContextV1, open_component_store};
+use ag_app::runtime::{open_component_store, ComponentActivationContextV1};
 use ag_app::signed_transport::{
-    AcceptedSignedRequestV1, SocketPeerCheckV1, accept_signed_request, call_signed_with_timeout,
-    write_signed_response,
+    accept_signed_request, call_signed_with_timeout, write_signed_response,
+    AcceptedSignedRequestV1, SocketPeerCheckV1,
 };
 use ag_app::transport::bind_socket;
 use ag_protocol::FrameCodec;
@@ -158,6 +160,9 @@ fn main() -> anyhow::Result<()> {
     };
     let socket_display = config.control_socket.display().to_string();
     let mut governor = AgdCoreV1::new(store, config, Arc::clone(&signer), Arc::clone(&replay))?;
+    if provider_io.is_some() {
+        governor.attach_provider_runtime()?;
+    }
     recover_startup(&mut governor)?;
 
     let (accepted_sender, accepted_receiver) = sync_channel(CONTROL_ACCEPT_QUEUE);
@@ -223,6 +228,10 @@ fn pump_provider_io(
     while let Ok(completion) = provider.completions.try_recv() {
         let session = completion.job.session.clone();
         let attempt = completion.job.attempt.clone();
+        if matches!(completion.job.operation, ProviderIoOperationV1::Terminate) {
+            governor.reconcile_worker_provider_termination(completion, current_unix_ms()?)?;
+            continue;
+        }
         let failure = match &completion.result {
             ApiResultV1::Error {
                 code,
@@ -231,9 +240,17 @@ fn pump_provider_io(
             } => Some((code.clone(), message.clone(), correlation.clone())),
             ApiResultV1::Ok { .. } => None,
         };
-        if let Some(ack) =
-            governor.reconcile_provider_io_completion(completion, current_unix_ms()?)?
-        {
+        let reconciled =
+            governor.reconcile_provider_io_completion(completion.clone(), current_unix_ms()?);
+        let followup = match reconciled {
+            Ok(followup) => followup,
+            Err(AgdError::WorkerRuntimeMissing | AgdError::WorkerProofMismatch) => {
+                governor.record_fenced_provider_completion(&completion, current_unix_ms()?)?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(ack) = followup {
             provider.jobs.try_send(ack)?;
         } else if let Some((code, message, correlation)) = failure {
             governor.queue_worker_provider_response(
@@ -247,6 +264,18 @@ fn pump_provider_io(
         } else {
             let response = governor.worker_provider_response(&session, &attempt)?;
             governor.queue_worker_provider_response(&session, &ApiResultV1::Ok { response })?;
+        }
+    }
+    while let Some(job) = governor.take_pending_provider_job() {
+        match provider.jobs.try_send(job) {
+            Ok(()) => {}
+            Err(TrySendError::Full(job)) => {
+                governor.restore_pending_provider_job(job);
+                break;
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                anyhow::bail!("the bounded provider I/O worker disconnected")
+            }
         }
     }
     for (session, request) in governor.poll_worker_provider_frames()? {

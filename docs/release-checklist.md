@@ -97,29 +97,29 @@ Known blockers in the current tree include:
   production/high-assurance configuration; the packaged agd unit cannot host
   it, and production worker/check wrappers, sandbox attestation, and one-shot
   launch-record consumption do not exist, so both templates remain withheld;
-- providerd is signed-agd-proxy-only. The implemented worker slice remains
-  offline rather than treating a partial provider path as usable;
-  this is a concrete multi-boundary prerequisite, not an endpoint-adapter gap.
+- providerd is signed-agd-proxy-only. Provider-enabled worker launch is
+  available only when the daemon has attached its enrolled bounded provider
+  I/O worker; library callers without that runtime still refuse before process
+  preparation.
   The first source prerequisite now exists: `WorkerProfileConfigV1` can enroll
   one exact provider-policy digest, envelope and budget; the session constructors
   derive the matching constrained principal, capability and provider-channel
   descriptor identities. The launcher now has a separately invoked primitive
   that installs directionally constrained pipes on exact worker fds 5 and 6,
   binds them into launch evidence, and retains the opposite endpoints for the
-  governor. The ordinary agd launch still deliberately refuses that profile
-  before process preparation: no daemon path consumes those endpoints, and
-  `AgdRequestV1` still has no worker-bound infer/fetch/acknowledge operations.
+  governor.
   Exact nonblocking bounded framing, canonical request/response custody,
   per-attempt request-before-dispatch state, closed dispatch/fetch/ack
   reconciliation, and mandatory per-transition active-session/capability
   reload now exist as source primitives. A capacity-one I/O queue, signed
   Register/Infer/Fetch worker, canonical fd frame pump, and main-thread exact
-  response/ack custody commit are wired into the daemon while launch remains
-  refused. The remaining release edge is terminal lifecycle composition:
-  timeout, cancellation, normal exit, and restart recovery must all submit and
-  reconcile `TerminateSession` before worker cleanup becomes complete. Only
-  after that edge has deterministic controls may provider-enabled launch be
-  released. This keeps provider I/O from suspending worker deadline polling ->
+  response/ack custody commit are wired into the daemon. Terminal lifecycle
+  composition durably records process cleanup separately, submits an exact
+  session/principal/capability-bound `TerminateSession`, retains indeterminate
+  testimony without completing cleanup, and completes the aggregate cleanup
+  only after the provider's terminal receipt. Startup recovery resumes the same
+  termination record, and late inference results are recorded as fenced rather
+  than admitted. This keeps provider I/O from suspending worker deadline polling ->
   session termination
   coupled to provider capability burn -> installed worker/session/peer
   qualification. Strict decoding refuses a provider-looking field outside the

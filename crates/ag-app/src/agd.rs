@@ -1,19 +1,19 @@
 //! Governor-side calculus replay and broker forwarding.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Cursor;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ag_effect::{EFFECT_SCHEMA_V1, EffectIntentV1, ProposalIntentV1, TargetId};
+use ag_effect::{EffectIntentV1, ProposalIntentV1, TargetId, EFFECT_SCHEMA_V1};
 use ag_kernel::{
-    AdmissionCommit, CapacityBook, CapacityBookEntry, CapacityClaim, CapacityRef, CustodyBook,
-    CustodyBookEntry, CustodyClaim, CustodyRef, EffectCrossingClaim, EffectCrossingRefusal,
-    EffectCrossingWitness, FailureEvidence, NativeJudgment, NonEmpty, ObligationBook,
-    ObligationBookEntry, ObligationClaim, ObligationRef, StandingBook, StandingBookEntry,
-    StandingClaim, StandingRef, evaluate_effect_crossing, reconstruct_effect_authority,
+    evaluate_effect_crossing, reconstruct_effect_authority, AdmissionCommit, CapacityBook,
+    CapacityBookEntry, CapacityClaim, CapacityRef, CustodyBook, CustodyBookEntry, CustodyClaim,
+    CustodyRef, EffectCrossingClaim, EffectCrossingRefusal, EffectCrossingWitness, FailureEvidence,
+    NativeJudgment, NonEmpty, ObligationBook, ObligationBookEntry, ObligationClaim, ObligationRef,
+    StandingBook, StandingBookEntry, StandingClaim, StandingRef,
 };
 use ag_primitives::{
     AuthorityDomain, BookLocalId, CgroupIdentity, Digest, Epoch, HostCredentialObservationV1,
@@ -25,9 +25,10 @@ use ag_protocol::{FrameCodec, RequestId};
 use ag_session::{
     AdmittedDescriptorV1, BatchSessionSpecV1, DescriptorAccessV1, DescriptorPurposeV1,
     IsolationEvidenceV1, ProviderRequestCustodyV1, ProviderResponseCustodyV1, SecurityProfileV1,
-    SessionError, SourceSnapshotV1, WorkerBindingV1, WorkerCandidateBrokerOutcomeV1,
-    WorkerCandidateCustodyStateV1, WorkerCandidateRefusalCodeV1, WorkerIngressContextV1,
-    WorkerSessionRecordV1, WorkerTerminationReasonV1, WorkspaceModeV1,
+    SessionError, SourceSnapshotV1, WorkerAuthorityStateV1, WorkerBindingV1,
+    WorkerCandidateBrokerOutcomeV1, WorkerCandidateCustodyStateV1, WorkerCandidateRefusalCodeV1,
+    WorkerCleanupStateV1, WorkerIngressContextV1, WorkerSessionRecordV1, WorkerTerminationReasonV1,
+    WorkspaceModeV1,
 };
 use ag_store::{BlobDescriptorV1, NewEventV1, Store};
 use base64::Engine as _;
@@ -35,29 +36,29 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::api::{
-    AgdRequestV1, AgdResponseV1, ApiErrorCodeV1, ApiResultV1, ArtifactTransferV1,
-    EffectProposalRequestV1, EffectProposalResponseV1, GovernedProposalIngressV1, HealthV1,
-    OpaqueBytesV1, ProposalIngressProofV1, ProviderRequestV1, ProviderResponseV1,
-    WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1, WorkerCandidateRequestV1,
-    WorkerCandidateSourceProofV1, WorkerProviderRequestV1, WorkerProviderResponseV1,
-    worker_candidate_ingress_proof_digest,
+    worker_candidate_ingress_proof_digest, AgdRequestV1, AgdResponseV1, ApiErrorCodeV1,
+    ApiResultV1, ArtifactTransferV1, EffectProposalRequestV1, EffectProposalResponseV1,
+    GovernedProposalIngressV1, HealthV1, OpaqueBytesV1, ProposalIngressProofV1, ProviderRequestV1,
+    ProviderResponseV1, WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1,
+    WorkerCandidateRequestV1, WorkerCandidateSourceProofV1, WorkerProviderRequestV1,
+    WorkerProviderResponseV1,
 };
 use crate::config::{AgdConfigV1, WorkerCandidateEffectV1, WorkerProfileConfigV1};
 use crate::peer::signed_principal_chain;
 use crate::rpc_auth::{
-    EphemeralRpcPrivateKeyV1, RpcKeyIdV1, RpcPeerEnrollmentV1, RpcPeerKeyPolicyV1,
-    RpcReplayGuardV1, RpcSignerV1, SignedServerChallengeV1, SystemRpcClockV1,
-    VerifiedRpcPrincipalV1, candidate_ingress_key_identity, verify_forwarded_signed_request,
-    verify_forwarded_signed_request_bindings,
+    candidate_ingress_key_identity, verify_forwarded_signed_request,
+    verify_forwarded_signed_request_bindings, EphemeralRpcPrivateKeyV1, RpcKeyIdV1,
+    RpcPeerEnrollmentV1, RpcPeerKeyPolicyV1, RpcReplayGuardV1, RpcSignerV1,
+    SignedServerChallengeV1, SystemRpcClockV1, VerifiedRpcPrincipalV1,
 };
-use crate::signed_transport::{AcceptedSignedRequestV1, SocketPeerCheckV1, call_signed};
+use crate::signed_transport::{call_signed, AcceptedSignedRequestV1, SocketPeerCheckV1};
 use crate::worker::{
-    AdmittedWorkerInputV1, PreparedWorkerLaunchV1, WorkerLaunchError, WorkerLaunchReleaseV1,
-    WorkerProcessV1, WorkerProviderChannelV1, prepare_worker_launch,
+    prepare_worker_launch, AdmittedWorkerInputV1, PreparedWorkerLaunchV1, WorkerLaunchError,
+    WorkerLaunchReleaseV1, WorkerProcessV1, WorkerProviderChannelV1,
 };
 use crate::worker_protocol::{
-    CANDIDATE_BOOTSTRAP_PURPOSE, CANDIDATE_INGRESS_CREDENTIAL_PURPOSE, WorkerProtocolError,
-    decode_exact_signed_worker_candidate,
+    decode_exact_signed_worker_candidate, WorkerProtocolError, CANDIDATE_BOOTSTRAP_PURPOSE,
+    CANDIDATE_INGRESS_CREDENTIAL_PURPOSE,
 };
 use crate::worker_session::{
     WorkerSessionStoreError, WorkerSessionStoreV1, WorkerStartupRecoveryReportV1,
@@ -221,6 +222,48 @@ pub enum WorkerProviderAttemptStateV1 {
         response: ProviderResponseCustodyV1,
         /// Provider-owned acknowledgment receipt.
         provider_receipt: Digest,
+    },
+}
+
+/// Durable governor-side progress for revoking one terminal worker's provider
+/// grants. Process cleanup and provider revocation remain separate evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerProviderTerminationRecordV1 {
+    /// Exact schema.
+    pub schema: String,
+    /// Permanently tombstoned session.
+    pub session: SessionId,
+    /// Principal whose grants are being revoked.
+    pub worker_principal: PrincipalId,
+    /// Exact capability admitted with the session.
+    pub capability: InferenceCapabilityV1,
+    /// Receipt proving the retained process is no longer live.
+    pub process_cleanup_receipt: Digest,
+    /// Provider-revocation lifecycle.
+    pub state: WorkerProviderTerminationStateV1,
+}
+
+/// Closed, crash-reconcilable provider-revocation states.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerProviderTerminationStateV1 {
+    /// Revocation is required and may be submitted idempotently.
+    Requested,
+    /// Transport returned an explicitly unavailable/uncertain observation.
+    /// Cleanup remains pending and the same session may be reconciled later.
+    Indeterminate {
+        /// Typed provider/API disposition.
+        code: ApiErrorCodeV1,
+        /// Bounded diagnostic text, never authority.
+        message: String,
+        /// Optional transport correlation evidence.
+        correlation: String,
+    },
+    /// Provider daemon durably burned all grants for this session.
+    Terminated {
+        /// Exact provider-owned revocation receipt.
+        receipt: Digest,
     },
 }
 
@@ -592,6 +635,8 @@ pub struct AgdCoreV1 {
     rpc_signer: Arc<RpcSignerV1>,
     rpc_replay: Arc<RpcReplayGuardV1>,
     active_workers: BTreeMap<SessionId, ActiveWorkerRuntimeV1>,
+    pending_provider_jobs: VecDeque<ProviderIoJobV1>,
+    provider_runtime_attached: bool,
     worker_recovery_required: bool,
 }
 
@@ -619,8 +664,20 @@ impl AgdCoreV1 {
             rpc_signer,
             rpc_replay,
             active_workers: BTreeMap::new(),
+            pending_provider_jobs: VecDeque::new(),
+            provider_runtime_attached: false,
             worker_recovery_required: false,
         })
+    }
+
+    /// Marks the bounded provider I/O worker as attached to this core. This is
+    /// process-local execution testimony, not durable provider readiness.
+    pub fn attach_provider_runtime(&mut self) -> Result<(), AgdError> {
+        if self.config.providerd_peer.is_none() {
+            return Err(AgdError::WorkerProviderRuntimeUnavailable);
+        }
+        self.provider_runtime_attached = true;
+        Ok(())
     }
 
     /// Permanently retires every prepared or active worker principal found
@@ -633,7 +690,88 @@ impl AgdCoreV1 {
     /// trusted clock cannot be represented, or the store cannot commit the
     /// restart tombstones.
     pub fn recover_worker_sessions(&mut self) -> Result<WorkerStartupRecoveryReportV1, AgdError> {
-        Ok(WorkerSessionStoreV1::new(&mut self.store).recover_startup(now_u64()?)?)
+        let now = now_u64()?;
+        let report = WorkerSessionStoreV1::new(&mut self.store).recover_startup(now)?;
+        self.prepare_pending_provider_terminations(now)?;
+        Ok(report)
+    }
+
+    /// Returns one locally queued provider transition. Removing it from this
+    /// queue does not change durable state; a daemon may restore it if bounded
+    /// transport backpressure prevents submission.
+    pub fn take_pending_provider_job(&mut self) -> Option<ProviderIoJobV1> {
+        self.pending_provider_jobs.pop_front()
+    }
+
+    /// Restores one unsubmitted transition at the front of the bounded local
+    /// scheduler queue without asserting that any provider operation occurred.
+    pub fn restore_pending_provider_job(&mut self, job: ProviderIoJobV1) {
+        self.pending_provider_jobs.push_front(job);
+    }
+
+    fn prepare_pending_provider_terminations(&mut self, now_unix_ms: u64) -> Result<(), AgdError> {
+        let mut cursor = None;
+        loop {
+            let entities =
+                self.store
+                    .entity_ids_after("worker-session:", cursor.as_deref(), 128)?;
+            if entities.is_empty() {
+                return Ok(());
+            }
+            cursor = entities.last().cloned();
+            for entity in entities {
+                let Some(loaded) = self
+                    .store
+                    .materialized_state::<WorkerSessionRecordV1>(&entity)?
+                else {
+                    continue;
+                };
+                if !matches!(
+                    loaded.state.authority,
+                    WorkerAuthorityStateV1::Tombstoned {
+                        cleanup: WorkerCleanupStateV1::Pending,
+                        ..
+                    }
+                ) {
+                    continue;
+                }
+                let termination_entity =
+                    worker_provider_termination_entity(&loaded.state.spec.session)?;
+                let existing_termination = self
+                    .store
+                    .materialized_state::<WorkerProviderTerminationRecordV1>(&termination_entity)?;
+                let receipt = if let Some(existing) = existing_termination {
+                    validate_worker_provider_termination_record(
+                        &termination_entity,
+                        &existing.state,
+                    )?;
+                    existing.state.process_cleanup_receipt
+                } else {
+                    Digest::from_serializable(&(
+                        "ag.worker-restart-process-absence/v1",
+                        &loaded.state.spec.session,
+                        &loaded.state.authority,
+                    ))?
+                };
+                if let Some(job) = self.prepare_worker_provider_termination(
+                    &loaded.state.spec.session,
+                    receipt,
+                    now_unix_ms,
+                )? {
+                    self.queue_provider_job_once(job);
+                }
+            }
+        }
+    }
+
+    fn queue_provider_job_once(&mut self, job: ProviderIoJobV1) {
+        if !self
+            .pending_provider_jobs
+            .iter()
+            .any(|existing| *existing == job)
+        {
+            self.pending_provider_jobs.push_back(job);
+        }
     }
 
     /// Loads one historical or live worker record directly from governor
@@ -961,6 +1099,317 @@ impl AgdCoreV1 {
         }
     }
 
+    /// Records exact late provider testimony after the worker principal was
+    /// durably fenced. It cannot create response custody or reopen execution.
+    pub fn record_fenced_provider_completion(
+        &mut self,
+        completion: &ProviderIoCompletionV1,
+        now_unix_ms: u64,
+    ) -> Result<(), AgdError> {
+        if matches!(completion.job.operation, ProviderIoOperationV1::Terminate) {
+            return Err(AgdError::WorkerProviderAttemptMismatch);
+        }
+        let session = WorkerSessionStoreV1::new(&mut self.store)
+            .load_session(&completion.job.session)?
+            .record;
+        if !matches!(session.authority, WorkerAuthorityStateV1::Tombstoned { .. })
+            || session.spec.worker.principal.id() != completion.job.worker_principal
+            || session.spec.provider_capability.as_ref() != Some(&completion.job.capability)
+        {
+            return Err(AgdError::WorkerProviderAttemptMismatch);
+        }
+        let entity =
+            worker_provider_attempt_entity(&completion.job.session, &completion.job.attempt)?;
+        let loaded = self
+            .store
+            .materialized_state::<WorkerProviderAttemptRecordV1>(&entity)?
+            .ok_or(AgdError::WorkerProviderAttemptNotFound)?;
+        validate_worker_provider_attempt_record(&entity, &loaded.state)?;
+        if loaded.state.worker_principal != completion.job.worker_principal
+            || loaded.state.request.capability_id != completion.job.capability.id()
+        {
+            return Err(AgdError::WorkerProviderAttemptMismatch);
+        }
+        let testimony = Digest::from_serializable(&completion.result)?;
+        self.store.append_event(
+            NewEventV1 {
+                event_id: uuid::Uuid::new_v4().to_string(),
+                entity_id: entity,
+                event_kind: "worker-provider.late-result-observed.v1".to_owned(),
+                occurred_at_unix_ms: i64::try_from(now_unix_ms)
+                    .map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
+                payload: (
+                    &completion.job.session,
+                    &completion.job.attempt,
+                    testimony,
+                    "fenced-not-admitted",
+                ),
+            },
+            &loaded.state,
+            loaded.revision,
+        )?;
+        Ok(())
+    }
+
+    /// Durably records that a tombstoned worker requires provider revocation,
+    /// then returns the exact idempotent termination job. The retained process
+    /// must already have exited; its receipt is kept distinct from provider
+    /// testimony until both can be aggregated by `CompleteCleanup`.
+    pub fn prepare_worker_provider_termination(
+        &mut self,
+        session: &SessionId,
+        process_cleanup_receipt: Digest,
+        now_unix_ms: u64,
+    ) -> Result<Option<ProviderIoJobV1>, AgdError> {
+        let loaded = WorkerSessionStoreV1::new(&mut self.store).load_session(session)?;
+        let WorkerAuthorityStateV1::Tombstoned {
+            tombstone,
+            cleanup: WorkerCleanupStateV1::Pending,
+            ..
+        } = &loaded.record.authority
+        else {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        };
+        if tombstone.session_id != *session
+            || tombstone.principal_id != loaded.record.spec.worker.principal.id()
+        {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        }
+        let Some(capability) = loaded.record.spec.provider_capability.clone() else {
+            WorkerSessionStoreV1::new(&mut self.store).complete_cleanup(
+                session,
+                process_cleanup_receipt,
+                now_unix_ms,
+            )?;
+            return Ok(None);
+        };
+        if capability.session_id != *session
+            || capability.worker_principal != tombstone.principal_id
+        {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        }
+        let entity = worker_provider_termination_entity(session)?;
+        let record = if let Some(existing) = self
+            .store
+            .materialized_state::<WorkerProviderTerminationRecordV1>(&entity)?
+        {
+            validate_worker_provider_termination_record(&entity, &existing.state)?;
+            if existing.state.capability != capability
+                || existing.state.process_cleanup_receipt != process_cleanup_receipt
+            {
+                return Err(AgdError::WorkerProviderTerminationMismatch);
+            }
+            existing.state
+        } else {
+            let record = WorkerProviderTerminationRecordV1 {
+                schema: "ag.worker-provider-termination/v1".to_owned(),
+                session: session.clone(),
+                worker_principal: tombstone.principal_id.clone(),
+                capability,
+                process_cleanup_receipt,
+                state: WorkerProviderTerminationStateV1::Requested,
+            };
+            self.store.append_event(
+                NewEventV1 {
+                    event_id: uuid::Uuid::new_v4().to_string(),
+                    entity_id: entity.clone(),
+                    event_kind: "worker-provider.termination-requested.v1".to_owned(),
+                    occurred_at_unix_ms: i64::try_from(now_unix_ms)
+                        .map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
+                    payload: (
+                        &record.session,
+                        &record.worker_principal,
+                        record.capability.id(),
+                    ),
+                },
+                &record,
+                0,
+            )?;
+            record
+        };
+        match record.state {
+            WorkerProviderTerminationStateV1::Terminated { .. } => {
+                self.complete_worker_provider_cleanup(&record, now_unix_ms)?;
+                Ok(None)
+            }
+            WorkerProviderTerminationStateV1::Requested
+            | WorkerProviderTerminationStateV1::Indeterminate { .. } => {
+                Ok(Some(worker_provider_termination_job(record)?))
+            }
+        }
+    }
+
+    /// Revalidates provider termination testimony against the exact durable
+    /// tombstone and capability. An indeterminate observation is retained but
+    /// cannot complete cleanup; an exact terminal receipt can.
+    pub fn reconcile_worker_provider_termination(
+        &mut self,
+        completion: ProviderIoCompletionV1,
+        now_unix_ms: u64,
+    ) -> Result<(), AgdError> {
+        if !matches!(completion.job.operation, ProviderIoOperationV1::Terminate) {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        }
+        let entity = worker_provider_termination_entity(&completion.job.session)?;
+        let loaded = self
+            .store
+            .materialized_state::<WorkerProviderTerminationRecordV1>(&entity)?
+            .ok_or(AgdError::WorkerProviderTerminationNotFound)?;
+        let mut record = loaded.state;
+        validate_worker_provider_termination_record(&entity, &record)?;
+        if completion.job.worker_principal != record.worker_principal
+            || completion.job.capability != record.capability
+            || completion.job.attempt != worker_provider_termination_attempt(&record.session)?
+        {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        }
+        if let (
+            WorkerProviderTerminationStateV1::Terminated { receipt: existing },
+            ApiResultV1::Ok {
+                response: ProviderResponseV1::SessionTerminated { receipt },
+            },
+        ) = (&record.state, &completion.result)
+        {
+            if existing != receipt {
+                return Err(AgdError::WorkerProviderTerminationMismatch);
+            }
+            self.validate_tombstoned_provider_binding(&record)?;
+            return Ok(());
+        }
+        self.revalidate_terminal_provider_binding(&record)?;
+        match completion.result {
+            ApiResultV1::Ok {
+                response: ProviderResponseV1::SessionTerminated { receipt },
+            } => {
+                match &record.state {
+                    WorkerProviderTerminationStateV1::Terminated { receipt: existing }
+                        if *existing == receipt => {}
+                    WorkerProviderTerminationStateV1::Terminated { .. } => {
+                        return Err(AgdError::WorkerProviderTerminationMismatch);
+                    }
+                    _ => {
+                        record.state = WorkerProviderTerminationStateV1::Terminated {
+                            receipt: receipt.clone(),
+                        };
+                        self.store.append_event(
+                            NewEventV1 {
+                                event_id: uuid::Uuid::new_v4().to_string(),
+                                entity_id: entity,
+                                event_kind: "worker-provider.session-terminated.v1".to_owned(),
+                                occurred_at_unix_ms: i64::try_from(now_unix_ms)
+                                    .map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
+                                payload: (&record.session, &receipt),
+                            },
+                            &record,
+                            loaded.revision,
+                        )?;
+                    }
+                }
+                self.complete_worker_provider_cleanup(&record, now_unix_ms)
+            }
+            ApiResultV1::Error {
+                code,
+                message,
+                correlation,
+            } => {
+                if message.len() > 1024 {
+                    return Err(AgdError::WorkerProviderTerminationMismatch);
+                }
+                if matches!(
+                    record.state,
+                    WorkerProviderTerminationStateV1::Terminated { .. }
+                ) {
+                    return Err(AgdError::WorkerProviderTerminationMismatch);
+                }
+                record.state = WorkerProviderTerminationStateV1::Indeterminate {
+                    code: code.clone(),
+                    message: message.clone(),
+                    correlation: correlation.clone(),
+                };
+                self.store.append_event(
+                    NewEventV1 {
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        entity_id: entity,
+                        event_kind: "worker-provider.termination-indeterminate.v1".to_owned(),
+                        occurred_at_unix_ms: i64::try_from(now_unix_ms)
+                            .map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
+                        payload: (&record.session, &code, &message, &correlation),
+                    },
+                    &record,
+                    loaded.revision,
+                )?;
+                Ok(())
+            }
+            _ => Err(AgdError::WorkerProviderTerminationMismatch),
+        }
+    }
+
+    fn revalidate_terminal_provider_binding(
+        &mut self,
+        record: &WorkerProviderTerminationRecordV1,
+    ) -> Result<(), AgdError> {
+        let session = WorkerSessionStoreV1::new(&mut self.store)
+            .load_session(&record.session)?
+            .record;
+        let WorkerAuthorityStateV1::Tombstoned {
+            tombstone,
+            cleanup: WorkerCleanupStateV1::Pending,
+            ..
+        } = &session.authority
+        else {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        };
+        if tombstone.session_id != record.session
+            || tombstone.principal_id != record.worker_principal
+            || session.spec.provider_capability.as_ref() != Some(&record.capability)
+        {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        }
+        Ok(())
+    }
+
+    fn validate_tombstoned_provider_binding(
+        &mut self,
+        record: &WorkerProviderTerminationRecordV1,
+    ) -> Result<(), AgdError> {
+        let session = WorkerSessionStoreV1::new(&mut self.store)
+            .load_session(&record.session)?
+            .record;
+        let WorkerAuthorityStateV1::Tombstoned { tombstone, .. } = &session.authority else {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        };
+        if tombstone.session_id != record.session
+            || tombstone.principal_id != record.worker_principal
+            || session.spec.provider_capability.as_ref() != Some(&record.capability)
+        {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        }
+        Ok(())
+    }
+
+    fn complete_worker_provider_cleanup(
+        &mut self,
+        record: &WorkerProviderTerminationRecordV1,
+        now_unix_ms: u64,
+    ) -> Result<(), AgdError> {
+        let WorkerProviderTerminationStateV1::Terminated { receipt } = &record.state else {
+            return Err(AgdError::WorkerProviderTerminationMismatch);
+        };
+        self.revalidate_terminal_provider_binding(record)?;
+        let aggregate = Digest::from_serializable(&(
+            "ag.worker-process-provider-cleanup/v1",
+            &record.session,
+            &record.process_cleanup_receipt,
+            receipt,
+        ))?;
+        WorkerSessionStoreV1::new(&mut self.store).complete_cleanup(
+            &record.session,
+            aggregate,
+            now_unix_ms,
+        )?;
+        Ok(())
+    }
+
     /// Launches one configured offline worker behind a durable principal fence.
     ///
     /// The child is prepared behind a descriptor gate. Its exact executable,
@@ -1001,11 +1450,9 @@ impl AgdCoreV1 {
             .find(|profile| profile.profile_id == profile_id)
             .cloned()
             .ok_or_else(|| WorkerLaunchError::UnknownProfile(profile_id.to_owned()))?;
-        if profile.provider_access.is_some() {
-            // The policy and session capability can be constructed, but the
-            // live worker request/response proxy is a separate custody
-            // boundary. Refuse before process preparation until that proxy
-            // can reload and prove the exact active session on every call.
+        if profile.provider_access.is_some() && !self.provider_runtime_attached {
+            // Do not create a provider-enabled principal unless the daemon has
+            // attached the bounded signed transport worker in this process.
             return Err(AgdError::WorkerProviderRuntimeUnavailable);
         }
         let security_profile = configured_worker_security_profile(&self.config.security_profile)?;
@@ -1162,12 +1609,13 @@ impl AgdCoreV1 {
                 self.worker_recovery_required = true;
                 return Err(AgdError::WorkerRecoveryRequired);
             };
-            if WorkerSessionStoreV1::new(&mut self.store)
-                .complete_cleanup(&session, cleanup, cleanup_at)
-                .is_err()
-            {
-                self.worker_recovery_required = true;
-                return Err(AgdError::WorkerRecoveryRequired);
+            match self.prepare_worker_provider_termination(&session, cleanup, cleanup_at) {
+                Ok(Some(job)) => self.queue_provider_job_once(job),
+                Ok(None) => {}
+                Err(_) => {
+                    self.worker_recovery_required = true;
+                    return Err(AgdError::WorkerRecoveryRequired);
+                }
             }
             return Err(error.into());
         }
@@ -1243,11 +1691,11 @@ impl AgdCoreV1 {
             release.abort();
         }
         process.terminate()?;
-        WorkerSessionStoreV1::new(&mut self.store).complete_cleanup(
-            session,
-            cleanup_receipt,
-            now_u64()?,
-        )?;
+        if let Some(job) =
+            self.prepare_worker_provider_termination(session, cleanup_receipt, now_u64()?)?
+        {
+            self.queue_provider_job_once(job);
+        }
         Ok(())
     }
 
@@ -1426,11 +1874,9 @@ impl AgdCoreV1 {
             &reason,
             terminal_at,
         ))?;
-        WorkerSessionStoreV1::new(&mut self.store).complete_cleanup(
-            session,
-            cleanup,
-            now_u64()?,
-        )?;
+        if let Some(job) = self.prepare_worker_provider_termination(session, cleanup, now_u64()?)? {
+            self.queue_provider_job_once(job);
+        }
         Ok(())
     }
 
@@ -1614,11 +2060,9 @@ impl AgdCoreV1 {
             &record.authority,
         ))?;
         process.terminate()?;
-        WorkerSessionStoreV1::new(&mut self.store).complete_cleanup(
-            session,
-            receipt,
-            now_u64()?,
-        )?;
+        if let Some(job) = self.prepare_worker_provider_termination(session, receipt, now_u64()?)? {
+            self.queue_provider_job_once(job);
+        }
         Ok(())
     }
 
@@ -2728,6 +3172,50 @@ fn worker_provider_attempt_entity(
     ))
 }
 
+fn worker_provider_termination_entity(session: &SessionId) -> Result<String, AgdError> {
+    Ok(format!(
+        "worker-provider-termination:{}",
+        Digest::from_serializable(&("ag.worker-provider-termination-identity/v1", session))?
+            .as_str()
+    ))
+}
+
+fn worker_provider_termination_attempt(session: &SessionId) -> Result<RequestId, AgdError> {
+    RequestId::new(format!(
+        "terminate-{}",
+        Digest::from_serializable(&("ag.worker-provider-termination-attempt/v1", session))?
+            .as_str()
+            .trim_start_matches("sha256:")
+    ))
+    .map_err(AgdError::from)
+}
+
+fn validate_worker_provider_termination_record(
+    entity: &str,
+    record: &WorkerProviderTerminationRecordV1,
+) -> Result<(), AgdError> {
+    if record.schema != "ag.worker-provider-termination/v1"
+        || entity != worker_provider_termination_entity(&record.session)?
+        || record.capability.session_id != record.session
+        || record.capability.worker_principal != record.worker_principal
+    {
+        return Err(AgdError::WorkerProviderTerminationMismatch);
+    }
+    Ok(())
+}
+
+fn worker_provider_termination_job(
+    record: WorkerProviderTerminationRecordV1,
+) -> Result<ProviderIoJobV1, AgdError> {
+    Ok(ProviderIoJobV1 {
+        session: record.session.clone(),
+        worker_principal: record.worker_principal,
+        attempt: worker_provider_termination_attempt(&record.session)?,
+        capability: record.capability,
+        operation: ProviderIoOperationV1::Terminate,
+    })
+}
+
 fn validate_worker_provider_attempt_record(
     entity: &str,
     record: &WorkerProviderAttemptRecordV1,
@@ -3210,6 +3698,12 @@ pub enum AgdError {
     /// Named provider attempt is absent from durable custody.
     #[error("worker provider attempt was not found")]
     WorkerProviderAttemptNotFound,
+    /// Provider termination testimony did not bind the durable tombstone.
+    #[error("worker provider termination does not match durable custody")]
+    WorkerProviderTerminationMismatch,
+    /// Named provider termination record is absent from durable custody.
+    #[error("worker provider termination was not found")]
+    WorkerProviderTerminationNotFound,
     /// Provider I/O queue has no bounded capacity.
     #[error("worker provider I/O queue capacity is invalid")]
     WorkerProviderQueueInvalid,
@@ -3577,11 +4071,9 @@ mod tests {
         lifecycle
             .reconcile_dispatch_available(dispatch.clone(), stream.clone(), true)
             .expect("exact duplicate is idempotent");
-        assert!(
-            lifecycle
-                .reconcile_dispatch_available(Digest::hash_bytes(b"late"), stream.clone(), true)
-                .is_err()
-        );
+        assert!(lifecycle
+            .reconcile_dispatch_available(Digest::hash_bytes(b"late"), stream.clone(), true)
+            .is_err());
         let response =
             ProviderResponseCustodyV1::new(lifecycle.request.custody_record.clone(), stream, true)
                 .expect("response custody");
@@ -3598,5 +4090,47 @@ mod tests {
         lifecycle
             .reconcile_acknowledgment(dispatch, receipt)
             .expect("duplicate acknowledgment is idempotent");
+
+        let process_cleanup_receipt = Digest::hash_bytes(b"process-cleanup");
+        let termination = WorkerProviderTerminationRecordV1 {
+            schema: "ag.worker-provider-termination/v1".to_owned(),
+            session: capability.session_id.clone(),
+            worker_principal: capability.worker_principal.clone(),
+            capability: capability.clone(),
+            process_cleanup_receipt,
+            state: WorkerProviderTerminationStateV1::Requested,
+        };
+        let termination_entity =
+            worker_provider_termination_entity(&termination.session).expect("termination entity");
+        validate_worker_provider_termination_record(&termination_entity, &termination)
+            .expect("termination record binding");
+        let termination_job =
+            worker_provider_termination_job(termination.clone()).expect("termination job");
+        let provider_receipt = Digest::hash_bytes(b"provider-termination");
+        let completion =
+            execute_provider_io_job(termination_job.clone(), |request| match request {
+                ProviderRequestV1::TerminateSession { session }
+                    if session == termination.session =>
+                {
+                    ApiResultV1::Ok {
+                        response: ProviderResponseV1::SessionTerminated {
+                            receipt: provider_receipt.clone(),
+                        },
+                    }
+                }
+                _ => panic!("unexpected termination request"),
+            });
+        assert_eq!(completion.job, termination_job);
+        assert!(matches!(
+            completion.result,
+            ApiResultV1::Ok {
+                response: ProviderResponseV1::SessionTerminated { receipt }
+            } if receipt == provider_receipt
+        ));
+        let mut changed = termination;
+        changed.worker_principal = PrincipalId::new(Digest::hash_bytes(b"other-worker"));
+        assert!(
+            validate_worker_provider_termination_record(&termination_entity, &changed).is_err()
+        );
     }
 }

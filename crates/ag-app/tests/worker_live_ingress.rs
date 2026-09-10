@@ -10,41 +10,43 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ag_app::agd::AgdCoreV1;
+use ag_app::agd::{AgdCoreV1, ProviderIoCompletionV1, ProviderIoOperationV1};
 use ag_app::api::{
     ApiErrorCodeV1, ApiResultV1, EffectAdminRequestV1, EffectAdminResponseV1,
-    EffectProposalRequestV1, EffectProposalResponseV1, WorkerCandidateBootstrapV1,
-    WorkerCandidateRequestV1,
+    EffectProposalRequestV1, EffectProposalResponseV1, ProviderResponseV1,
+    WorkerCandidateBootstrapV1, WorkerCandidateRequestV1,
 };
 use ag_app::config::{
     AgdConfigV1, AgdLimitsV1, EffectTargetConfigV1, EffectdConfigV1, FilesystemNodeCustodyV1,
     PeerPolicyV1, SocketCustodyConfigV1, StoreConfigV1, StoreCustodyConfigV1,
     WorkerCandidateEffectV1, WorkerLauncherConfigV1, WorkerProfileConfigV1,
+    WorkerProviderProfileConfigV1,
 };
-use ag_app::effectd::{EffectBrokerV1, RefusingEffectRunnerV1, configured_catalog_identity};
+use ag_app::effectd::{configured_catalog_identity, EffectBrokerV1, RefusingEffectRunnerV1};
 use ag_app::managed_pointer::{
-    MANAGED_REPOSITORY_IDENTITY_SCHEMA_V1, MANAGED_REPOSITORY_STATE_SCHEMA_V1,
-    ManagedRepositoryIdentityEvidenceV1, ManagedRepositoryStateEvidenceV1,
-    managed_pointer_launch_profile_identity,
+    managed_pointer_launch_profile_identity, ManagedRepositoryIdentityEvidenceV1,
+    ManagedRepositoryStateEvidenceV1, MANAGED_REPOSITORY_IDENTITY_SCHEMA_V1,
+    MANAGED_REPOSITORY_STATE_SCHEMA_V1,
 };
 use ag_app::rpc_auth::{
-    RpcKeyIdV1, RpcReplayGuardV1, RpcSignerV1, RpcSigningIdentityConfigV1, SystemRpcClockV1,
-    VerifiedRpcPrincipalV1, verify_forwarded_signed_request,
+    verify_forwarded_signed_request, RpcKeyIdV1, RpcReplayGuardV1, RpcSignerV1,
+    RpcSigningIdentityConfigV1, SystemRpcClockV1, VerifiedRpcPrincipalV1,
 };
 use ag_app::signed_transport::{
-    AcceptedSignedRequestV1, SocketPeerCheckV1, accept_signed_request, write_signed_response,
+    accept_signed_request, write_signed_response, AcceptedSignedRequestV1, SocketPeerCheckV1,
 };
 use ag_app::transport::bind_socket;
-use ag_app::worker::{AdmittedWorkerInputV1, prepare_worker_launch};
+use ag_app::worker::{prepare_worker_launch, AdmittedWorkerInputV1};
 use ag_app::worker_protocol::{
-    CANDIDATE_BOOTSTRAP_PURPOSE, CANDIDATE_INGRESS_CREDENTIAL_PURPOSE,
-    decode_exact_signed_worker_candidate,
+    decode_exact_signed_worker_candidate, CANDIDATE_BOOTSTRAP_PURPOSE,
+    CANDIDATE_INGRESS_CREDENTIAL_PURPOSE,
 };
 use ag_effect::{CanonicalEffectV1, GitObjectFormatV1, ProposalStateV1, RatificationV1};
 use ag_primitives::{
-    AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, LifecycleNonce, PrincipalKindV1,
+    AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, InferenceBudgetV1, InferenceEnvelopeV1,
+    InferenceMethodId, LifecycleNonce, ModelId, PrincipalKindV1, ProviderEndpointId,
 };
-use ag_protocol::{FrameCodec, RequestId, canonical_json};
+use ag_protocol::{canonical_json, FrameCodec, RequestId};
 use ag_session::{
     SecurityProfileV1, SessionError, WorkerAuthorityStateV1, WorkerCandidateBrokerOutcomeV1,
     WorkerCandidateCustodyStateV1, WorkerCandidateRefusalCodeV1, WorkerCleanupStateV1,
@@ -547,6 +549,7 @@ fn real_fixed_elf_enters_only_through_signed_candidate_ingress() {
             candidate_semantic_type: "managed_file_content_v1".to_owned(),
             timeout_ms: 2_000,
             output_budget_bytes: 1024,
+            provider_access: None,
         }],
     };
 
@@ -739,6 +742,7 @@ fn agd_core_recovers_custodied_fixture_into_broker_owned_canonical_proposal() {
             candidate_semantic_type: "managed_file_content_v1".to_owned(),
             timeout_ms: 30_000,
             output_budget_bytes: 1024,
+            provider_access: None,
         }],
     };
     let governor_enrollment = governor.enrollment(30_000).expect("governor enrollment");
@@ -759,6 +763,7 @@ fn agd_core_recovers_custodied_fixture_into_broker_owned_canonical_proposal() {
             .join("effectd-proposal")
             .join("proposal.sock"),
         providerd_socket: temporary.path().join("absent-providerd.sock"),
+        providerd_peer: None,
         rpc_signing_identity: RpcSigningIdentityConfigV1 {
             principal: governor_enrollment.principal,
             key_id: governor_enrollment.key.key_id,
@@ -1058,6 +1063,7 @@ fn live_worker_bundle_closes_the_managed_pointer_lifecycle() {
             timeout_ms: 30_000,
             output_budget_bytes: u64::try_from(pointer.bundle.len())
                 .expect("candidate bundle length fits u64"),
+            provider_access: None,
         }],
     };
     let governor_enrollment = governor.enrollment(30_000).expect("governor enrollment");
@@ -1078,6 +1084,7 @@ fn live_worker_bundle_closes_the_managed_pointer_lifecycle() {
             .join("pointer-effectd-proposal")
             .join("proposal.sock"),
         providerd_socket: temporary.path().join("absent-pointer-providerd.sock"),
+        providerd_peer: None,
         rpc_signing_identity: RpcSigningIdentityConfigV1 {
             principal: governor_enrollment.principal,
             key_id: governor_enrollment.key.key_id,
@@ -1384,19 +1391,17 @@ fn live_worker_bundle_closes_the_managed_pointer_lifecycle() {
         proposal.body().proposer.leaf().principal_id,
         worker_principal
     );
-    let [
-        CanonicalEffectV1::ManagedPointerPromotion {
-            artifact,
-            expected_object,
-            expected_tree,
-            new_object,
-            expected_post_tree,
-            repository_identity,
-            helper_executable,
-            helper_launch_profile,
-            ..
-        },
-    ] = proposal.body().effects.as_slice()
+    let [CanonicalEffectV1::ManagedPointerPromotion {
+        artifact,
+        expected_object,
+        expected_tree,
+        new_object,
+        expected_post_tree,
+        repository_identity,
+        helper_executable,
+        helper_launch_profile,
+        ..
+    }] = proposal.body().effects.as_slice()
     else {
         panic!("worker candidate did not compile to one closed promotion");
     };
@@ -1497,6 +1502,7 @@ fn wrong_live_semantic_is_fenced_before_candidate_custody() {
             candidate_semantic_type: "managed_file_content_v1".to_owned(),
             timeout_ms: 30_000,
             output_budget_bytes: 1024,
+            provider_access: None,
         }],
     };
     let governor_enrollment = governor.enrollment(30_000).expect("governor enrollment");
@@ -1522,6 +1528,7 @@ fn wrong_live_semantic_is_fenced_before_candidate_custody() {
         },
         effectd_proposal_socket: temporary.path().join("absent-hostile-effectd.sock"),
         providerd_socket: temporary.path().join("absent-hostile-providerd.sock"),
+        providerd_peer: None,
         rpc_signing_identity: RpcSigningIdentityConfigV1 {
             principal: governor_enrollment.principal,
             key_id: governor_enrollment.key.key_id,
@@ -1605,6 +1612,7 @@ fn supervisor_timeout_tombstones_reaps_and_releases_fresh_capacity() {
     let governor = std::sync::Arc::new(ephemeral_signer("agd-timeout"));
     let proposer = ephemeral_signer("proposer-timeout");
     let effectd = ephemeral_signer("effectd-timeout");
+    let providerd = ephemeral_signer("providerd-timeout");
     let store = open_agd_store(&store_root, &governor);
     let unused_custody = filesystem_custody(temporary.path());
     let unused_directory_custody = FilesystemNodeCustodyV1 {
@@ -1640,6 +1648,22 @@ fn supervisor_timeout_tombstones_reaps_and_releases_fresh_capacity() {
             candidate_semantic_type: "managed_file_content_v1".to_owned(),
             timeout_ms: 750,
             output_budget_bytes: 1024,
+            provider_access: Some(WorkerProviderProfileConfigV1 {
+                provider_policy_digest: Digest::hash_bytes(b"timeout-provider-policy"),
+                envelope: InferenceEnvelopeV1 {
+                    endpoint: ProviderEndpointId::new("fixture-primary")
+                        .expect("provider endpoint"),
+                    model: ModelId::new("fixture-model").expect("model"),
+                    method: InferenceMethodId::new("fixture-method").expect("method"),
+                    protocol_digest: Digest::hash_bytes(b"fixture-provider-protocol"),
+                },
+                budget: InferenceBudgetV1 {
+                    requests: 1,
+                    input_bytes: 4096,
+                    output_bytes: 4096,
+                    cost_microunits: 1000,
+                },
+            }),
         }],
     };
     let governor_enrollment = governor.enrollment(30_000).expect("governor enrollment");
@@ -1671,6 +1695,11 @@ fn supervisor_timeout_tombstones_reaps_and_releases_fresh_capacity() {
         },
         effectd_proposal_socket: temporary.path().join("absent-timeout-effectd.sock"),
         providerd_socket: temporary.path().join("absent-timeout-providerd.sock"),
+        providerd_peer: Some(peer_policy(
+            "provider_broker",
+            &providerd,
+            PrincipalKindV1::Daemon,
+        )),
         rpc_signing_identity: RpcSigningIdentityConfigV1 {
             principal: governor_enrollment.principal,
             key_id: governor_enrollment.key.key_id,
@@ -1693,6 +1722,8 @@ fn supervisor_timeout_tombstones_reaps_and_releases_fresh_capacity() {
         .expect("valid timeout worker configuration");
     let replay = std::sync::Arc::new(RpcReplayGuardV1::new(4096).expect("replay guard"));
     let mut core = AgdCoreV1::new(store, config, governor, replay).expect("timeout governor core");
+    core.attach_provider_runtime()
+        .expect("bounded provider runtime attached");
 
     let (expired_session, expired_principal) = core
         .launch_worker("timeout-fixture")
@@ -1725,8 +1756,70 @@ fn supervisor_timeout_tombstones_reaps_and_releases_fresh_capacity() {
         WorkerAuthorityStateV1::Tombstoned {
             launch_receipt: Some(_),
             tombstone,
-            cleanup: WorkerCleanupStateV1::Complete { .. },
+            cleanup: WorkerCleanupStateV1::Pending,
         } if tombstone.reason == WorkerTerminationReasonV1::DeadlineExpired
+    ));
+    let termination = core
+        .take_pending_provider_job()
+        .expect("timeout queues exact provider termination");
+    assert!(matches!(
+        termination.operation,
+        ProviderIoOperationV1::Terminate
+    ));
+    core.reconcile_worker_provider_termination(
+        ProviderIoCompletionV1 {
+            job: termination.clone(),
+            result: ApiResultV1::error(
+                ApiErrorCodeV1::Indeterminate,
+                "fixture provider outcome unavailable",
+            ),
+        },
+        now_unix_ms(),
+    )
+    .expect("retain bounded indeterminate termination observation");
+    assert!(matches!(
+        core.inspect_worker_session(&expired_session)
+            .expect("inspect pending cleanup")
+            .authority,
+        WorkerAuthorityStateV1::Tombstoned {
+            cleanup: WorkerCleanupStateV1::Pending,
+            ..
+        }
+    ));
+    let provider_receipt = Digest::hash_bytes(b"timeout-provider-termination");
+    core.reconcile_worker_provider_termination(
+        ProviderIoCompletionV1 {
+            job: termination.clone(),
+            result: ApiResultV1::Ok {
+                response: ProviderResponseV1::SessionTerminated {
+                    receipt: provider_receipt.clone(),
+                },
+            },
+        },
+        now_unix_ms(),
+    )
+    .expect("reconcile exact provider termination");
+    core.reconcile_worker_provider_termination(
+        ProviderIoCompletionV1 {
+            job: termination,
+            result: ApiResultV1::Ok {
+                response: ProviderResponseV1::SessionTerminated {
+                    receipt: provider_receipt,
+                },
+            },
+        },
+        now_unix_ms(),
+    )
+    .expect("exact duplicate terminal receipt is idempotent");
+    let expired = core
+        .inspect_worker_session(&expired_session)
+        .expect("inspect completed timeout cleanup");
+    assert!(matches!(
+        expired.authority,
+        WorkerAuthorityStateV1::Tombstoned {
+            cleanup: WorkerCleanupStateV1::Complete { .. },
+            ..
+        }
     ));
     let principal = &expired.spec.worker.principal;
     let exact_late_context = WorkerIngressContextV1 {
@@ -1771,10 +1864,34 @@ fn supervisor_timeout_tombstones_reaps_and_releases_fresh_capacity() {
         fresh.authority,
         WorkerAuthorityStateV1::Tombstoned {
             tombstone,
-            cleanup: WorkerCleanupStateV1::Complete { .. },
+            cleanup: WorkerCleanupStateV1::Pending,
             ..
         } if tombstone.reason == WorkerTerminationReasonV1::Cancelled {
             reason_digest: cancellation,
+        }
+    ));
+    let cancellation_termination = core
+        .take_pending_provider_job()
+        .expect("cancellation queues provider termination");
+    core.reconcile_worker_provider_termination(
+        ProviderIoCompletionV1 {
+            job: cancellation_termination,
+            result: ApiResultV1::Ok {
+                response: ProviderResponseV1::SessionTerminated {
+                    receipt: Digest::hash_bytes(b"cancel-provider-termination"),
+                },
+            },
+        },
+        now_unix_ms(),
+    )
+    .expect("cancel cleanup waits for provider termination");
+    assert!(matches!(
+        core.inspect_worker_session(&fresh_session)
+            .expect("inspect completed cancel cleanup")
+            .authority,
+        WorkerAuthorityStateV1::Tombstoned {
+            cleanup: WorkerCleanupStateV1::Complete { .. },
+            ..
         }
     ));
 }
