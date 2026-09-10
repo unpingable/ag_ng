@@ -87,6 +87,23 @@ key_id = "effectd.v1"
 public_key = "QhDr60ldHKGyw-8W8f9_0UPDXZ2llDaCjOlKhs-mORs"
 maximum_clock_skew_ms = 30000
 
+# Required only when a reviewed worker profile enrolls provider access. This
+# is the provider daemon's signed identity; it is not a model-selection route.
+[providerd_peer]
+role = "provider_broker"
+uid = 990
+gid = 990
+executable_identity = "sha256:7111111111111111111111111111111111111111111111111111111111111111"
+cgroup_contains = "ag-providerd.service"
+stable_principal_root = "sha256:b111111111111111111111111111111111111111111111111111111111111111"
+principal_kind = "daemon"
+
+[providerd_peer.rpc_key]
+principal = "sha256:c111111111111111111111111111111111111111111111111111111111111111"
+key_id = "providerd.v1"
+public_key = "Wt87MtR1fgf8L7BTeSAEkSps5V8ka2JdFbRxzFC-x6w"
+maximum_clock_skew_ms = 30000
+
 [limits]
 max_control_frame_bytes = 1048576
 max_artifact_bytes = 2147483648

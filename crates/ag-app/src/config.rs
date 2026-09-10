@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use ag_effect::{SystemdUnitActionV1, TargetId};
 use ag_primitives::{
-    AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, InferenceBudgetV1,
-    InferenceEnvelopeV1, PrincipalKindV1, ProjectId,
+    AuthorityDomain, Digest, Epoch, ExecutableIdentityV1, InferenceBudgetV1, InferenceEnvelopeV1,
+    PrincipalKindV1, ProjectId,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -342,6 +342,10 @@ pub struct AgdConfigV1 {
     pub effectd_proposal_socket: PathBuf,
     /// Provider broker socket.
     pub providerd_socket: PathBuf,
+    /// Authenticated provider-broker policy for outbound worker inference.
+    /// Required whenever an enrolled worker profile has provider access.
+    #[serde(default)]
+    pub providerd_peer: Option<PeerPolicyV1>,
     /// Local Ed25519 identity loaded from a systemd credential.
     pub rpc_signing_identity: RpcSigningIdentityConfigV1,
     /// Exact original proposal signer accepted on the governor ingress.
@@ -1215,15 +1219,31 @@ impl AgdConfigV1 {
         validate_signer(&self.rpc_signing_identity)?;
         validate_peer(&self.proposer_peer)?;
         validate_peer(&self.effectd_peer)?;
+        if let Some(providerd_peer) = &self.providerd_peer {
+            validate_peer(providerd_peer)?;
+            validate_peer_kind(providerd_peer, &[PrincipalKindV1::Daemon])?;
+        }
         validate_peer_kind(
             &self.proposer_peer,
             &[PrincipalKindV1::Operator, PrincipalKindV1::Service],
         )?;
         validate_peer_kind(&self.effectd_peer, &[PrincipalKindV1::Daemon])?;
-        validate_separate_roles(
-            &self.rpc_signing_identity,
-            &[&self.proposer_peer, &self.effectd_peer],
-        )?;
+        let mut remote_peers = vec![&self.proposer_peer, &self.effectd_peer];
+        if let Some(providerd_peer) = &self.providerd_peer {
+            remote_peers.push(providerd_peer);
+        }
+        validate_separate_roles(&self.rpc_signing_identity, &remote_peers)?;
+        if self.worker_launcher.as_ref().is_some_and(|launcher| {
+            launcher
+                .profiles
+                .iter()
+                .any(|profile| profile.provider_access.is_some())
+        }) && self.providerd_peer.is_none()
+        {
+            return Err(ConfigError::InvalidLimit(
+                "provider-enabled worker has no providerd peer",
+            ));
+        }
         if self.limits.max_control_frame_bytes == 0
             || self.limits.max_rpc_replay_entries == 0
             || self.limits.max_active_sessions == 0
@@ -1426,8 +1446,7 @@ impl ProviderdConfigV1 {
                     {
                         return Err(ConfigError::InvalidProvider {
                             provider,
-                            reason:
-                                "remote API requires an enrolled credential and supported header",
+                            reason: "remote API requires an enrolled credential and supported header",
                         });
                     }
                 }
@@ -1743,7 +1762,10 @@ mod tests {
             "a provider-looking profile field must refuse until the live worker/session contract exists"
         );
 
-        profile.as_object_mut().expect("profile object").remove("provider_route");
+        profile
+            .as_object_mut()
+            .expect("profile object")
+            .remove("provider_route");
         profile.as_object_mut().expect("profile object").insert(
             "provider_access".to_owned(),
             serde_json::json!({
@@ -1760,8 +1782,8 @@ mod tests {
         serde_json::from_value::<WorkerProfileConfigV1>(profile.clone())
             .expect("closed provider policy must decode");
         profile["provider_access"]["budget"]["requests"] = serde_json::json!(0);
-        let profile: WorkerProfileConfigV1 = serde_json::from_value(profile)
-            .expect("zero budget is a semantic validation failure");
+        let profile: WorkerProfileConfigV1 =
+            serde_json::from_value(profile).expect("zero budget is a semantic validation failure");
         assert!(!valid_worker_provider_profile(
             profile.provider_access.as_ref().expect("provider policy")
         ));

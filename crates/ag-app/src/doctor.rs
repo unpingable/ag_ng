@@ -237,16 +237,26 @@ fn inspect_cross_plane_enrollment(
         == agd.rpc_signing_identity.principal
         && providerd.caller_peer.rpc_key.key_id == agd.rpc_signing_identity.key_id
         && providerd.caller_peer.rpc_key.public_key == agd.rpc_signing_identity.public_key;
+    let agd_to_provider = agd.providerd_peer.as_ref().is_some_and(|peer| {
+        peer.rpc_key.principal == providerd.rpc_signing_identity.principal
+            && peer.rpc_key.key_id == providerd.rpc_signing_identity.key_id
+            && peer.rpc_key.public_key == providerd.rpc_signing_identity.public_key
+    });
     checks.push(boolean_check(
         "cross-plane.daemon-enrollment",
         "cross-plane",
-        agd_to_effectd && effectd_to_agd && provider_to_agd,
+        agd_to_effectd && effectd_to_agd && provider_to_agd && agd_to_provider,
         "daemon signing identities match every opposite-plane enrollment",
         "daemon signing identity and opposite-plane enrollment differ",
     ));
     let service_units_match = effectd.agd_peer.cgroup_contains.as_deref() == Some("agd.service")
         && providerd.caller_peer.cgroup_contains.as_deref() == Some("agd.service")
-        && agd.effectd_peer.cgroup_contains.as_deref() == Some("ag-effectd.service");
+        && agd.effectd_peer.cgroup_contains.as_deref() == Some("ag-effectd.service")
+        && agd
+            .providerd_peer
+            .as_ref()
+            .and_then(|peer| peer.cgroup_contains.as_deref())
+            == Some("ag-providerd.service");
     checks.push(boolean_check(
         "cross-plane.service-unit-observations",
         "cross-plane",
