@@ -777,6 +777,158 @@ impl AgdCoreV1 {
         })
     }
 
+    /// Projects one durable attempt for fd6 without dispatching or changing
+    /// provider state. Response bytes are returned only from exact local blob
+    /// custody.
+    pub fn worker_provider_response(
+        &mut self,
+        session: &SessionId,
+        attempt: &RequestId,
+    ) -> Result<WorkerProviderResponseV1, AgdError> {
+        let record = self.inspect_worker_provider_attempt(session, attempt)?;
+        match record.state {
+            WorkerProviderAttemptStateV1::RequestInCustody
+            | WorkerProviderAttemptStateV1::DispatchAvailable { .. } => {
+                Ok(WorkerProviderResponseV1::Pending {
+                    attempt: attempt.clone(),
+                })
+            }
+            WorkerProviderAttemptStateV1::ResponseInCustody { response, .. }
+            | WorkerProviderAttemptStateV1::Acknowledged { response, .. } => {
+                response.verify()?;
+                let bytes = self.store.read_blob(
+                    &response.complete_event_stream,
+                    self.config.limits.max_control_frame_bytes.into(),
+                )?;
+                if Digest::hash_bytes(&bytes) != response.complete_event_stream {
+                    return Err(AgdError::WorkerProviderAttemptMismatch);
+                }
+                Ok(WorkerProviderResponseV1::Available {
+                    attempt: attempt.clone(),
+                    exact_event_stream: response.complete_event_stream,
+                    event_stream: OpaqueBytesV1::new(bytes),
+                    protocol_terminal: response.protocol_terminal,
+                })
+            }
+        }
+    }
+
+    /// Revalidates and commits one provider I/O completion on agd's durable
+    /// single-writer thread. A fetched response returns the exact follow-up
+    /// acknowledgment job; no error completion authorizes redispatch.
+    pub fn reconcile_provider_io_completion(
+        &mut self,
+        completion: ProviderIoCompletionV1,
+        now_unix_ms: u64,
+    ) -> Result<Option<ProviderIoJobV1>, AgdError> {
+        let current =
+            self.reload_active_worker_provider_capability(&completion.job.session, now_unix_ms)?;
+        if current != completion.job.capability
+            || current.worker_principal != completion.job.worker_principal
+        {
+            return Err(AgdError::WorkerProviderAttemptMismatch);
+        }
+        let entity =
+            worker_provider_attempt_entity(&completion.job.session, &completion.job.attempt)?;
+        let loaded = self
+            .store
+            .materialized_state::<WorkerProviderAttemptRecordV1>(&entity)?
+            .ok_or(AgdError::WorkerProviderAttemptNotFound)?;
+        let mut record = loaded.state;
+        validate_worker_provider_attempt_record(&entity, &record)?;
+        match (completion.job.operation, completion.result) {
+            (
+                ProviderIoOperationV1::Begin { .. },
+                ApiResultV1::Ok {
+                    response:
+                        ProviderResponseV1::Inference {
+                            dispatch,
+                            exact_event_stream,
+                            event_stream,
+                            sanitized_headers: _,
+                            protocol_terminal,
+                        },
+                },
+            ) => {
+                if Digest::hash_bytes(event_stream.as_slice()) != exact_event_stream {
+                    return Err(AgdError::WorkerProviderAttemptMismatch);
+                }
+                record.reconcile_dispatch_available(
+                    dispatch.clone(),
+                    exact_event_stream.clone(),
+                    protocol_terminal,
+                )?;
+                let byte_length = u64::try_from(event_stream.len())
+                    .map_err(|_| AgdError::ArtifactTransferTooLarge)?;
+                self.store.install_blob(
+                    &BlobDescriptorV1 {
+                        digest: exact_event_stream.clone(),
+                        byte_length,
+                    },
+                    &mut Cursor::new(event_stream.as_slice()),
+                    i64::try_from(now_unix_ms)
+                        .map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
+                )?;
+                let response = ProviderResponseCustodyV1::new(
+                    record.request.custody_record.clone(),
+                    exact_event_stream.clone(),
+                    protocol_terminal,
+                )?;
+                record.reconcile_response_custody(dispatch.clone(), response.clone())?;
+                self.store.append_event(
+                    NewEventV1 {
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        entity_id: entity,
+                        event_kind: "worker-provider.response-custodied.v1".to_owned(),
+                        occurred_at_unix_ms: i64::try_from(now_unix_ms)
+                            .map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
+                        payload: (&dispatch, &response),
+                    },
+                    &record,
+                    loaded.revision,
+                )?;
+                Ok(Some(ProviderIoJobV1 {
+                    session: completion.job.session,
+                    worker_principal: completion.job.worker_principal,
+                    attempt: completion.job.attempt,
+                    capability: current,
+                    operation: ProviderIoOperationV1::Acknowledge {
+                        dispatch,
+                        exact_event_stream,
+                        governor_custody_record: response.custody_record,
+                    },
+                }))
+            }
+            (
+                ProviderIoOperationV1::Acknowledge { dispatch, .. },
+                ApiResultV1::Ok {
+                    response:
+                        ProviderResponseV1::InferenceCustodyAcknowledged {
+                            dispatch: returned,
+                            receipt,
+                        },
+                },
+            ) if dispatch == returned => {
+                record.reconcile_acknowledgment(dispatch.clone(), receipt.clone())?;
+                self.store.append_event(
+                    NewEventV1 {
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        entity_id: entity,
+                        event_kind: "worker-provider.custody-acknowledged.v1".to_owned(),
+                        occurred_at_unix_ms: i64::try_from(now_unix_ms)
+                            .map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
+                        payload: (&dispatch, &receipt),
+                    },
+                    &record,
+                    loaded.revision,
+                )?;
+                Ok(None)
+            }
+            (_, ApiResultV1::Error { .. }) => Ok(None),
+            _ => Err(AgdError::WorkerProviderAttemptMismatch),
+        }
+    }
+
     /// Launches one configured offline worker behind a durable principal fence.
     ///
     /// The child is prepared behind a descriptor gate. Its exact executable,
