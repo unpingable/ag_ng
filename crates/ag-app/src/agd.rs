@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ag_effect::{EFFECT_SCHEMA_V1, EffectIntentV1, ProposalIntentV1, TargetId};
@@ -320,6 +322,46 @@ pub fn execute_provider_io_job(
         }),
     };
     ProviderIoCompletionV1 { job, result }
+}
+
+/// Handle set for one bounded provider I/O worker. Durable state remains in
+/// the caller; the worker owns only signed transport testimony.
+pub struct ProviderIoWorkerV1 {
+    /// Bounded admitted-job sender.
+    pub jobs: SyncSender<ProviderIoJobV1>,
+    /// Bounded exact-completion receiver.
+    pub completions: Receiver<ProviderIoCompletionV1>,
+    /// Worker liveness handle.
+    pub thread: JoinHandle<()>,
+}
+
+/// Starts one bounded FIFO provider I/O worker around an enrolled signed-call
+/// function. Queue backpressure is explicit through `try_send`.
+pub fn spawn_provider_io_worker(
+    capacity: usize,
+    mut call: impl FnMut(ProviderRequestV1) -> ApiResultV1<ProviderResponseV1> + Send + 'static,
+) -> Result<ProviderIoWorkerV1, AgdError> {
+    if capacity == 0 {
+        return Err(AgdError::WorkerProviderQueueInvalid);
+    }
+    let (job_sender, job_receiver) = sync_channel(capacity);
+    let (completion_sender, completion_receiver) = sync_channel(capacity);
+    let thread = thread::Builder::new()
+        .name("agd-provider-io".to_owned())
+        .spawn(move || {
+            while let Ok(job) = job_receiver.recv() {
+                let completion = execute_provider_io_job(job, &mut call);
+                if completion_sender.send(completion).is_err() {
+                    return;
+                }
+            }
+        })
+        .map_err(AgdError::ProviderIoThread)?;
+    Ok(ProviderIoWorkerV1 {
+        jobs: job_sender,
+        completions: completion_receiver,
+        thread,
+    })
 }
 
 impl WorkerProviderAttemptRecordV1 {
@@ -2878,6 +2920,12 @@ pub enum AgdError {
     /// A repeated attempt identity disagreed with its durable request/state.
     #[error("worker provider attempt does not match durable custody")]
     WorkerProviderAttemptMismatch,
+    /// Provider I/O queue has no bounded capacity.
+    #[error("worker provider I/O queue capacity is invalid")]
+    WorkerProviderQueueInvalid,
+    /// Provider I/O worker could not start.
+    #[error("worker provider I/O thread could not start: {0}")]
+    ProviderIoThread(#[source] std::io::Error),
     /// Configured maximum live-worker count has been reached.
     #[error("worker launch capacity is exhausted")]
     WorkerCapacityExhausted,
@@ -3150,6 +3198,31 @@ mod tests {
             }
         ));
         assert_eq!(calls.len(), 3);
+        let ProviderIoWorkerV1 {
+            jobs,
+            completions,
+            thread,
+        } = spawn_provider_io_worker(1, |_| {
+            ApiResultV1::error(
+                ApiErrorCodeV1::Indeterminate,
+                "fixture transport unavailable",
+            )
+        })
+        .expect("bounded provider I/O worker");
+        jobs.try_send(io_job.clone()).expect("enqueue exact job");
+        let queued = completions
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("exact completion");
+        assert_eq!(queued.job, io_job);
+        assert!(matches!(
+            queued.result,
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::Indeterminate,
+                ..
+            }
+        ));
+        drop(jobs);
+        thread.join().expect("bounded provider I/O worker exit");
         let entity = worker_provider_attempt_entity(&session, &attempt).expect("entity");
         let record = WorkerProviderAttemptRecordV1 {
             schema: "ag.worker-provider-attempt/v1".to_owned(),
