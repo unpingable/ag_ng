@@ -41,10 +41,17 @@ managed-file path.
 
 ## Build and run
 
-Start with this AG-ng guide checkout in `ag-ng`. Fetch Docket's published campaign ref and
-detach at the exact dependency revision:
+From an empty parent directory, obtain both exact witnessed sources. These commands
+require network access and dependency downloads; they are instructions, not permission
+to contact a service during an offline qualification. Existing local clones/caches can
+supply the same immutable objects. The pins reproduce the witness above, not a newer
+operator-beta release candidate:
 
 ```sh
+git clone https://github.com/unpingable/ag_ng.git ag-ng
+git -C ag-ng fetch origin campaign/constellation-operator-beta-ag-docket-adoption-integration-v1-20260907
+git -C ag-ng checkout --detach 837de287497942c79966aa05c083acee9c312261
+test "$(git -C ag-ng rev-parse HEAD)" = 837de287497942c79966aa05c083acee9c312261
 git clone https://github.com/unpingable/docket.git docket
 git -C docket fetch origin campaign/c2-governed-loop-layering
 git -C docket checkout --detach c49ad8d0f26fb2a13b9dbafdde84d7abfe1f867b
@@ -110,15 +117,12 @@ The AG, Docket, and executor SQLite files under `RUN_ROOT` are persistence artif
 a documented raw-query API. Preserve them together for restart/reconciliation; use the
 summary and Docket command above for this example.
 
-When finished, confirm `RUN_ROOT` contains this example summary, then remove only that
-directory and its empty campaign-created parent:
-
-```sh
-test -f "$RUN_ROOT/summary.json"
-python3 -m json.tool "$RUN_ROOT/summary.json" >/dev/null
-rm -rf -- "$RUN_ROOT"
-rmdir -- "$RUN_PARENT"
-```
+When finished, retain the summary and the complete state/evidence tree until the
+qualification owner has accepted the result. Do not treat a valid `summary.json` as
+proof the whole directory is disposable. Before any separately authorized cleanup,
+resolve the exact directory, check producer quiescence, ownership, hard links and
+evidence dependencies, and preserve any unique recovery evidence. No cleanup is
+required to run or inspect this example.
 
 The example enrolls and writes no resource outside `RUN_ROOT`.
 
@@ -214,3 +218,6 @@ For protocol detail, see Docket's `docs/governed-runtime/executor-transport-v1.m
 `docs/governed-runtime/governed-loop-c2-layering.md`; for AG restart and state ownership, see
 [`governed-loop-c1.md`](governed-loop-c1.md) and
 [`governed-loop-deployment-qualification.md`](governed-loop-deployment-qualification.md).
+
+For installation boundaries, adapter ownership, upgrade/rollback and a short showing
+sequence, use the [adoption operational kit](ag-ng-docket-operational-kit.md).
