@@ -97,10 +97,8 @@ Known blockers in the current tree include:
   production/high-assurance configuration; the packaged agd unit cannot host
   it, and production worker/check wrappers, sandbox attestation, and one-shot
   launch-record consumption do not exist, so both templates remain withheld;
-- providerd is signed-agd-proxy-only, while the session ingress/proxy path does
-  not yet prove the live `WorkerSessionPrincipal` before spending its committed
-  provider capability; the implemented worker slice is offline rather than a
-  provider-capability workaround;
+- providerd is signed-agd-proxy-only. The implemented worker slice remains
+  offline rather than treating a partial provider path as usable;
   this is a concrete multi-boundary prerequisite, not an endpoint-adapter gap.
   The first source prerequisite now exists: `WorkerProfileConfigV1` can enroll
   one exact provider-policy digest, envelope and budget; the session constructors
@@ -111,9 +109,13 @@ Known blockers in the current tree include:
   governor. The ordinary agd launch still deliberately refuses that profile
   before process preparation: no daemon path consumes those endpoints, and
   `AgdRequestV1` still has no worker-bound infer/fetch/acknowledge operations.
-  The remaining order is a bounded framed channel plus durable agd proxy
-  operations that reload and verify the active session on every transition ->
-  session termination
+  Exact nonblocking bounded framing, canonical request/response custody,
+  per-attempt request-before-dispatch state, closed dispatch/fetch/ack
+  reconciliation, and mandatory per-transition active-session/capability
+  reload now exist as source primitives. They are not yet wired into the agd
+  event loop. The remaining order is a bounded provider I/O queue whose
+  completions return to agd's single durable writer without suspending worker
+  deadline polling -> live infer/fetch/ack channel dispatch -> session termination
   coupled to provider capability burn -> installed worker/session/peer
   qualification. Strict decoding refuses a provider-looking field outside the
   enrolled shape, and focused tests cover the exact route/capability/descriptor
