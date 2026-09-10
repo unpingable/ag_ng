@@ -200,6 +200,40 @@ pub struct ProviderRequestCustodyV1 {
 }
 
 impl ProviderRequestCustodyV1 {
+    /// Constructs exact credential-free request custody.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the binding cannot be canonically encoded.
+    pub fn new(
+        capability_id: InferenceCapabilityId,
+        exact_request: Digest,
+        sanitized_headers: BTreeMap<String, String>,
+        envelope: ProviderEnvelopeV1,
+    ) -> Result<Self, SessionError> {
+        #[derive(Serialize)]
+        struct CustodyBinding<'a> {
+            capability_id: &'a InferenceCapabilityId,
+            exact_request: &'a Digest,
+            sanitized_headers: &'a BTreeMap<String, String>,
+            envelope: &'a ProviderEnvelopeV1,
+        }
+        let custody_record = Digest::from_serializable(&CustodyBinding {
+            capability_id: &capability_id,
+            exact_request: &exact_request,
+            sanitized_headers: &sanitized_headers,
+            envelope: &envelope,
+        })
+        .map_err(|error| SessionError::CustodyBinding(error.to_string()))?;
+        Ok(Self {
+            capability_id,
+            exact_request,
+            sanitized_headers,
+            envelope,
+            custody_record,
+        })
+    }
+
     /// Recomputes the exact credential-free custody binding.
     ///
     /// # Errors
@@ -240,6 +274,62 @@ pub struct ProviderResponseCustodyV1 {
     pub custody_record: Digest,
     /// True only when the stream includes a protocol terminal event.
     pub protocol_terminal: bool,
+}
+
+impl ProviderResponseCustodyV1 {
+    /// Constructs custody for one exact complete provider event stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the binding cannot be canonically encoded.
+    pub fn new(
+        request_custody: Digest,
+        complete_event_stream: Digest,
+        protocol_terminal: bool,
+    ) -> Result<Self, SessionError> {
+        let custody_record = provider_response_custody_digest(
+            &request_custody,
+            &complete_event_stream,
+            protocol_terminal,
+        )?;
+        Ok(Self {
+            request_custody,
+            complete_event_stream,
+            custody_record,
+            protocol_terminal,
+        })
+    }
+
+    /// Revalidates the exact response-custody binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any bound field differs.
+    pub fn verify(&self) -> Result<(), SessionError> {
+        let observed = provider_response_custody_digest(
+            &self.request_custody,
+            &self.complete_event_stream,
+            self.protocol_terminal,
+        )?;
+        if observed != self.custody_record {
+            return Err(SessionError::CustodyMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn provider_response_custody_digest(
+    request_custody: &Digest,
+    complete_event_stream: &Digest,
+    protocol_terminal: bool,
+) -> Result<Digest, SessionError> {
+    Digest::from_serializable(&(
+        "ag.provider-response-custody/v1",
+        request_custody,
+        complete_event_stream,
+        protocol_terminal,
+    ))
+    .map_err(|error| SessionError::CustodyBinding(error.to_string()))
 }
 
 /// Strength of evidence available for a provider interaction.
@@ -1458,6 +1548,39 @@ mod tests {
             response_digest: Digest::hash_bytes(b"response"),
         };
         assert!(!record.is_replayable());
+    }
+
+    #[test]
+    fn exact_provider_custody_constructors_bind_every_field() {
+        let envelope = InferenceEnvelopeV1 {
+            endpoint: ProviderEndpointId::new("fixture:provider").unwrap(),
+            model: ModelId::new("fixture-model").unwrap(),
+            method: InferenceMethodId::new("complete").unwrap(),
+            protocol_digest: digest("fixture-protocol"),
+        };
+        let capability = InferenceCapabilityId::new(digest("capability"));
+        let request = ProviderRequestCustodyV1::new(
+            capability,
+            digest("request-bytes"),
+            BTreeMap::from([("content-type".to_owned(), "application/json".to_owned())]),
+            envelope,
+        )
+        .unwrap();
+        request.verify().unwrap();
+        let mut wrong_request = request.clone();
+        wrong_request.exact_request = digest("other-request");
+        assert_eq!(wrong_request.verify(), Err(SessionError::CustodyMismatch));
+
+        let response = ProviderResponseCustodyV1::new(
+            request.custody_record,
+            digest("complete-event-stream"),
+            true,
+        )
+        .unwrap();
+        response.verify().unwrap();
+        let mut wrong_response = response;
+        wrong_response.protocol_terminal = false;
+        assert_eq!(wrong_response.verify(), Err(SessionError::CustodyMismatch));
     }
 
     #[test]
