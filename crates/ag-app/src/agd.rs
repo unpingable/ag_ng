@@ -2,18 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Cursor;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ag_effect::{EffectIntentV1, ProposalIntentV1, TargetId, EFFECT_SCHEMA_V1};
+use ag_effect::{EFFECT_SCHEMA_V1, EffectIntentV1, ProposalIntentV1, TargetId};
 use ag_kernel::{
-    evaluate_effect_crossing, reconstruct_effect_authority, AdmissionCommit, CapacityBook,
-    CapacityBookEntry, CapacityClaim, CapacityRef, CustodyBook, CustodyBookEntry, CustodyClaim,
-    CustodyRef, EffectCrossingClaim, EffectCrossingRefusal, EffectCrossingWitness, FailureEvidence,
-    NativeJudgment, NonEmpty, ObligationBook, ObligationBookEntry, ObligationClaim, ObligationRef,
-    StandingBook, StandingBookEntry, StandingClaim, StandingRef,
+    AdmissionCommit, CapacityBook, CapacityBookEntry, CapacityClaim, CapacityRef, CustodyBook,
+    CustodyBookEntry, CustodyClaim, CustodyRef, EffectCrossingClaim, EffectCrossingRefusal,
+    EffectCrossingWitness, FailureEvidence, NativeJudgment, NonEmpty, ObligationBook,
+    ObligationBookEntry, ObligationClaim, ObligationRef, StandingBook, StandingBookEntry,
+    StandingClaim, StandingRef, evaluate_effect_crossing, reconstruct_effect_authority,
 };
 use ag_primitives::{
     AuthorityDomain, BookLocalId, CgroupIdentity, Digest, Epoch, HostCredentialObservationV1,
@@ -36,33 +36,40 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::api::{
-    worker_candidate_ingress_proof_digest, AgdRequestV1, AgdResponseV1, ApiErrorCodeV1,
-    ApiResultV1, ArtifactTransferV1, EffectProposalRequestV1, EffectProposalResponseV1,
-    GovernedProposalIngressV1, HealthV1, OpaqueBytesV1, ProposalIngressProofV1, ProviderRequestV1,
-    ProviderResponseV1, WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1,
-    WorkerCandidateRequestV1, WorkerCandidateSourceProofV1, WorkerProviderRequestV1,
-    WorkerProviderResponseV1,
+    AgdRequestV1, AgdResponseV1, ApiErrorCodeV1, ApiResultV1, ArtifactTransferV1,
+    EffectProposalRequestV1, EffectProposalResponseV1, GovernedProposalIngressV1, HealthV1,
+    OpaqueBytesV1, ProposalIngressProofV1, ProviderRequestV1, ProviderResponseV1,
+    WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1, WorkerCandidateRequestV1,
+    WorkerCandidateSourceProofV1, WorkerProviderRequestV1, WorkerProviderResponseV1,
+    worker_candidate_ingress_proof_digest,
 };
 use crate::config::{AgdConfigV1, WorkerCandidateEffectV1, WorkerProfileConfigV1};
 use crate::peer::signed_principal_chain;
 use crate::rpc_auth::{
-    candidate_ingress_key_identity, verify_forwarded_signed_request,
-    verify_forwarded_signed_request_bindings, EphemeralRpcPrivateKeyV1, RpcKeyIdV1,
-    RpcPeerEnrollmentV1, RpcPeerKeyPolicyV1, RpcReplayGuardV1, RpcSignerV1,
-    SignedServerChallengeV1, SystemRpcClockV1, VerifiedRpcPrincipalV1,
+    EphemeralRpcPrivateKeyV1, RpcKeyIdV1, RpcPeerEnrollmentV1, RpcPeerKeyPolicyV1,
+    RpcReplayGuardV1, RpcSignerV1, SignedServerChallengeV1, SystemRpcClockV1,
+    VerifiedRpcPrincipalV1, candidate_ingress_key_identity, verify_forwarded_signed_request,
+    verify_forwarded_signed_request_bindings,
 };
-use crate::signed_transport::{call_signed, AcceptedSignedRequestV1, SocketPeerCheckV1};
+use crate::signed_transport::{AcceptedSignedRequestV1, SocketPeerCheckV1, call_signed};
 use crate::worker::{
-    prepare_worker_launch, AdmittedWorkerInputV1, PreparedWorkerLaunchV1, WorkerLaunchError,
-    WorkerLaunchReleaseV1, WorkerProcessV1, WorkerProviderChannelV1,
+    AdmittedWorkerInputV1, PreparedWorkerLaunchV1, WorkerLaunchError, WorkerLaunchReleaseV1,
+    WorkerProcessV1, WorkerProviderChannelV1, prepare_worker_launch,
 };
 use crate::worker_protocol::{
-    decode_exact_signed_worker_candidate, WorkerProtocolError, CANDIDATE_BOOTSTRAP_PURPOSE,
-    CANDIDATE_INGRESS_CREDENTIAL_PURPOSE,
+    CANDIDATE_BOOTSTRAP_PURPOSE, CANDIDATE_INGRESS_CREDENTIAL_PURPOSE, WorkerProtocolError,
+    decode_exact_signed_worker_candidate,
 };
 use crate::worker_session::{
     WorkerSessionStoreError, WorkerSessionStoreV1, WorkerStartupRecoveryReportV1,
 };
+
+const PROVIDER_JOB_SCHEDULER_CAPACITY: usize = 128;
+const PROVIDER_INTERACTIVE_RESERVE: usize = 2;
+const PROVIDER_TERMINATION_QUEUE_LIMIT: usize =
+    PROVIDER_JOB_SCHEDULER_CAPACITY - PROVIDER_INTERACTIVE_RESERVE;
+const PROVIDER_WORKER_REQUEST_QUEUE_LIMIT: usize = PROVIDER_JOB_SCHEDULER_CAPACITY - 1;
+const PROVIDER_TERMINATION_SCAN_BATCH: u32 = 128;
 
 /// Exact replay inputs from the four separately committed family books.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -225,6 +232,13 @@ pub enum WorkerProviderAttemptStateV1 {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderFetchedReconcileV1 {
+    NewlyCustodied,
+    ExistingNeedsAcknowledgment,
+    ExistingAcknowledged,
+}
+
 /// Durable governor-side progress for revoking one terminal worker's provider
 /// grants. Process cleanup and provider revocation remain separate evidence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -315,6 +329,21 @@ pub struct ProviderIoCompletionV1 {
     pub result: ApiResultV1<ProviderResponseV1>,
 }
 
+fn enqueue_provider_job_bounded(
+    queue: &mut VecDeque<ProviderIoJobV1>,
+    job: ProviderIoJobV1,
+    limit: usize,
+) -> bool {
+    if queue.iter().any(|existing| *existing == job) {
+        return true;
+    }
+    if queue.len() >= limit {
+        return false;
+    }
+    queue.push_back(job);
+    true
+}
+
 /// Executes one already-admitted provider job without owning governor state.
 /// The caller supplies the signed RPC boundary and returns the completion to
 /// agd's single writer for exact identity revalidation.
@@ -332,12 +361,18 @@ pub fn execute_provider_io_job(
                 worker_principal: job.worker_principal.clone(),
             });
             if !matches!(
-                registered,
+                &registered,
                 ApiResultV1::Ok {
-                    response: ProviderResponseV1::CapabilityRegistered { .. }
-                }
+                    response: ProviderResponseV1::CapabilityRegistered { capability }
+                } if *capability == job.capability.id()
             ) {
-                registered
+                match registered {
+                    ApiResultV1::Ok { .. } => ApiResultV1::error(
+                        ApiErrorCodeV1::Indeterminate,
+                        "provider capability registration identity differs",
+                    ),
+                    error => error,
+                }
             } else {
                 let inferred = call(ProviderRequestV1::Infer {
                     capability: Box::new(job.capability.clone()),
@@ -468,6 +503,40 @@ impl WorkerProviderAttemptRecordV1 {
             exact_event_stream,
             protocol_terminal,
         }
+    }
+
+    fn reconcile_fetched_response(
+        &mut self,
+        dispatch: Digest,
+        response: ProviderResponseCustodyV1,
+    ) -> Result<ProviderFetchedReconcileV1, AgdError> {
+        match &self.state {
+            WorkerProviderAttemptStateV1::ResponseInCustody {
+                dispatch: existing_dispatch,
+                response: existing_response,
+            } if *existing_dispatch == dispatch && *existing_response == response => {
+                return Ok(ProviderFetchedReconcileV1::ExistingNeedsAcknowledgment);
+            }
+            WorkerProviderAttemptStateV1::Acknowledged {
+                dispatch: existing_dispatch,
+                response: existing_response,
+                ..
+            } if *existing_dispatch == dispatch && *existing_response == response => {
+                return Ok(ProviderFetchedReconcileV1::ExistingAcknowledged);
+            }
+            WorkerProviderAttemptStateV1::ResponseInCustody { .. }
+            | WorkerProviderAttemptStateV1::Acknowledged { .. } => {
+                return Err(AgdError::WorkerProviderAttemptMismatch);
+            }
+            _ => {}
+        }
+        self.reconcile_dispatch_available(
+            dispatch.clone(),
+            response.complete_event_stream.clone(),
+            response.protocol_terminal,
+        )?;
+        self.reconcile_response_custody(dispatch, response)?;
+        Ok(ProviderFetchedReconcileV1::NewlyCustodied)
     }
 
     /// Reconciles exact fetched bytes after they entered governor blob custody.
@@ -636,6 +705,9 @@ pub struct AgdCoreV1 {
     rpc_replay: Arc<RpcReplayGuardV1>,
     active_workers: BTreeMap<SessionId, ActiveWorkerRuntimeV1>,
     pending_provider_jobs: VecDeque<ProviderIoJobV1>,
+    submitted_provider_jobs: Vec<ProviderIoJobV1>,
+    provider_termination_scan_cursor: Option<String>,
+    provider_termination_scan_complete: bool,
     provider_runtime_attached: bool,
     worker_recovery_required: bool,
 }
@@ -665,6 +737,9 @@ impl AgdCoreV1 {
             rpc_replay,
             active_workers: BTreeMap::new(),
             pending_provider_jobs: VecDeque::new(),
+            submitted_provider_jobs: Vec::new(),
+            provider_termination_scan_cursor: None,
+            provider_termination_scan_complete: false,
             provider_runtime_attached: false,
             worker_recovery_required: false,
         })
@@ -692,7 +767,7 @@ impl AgdCoreV1 {
     pub fn recover_worker_sessions(&mut self) -> Result<WorkerStartupRecoveryReportV1, AgdError> {
         let now = now_u64()?;
         let report = WorkerSessionStoreV1::new(&mut self.store).recover_startup(now)?;
-        self.prepare_pending_provider_terminations(now)?;
+        self.refill_pending_provider_terminations(now)?;
         Ok(report)
     }
 
@@ -706,72 +781,129 @@ impl AgdCoreV1 {
     /// Restores one unsubmitted transition at the front of the bounded local
     /// scheduler queue without asserting that any provider operation occurred.
     pub fn restore_pending_provider_job(&mut self, job: ProviderIoJobV1) {
+        debug_assert!(self.pending_provider_jobs.len() < PROVIDER_JOB_SCHEDULER_CAPACITY);
         self.pending_provider_jobs.push_front(job);
     }
 
-    fn prepare_pending_provider_terminations(&mut self, now_unix_ms: u64) -> Result<(), AgdError> {
-        let mut cursor = None;
-        loop {
-            let entities =
-                self.store
-                    .entity_ids_after("worker-session:", cursor.as_deref(), 128)?;
-            if entities.is_empty() {
-                return Ok(());
-            }
-            cursor = entities.last().cloned();
-            for entity in entities {
-                let Some(loaded) = self
-                    .store
-                    .materialized_state::<WorkerSessionRecordV1>(&entity)?
-                else {
-                    continue;
-                };
-                if !matches!(
-                    loaded.state.authority,
-                    WorkerAuthorityStateV1::Tombstoned {
-                        cleanup: WorkerCleanupStateV1::Pending,
-                        ..
-                    }
-                ) {
-                    continue;
-                }
-                let termination_entity =
-                    worker_provider_termination_entity(&loaded.state.spec.session)?;
-                let existing_termination = self
-                    .store
-                    .materialized_state::<WorkerProviderTerminationRecordV1>(&termination_entity)?;
-                let receipt = if let Some(existing) = existing_termination {
-                    validate_worker_provider_termination_record(
-                        &termination_entity,
-                        &existing.state,
-                    )?;
-                    existing.state.process_cleanup_receipt
-                } else {
-                    Digest::from_serializable(&(
-                        "ag.worker-restart-process-absence/v1",
-                        &loaded.state.spec.session,
-                        &loaded.state.authority,
-                    ))?
-                };
-                if let Some(job) = self.prepare_worker_provider_termination(
-                    &loaded.state.spec.session,
-                    receipt,
-                    now_unix_ms,
-                )? {
-                    self.queue_provider_job_once(job);
-                }
-            }
+    /// Records process-local testimony that an exact job entered the provider
+    /// worker channel. This is liveness/transport evidence, not a durable
+    /// provider outcome, and is bounded by the scheduler capacity.
+    pub fn note_provider_job_submitted(&mut self, job: &ProviderIoJobV1) {
+        if !self
+            .submitted_provider_jobs
+            .iter()
+            .any(|existing| existing == job)
+        {
+            debug_assert!(self.submitted_provider_jobs.len() < PROVIDER_JOB_SCHEDULER_CAPACITY);
+            self.submitted_provider_jobs.push(job.clone());
         }
     }
 
-    fn queue_provider_job_once(&mut self, job: ProviderIoJobV1) {
-        if !self
-            .pending_provider_jobs
-            .iter()
-            .any(|existing| *existing == job)
+    /// Retires process-local submission testimony when its exact completion is
+    /// received. Durable reconciliation remains a separate operation.
+    pub fn note_provider_job_completed(&mut self, job: &ProviderIoJobV1) {
+        self.submitted_provider_jobs
+            .retain(|existing| existing != job);
+    }
+
+    /// Advances at most one bounded page of durable termination work into the
+    /// bounded process-local scheduler. The cursor makes startup recovery
+    /// resumable without accumulating the complete historical session set.
+    pub fn refill_pending_provider_terminations(
+        &mut self,
+        now_unix_ms: u64,
+    ) -> Result<(), AgdError> {
+        if self.provider_termination_scan_complete
+            || self.pending_provider_jobs.len() >= PROVIDER_TERMINATION_QUEUE_LIMIT
         {
-            self.pending_provider_jobs.push_back(job);
+            return Ok(());
         }
+        let remaining = PROVIDER_TERMINATION_QUEUE_LIMIT - self.pending_provider_jobs.len();
+        let limit = PROVIDER_TERMINATION_SCAN_BATCH
+            .min(u32::try_from(remaining).map_err(|_| AgdError::ArtifactTransferTooLarge)?);
+        let entities = self.store.entity_ids_after(
+            "worker-session:",
+            self.provider_termination_scan_cursor.as_deref(),
+            limit,
+        )?;
+        if entities.is_empty() {
+            self.provider_termination_scan_complete = true;
+            return Ok(());
+        }
+        for entity in entities {
+            self.provider_termination_scan_cursor = Some(entity.clone());
+            let Some(loaded) = self
+                .store
+                .materialized_state::<WorkerSessionRecordV1>(&entity)?
+            else {
+                continue;
+            };
+            if !matches!(
+                loaded.state.authority,
+                WorkerAuthorityStateV1::Tombstoned {
+                    cleanup: WorkerCleanupStateV1::Pending,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            let termination_entity =
+                worker_provider_termination_entity(&loaded.state.spec.session)?;
+            let existing_termination = self
+                .store
+                .materialized_state::<WorkerProviderTerminationRecordV1>(&termination_entity)?;
+            let receipt = if let Some(existing) = existing_termination {
+                validate_worker_provider_termination_record(&termination_entity, &existing.state)?;
+                existing.state.process_cleanup_receipt
+            } else {
+                Digest::from_serializable(&(
+                    "ag.worker-restart-process-absence/v1",
+                    &loaded.state.spec.session,
+                    &loaded.state.authority,
+                ))?
+            };
+            if let Some(job) = self.prepare_worker_provider_termination(
+                &loaded.state.spec.session,
+                receipt,
+                now_unix_ms,
+            )? {
+                self.queue_provider_job_once(job);
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_provider_job_once(&mut self, job: ProviderIoJobV1) {
+        let termination = matches!(job.operation, ProviderIoOperationV1::Terminate);
+        let limit = if termination {
+            PROVIDER_TERMINATION_QUEUE_LIMIT
+        } else {
+            PROVIDER_JOB_SCHEDULER_CAPACITY
+        };
+        if !enqueue_provider_job_bounded(&mut self.pending_provider_jobs, job, limit) && termination
+        {
+            self.provider_termination_scan_cursor = None;
+            self.provider_termination_scan_complete = false;
+        }
+    }
+
+    /// Queues one exact Begin/Acknowledge transition from durable custody.
+    /// `false` means it remains unsubmitted and recoverable from that custody;
+    /// it never means a provider outcome is known.
+    pub fn queue_interactive_provider_job(&mut self, job: ProviderIoJobV1) -> bool {
+        debug_assert!(!matches!(job.operation, ProviderIoOperationV1::Terminate));
+        enqueue_provider_job_bounded(
+            &mut self.pending_provider_jobs,
+            job,
+            PROVIDER_JOB_SCHEDULER_CAPACITY,
+        )
+    }
+
+    /// True only while one slot remains reserved for a response-custody
+    /// acknowledgment. When false, fd5 remains unread and therefore bounded
+    /// by its existing framed channel rather than accumulating admitted jobs.
+    pub fn provider_scheduler_accepts_worker_request(&self) -> bool {
+        self.pending_provider_jobs.len() < PROVIDER_WORKER_REQUEST_QUEUE_LIMIT
     }
 
     /// Loads one historical or live worker record directly from governor
@@ -947,6 +1079,46 @@ impl AgdCoreV1 {
         })
     }
 
+    /// Reconstructs only the next lawful provider transition from durable
+    /// attempt custody. Exact duplicate Infer requests therefore project an
+    /// existing response or acknowledgment instead of dispatching again.
+    pub fn worker_provider_resume_job(
+        &mut self,
+        session: &SessionId,
+        attempt: &RequestId,
+        now_unix_ms: u64,
+    ) -> Result<Option<ProviderIoJobV1>, AgdError> {
+        let capability = self.reload_active_worker_provider_capability(session, now_unix_ms)?;
+        let record = self.inspect_worker_provider_attempt(session, attempt)?;
+        if record.worker_principal != capability.worker_principal
+            || record.request.capability_id != capability.id()
+        {
+            return Err(AgdError::WorkerProviderAttemptMismatch);
+        }
+        match record.state {
+            WorkerProviderAttemptStateV1::RequestInCustody => self
+                .worker_provider_begin_job(session, attempt, now_unix_ms)
+                .map(Some),
+            WorkerProviderAttemptStateV1::DispatchAvailable { .. } => {
+                Err(AgdError::WorkerProviderAttemptMismatch)
+            }
+            WorkerProviderAttemptStateV1::ResponseInCustody { dispatch, response } => {
+                Ok(Some(ProviderIoJobV1 {
+                    session: session.clone(),
+                    worker_principal: capability.worker_principal.clone(),
+                    attempt: attempt.clone(),
+                    capability,
+                    operation: ProviderIoOperationV1::Acknowledge {
+                        dispatch,
+                        exact_event_stream: response.complete_event_stream,
+                        governor_custody_record: response.custody_record,
+                    },
+                }))
+            }
+            WorkerProviderAttemptStateV1::Acknowledged { .. } => Ok(None),
+        }
+    }
+
     /// Projects one durable attempt for fd6 without dispatching or changing
     /// provider state. Response bytes are returned only from exact local blob
     /// custody.
@@ -980,6 +1152,37 @@ impl AgdCoreV1 {
                     protocol_terminal: response.protocol_terminal,
                 })
             }
+        }
+    }
+
+    /// Projects durable response custody plus process-local submission state.
+    /// A queued/full job remains `Pending` (known unsubmitted); an accepted
+    /// channel submission without a completion is explicitly `Uncertain`.
+    pub fn worker_provider_live_response(
+        &mut self,
+        session: &SessionId,
+        attempt: &RequestId,
+    ) -> Result<WorkerProviderResponseV1, AgdError> {
+        let durable = self.worker_provider_response(session, attempt)?;
+        if !matches!(durable, WorkerProviderResponseV1::Pending { .. }) {
+            return Ok(durable);
+        }
+        let submitted = self.submitted_provider_jobs.iter().any(|job| {
+            job.session == *session
+                && job.attempt == *attempt
+                && !matches!(job.operation, ProviderIoOperationV1::Terminate)
+        });
+        if submitted {
+            Ok(WorkerProviderResponseV1::Uncertain {
+                attempt: attempt.clone(),
+                evidence: Digest::from_serializable(&(
+                    "ag.worker-provider.local-submission-unreconciled/v1",
+                    session,
+                    attempt,
+                ))?,
+            })
+        } else {
+            Ok(durable)
         }
     }
 
@@ -1023,11 +1226,30 @@ impl AgdCoreV1 {
                 if Digest::hash_bytes(event_stream.as_slice()) != exact_event_stream {
                     return Err(AgdError::WorkerProviderAttemptMismatch);
                 }
-                record.reconcile_dispatch_available(
-                    dispatch.clone(),
+                let response = ProviderResponseCustodyV1::new(
+                    record.request.custody_record.clone(),
                     exact_event_stream.clone(),
                     protocol_terminal,
                 )?;
+                match record.reconcile_fetched_response(dispatch.clone(), response.clone())? {
+                    ProviderFetchedReconcileV1::ExistingNeedsAcknowledgment => {
+                        return Ok(Some(ProviderIoJobV1 {
+                            session: completion.job.session,
+                            worker_principal: completion.job.worker_principal,
+                            attempt: completion.job.attempt,
+                            capability: current,
+                            operation: ProviderIoOperationV1::Acknowledge {
+                                dispatch,
+                                exact_event_stream,
+                                governor_custody_record: response.custody_record,
+                            },
+                        }));
+                    }
+                    ProviderFetchedReconcileV1::ExistingAcknowledged => {
+                        return Ok(None);
+                    }
+                    ProviderFetchedReconcileV1::NewlyCustodied => {}
+                }
                 let byte_length = u64::try_from(event_stream.len())
                     .map_err(|_| AgdError::ArtifactTransferTooLarge)?;
                 self.store.install_blob(
@@ -1039,12 +1261,6 @@ impl AgdCoreV1 {
                     i64::try_from(now_unix_ms)
                         .map_err(|_| AgdError::Clock("time overflow".to_owned()))?,
                 )?;
-                let response = ProviderResponseCustodyV1::new(
-                    record.request.custody_record.clone(),
-                    exact_event_stream.clone(),
-                    protocol_terminal,
-                )?;
-                record.reconcile_response_custody(dispatch.clone(), response.clone())?;
                 self.store.append_event(
                     NewEventV1 {
                         event_id: uuid::Uuid::new_v4().to_string(),
@@ -1079,7 +1295,18 @@ impl AgdCoreV1 {
                         },
                 },
             ) if dispatch == returned => {
+                let duplicate = matches!(
+                    &record.state,
+                    WorkerProviderAttemptStateV1::Acknowledged {
+                        dispatch: existing_dispatch,
+                        provider_receipt,
+                        ..
+                    } if *existing_dispatch == dispatch && *provider_receipt == receipt
+                );
                 record.reconcile_acknowledgment(dispatch.clone(), receipt.clone())?;
+                if duplicate {
+                    return Ok(None);
+                }
                 self.store.append_event(
                     NewEventV1 {
                         event_id: uuid::Uuid::new_v4().to_string(),
@@ -3985,6 +4212,45 @@ mod tests {
             }
         ));
         assert_eq!(calls.len(), 3);
+        let mut registration_calls = 0;
+        let mut different_capability = capability.clone();
+        different_capability.expires_at_unix_ms += 1;
+        let different_capability_id = different_capability.id();
+        let mismatched_registration = execute_provider_io_job(io_job.clone(), |_| {
+            registration_calls += 1;
+            ApiResultV1::Ok {
+                response: ProviderResponseV1::CapabilityRegistered {
+                    capability: different_capability_id.clone(),
+                },
+            }
+        });
+        assert_eq!(registration_calls, 1);
+        assert!(matches!(
+            mismatched_registration.result,
+            ApiResultV1::Error {
+                code: ApiErrorCodeV1::Indeterminate,
+                ..
+            }
+        ));
+
+        let mut bounded = VecDeque::new();
+        let first = io_job.clone();
+        let mut second = io_job.clone();
+        second.attempt = RequestId::new("attempt-2").expect("second attempt");
+        let mut retained = io_job.clone();
+        retained.attempt = RequestId::new("attempt-retained").expect("retained attempt");
+        assert!(enqueue_provider_job_bounded(&mut bounded, first.clone(), 2));
+        assert!(enqueue_provider_job_bounded(&mut bounded, first, 2));
+        assert!(enqueue_provider_job_bounded(&mut bounded, second, 2));
+        assert!(!enqueue_provider_job_bounded(
+            &mut bounded,
+            retained.clone(),
+            2
+        ));
+        assert_eq!(bounded.len(), 2);
+        assert!(!bounded.contains(&retained));
+        assert_eq!(PROVIDER_TERMINATION_QUEUE_LIMIT, 126);
+        assert_eq!(PROVIDER_JOB_SCHEDULER_CAPACITY, 128);
         let mut phase = 0;
         let mismatched_fetch = execute_provider_io_job(io_job.clone(), |request| {
             phase += 1;
@@ -4071,9 +4337,11 @@ mod tests {
         lifecycle
             .reconcile_dispatch_available(dispatch.clone(), stream.clone(), true)
             .expect("exact duplicate is idempotent");
-        assert!(lifecycle
-            .reconcile_dispatch_available(Digest::hash_bytes(b"late"), stream.clone(), true)
-            .is_err());
+        assert!(
+            lifecycle
+                .reconcile_dispatch_available(Digest::hash_bytes(b"late"), stream.clone(), true)
+                .is_err()
+        );
         let response =
             ProviderResponseCustodyV1::new(lifecycle.request.custody_record.clone(), stream, true)
                 .expect("response custody");
@@ -4081,15 +4349,32 @@ mod tests {
             .reconcile_response_custody(dispatch.clone(), response.clone())
             .expect("response custody transition");
         lifecycle
-            .reconcile_response_custody(dispatch.clone(), response)
+            .reconcile_response_custody(dispatch.clone(), response.clone())
             .expect("duplicate fetch is idempotent");
+        assert_eq!(
+            lifecycle
+                .reconcile_fetched_response(dispatch.clone(), response.clone())
+                .expect("duplicate Begin completion projects existing custody"),
+            ProviderFetchedReconcileV1::ExistingNeedsAcknowledgment
+        );
         let receipt = Digest::hash_bytes(b"provider-ack");
         lifecycle
             .reconcile_acknowledgment(dispatch.clone(), receipt.clone())
             .expect("acknowledgment");
         lifecycle
-            .reconcile_acknowledgment(dispatch, receipt)
+            .reconcile_acknowledgment(dispatch.clone(), receipt)
             .expect("duplicate acknowledgment is idempotent");
+        assert_eq!(
+            lifecycle
+                .reconcile_fetched_response(dispatch, response.clone())
+                .expect("duplicate Begin completion preserves acknowledgment"),
+            ProviderFetchedReconcileV1::ExistingAcknowledged
+        );
+        assert!(
+            lifecycle
+                .reconcile_fetched_response(Digest::hash_bytes(b"other-dispatch"), response)
+                .is_err()
+        );
 
         let process_cleanup_receipt = Digest::hash_bytes(b"process-cleanup");
         let termination = WorkerProviderTerminationRecordV1 {
