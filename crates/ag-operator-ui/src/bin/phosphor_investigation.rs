@@ -5,7 +5,7 @@ use std::{
 };
 
 use ag_operator_ui::investigation;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{bail, Context as _, Result};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -15,6 +15,9 @@ struct Args {
     root: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8437")]
     bind: SocketAddr,
+    /// Mutable design surface used by cross-surface navigation.
+    #[arg(long, default_value = "http://127.0.0.1:8427/phosphor/design")]
+    design_url: String,
     #[arg(long)]
     terminal: Option<String>,
     /// Open the interactive read-only terminal inspector for one investigation.
@@ -63,7 +66,7 @@ fn main() -> Result<()> {
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(error) = handle_connection(&root, &mut stream) {
+                if let Err(error) = handle_connection(&root, &args.design_url, &mut stream) {
                     eprintln!("investigation request failed: {error:#}");
                 }
             }
@@ -75,6 +78,7 @@ fn main() -> Result<()> {
 
 fn handle_connection(
     root: &std::path::Path,
+    design_url: &str,
     stream: &mut (impl std::io::Read + std::io::Write),
 ) -> Result<()> {
     let mut bytes = [0_u8; 16 * 1024];
@@ -90,24 +94,32 @@ fn handle_connection(
     if !matches!(method, "GET" | "HEAD") {
         return write_response(stream, 405, "text/plain", b"read only", method == "HEAD");
     }
-    let (status, kind, body) = route(root, path);
+    let (status, kind, body) = route(root, path, design_url);
     write_response(stream, status, kind, body.as_bytes(), method == "HEAD")
 }
 
-fn route(root: &std::path::Path, path: &str) -> (u16, &'static str, String) {
+fn route(root: &std::path::Path, path: &str, design_url: &str) -> (u16, &'static str, String) {
     if path == "/style.css" {
         return (200, "text/css", investigation::style().into());
     }
     if matches!(path, "/" | "/phosphor-ng/investigations") {
         return match investigation::list(root) {
-            Ok(v) => (200, "text/html", investigation::render_index(&v)),
+            Ok(v) => (
+                200,
+                "text/html",
+                investigation::render_index_with_design(&v, design_url),
+            ),
             Err(e) => (503, "text/plain", e),
         };
     }
     if let Some(id) = path.strip_prefix("/phosphor-ng/investigations/") {
         let id = id.replace("%3A", ":").replace("%3a", ":");
         return match investigation::load(root, &id) {
-            Ok(v) => (200, "text/html", investigation::render_detail(&v)),
+            Ok(v) => (
+                200,
+                "text/html",
+                investigation::render_detail_with_design(&v, design_url),
+            ),
             Err(e) => (404, "text/plain", e),
         };
     }
@@ -162,7 +174,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut stream = Cursor::new(Vec::new());
 
-        handle_connection(root.path(), &mut stream).unwrap();
+        handle_connection(
+            root.path(),
+            "http://127.0.0.1:8427/phosphor/design",
+            &mut stream,
+        )
+        .unwrap();
         assert!(stream.into_inner().is_empty());
     }
 }

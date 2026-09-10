@@ -4,16 +4,16 @@ use std::{fmt::Write as _, fs, io, path::Path};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
 use ratatui::{
-    Terminal,
     backend::{CrosstermBackend, TestBackend},
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
+    Terminal,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -200,19 +200,85 @@ fn raw(label: &str, value: &Value) -> String {
 /// Shared browser style for the operational investigation surface.
 #[must_use]
 pub fn style() -> &'static str {
-    r":root{color-scheme:dark;--bg:#0b0c0c;--panel:#151614;--line:#555248;--text:#e2dece;--muted:#9e9a8d;--amber:#d7a53b;--oxide:#b66b52}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-monospace,monospace}a{color:#e6bd65}.top{padding:.7rem 1rem;border-bottom:3px double var(--line);display:flex;gap:1rem}.top span{margin-left:auto;color:var(--muted)}main{max-width:1500px;margin:auto;padding:1rem}.rail{border-left:2px solid var(--line);padding:.25rem 0 1rem 1rem;margin-left:.4rem;overflow-wrap:anywhere}.seam{border-top:3px double var(--line);padding-top:.7rem}.open{border-left:2px dashed var(--amber)}.stop{border-right:5px double var(--oxide);padding:.6rem;background:#211711}.grid{display:grid;grid-template-columns:1fr 1.4fr 1fr;gap:.8rem}.panel{border:1px solid var(--line);background:var(--panel);padding:.8rem;min-width:0}.wide{grid-column:1/-1}.muted{color:var(--muted);overflow-wrap:anywhere}.tag{border:1px solid var(--line);padding:.1rem .35rem;text-transform:uppercase;font-size:.7rem}.raw{margin-top:.5rem}.raw pre{overflow:auto;max-height:30rem;background:#070808;padding:.7rem}.finding{border-left:2px solid var(--amber);padding-left:.7rem;margin:.7rem 0}@media(max-width:900px){.grid{grid-template-columns:1fr}.wide{grid-column:auto}}"
+    r":root{color-scheme:dark;--bg:#0d0d0b;--surface:#141410;--panel:#1a1a15;--raised:#22221b;--line:#555247;--line-soft:#35332c;--text:#e7e0ce;--muted:#aaa28f;--amber:#d3a445;--blue:#8299ad;--green:#849b72;--oxide:#b36d55;--focus:#f0c66d}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.55 system-ui,sans-serif}a{color:#e2b95f;text-underline-offset:.18em}a:focus-visible,summary:focus-visible{outline:3px solid var(--focus);outline-offset:3px}.skip{position:absolute;left:-10000px}.skip:focus{left:.8rem;top:.8rem;z-index:30;background:var(--raised);padding:.5rem}.top{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:1.2rem;padding:.8rem 1.2rem;background:#10100deF;border-bottom:3px double var(--line)}.brand{color:var(--text);font-weight:800;text-decoration:none;letter-spacing:.04em}.nav{display:flex;gap:.25rem}.nav a{color:var(--muted);padding:.3rem .45rem;text-decoration:none}.nav a[aria-current=page]{color:var(--text);border-bottom:2px solid var(--amber)}.context{margin-left:auto;color:var(--muted);font:12px/1.4 ui-monospace,monospace;overflow-wrap:anywhere}main{max-width:1240px;margin:auto;padding:2rem 1.2rem 5rem}h1,h2,h3,p{margin-top:0}h1{font-size:clamp(1.8rem,4vw,3rem);line-height:1.08;max-width:22ch;margin-bottom:.65rem}h2{font-size:1.05rem;letter-spacing:.02em}h3{font-size:1rem}.eyebrow,.label{display:block;color:var(--muted);font:700 11px/1.4 ui-monospace,monospace;letter-spacing:.1em;text-transform:uppercase}.lede{font-size:1.13rem;max-width:72ch;color:#d4ccba}.muted{color:var(--muted);overflow-wrap:anywhere}.mono,code,pre{font-family:ui-monospace,monospace;overflow-wrap:anywhere}.button{display:inline-block;border:1px solid var(--amber);background:#2b2415;color:#f1d28c;padding:.55rem .8rem;text-decoration:none;font-weight:750}.summary{border-left:5px solid var(--amber);background:var(--surface);padding:1rem 1.15rem;margin:1.4rem 0}.summary strong{display:block;font-size:1.2rem}.nonclaim{color:var(--muted);font-size:.88rem;margin:.45rem 0 0}.status-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border:1px solid var(--line);margin:1.2rem 0}.status-cell{padding:.85rem;border-left:1px solid var(--line-soft);min-width:0}.status-cell:first-child{border-left:0}.status-cell strong{display:block}.layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(17rem,1fr);gap:1rem;align-items:start}.panel{border:1px solid var(--line);background:var(--panel);padding:1rem;min-width:0}.panel+.panel{margin-top:1rem}.observation{border-top:1px solid var(--line);padding:1.15rem 0}.observation:first-of-type{border-top:0}.observation-head{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem}.observation h3{font-size:1.2rem;margin:.15rem 0 .35rem}.state{display:inline-block;border:1px solid var(--line);padding:.15rem .4rem;font:700 11px/1.3 ui-monospace,monospace;text-transform:uppercase;letter-spacing:.05em}.state.observed{border-color:var(--green);color:#b9cca9}.state.unresolved{border-color:var(--amber);color:#efca7a}.state.refused{border-color:var(--oxide);color:#e5a18a}.facts{display:grid;grid-template-columns:minmax(8rem,11rem) minmax(0,1fr);gap:.35rem .8rem;margin:.8rem 0}.facts dt{color:var(--muted)}.facts dd{margin:0;overflow-wrap:anywhere}.limits{margin:.5rem 0;padding-left:1.2rem;color:var(--muted)}.timeline{border-left:2px solid var(--blue);padding-left:1rem;margin-left:.25rem}.timeline div{padding:.2rem 0 1rem}.timeline strong{display:block}.evidence-list{display:grid;gap:.55rem}.evidence{border-left:2px solid var(--line);padding-left:.8rem;min-width:0}.evidence strong{display:block}.raw{margin-top:.65rem;border:1px solid var(--line-soft)}.raw summary{cursor:pointer;padding:.6rem .7rem;background:var(--raised);font-weight:700}.raw pre{white-space:pre;overflow:auto;max-height:34rem;margin:0;background:#090906;padding:.8rem;font-size:.72rem;line-height:1.45}.record-actions{display:flex;gap:.6rem;flex-wrap:wrap;margin:1rem 0}.service-list{display:grid;gap:.8rem}.service-card{border:1px solid var(--line);background:var(--panel);padding:1rem}.service-card h2{font-size:1.35rem;margin:.2rem 0}.service-meta{display:flex;gap:1rem;flex-wrap:wrap;color:var(--muted);font-size:.88rem}.empty{border-left:4px dashed var(--blue);padding:1rem;background:var(--surface)}@media(max-width:760px){.top{position:static;align-items:flex-start;flex-wrap:wrap}.context{width:100%;margin:0}.status-grid,.layout{grid-template-columns:1fr}.status-cell{border-left:0;border-top:1px solid var(--line-soft)}.status-cell:first-child{border-top:0}main{padding:1.25rem .8rem 4rem}.observation-head{display:block}.state{margin-bottom:.5rem}.facts{grid-template-columns:1fr}.facts dd{margin-bottom:.35rem}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}"
 }
 
-fn page(title: &str, body: &str) -> String {
+fn page(title: &str, body: &str, design_url: &str, active: &str, context: &str) -> String {
     format!(
-        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=stylesheet href=/style.css></head><body><header class=top><a href=/phosphor-ng/investigations><strong>PHOSPHOR-NG</strong></a><b>service investigations</b><span>read only · no aggregate verdict</span></header><main>{body}</main></body></html>",
-        esc(title)
+        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{} · Operational ECAD</title><link rel=stylesheet href=/style.css></head><body><a class=skip href=#main>Skip to investigation</a><header class=top><a class=brand href=\"{}\">OPERATIONAL ECAD</a><nav class=nav aria-label=Workspace><a href=\"{}\">Service</a><a {} href=/phosphor-ng/investigations>Findings</a><a href=\"{}#advanced-plan-editing\">Advanced</a></nav><span class=context>{}</span></header><main id=main>{body}</main></body></html>",
+        esc(title), esc(design_url), esc(design_url), if active == "findings" { "aria-current=page" } else { "" }, esc(design_url), esc(context)
     )
+}
+
+fn profile_copy(profile: &str) -> (&'static str, &'static str) {
+    match profile {
+        "nq.systemd_unit/v1" => (
+            "Service-manager observation",
+            "Does the target service-manager state match the admitted policy?",
+        ),
+        "nq.http_endpoint/v1" => (
+            "HTTP observation",
+            "Is complete current HTTP testimony available from the controller vantage?",
+        ),
+        _ => (
+            "Bounded observation",
+            "What did the configured diagnostic establish?",
+        ),
+    }
+}
+
+fn source_for<'a>(
+    item: &'a InvestigationProjectionV1,
+    node: &str,
+    suffix: &str,
+) -> Option<&'a SourceArtifactV1> {
+    item.sources
+        .iter()
+        .find(|source| source.name == format!("{node}.{suffix}.json"))
+}
+
+fn outcome_phrase(profile: &str, condition: &str, summary: &str) -> String {
+    match (profile, condition) {
+        ("nq.systemd_unit/v1", "present") => "Service-manager policy mismatch observed".into(),
+        ("nq.http_endpoint/v1", "unresolved") => "HTTP question unresolved".into(),
+        (_, _) if !summary.is_empty() => summary.into(),
+        _ => format!("Observation condition: {condition}"),
+    }
+}
+
+fn source_label(name: &str) -> &'static str {
+    if name.ends_with(".nq.json") {
+        "Diagnostic finding"
+    } else if name.ends_with(".qualification.json") {
+        "Evidence applicability check"
+    } else if name.ends_with(".standing.json") {
+        "Permission receipt"
+    } else {
+        "Owner artifact"
+    }
+}
+
+fn compact_identity(value: &str) -> String {
+    if value.len() <= 28 {
+        value.into()
+    } else {
+        format!("{}…{}", &value[..18], &value[value.len() - 7..])
+    }
+}
+
+fn display_time(value: &str) -> String {
+    value.replace('T', " ")
 }
 
 /// Render the read-only investigation index.
 #[must_use]
 pub fn render_index(items: &[InvestigationProjectionV1]) -> String {
+    render_index_with_design(items, "http://127.0.0.1:8427/phosphor/design")
+}
+
+/// Render the read-only investigation index with an explicit mutable-design return URL.
+#[must_use]
+pub fn render_index_with_design(items: &[InvestigationProjectionV1], design_url: &str) -> String {
     let mut rows = String::new();
     for item in items {
         let state = item
@@ -227,23 +293,34 @@ pub fn render_index(items: &[InvestigationProjectionV1]) -> String {
             .unwrap_or("unnamed subject");
         let _ = write!(
             rows,
-            "<div class=rail><span class=tag>{}</span><h2><a href=\"/phosphor-ng/investigations/{}\">{}</a></h2><div class=muted>{}</div></div>",
-            esc(state),
+            "<article class=service-card><span class=state>{}</span><h2><a href=\"/phosphor-ng/investigations/{}\">{}</a></h2><p>{}</p><div class=service-meta><span>Investigation {}</span><span>Last observed {}</span></div></article>",
+            esc(if state == "completed" { "diagnostic completed" } else { state }),
             esc(id(item)),
             esc(label),
-            esc(id(item))
+            if state == "completed" { "Review the independent observations and unresolved questions." } else { "Open the retained investigation state." },
+            esc(state),
+            esc(&display_time(item.state.get("updated_at").and_then(Value::as_str).unwrap_or("time unavailable")))
         );
     }
     page(
         "Service investigations",
         &format!(
-            "<h1>Operational investigations</h1><p class=muted>Nightshift lifecycle and exact NQ/Standing custody, projected without mutation.</p>{rows}"
+            "<span class=eyebrow>Investigation history</span><h1>Service investigations</h1><p class=lede>Open a retained diagnostic to understand what each observation established. A completed diagnostic is not a service-health verdict.</p><section class=service-list>{}</section>",
+            if rows.is_empty() { "<div class=empty>No retained investigation records are available. Return to Service to prepare the supported diagnostic.</div>" } else { &rows }
         ),
+        design_url,
+        "findings",
+        "service investigations",
     )
 }
 
 /// Render operations, reasoning, and custody planes for one occurrence.
 pub fn render_detail(item: &InvestigationProjectionV1) -> String {
+    render_detail_with_design(item, "http://127.0.0.1:8427/phosphor/design")
+}
+
+/// Render one occurrence with an explicit mutable-design return URL.
+pub fn render_detail_with_design(item: &InvestigationProjectionV1, design_url: &str) -> String {
     let state = item
         .state
         .get("state")
@@ -254,76 +331,153 @@ pub fn render_detail(item: &InvestigationProjectionV1) -> String {
         .pointer("/profile/subject_label")
         .and_then(Value::as_str)
         .unwrap_or("unnamed subject");
-    let findings = item
+    let finding_values = item
         .record
         .as_ref()
         .and_then(|v| v.get("findings"))
-        .and_then(Value::as_array)
-        .map_or_else(
-            || {
-                "<div class=\"rail open\">Expected findings ─────────╴ unresolved coverage</div>"
-                    .into()
-            },
-            |values| {
-                let mut rendered = String::new();
-                for finding in values {
-                    let profile = finding
-                        .get("profile")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown profile");
-                    let condition = finding
-                        .pointer("/outcome/condition")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    let _ = write!(
-                        rendered,
-                        "<div class=finding><strong>{}</strong><p>condition: {}</p>{}</div>",
-                        esc(profile),
-                        esc(condition),
-                        raw("Exact finding", finding)
-                    );
-                }
-                rendered
-            },
-        );
+        .and_then(Value::as_array);
+    let mut findings = String::new();
+    let mut summary_parts = Vec::new();
+    if let Some(values) = finding_values {
+        for finding in values {
+            let profile = finding
+                .get("profile")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown profile");
+            let node = finding
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let condition = finding
+                .pointer("/outcome/condition")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let summary = finding
+                .pointer("/outcome/summary")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let coverage = finding
+                .pointer("/outcome/coverage")
+                .and_then(Value::as_str)
+                .unwrap_or("not stated");
+            let (title, question) = profile_copy(profile);
+            let phrase = outcome_phrase(profile, condition, summary);
+            summary_parts.push(phrase.clone());
+            let source = source_for(item, node, "nq");
+            let completed = source
+                .and_then(|value| value.value.get("completed_at"))
+                .and_then(Value::as_str)
+                .map_or_else(|| "time unavailable".into(), display_time);
+            let vantage = item
+                .handoff
+                .pointer("/profile/diagnostics")
+                .and_then(Value::as_array)
+                .and_then(|values| {
+                    values
+                        .iter()
+                        .find(|value| value.get("node_id").and_then(Value::as_str) == Some(node))
+                })
+                .and_then(|value| value.get("vantage"))
+                .and_then(Value::as_str)
+                .unwrap_or("vantage unavailable");
+            let limits = source
+                .and_then(|value| value.value.get("limitations"))
+                .and_then(Value::as_array)
+                .map_or_else(
+                    || "<li>No additional limitation projection is available.</li>".into(),
+                    |values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.get("detail").and_then(Value::as_str))
+                            .map(|value| format!("<li>{}</li>", esc(value)))
+                            .collect::<Vec<_>>()
+                            .join("")
+                    },
+                );
+            let refusal = source
+                .and_then(|value| {
+                    value
+                        .value
+                        .pointer("/outcome/refusals/0/origin/payload/refusal/message")
+                })
+                .and_then(Value::as_str);
+            let _ = write!(findings, "<article class=observation><div class=observation-head><div><span class=eyebrow>{}</span><h3>{}</h3></div><span class=\"state {}\">{}</span></div><p>{}</p><dl class=facts><dt>Question</dt><dd>{}</dd><dt>Observed from</dt><dd>{}</dd><dt>Observation time</dt><dd>{}</dd><dt>Coverage</dt><dd>{}</dd>{}</dl><h3>Limits of this observation</h3><ul class=limits>{}</ul><p><a href=\"#evidence-{}.nq.json\">View supporting evidence</a></p>{}</article>",
+                esc(title), esc(&phrase), if condition == "unresolved" { "unresolved" } else { "observed" }, if condition == "unresolved" { "unresolved" } else { "bounded finding" }, esc(summary), esc(question), esc(vantage), esc(&completed), esc(coverage), refusal.map_or_else(String::new, |message| format!("<dt>Why unresolved</dt><dd>{}</dd>", esc(message))), limits, esc(node), raw("Exact bounded finding", finding));
+        }
+    } else {
+        findings.push_str("<div class=empty>Individual findings are not yet available. Reopen this same investigation later; do not submit replacement work.</div>");
+    }
     let mut custody = String::new();
-    for source in &item.sources {
+    let mut ordered_sources = item.sources.iter().collect::<Vec<_>>();
+    ordered_sources.sort_by_key(|source| {
+        let node = if source.name.starts_with("pn_systemd.") {
+            0
+        } else if source.name.starts_with("pn_http.") {
+            1
+        } else {
+            2
+        };
+        let kind = if source.name.ends_with(".nq.json") {
+            0
+        } else if source.name.ends_with(".qualification.json") {
+            1
+        } else {
+            2
+        };
+        (node, kind, &source.name)
+    });
+    for source in ordered_sources {
         let _ = write!(
             custody,
-            "<div class=rail><strong>{}</strong><div class=muted>{}</div>{}</div>",
+            "<div class=evidence id=\"evidence-{}\"><span class=eyebrow>{}</span><strong>{}</strong><span class=muted>Original file: {}<br><code>{}</code></span>{}</div>",
             esc(&source.name),
-            esc(&source.digest),
+            source_label(&source.name),
+            esc(match source_label(&source.name) { "Diagnostic finding" => "Observation result and derivation", "Evidence applicability check" => "Applicability of admitted evidence", "Permission receipt" => "Permission consumed before this check", _ => "Exact owner artifact" }),
+            esc(&source.name),
+            esc(&compact_identity(&source.digest)),
             raw("Exact owner artifact", &source.value)
         );
     }
-    let authority = if item
+    let authority_count = item
         .sources
         .iter()
-        .any(|v| v.name.ends_with(".standing.json"))
-    {
-        "Standing admission attached to acquisition rail"
+        .filter(|value| value.name.ends_with(".standing.json"))
+        .count();
+    let draft = item
+        .handoff
+        .get("draft_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let preparation_url = format!(
+        "{}/drafts/{}/investigation",
+        design_url.trim_end_matches('/'),
+        draft
+    );
+    let overall = if state == "completed" {
+        format!("Diagnostic completed. {}.", summary_parts.join("; "))
     } else {
-        "acquisition ─────⊣ Standing admission absent"
+        format!("Investigation state: {state}.")
     };
+    let accepted = item
+        .submission
+        .as_ref()
+        .and_then(|value| value.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("not recorded");
+    let updated = item
+        .state
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .map_or_else(|| "time unavailable".into(), display_time);
     page(
         label,
         &format!(
-            "<h1>{}</h1><p><span class=tag>{}</span> <span class=muted>{}</span></p><div class=grid><section class=panel><h2>Operations</h2><div class=rail>plan revision<br>{}</div><div class=\"rail seam\">Nightshift state<br><strong>{}</strong></div><div class=stop>{}</div></section><section class=panel><h2>Reasoning</h2>{}</section><section class=panel><h2>Custody</h2>{}</section><section class=\"panel wide\"><h2>Exact lifecycle</h2>{}{}</section></div>",
-            esc(label),
-            esc(state),
-            esc(id(item)),
-            esc(item
-                .handoff
-                .get("revision_id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")),
-            esc(state),
-            esc(authority),
-            findings,
-            custody,
-            raw("Handoff", &item.handoff),
-            raw("State", &item.state)
+            "<span class=eyebrow>Findings / retained investigation</span><h1>{}</h1><p class=lede>Understand what the diagnostic established, what remains unanswered, and where its exact record lives.</p><div class=summary><strong>{}</strong><p class=nonclaim>These are independent bounded observations. No aggregate service-health verdict was produced.</p></div><section class=status-grid aria-label=Investigation status><div class=status-cell><span class=label>Submission</span><strong>Investigation {}</strong></div><div class=status-cell><span class=label>Diagnostic lifecycle</span><strong>{}</strong></div><div class=status-cell><span class=label>Last observed</span><strong>{}</strong></div></section><div class=record-actions><a class=button href=\"{}\">Review diagnostic plan</a><a href=#record>Investigation record</a></div><div class=layout><div><section class=panel><span class=eyebrow>Explanation and observations</span><h2>What the checks found</h2>{}</section><section class=panel id=record><span class=eyebrow>Accountable record</span><h2>Investigation record</h2><p>The diagnostic retained {} permission record(s) for {} observation(s). Exact identities remain available below.</p><div class=timeline><div><strong>Investigation accepted</strong>{}</div><div><strong>Diagnostic {}</strong>{}</div></div>{}{}{}</section></div><aside><section class=panel><span class=eyebrow>Supporting evidence</span><h2>Evidence and permission records</h2><div class=evidence-list>{}</div></section></aside></div>",
+            esc(label), esc(&overall), esc(accepted), esc(state), esc(&updated), esc(&preparation_url), findings, authority_count, finding_values.map_or(0, |values| values.len()), esc(item.submission.as_ref().and_then(|value| value.get("run_id")).and_then(Value::as_str).unwrap_or("run identity unavailable")), esc(state), esc(&updated), item.record.as_ref().map_or_else(String::new, |record| raw("Exact investigation record", record)), raw("Exact plan handoff", &item.handoff), raw("Exact lifecycle state", &item.state), custody
         ),
+        design_url,
+        "findings",
+        label,
     )
 }
 
@@ -591,8 +745,9 @@ mod tests {
         let loaded = load(temp.path(), handoff["investigation_id"].as_str().unwrap()).unwrap();
         assert_eq!(loaded.sources.len(), 1);
         let browser = render_detail(&loaded);
-        assert!(browser.contains("no aggregate verdict"));
-        assert!(browser.contains("Standing admission attached"));
+        assert!(browser.contains("No aggregate service-health verdict"));
+        assert!(browser.contains("Service-manager policy mismatch observed"));
+        assert!(browser.contains("Permission consumed before this check"));
         assert!(style().contains("overflow-wrap:anywhere"));
         let wide = render_terminal(&loaded, 140, 40, false, false).unwrap();
         assert!(wide.contains("OPERATIONS") && wide.contains("REASONING"));
