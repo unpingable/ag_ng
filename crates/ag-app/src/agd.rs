@@ -220,6 +220,103 @@ pub enum WorkerProviderAttemptStateV1 {
     },
 }
 
+impl WorkerProviderAttemptRecordV1 {
+    /// Reconciles the provider's durable dispatch-available testimony.
+    /// Exact repeats are idempotent; a different or late result refuses.
+    pub fn reconcile_dispatch_available(
+        &mut self,
+        dispatch: Digest,
+        exact_event_stream: Digest,
+        protocol_terminal: bool,
+    ) -> Result<(), AgdError> {
+        let next = Self::dispatch_available(dispatch, exact_event_stream, protocol_terminal);
+        match &self.state {
+            WorkerProviderAttemptStateV1::RequestInCustody => self.state = next,
+            existing if *existing == next => {}
+            _ => return Err(AgdError::WorkerProviderAttemptMismatch),
+        }
+        Ok(())
+    }
+
+    fn dispatch_available(
+        dispatch: Digest,
+        exact_event_stream: Digest,
+        protocol_terminal: bool,
+    ) -> WorkerProviderAttemptStateV1 {
+        WorkerProviderAttemptStateV1::DispatchAvailable {
+            dispatch,
+            exact_event_stream,
+            protocol_terminal,
+        }
+    }
+
+    /// Reconciles exact fetched bytes after they entered governor blob custody.
+    /// Exact repeats are idempotent and cannot regress an acknowledged state.
+    pub fn reconcile_response_custody(
+        &mut self,
+        dispatch: Digest,
+        response: ProviderResponseCustodyV1,
+    ) -> Result<(), AgdError> {
+        response.verify()?;
+        if response.request_custody != self.request.custody_record {
+            return Err(AgdError::WorkerProviderAttemptMismatch);
+        }
+        let expected_stream = match &self.state {
+            WorkerProviderAttemptStateV1::DispatchAvailable {
+                dispatch: expected_dispatch,
+                exact_event_stream,
+                protocol_terminal,
+            } if *expected_dispatch == dispatch
+                && *exact_event_stream == response.complete_event_stream
+                && *protocol_terminal == response.protocol_terminal =>
+            {
+                exact_event_stream
+            }
+            WorkerProviderAttemptStateV1::ResponseInCustody {
+                dispatch: expected_dispatch,
+                response: existing,
+            } if *expected_dispatch == dispatch && *existing == response => return Ok(()),
+            WorkerProviderAttemptStateV1::Acknowledged {
+                dispatch: expected_dispatch,
+                response: existing,
+                ..
+            } if *expected_dispatch == dispatch && *existing == response => return Ok(()),
+            _ => return Err(AgdError::WorkerProviderAttemptMismatch),
+        };
+        debug_assert_eq!(expected_stream, &response.complete_event_stream);
+        self.state = WorkerProviderAttemptStateV1::ResponseInCustody { dispatch, response };
+        Ok(())
+    }
+
+    /// Reconciles the provider's exact acknowledgment receipt. An
+    /// acknowledgment cannot precede governor response custody.
+    pub fn reconcile_acknowledgment(
+        &mut self,
+        dispatch: Digest,
+        provider_receipt: Digest,
+    ) -> Result<(), AgdError> {
+        match &self.state {
+            WorkerProviderAttemptStateV1::ResponseInCustody {
+                dispatch: expected,
+                response,
+            } if *expected == dispatch => {
+                self.state = WorkerProviderAttemptStateV1::Acknowledged {
+                    dispatch,
+                    response: response.clone(),
+                    provider_receipt,
+                };
+            }
+            WorkerProviderAttemptStateV1::Acknowledged {
+                dispatch: expected,
+                provider_receipt: existing,
+                ..
+            } if *expected == dispatch && *existing == provider_receipt => {}
+            _ => return Err(AgdError::WorkerProviderAttemptMismatch),
+        }
+        Ok(())
+    }
+}
+
 /// Result of one bounded startup pass over the durable forwarding outbox.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ForwardRecoveryReportV1 {
@@ -2917,5 +3014,37 @@ mod tests {
         let mut mismatched = record;
         mismatched.request.exact_request = Digest::hash_bytes(b"changed");
         assert!(validate_worker_provider_attempt_record(&entity, &mismatched).is_err());
+
+        let mut lifecycle = mismatched;
+        lifecycle.request.exact_request = Digest::hash_bytes(b"request");
+        let dispatch = Digest::hash_bytes(b"dispatch");
+        let stream = Digest::hash_bytes(b"stream");
+        lifecycle
+            .reconcile_dispatch_available(dispatch.clone(), stream.clone(), true)
+            .expect("dispatch available");
+        lifecycle
+            .reconcile_dispatch_available(dispatch.clone(), stream.clone(), true)
+            .expect("exact duplicate is idempotent");
+        assert!(
+            lifecycle
+                .reconcile_dispatch_available(Digest::hash_bytes(b"late"), stream.clone(), true)
+                .is_err()
+        );
+        let response =
+            ProviderResponseCustodyV1::new(lifecycle.request.custody_record.clone(), stream, true)
+                .expect("response custody");
+        lifecycle
+            .reconcile_response_custody(dispatch.clone(), response.clone())
+            .expect("response custody transition");
+        lifecycle
+            .reconcile_response_custody(dispatch.clone(), response)
+            .expect("duplicate fetch is idempotent");
+        let receipt = Digest::hash_bytes(b"provider-ack");
+        lifecycle
+            .reconcile_acknowledgment(dispatch.clone(), receipt.clone())
+            .expect("acknowledgment");
+        lifecycle
+            .reconcile_acknowledgment(dispatch, receipt)
+            .expect("duplicate acknowledgment is idempotent");
     }
 }
