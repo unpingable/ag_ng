@@ -727,6 +727,56 @@ impl AgdCoreV1 {
         Ok(record)
     }
 
+    /// Loads one exact durable provider attempt without changing or repeating
+    /// its provider operation.
+    pub fn inspect_worker_provider_attempt(
+        &mut self,
+        session: &SessionId,
+        attempt: &RequestId,
+    ) -> Result<WorkerProviderAttemptRecordV1, AgdError> {
+        let entity = worker_provider_attempt_entity(session, attempt)?;
+        let loaded = self
+            .store
+            .materialized_state::<WorkerProviderAttemptRecordV1>(&entity)?
+            .ok_or(AgdError::WorkerProviderAttemptNotFound)?;
+        validate_worker_provider_attempt_record(&entity, &loaded.state)?;
+        Ok(loaded.state)
+    }
+
+    /// Reconstructs an identity-bound begin job from durable request custody.
+    /// This does not dispatch; callers must use a bounded provider I/O queue.
+    pub fn worker_provider_begin_job(
+        &mut self,
+        session: &SessionId,
+        attempt: &RequestId,
+        now_unix_ms: u64,
+    ) -> Result<ProviderIoJobV1, AgdError> {
+        let capability = self.reload_active_worker_provider_capability(session, now_unix_ms)?;
+        let record = self.inspect_worker_provider_attempt(session, attempt)?;
+        if record.worker_principal != capability.worker_principal
+            || record.request.capability_id != capability.id()
+            || !matches!(record.state, WorkerProviderAttemptStateV1::RequestInCustody)
+        {
+            return Err(AgdError::WorkerProviderAttemptMismatch);
+        }
+        let request_bytes = self
+            .store
+            .read_blob(&record.request.exact_request, capability.budget.input_bytes)?;
+        if Digest::hash_bytes(&request_bytes) != record.request.exact_request {
+            return Err(AgdError::WorkerProviderAttemptMismatch);
+        }
+        Ok(ProviderIoJobV1 {
+            session: session.clone(),
+            worker_principal: capability.worker_principal.clone(),
+            attempt: attempt.clone(),
+            capability,
+            operation: ProviderIoOperationV1::Begin {
+                request: record.request,
+                request_bytes: OpaqueBytesV1::new(request_bytes),
+            },
+        })
+    }
+
     /// Launches one configured offline worker behind a durable principal fence.
     ///
     /// The child is prepared behind a descriptor gate. Its exact executable,
@@ -2973,6 +3023,9 @@ pub enum AgdError {
     /// A repeated attempt identity disagreed with its durable request/state.
     #[error("worker provider attempt does not match durable custody")]
     WorkerProviderAttemptMismatch,
+    /// Named provider attempt is absent from durable custody.
+    #[error("worker provider attempt was not found")]
+    WorkerProviderAttemptNotFound,
     /// Provider I/O queue has no bounded capacity.
     #[error("worker provider I/O queue capacity is invalid")]
     WorkerProviderQueueInvalid,
