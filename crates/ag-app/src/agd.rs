@@ -35,8 +35,9 @@ use thiserror::Error;
 use crate::api::{
     AgdRequestV1, AgdResponseV1, ApiErrorCodeV1, ApiResultV1, ArtifactTransferV1,
     EffectProposalRequestV1, EffectProposalResponseV1, GovernedProposalIngressV1, HealthV1,
-    ProposalIngressProofV1, WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1,
-    WorkerCandidateRequestV1, WorkerCandidateSourceProofV1, worker_candidate_ingress_proof_digest,
+    OpaqueBytesV1, ProposalIngressProofV1, ProviderRequestV1, ProviderResponseV1,
+    WorkerCandidateBootstrapV1, WorkerCandidateIngressProofV1, WorkerCandidateRequestV1,
+    WorkerCandidateSourceProofV1, worker_candidate_ingress_proof_digest,
 };
 use crate::config::{AgdConfigV1, WorkerCandidateEffectV1, WorkerProfileConfigV1};
 use crate::peer::signed_principal_chain;
@@ -218,6 +219,107 @@ pub enum WorkerProviderAttemptStateV1 {
         /// Provider-owned acknowledgment receipt.
         provider_receipt: Digest,
     },
+}
+
+/// Identity-bound work admitted to the bounded provider I/O worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderIoJobV1 {
+    /// Exact durable worker session.
+    pub session: SessionId,
+    /// Exact launcher-bound worker principal.
+    pub worker_principal: PrincipalId,
+    /// Stable worker-local attempt identity.
+    pub attempt: RequestId,
+    /// Exact reloaded capability for this transition.
+    pub capability: InferenceCapabilityV1,
+    /// One closed provider operation.
+    pub operation: ProviderIoOperationV1,
+}
+
+/// Provider operation performed outside agd's durable single-writer loop.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderIoOperationV1 {
+    /// Idempotently register the capability, dispatch, then fetch available
+    /// exact response custody.
+    Begin {
+        /// Exact governor request custody.
+        request: ProviderRequestCustodyV1,
+        /// Exact credential-free bytes matching request custody.
+        request_bytes: OpaqueBytesV1,
+    },
+    /// Acknowledge exact response custody after its local commit.
+    Acknowledge {
+        /// Provider-owned dispatch identity.
+        dispatch: Digest,
+        /// Digest of exact complete response bytes.
+        exact_event_stream: Digest,
+        /// Governor response-custody identity.
+        governor_custody_record: Digest,
+    },
+    /// Burn every provider grant for the terminal session.
+    Terminate,
+}
+
+/// Exact I/O testimony returned to agd for revalidation and durable commit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderIoCompletionV1 {
+    /// Exact submitted job, retained for identity revalidation.
+    pub job: ProviderIoJobV1,
+    /// Signed provider-daemon testimony or typed refusal.
+    pub result: ApiResultV1<ProviderResponseV1>,
+}
+
+/// Executes one already-admitted provider job without owning governor state.
+/// The caller supplies the signed RPC boundary and returns the completion to
+/// agd's single writer for exact identity revalidation.
+pub fn execute_provider_io_job(
+    job: ProviderIoJobV1,
+    mut call: impl FnMut(ProviderRequestV1) -> ApiResultV1<ProviderResponseV1>,
+) -> ProviderIoCompletionV1 {
+    let result = match &job.operation {
+        ProviderIoOperationV1::Begin {
+            request,
+            request_bytes,
+        } => {
+            let registered = call(ProviderRequestV1::RegisterCapability {
+                capability: Box::new(job.capability.clone()),
+                worker_principal: job.worker_principal.clone(),
+            });
+            if !matches!(
+                registered,
+                ApiResultV1::Ok {
+                    response: ProviderResponseV1::CapabilityRegistered { .. }
+                }
+            ) {
+                registered
+            } else {
+                let inferred = call(ProviderRequestV1::Infer {
+                    capability: Box::new(job.capability.clone()),
+                    request: Box::new(request.clone()),
+                    request_bytes: request_bytes.clone(),
+                });
+                match inferred {
+                    ApiResultV1::Ok {
+                        response: ProviderResponseV1::InferenceAvailable { dispatch, .. },
+                    } => call(ProviderRequestV1::FetchInference { dispatch }),
+                    other => other,
+                }
+            }
+        }
+        ProviderIoOperationV1::Acknowledge {
+            dispatch,
+            exact_event_stream,
+            governor_custody_record,
+        } => call(ProviderRequestV1::AcknowledgeInferenceCustody {
+            dispatch: dispatch.clone(),
+            exact_event_stream: exact_event_stream.clone(),
+            governor_custody_record: governor_custody_record.clone(),
+        }),
+        ProviderIoOperationV1::Terminate => call(ProviderRequestV1::TerminateSession {
+            session: job.session.clone(),
+        }),
+    };
+    ProviderIoCompletionV1 { job, result }
 }
 
 impl WorkerProviderAttemptRecordV1 {
@@ -2997,10 +3099,57 @@ mod tests {
             capability.id(),
             Digest::hash_bytes(b"request"),
             BTreeMap::new(),
-            capability.envelope,
+            capability.envelope.clone(),
         )
         .expect("request custody");
         let attempt = RequestId::new("attempt-1").expect("attempt identity");
+        let io_job = ProviderIoJobV1 {
+            session: session.clone(),
+            worker_principal: principal.clone(),
+            attempt: attempt.clone(),
+            capability: capability.clone(),
+            operation: ProviderIoOperationV1::Begin {
+                request: request.clone(),
+                request_bytes: OpaqueBytesV1::new(b"request".to_vec()),
+            },
+        };
+        let mut calls = Vec::new();
+        let io_completion = execute_provider_io_job(io_job.clone(), |provider_request| {
+            calls.push(provider_request.clone());
+            match provider_request {
+                ProviderRequestV1::RegisterCapability { capability, .. } => ApiResultV1::Ok {
+                    response: ProviderResponseV1::CapabilityRegistered {
+                        capability: capability.id(),
+                    },
+                },
+                ProviderRequestV1::Infer { .. } => ApiResultV1::Ok {
+                    response: ProviderResponseV1::InferenceAvailable {
+                        dispatch: Digest::hash_bytes(b"dispatch"),
+                        exact_event_stream: Digest::hash_bytes(b"stream"),
+                        byte_length: 6,
+                        protocol_terminal: true,
+                    },
+                },
+                ProviderRequestV1::FetchInference { dispatch } => ApiResultV1::Ok {
+                    response: ProviderResponseV1::Inference {
+                        dispatch,
+                        exact_event_stream: Digest::hash_bytes(b"stream"),
+                        event_stream: OpaqueBytesV1::new(b"stream".to_vec()),
+                        sanitized_headers: Vec::new(),
+                        protocol_terminal: true,
+                    },
+                },
+                _ => panic!("unexpected provider request"),
+            }
+        });
+        assert_eq!(io_completion.job, io_job);
+        assert!(matches!(
+            io_completion.result,
+            ApiResultV1::Ok {
+                response: ProviderResponseV1::Inference { .. }
+            }
+        ));
+        assert_eq!(calls.len(), 3);
         let entity = worker_provider_attempt_entity(&session, &attempt).expect("entity");
         let record = WorkerProviderAttemptRecordV1 {
             schema: "ag.worker-provider-attempt/v1".to_owned(),
