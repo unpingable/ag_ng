@@ -251,20 +251,20 @@ def validate_projection(value: dict) -> None:
 PAGE = r'''<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Investigate · Constellation</title><style>
-body{font:17px/1.5 system-ui,sans-serif;max-width:1000px;margin:3rem auto;padding:0 1.5rem;color:#172027;background:#f6f5f1}
-h1{font-size:2.6rem;margin-bottom:.3rem}h2{font-size:1.15rem}button{font:700 1.1rem system-ui;padding:.8rem 2.5rem;background:#164f48;color:white;border:0;border-radius:4px;cursor:pointer}button:disabled{opacity:.5;cursor:default}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem}section{background:white;border:1px solid #d6d9d7;padding:1rem;margin:1rem 0;border-radius:5px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.5 ui-monospace,monospace}.muted{color:#52616a}.notice{border-left:5px solid #ae6922;padding:1rem;background:#fff2df}#terminal{font-size:1.2rem}a{color:#164f48}.evidence-row{padding:.7rem 0;border-bottom:1px solid #e5e7e5}.evidence-row strong{display:block}.evidence-row small{display:block;color:#52616a}
-</style><h1>Investigate</h1>
-<p>Can a bounded, authorized service action run once through the governed execution path, with independently checked observations and retained evidence?</p>
-<p class="muted">This fixed local demonstration uses two virtual machines, AG-ng, Docket, and NQ-ng. The deterministic runner performs the work; Docket's evidence checks determine what can be claimed.</p>
+body{font:17px/1.5 system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1.5rem;color:#172027;background:#f6f5f1}
+h1{font-size:2.6rem;margin:.25rem 0}h2{font-size:1.15rem}button{font:700 1.1rem system-ui;padding:.8rem 2.5rem;background:#164f48;color:white;border:0;border-radius:4px;cursor:pointer}button:disabled{opacity:.5;cursor:default}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem}section{background:white;border:1px solid #d6d9d7;padding:1rem;margin:1rem 0;border-radius:5px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.5 ui-monospace,monospace}.muted{color:#52616a}.notice{border-left:5px solid #ae6922;padding:1rem;background:#fff2df}#terminal{font-size:1.6rem;font-weight:750}a{color:#164f48}.evidence-row{padding:.7rem 0;border-bottom:1px solid #e5e7e5}.evidence-row strong{display:block}.evidence-row small{display:block;color:#52616a}.banner{background:#352f28;color:#fff;padding:.65rem 1rem;font-weight:750;letter-spacing:.02em}.outcome{border-left:7px solid #ae6922;padding:1.2rem}.subject{font-size:1.08rem}.actions{display:flex;gap:1rem;flex-wrap:wrap}.machine{margin-top:1rem}
+</style><div id="mode-banner" class="banner" hidden></div><h1>Investigate</h1>
+<p class="subject"><strong>Target:</strong> <code>constellation-beta-http-fixture.service</code> on an enrolled local test VM.<br><strong>Problem:</strong> the service is inactive and its health endpoint is unavailable. Determine whether one authorized start can restore the declared condition.</p>
+<p class="muted">AG-ng owns authorization, Docket owns execution custody, and NQ-ng owns factual qualification. A worker report or process exit cannot decide the result.</p>
 <form method="post" action="/run"><input type="hidden" name="token" value="TOKEN"><button id="run" disabled>RUN</button></form>
 <p id="launch-note">Reading Docket launch custody…</p><p id="notice" class="notice" hidden></p>
+<section class="outcome"><h2>Current warranted result</h2><div id="terminal">No validated terminal record observed.</div><p id="reason"></p><h2>What can happen next?</h2><p id="next">Current owner evidence is still loading.</p><div class="actions"><a href="#evidence-section">Inspect missing evidence</a><a href="#receipt-section">View retained receipt</a></div><details class="machine"><summary>Exact machine disposition</summary><pre id="terminal-detail"></pre></details></section>
 <div class="grid"><section><h2>Investigation state</h2><div id="durable">NOT_OBSERVABLE</div><p class="muted">Retained composition records</p></section>
-<section><h2>Execution right now</h2><div id="live">NOT_OBSERVABLE</div><p class="muted">Current manager / operating-system testimony</p><details><summary>Process evidence</summary><pre id="live-detail"></pre></details></section></div>
-<section><h2>Current warranted result</h2><div id="terminal">No validated terminal record observed.</div><pre id="reason"></pre></section>
-<div class="grid"><section><h2>Launch custody</h2><pre id="custody"></pre></section><section><h2>Who is doing the work?</h2><pre id="worker"></pre><details><summary>Exact execution identities</summary><pre id="execution-detail"></pre></details><p class="muted">Worker handoff is not supported for this producer occurrence.</p></section></div>
-<section><h2>Evidence and next required step</h2><div id="evidence"></div><pre id="next"></pre></section>
-<section><h2>Receipt and replay</h2><pre id="receipt">No validated terminal receipt observed.</pre><a href="/api/v1/status">Inspect current source-labeled JSON</a></section>
+<section><h2>Execution right now</h2><div id="live">NOT_OBSERVABLE</div><p class="muted">Live manager / operating-system testimony, separate from retained history</p><details><summary>Retained and current process evidence</summary><pre id="live-detail"></pre></details></section></div>
+<section id="evidence-section"><h2>Evidence</h2><div id="evidence"></div></section>
+<section id="receipt-section"><h2>Receipt and replay</h2><pre id="receipt">No validated terminal receipt observed.</pre><a href="/api/v1/status">Inspect current source-labeled JSON</a></section>
+<details class="machine"><summary>Launch custody, worker and exact identities</summary><div class="grid"><section><h2>Launch custody</h2><pre id="custody"></pre></section><section><h2>Worker</h2><pre id="worker"></pre><pre id="execution-detail"></pre><p class="muted">Worker handoff is not supported for this producer occurrence.</p></section></div></details>
 <details><summary>Source agreement and limitations</summary><pre id="sources"></pre><pre id="limits"></pre></details>
 <p class="muted">Refreshing this page queries Docket again. It never starts another execution. Process exit and a completed HTTP request do not establish a successful investigation.</p>
 <script nonce="TOKEN">
@@ -283,18 +283,25 @@ async function refresh(){if(pending)return;pending=true;try{
  const response=await fetch('/api/v1/status',{cache:'no-store'}), value=await response.json();
  if(!response.ok)throw Error(value.message||'Docket unavailable');
  const runner=value.runner_durable, terminal=runner.terminal;
- text('durable',runner.state);text('live',value.liveness.state);text('live-detail',value.liveness);text('custody',value.controller_custody);text('worker',value.execution.identity+'\nModel/provider: '+value.execution.model_provider);text('execution-detail',value.execution);
- text('terminal',terminal?terminal.disposition||terminal.state:'No validated terminal record observed.');
- text('reason',terminal&&terminal.reason||'');
+ const fixture=value.subject.run_id==='LABELED_LOCAL_FIXTURE';el('mode-banner').hidden=!fixture;
+ text('mode-banner',fixture?'DEMONSTRATION FIXTURE · '+(terminal?terminal.state:'NONTERMINAL'):'');
+ text('durable',runner.state);
+ const currentLive=Object.values(value.live_sources).some(item=>item.state==='PROCESS_ACTIVE'||item.state==='PROCESS_EXITED');
+ text('live',currentLive?value.liveness.state:'Live process status unavailable');text('live-detail',{retained:value.liveness,current_sources:value.live_sources});text('custody',value.controller_custody);text('worker',value.execution.identity+'\nModel/provider: '+value.execution.model_provider);text('execution-detail',value.execution);
+ text('terminal',terminal?(terminal.state==='TERMINAL'?'BOUNDED RESULT ESTABLISHED':terminal.state):'NOT YET ESTABLISHED');
+ text('terminal-detail',terminal||'No validated terminal record observed.');
+ text('reason',terminal&&terminal.reason||'The evidence owner has not admitted a terminal result.');
  ledger(value.evidence,runner.recovery);
- text('next',runner.recovery&&runner.recovery.next_lawful_action||'Next required transition: NOT_OBSERVABLE');
+ const missing=value.evidence.filter(item=>item.state==='MISSING'||item.state==='NOT_OBSERVABLE').map(item=>item.label);
+ const next=runner.recovery&&runner.recovery.next_lawful_action;
+ text('next',next?next:fixture&&missing.length?'No supported next action can be determined from this fixture. Missing or unavailable: '+missing.join(', ')+'.':terminal&&terminal.replay?'Inspect the retained receipt and run the owner\'s '+terminal.replay+' operation.':'No supported next action is established by the available evidence.');
  text('receipt',terminal&&terminal.evidence?{owner:terminal.owner,validator:terminal.validator,evidence:terminal.evidence,replay:terminal.replay}:'No validated terminal receipt observed.');
  text('sources',{disagreements:value.disagreements,live_sources:value.live_sources});text('limits',value.limitations);
  const ready=value.controller_custody.state==='NO_INTENT_RECORDED'&&value.disagreements.length===0;
  el('run').disabled=!ready;text('launch-note',ready?'Ready to request the one admitted execution.':'Docket has retained launch custody or unresolved evidence. RUN is unavailable; inspect the state below.');
  el('notice').hidden=value.disagreements.length===0;text('notice',value.disagreements.join('\n'));
  }catch(error){el('run').disabled=true;el('notice').hidden=false;text('notice','Current state NOT_OBSERVABLE: '+error.message);
- for(const id of ['durable','live','live-detail','terminal','reason','custody','worker','execution-detail','evidence','next','receipt','sources','limits'])text(id,'NOT_OBSERVABLE');
+ for(const id of ['durable','live','live-detail','terminal','terminal-detail','reason','custody','worker','execution-detail','evidence','next','receipt','sources','limits'])text(id,'NOT_OBSERVABLE');
  text('launch-note','Current owner query unavailable. Previous snapshot cleared; refresh will query the owner again.');}
  finally{pending=false;setTimeout(refresh,3000);}}
 refresh();

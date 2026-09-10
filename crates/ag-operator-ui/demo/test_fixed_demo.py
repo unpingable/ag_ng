@@ -76,7 +76,12 @@ class HttpBoundary(unittest.TestCase):
                             {"Origin": self.server.origin})
 
     def test_screen_and_head_never_start(self):
-        self.assertIn(b"Investigate", self.request("GET", "/")[2])
+        page = self.request("GET", "/")[2]
+        self.assertIn(b"Investigate", page)
+        self.assertIn(b"constellation-beta-http-fixture.service", page)
+        self.assertIn(b"What can happen next?", page)
+        self.assertIn(b"DEMONSTRATION FIXTURE", page)
+        self.assertIn(b"Live process status unavailable", page)
         self.assertEqual(self.request("HEAD", "/")[2], b"")
         self.assertEqual(self.controller.calls, [])
 

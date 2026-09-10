@@ -4,9 +4,9 @@ const {test} = require('node:test');
 const {select} = require('./response_dom_match.cjs');
 function response(phase) {return {status:200,bytes:Buffer.from(phase),value:{
   runner_durable:{state:phase,terminal:null},controller_custody:{state:'ACCEPTANCE_VALIDATED'},
-  liveness:{state:'PROCESS_ACTIVE'},disagreements:[]}};}
+  liveness:{state:'PROCESS_ACTIVE'},live_sources:{os:{state:'PROCESS_ACTIVE'}},disagreements:[]}};}
 function dom(phase) {return {runDisabled:true,texts:{durable:phase,live:'PROCESS_ACTIVE',
-  custody:'ACCEPTANCE_VALIDATED',notice:'',terminal:'No validated terminal record observed.',receipt:''}};}
+  custody:'ACCEPTANCE_VALIDATED',notice:'',terminal:'NOT YET ESTABLISHED',receipt:''}};}
 test('source advance selects exact browser response matching current DOM, not stale independent sample',()=>{
   const earlier=response('created'), later=response('guests_ready');
   assert.equal(select([earlier,later],dom('guests_ready')),later);

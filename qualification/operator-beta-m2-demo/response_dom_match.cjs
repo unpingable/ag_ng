@@ -9,9 +9,15 @@ function matches(status, value, dom) {
       || !Array.isArray(value.disagreements)) return false;
   const terminal = value.runner_durable.terminal;
   const ready = value.controller_custody.state === 'NO_INTENT_RECORDED' && value.disagreements.length === 0;
+  const currentLive = Object.values(value.live_sources || {}).some(item =>
+    item.state === 'PROCESS_ACTIVE' || item.state === 'PROCESS_EXITED');
+  const liveLabel = currentLive ? value.liveness.state : 'Live process status unavailable';
+  const terminalLabel = terminal
+    ? (terminal.state === 'TERMINAL' ? 'BOUNDED RESULT ESTABLISHED' : terminal.state)
+    : 'NOT YET ESTABLISHED';
   if(dom.extra) {
     try {
-      for(const [key,expected] of Object.entries({liveDetail:value.liveness,execution:value.execution,
+      for(const [key,expected] of Object.entries({liveDetail:{retained:value.liveness,current_sources:value.live_sources},execution:value.execution,
         limits:value.limitations,sources:{disagreements:value.disagreements,live_sources:value.live_sources}})) {
         if(JSON.stringify(JSON.parse(dom.extra[key]))!==JSON.stringify(expected))return false;
       }
@@ -24,14 +30,14 @@ function matches(status, value, dom) {
     } catch {return false;}
   }
   return dom.texts.durable === value.runner_durable.state
-    && dom.texts.live === value.liveness.state
+    && dom.texts.live === liveLabel
     && dom.texts.custody.includes(value.controller_custody.state)
     && dom.runDisabled === !ready
     && value.disagreements.every(reason => dom.texts.notice.includes(reason))
-    && (terminal ? dom.texts.terminal === (terminal.disposition || terminal.state)
+    && (terminal ? dom.texts.terminal === terminalLabel
       && (!terminal.evidence || dom.texts.receipt.includes(terminal.evidence)
         && dom.texts.receipt.includes(terminal.owner) && dom.texts.receipt.includes(terminal.validator))
-      : dom.texts.terminal.includes('No validated terminal'));
+      : dom.texts.terminal === terminalLabel);
 }
 
 function select(observations, dom) {
