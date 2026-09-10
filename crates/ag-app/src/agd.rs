@@ -323,6 +323,40 @@ impl AgdCoreV1 {
             .record)
     }
 
+    /// Reloads the exact durable provider capability for a presently retained
+    /// worker runtime and revalidates every launcher-owned live binding.
+    ///
+    /// This is the mandatory entry to each future infer/fetch/ack transition;
+    /// callers must not cache the returned capability across transitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when process custody is absent, the durable
+    /// session changed, any live binding differs, or the capability is not
+    /// currently effective.
+    pub fn reload_active_worker_provider_capability(
+        &mut self,
+        session: &SessionId,
+        now_unix_ms: u64,
+    ) -> Result<InferenceCapabilityV1, AgdError> {
+        let runtime = self
+            .active_workers
+            .get(session)
+            .ok_or(AgdError::WorkerRuntimeMissing)?;
+        let loaded = WorkerSessionStoreV1::new(&mut self.store).load_session(session)?;
+        if loaded.record.spec.session != *session
+            || runtime.ingress.session_id != *session
+            || runtime.ingress.session_binding != Digest::from_serializable(&loaded.record.spec)?
+        {
+            return Err(AgdError::WorkerProofMismatch);
+        }
+        loaded
+            .record
+            .active_provider_capability(&runtime.ingress.context(now_unix_ms))
+            .cloned()
+            .map_err(AgdError::from)
+    }
+
     /// Launches one configured offline worker behind a durable principal fence.
     ///
     /// The child is prepared behind a descriptor gate. Its exact executable,
