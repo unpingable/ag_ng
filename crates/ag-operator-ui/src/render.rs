@@ -57,11 +57,11 @@ pub fn campaign_index_with_context(
     let mut body = String::new();
     let _ = write!(
         body,
-        "<div class=eyebrow>Phosphor-ng / governed-runtime inspector</div><h1>Governed campaigns</h1><p class=lede><span class=projection>projection</span> {}. Canonical states and source problems are shown directly; no aggregate health judgment is computed.</p>",
+        "<div class=eyebrow>Phosphor-ng / governed-runtime inspector</div><h1>Governed campaigns</h1><p class=lede><span class=projection>read-only view</span> {}. Open a campaign to see its current run, what each owner recorded, what is missing, and where to inspect the supporting records. This page does not calculate an overall health result.</p>",
         escape(source_mode)
     );
     index_controls(&mut body, view, sort, model.campaigns.len(), entries.len());
-    body.push_str("<section class=campaign-list aria-label=\"Campaign projections\"><div class=index-head><span>Campaign store / identity / occurrence</span><span>Current program counter</span><span>Immediate condition</span><span>Last durable fact</span></div>");
+    body.push_str("<section class=campaign-list aria-label=\"Campaign records\"><div class=index-head><span>Campaign source / identity / run</span><span>Current step</span><span>What is needed now</span><span>Last recorded fact</span></div>");
     if entries.is_empty() {
         body.push_str("<p class=empty>No campaign stores were found in the configured root.</p>");
     }
@@ -77,7 +77,7 @@ pub fn campaign_index_with_context(
             let source_label = campaign_source_label(&entry.locator);
             let _ = write!(
                 body,
-                "<div class=identity><a href=\"{}\" title=\"Campaign {} · store {}\" aria-label=\"Campaign {}; store {}\"><span class=campaign-source>{}</span><code class=campaign-digest aria-hidden=true>{}</code></a><div class=k>occurrence {}</div></div><div><span class=pc>{}</span><div class=k>{}</div></div><div>{}</div>",
+                "<div class=identity><a href=\"{}\" title=\"Campaign {} · store {}\" aria-label=\"Campaign {}; store {}\"><span class=campaign-source>{}</span><code class=campaign-digest aria-hidden=true>{}</code></a><div class=k>run {}</div></div><div><span class=pc>{}</span><div class=k>{}</div></div><div>{}</div>",
                 escape(&link),
                 escape(campaign),
                 escape(&entry.locator),
@@ -93,7 +93,7 @@ pub fn campaign_index_with_context(
         } else {
             let _ = write!(
                 body,
-                "<div class=identity><a href=\"/campaign/{}\">{}</a><div class=unknown>unknown</div></div><div>AG inspect unavailable</div><div><span class=unknown>unavailable</span> authoritative occurrence cannot be displayed</div>",
+                "<div class=identity><a href=\"/campaign/{}\">{}</a><div class=unknown>unknown</div></div><div>AG record unavailable</div><div><span class=unknown>unavailable</span> the current run cannot be displayed; open the campaign for source diagnostics</div>",
                 escape(&entry.locator_token),
                 escape(&entry.locator)
             );
@@ -121,7 +121,7 @@ pub fn campaign_index_with_context(
             }
             body.push_str("</div>");
         } else {
-            body.push_str("<div><span class=unknown>unknown</span><div>last durable transition unavailable</div></div>");
+            body.push_str("<div><span class=unknown>unknown</span><div>last recorded transition unavailable</div></div>");
         }
         body.push_str("</article>");
     }
@@ -261,7 +261,7 @@ fn index_controls(
     for (candidate, label) in [
         (IndexSortV1::Recent, "recent transition"),
         (IndexSortV1::Campaign, "campaign identity"),
-        (IndexSortV1::ProgramCounter, "program counter"),
+        (IndexSortV1::ProgramCounter, "current step"),
     ] {
         let current = if candidate == sort {
             " aria-current=true"
@@ -347,7 +347,7 @@ fn campaign_detail_selection(
             let current_link = snapshot_link(&inspect.current, false).relative_path();
             let _ = write!(
                 body,
-                "<p class=note><span class=fact>historical occurrence</span> This view is pinned to occurrence {} from the verified journal. The campaign's <a href=\"{}\">authoritative current occurrence</a> is {}.</p>",
+                "<p class=note><span class=fact>historical run</span> This view shows run {} from the verified journal. The campaign's <a href=\"{}\">current run</a> is {}.</p>",
                 escape(&selected.key().occurrence.to_string()),
                 escape(&current_link),
                 escape(&inspect.current.key().occurrence.to_string())
@@ -387,11 +387,11 @@ fn quick_orientation(body: &mut String, current: &OccurrenceSnapshotV1, selected
     };
     let _ = write!(
         body,
-        "<section class=summary-strip aria-label=\"Selected occurrence summary\"><div class=summary-cell><span class=eyebrow>{}</span><strong>{}</strong><span class=k>{}</span></div><div class=summary-cell><span class=eyebrow>Program counter</span><strong class=pc>{}</strong><span class=k>{}</span></div><div class=\"summary-cell{}\"><span class=eyebrow>Immediate condition</span><strong>{}</strong></div></section>",
+        "<section class=summary-strip aria-label=\"Selected run summary\"><div class=summary-cell><span class=eyebrow>{}</span><strong>{}</strong><span class=k>{}</span></div><div class=summary-cell><span class=eyebrow>Current step</span><strong class=pc>{}</strong><span class=k>raw program counter · expected work {}</span></div><div class=\"summary-cell{}\"><span class=eyebrow>What is needed now</span><strong>{}</strong></div></section>",
         if selected_is_current {
-            "Authoritative current occurrence"
+            "Current run"
         } else {
-            "Selected historical occurrence"
+            "Historical run"
         },
         escape(&current.key().occurrence.to_string()),
         escape(current.key().campaign.as_str()),
@@ -403,7 +403,7 @@ fn quick_orientation(body: &mut String, current: &OccurrenceSnapshotV1, selected
 }
 
 fn local_navigation(body: &mut String) {
-    body.push_str("<nav class=localnav aria-label=\"Available read-only inspections\"><span class=eyebrow>Available inspections</span><a href=#overview>orient this occurrence</a><a href=#authority>inspect authority</a><a href=#execution>inspect execution</a><a href=#timeline>trace history</a><a href=#evidence>inspect evidence</a><a href=#refusals>inspect refusals</a><a href=#intervention-submissions>inspect submitted intent</a><a href=#raw>verify raw owner facts</a></nav>");
+    body.push_str("<nav class=localnav aria-label=\"Read-only navigation\"><span class=eyebrow>Inspect this run</span><a href=#overview>summary and exact IDs</a><a href=#authority>standing and authority</a><a href=#execution>execution outcome</a><a href=#timeline>recorded history</a><a href=#evidence>evidence and proposal</a><a href=#refusals>refusals</a><a href=#intervention-submissions>submitted intent</a><a href=#raw>raw owner records</a></nav>");
 }
 
 fn refusals(
@@ -423,7 +423,7 @@ fn refusals(
                     kv("refusal", refusal.refusal.as_str()),
                     kv("code", &format!("{:?}", refusal.outcome.code)),
                     kv("campaign", refusal.outcome.key.campaign.as_str()),
-                    kv("occurrence", &refusal.outcome.key.occurrence.to_string()),
+                    kv("run", &refusal.outcome.key.occurrence.to_string()),
                     kv("at state", refusal.outcome.at_state_digest.as_str()),
                     kv("recorded at", &refusal.recorded_at_unix_ms.to_string()),
                     raw_details("canonical refusal", refusal)
@@ -527,9 +527,9 @@ fn overview(
             "Selected historical coordinates"
         },
         kv("campaign", current.key().campaign.as_str()),
-        kv("occurrence", &current.key().occurrence.to_string()),
+        kv("run", &current.key().occurrence.to_string()),
         kv(
-            "program counter",
+            "raw program counter",
             &format!("{:?}", current.program_counter())
         ),
         kv("state digest", current.state_digest().as_str()),
@@ -565,8 +565,8 @@ fn overview(
     if let Some(prior) = current.prior_occurrence() {
         let _ = write!(
             body,
-            "<h3>Predecessor occurrence</h3><div class=kv>{}{}{}</div>",
-            kv("occurrence", &prior.key.occurrence.to_string()),
+            "<h3>Previous run</h3><div class=kv>{}{}{}</div>",
+            kv("run", &prior.key.occurrence.to_string()),
             kv("state digest", prior.state_digest.as_str()),
             kv(
                 "prior proposal",
@@ -611,7 +611,7 @@ fn timeline(
             .iter()
             .map(|transition| transition.successor.key().occurrence.to_string())
             .collect::<BTreeSet<_>>();
-        body.push_str("<nav class=occurrence-jumps aria-label=\"Occurrence jumps\"><span class=eyebrow>Occurrences</span>");
+        body.push_str("<nav class=occurrence-jumps aria-label=\"Run jumps\"><span class=eyebrow>Runs</span>");
         for occurrence in &occurrences {
             let _ = write!(
                 body,
@@ -620,7 +620,7 @@ fn timeline(
                 escape(occurrence)
             );
         }
-        body.push_str("</nav><p class=lede>Journal order is authoritative. Missing transitions are not inferred. Occurrence boundaries mark fresh governed continuation.</p><ol class=timeline>");
+        body.push_str("</nav><p class=lede>The journal determines the order shown here. Missing transitions are left missing rather than guessed. Each run boundary marks a fresh governed continuation.</p><ol class=timeline>");
         let mut prior_occurrence: Option<String> = None;
         for transition in rendered {
             let is_current = transition.successor_state_digest == *current.state_digest();
@@ -631,7 +631,7 @@ fn timeline(
                 let occurrence_link = snapshot_link(&transition.successor, false).relative_path();
                 let _ = write!(
                     body,
-                    "<li id=\"occurrence-{}\" class=occurrence-boundary>Occurrence {}{} <a href=\"{}\">open exact occurrence</a></li>",
+                    "<li id=\"occurrence-{}\" class=occurrence-boundary>Run {}{} <a href=\"{}\">open this exact run</a></li>",
                     escape(&occurrence),
                     escape(&occurrence),
                     predecessor.map_or_else(String::new, |prior| format!(
@@ -646,7 +646,7 @@ fn timeline(
             let current_attr = if is_current { " aria-current=step" } else { "" };
             let _ = write!(
                 body,
-                "<li id=transition-{} class=\"event{} {}\"{}><div class=event-title><a class=seq href=\"#transition-{}\">#{}</a><strong>{:?}</strong><span class=pc>{:?}</span><span class=fact>persisted fact</span>{}{}</div><div class=k>occurrence {} · recorded {} · state {}</div>{}",
+                "<li id=transition-{} class=\"event{} {}\"{}><div class=event-title><a class=seq href=\"#transition-{}\">#{}</a><strong>{:?}</strong><span class=pc>{:?}</span><span class=fact>recorded fact</span>{}{}</div><div class=k>run {} · recorded {} · state {}</div>{}",
                 transition.sequence,
                 if is_current { " current" } else { "" },
                 state_tone_class(counter),
@@ -714,11 +714,11 @@ fn intervention_summary(
         I::OpenSuccessor {
             successor_occurrence,
             exact_work,
-        } => format!("open successor {successor_occurrence} for exact work {exact_work}"),
+        } => format!("open successor run {successor_occurrence} for exact work {exact_work}"),
         I::HaltContinuation { reason } => format!("halt continuation: {reason}"),
     };
     format!(
-        "{} · request {} · principal {} · target occurrence {}",
+        "{} · request {} · principal {} · target run {}",
         escape(&target),
         escape(verified.request.request.as_str()),
         escape(verified.request.principal.as_str()),
@@ -785,7 +785,7 @@ fn evidence(
     if let Some(proposal) = current.proposal() {
         let permalink = snapshot_link(current, true).relative_path();
         let permalink_row = format!(
-            "<div class=k>semantic permalink</div><div class=v><a href=\"{}\">campaign + occurrence + proposal</a></div>",
+            "<div class=k>permanent record link</div><div class=v><a href=\"{}\">campaign + run + proposal</a></div>",
             escape(&permalink)
         );
         let _ = write!(
@@ -793,7 +793,7 @@ fn evidence(
             "<h3>Exact-work proposal <span class=fact>canonical persisted fact</span></h3><div class=kv>{}{}{}{}{}{}{}{}</div>",
             kv("proposal", proposal.reference().as_str()),
             kv(
-                "occurrence link",
+                "canonical run link",
                 &current
                     .occurrence_link()
                     .map_or_else(|| "unknown".to_owned(), |value| format!("{value:?}")),
@@ -867,7 +867,7 @@ fn external_observation(
     let identity = format!("{campaign}/{occurrence}");
     acquisition_history(body, &identity, acquisitions);
     let Some(source) = related.iter().find(|source| source.identity == identity) else {
-        body.push_str("<p class=k><span class=unknown>application evidence unavailable</span> No exact Nightshift candidate lookup was captured for this occurrence.</p>");
+        body.push_str("<p class=k><span class=unknown>application evidence unavailable</span> No exact Nightshift candidate lookup was captured for this run. Inspect raw owner records for source diagnostics.</p>");
         return;
     };
     let SourceResultV1::Available { value, .. } = &source.result else {
@@ -875,14 +875,14 @@ fn external_observation(
         return;
     };
     let Some(item) = value.matches.first() else {
-        body.push_str("<p class=k><span class=unknown>application evidence not recorded</span> No workflow-specific world-observation candidate is bound to this occurrence.</p>");
+        body.push_str("<p class=k><span class=unknown>application evidence not recorded</span> No workflow-specific world-observation candidate is bound to this run.</p>");
         return;
     };
     let observation = &item.observation;
     let (selected_binding, selected_has_result_basis) =
         external_observation_binding(current, composition, observation, &item.custody);
     if !selected_binding {
-        body.push_str("<p class=source-error><span class=error>application-evidence disagreement</span> Nightshift returned a candidate for this occurrence whose proposal/work/issuance/attempt/settlement binding disagrees with the selected AG state.</p>");
+        body.push_str("<p class=source-error><span class=error>application-evidence disagreement</span> Nightshift returned a candidate for this run whose proposal/work/issuance/attempt/settlement binding disagrees with the selected AG state. Inspect the raw Nightshift and AG records; no result is inferred.</p>");
         return;
     }
     let age = match item.evidence_age {
@@ -911,7 +911,7 @@ fn external_observation(
     }
     external_claims(body, observation);
     if !selected_has_result_basis {
-        body.push_str("<p class=note>The selected historical snapshot predates or no longer exposes the complete proposal/issuance/attempt/settlement tuple. The candidate remains occurrence-scoped; exact result coordinates are available in the raw owner record and are not inferred onto this snapshot.</p>");
+        body.push_str("<p class=note>This historical snapshot does not expose the complete proposal/issuance/attempt/settlement set. The candidate remains scoped to this run. Its exact result IDs remain in the raw owner record and are not copied onto this snapshot.</p>");
     }
 }
 
@@ -952,7 +952,7 @@ fn acquisition_history(
     related: &[RelatedSourceV1<crate::model::AcquisitionHistoryV1>],
 ) {
     let Some(source) = related.iter().find(|source| source.identity == identity) else {
-        body.push_str("<h3>Observation acquisition</h3><p class=k><span class=unknown>not configured</span> No exact Maude acquisition-history lookup was captured for this occurrence.</p>");
+        body.push_str("<h3>Observation acquisition</h3><p class=k><span class=unknown>not configured</span> No exact Maude acquisition-history lookup was captured for this run.</p>");
         return;
     };
     let SourceResultV1::Available { value, .. } = &source.result else {
@@ -960,7 +960,7 @@ fn acquisition_history(
         return;
     };
     if value.acquisitions.is_empty() {
-        body.push_str("<h3>Observation acquisition</h3><p class=k><span class=unknown>absent</span> No workflow-specific acquisition trigger is recorded for this exact occurrence.</p>");
+        body.push_str("<h3>Observation acquisition</h3><p class=k><span class=unknown>absent</span> No workflow-specific acquisition trigger is recorded for this exact run.</p>");
         return;
     }
     body.push_str(
@@ -1100,7 +1100,7 @@ fn external_composition(
             ),
             kv("qualified compilation", q("compilation_id")),
             kv("qualified exact work", q("exact_work_id")),
-            kv("qualification occurrence", q("occurrence_id")),
+            kv("qualification run", q("occurrence_id")),
             kv(
                 "qualification acquired",
                 &scalar("/qualification/acquired_at_unix_ms")
@@ -1158,7 +1158,7 @@ fn external_composition(
                 .unwrap_or("malformed owner projection")
         ),
         kv("profile max age ms", &numeric("/profile/max_age_ms")),
-        kv("source occurrence", field("source_occurrence_id")),
+        kv("source run", field("source_occurrence_id")),
         kv("source PlanDocument", field("source_plan_document_digest")),
         kv("source compilation", field("source_compilation_id")),
         kv("canonical observation", resolution.observation().as_str()),
@@ -1212,7 +1212,7 @@ fn authoring_context(
         }) || source.identity == identity
     });
     let Some(source) = source else {
-        body.push_str("<p class=k><span class=unknown>authoring context unavailable</span> No owner-side lookup was captured for this exact occurrence. No Maude relation is inferred.</p>");
+        body.push_str("<p class=k><span class=unknown>authoring context unavailable</span> No owner-side lookup was captured for this exact run. No Maude relation is inferred. Inspect raw owner records for source diagnostics.</p>");
         return;
     };
     let SourceResultV1::Available { value, .. } = &source.result else {
@@ -1220,7 +1220,7 @@ fn authoring_context(
         return;
     };
     match value.matches.as_slice() {
-        [] => body.push_str("<p class=k><span class=unknown>authoring context not recorded</span> This occurrence is honestly unlinked; Phosphor-ng does not inherit or infer a predecessor context.</p>"),
+        [] => body.push_str("<p class=k><span class=unknown>authoring context not recorded</span> This run has no recorded authoring link; Phosphor-ng does not inherit or guess a previous run's context.</p>"),
         [record]
             if record
                 .validate_for_governed_relationship(
@@ -1251,11 +1251,11 @@ fn authoring_context(
                 custody_related,
             );
         }
-        [_] => body.push_str("<p class=source-error><span class=error>projection disagreement</span> Nightshift returned an authoring relation for this occurrence, but its proposal/work binding does not match the selected canonical AG state. No backlink was emitted.</p>"),
+        [_] => body.push_str("<p class=source-error><span class=error>record disagreement</span> Nightshift returned an authoring relation for this run, but its proposal/work binding does not match the selected AG state. No backlink is shown; inspect both raw owner records.</p>"),
         records => {
             let _ = write!(
                 body,
-                "<p class=source-error><span class=error>ambiguous owner relation</span> Nightshift returned {} authoring records for one governed occurrence. No backlink was emitted.</p>",
+                "<p class=source-error><span class=error>more than one authoring record</span> Nightshift returned {} authoring records for one governed run. No backlink is shown; inspect the raw Nightshift records.</p>",
                 records.len()
             );
         }
@@ -1312,7 +1312,7 @@ fn authoring_custody(
         records => {
             let _ = write!(
                 body,
-                "<p class=source-error><span class=error>ambiguous custody</span> Nightshift returned {} custody records for one occurrence.</p>",
+                "<p class=source-error><span class=error>more than one custody record</span> Nightshift returned {} custody records for one run. Inspect the raw Nightshift records.</p>",
                 records.len()
             );
         }
@@ -1383,7 +1383,7 @@ fn authority_lifecycle(body: &mut String, current: &OccurrenceSnapshotV1) {
             "<div class=kv>{}{}{}{}{}{}</div>",
             kv("authorization", spend.authorization.as_str()),
             kv("spend", spend.spend.as_str()),
-            kv("occurrence", &spend.key.occurrence.to_string()),
+            kv("run", &spend.key.occurrence.to_string()),
             kv("proposal", spend.proposal.as_str()),
             kv("observation", spend.observation.as_str()),
             kv("consumed at", &spend.consumed_at_unix_ms.to_string())
@@ -1469,9 +1469,9 @@ fn execution(
         body.push_str("<p><span class=unknown>unknown/not present</span> No Docket custody fact exists in AG’s current snapshot.</p>");
     }
     match current.program_counter() {
-        ProgramCounterV1::Dispatched => body.push_str("<p class=note><span class=unknown>outcome unknown</span> Docket custody exists and mechanics may have occurred. AG has no settlement. Absence of a receipt is not failure, and repeat dispatch is not available.</p>"),
-        ProgramCounterV1::ReconciliationRequired => body.push_str("<p class=note><span class=error>reconciliation required</span> Effect outcome is indeterminate. Repeat dispatch is not authorized. Exact issuance, attempt, and evidence appear below.</p>"),
-        ProgramCounterV1::SettledObservationRequired => body.push_str("<p class=note><span class=fact>settled</span> The prior occurrence outcome is known. Settlement does not authorize continuation; a fresh independent observation is required.</p>"),
+        ProgramCounterV1::Dispatched => body.push_str("<p class=note><span class=unknown>outcome unknown</span> Docket accepted custody, but AG has no settlement record. The work may or may not have occurred. A missing receipt is not a failure result, and this page offers no repeat action. Inspect the Docket source records below.</p>"),
+        ProgramCounterV1::ReconciliationRequired => body.push_str("<p class=note><span class=error>reconciliation required</span> The outcome is indeterminate. Repeat dispatch is not authorized. Inspect the exact issuance, attempt, evidence, and raw owner records below.</p>"),
+        ProgramCounterV1::SettledObservationRequired => body.push_str("<p class=note><span class=fact>outcome recorded</span> Docket recorded the prior run's outcome; see the outcome field below. Settlement alone does not mean success or present health, and it does not authorize continuation. A fresh independent observation is required.</p>"),
         _ => {}
     }
     if let Some(indeterminate) = current.indeterminate() {
@@ -1505,7 +1505,7 @@ fn execution(
                 if let Some(record) = &value.record {
                     let status = match record.status {
                         DocketRecordStatusV1::Accepted => "accepted — outcome unknown",
-                        DocketRecordStatusV1::Settled => "settled — known outcome",
+                        DocketRecordStatusV1::Settled => "settled — outcome recorded (not necessarily success)",
                         DocketRecordStatusV1::Indeterminate => {
                             "indeterminate — reconciliation required"
                         }
@@ -1619,7 +1619,7 @@ fn budget_html(budget: ag_campaign::governed::LoopBudgetV1) -> String {
     format!(
         "{}{}{}",
         kv(
-            "retry occurrences",
+            "retry runs",
             &format!("{} / {}", budget.retries_used, budget.retry_limit)
         ),
         kv(
@@ -1658,7 +1658,7 @@ fn immediate_condition(snapshot: &OccurrenceSnapshotV1) -> &'static str {
 fn immediate_condition_for(counter: ProgramCounterV1) -> &'static str {
     match counter {
         ProgramCounterV1::ObservationRequired => {
-            "<span class=projection>fresh observation required</span> no proposal or authority exists"
+            "<span class=projection>fresh observation required</span> no proposal or authority has been recorded"
         }
         ProgramCounterV1::ProposalRecorded => {
             "<span class=projection>proposal recorded</span> standing has not yet been established"
@@ -1667,19 +1667,19 @@ fn immediate_condition_for(counter: ProgramCounterV1) -> &'static str {
             "<span class=projection>standing required</span> no authorization exists"
         }
         ProgramCounterV1::AdmissiblePendingAuthorization => {
-            "<span class=projection>authorization pending</span> admissibility is not a spend"
+            "<span class=projection>authorization pending</span> the work passed admission, but no authorization has been used"
         }
         ProgramCounterV1::AuthorizationConsumed => {
-            "<span class=spent>authority consumed</span> issuance exists; dispatch is not established"
+            "<span class=spent>authority consumed</span> an issuance is recorded; dispatch is not recorded"
         }
         ProgramCounterV1::Dispatched => {
-            "<span class=unknown>outcome unknown</span> custody exists; absence of settlement is not failure"
+            "<span class=unknown>outcome unknown</span> Docket custody is recorded, but no settlement is recorded; this is not a failure result"
         }
         ProgramCounterV1::ReconciliationRequired => {
-            "<span class=error>reconciliation required</span> effect may have occurred; no repeat dispatch"
+            "<span class=error>reconciliation required</span> the work may have occurred; repeat dispatch is unavailable"
         }
         ProgramCounterV1::SettledObservationRequired => {
-            "<span class=fact>settled</span> fresh independent observation is required before continuation"
+            "<span class=fact>outcome recorded</span> inspect the outcome, then obtain a fresh independent observation before continuation"
         }
         ProgramCounterV1::Halted => {
             "<span class=error>halted</span> inspect the durable reason and refusal provenance"
@@ -1836,12 +1836,12 @@ mod tests {
     }
 
     #[test]
-    fn contextual_occurrence_moves_are_navigation_only() {
+    fn contextual_run_links_are_read_only_navigation() {
         let mut body = String::new();
         local_navigation(&mut body);
-        assert!(body.contains("Available inspections"));
-        assert!(body.contains("inspect evidence"));
-        assert!(body.contains("verify raw owner facts"));
+        assert!(body.contains("Inspect this run"));
+        assert!(body.contains("evidence and proposal"));
+        assert!(body.contains("raw owner records"));
         assert!(!body.contains("retry"));
     }
 
@@ -1955,7 +1955,7 @@ mod tests {
     fn qualification_view_keeps_target_generation_and_passive_time_distinct() {
         let source = include_str!("render.rs");
         assert!(source.contains("target PlanDocument (qualification exact match)"));
-        assert!(source.contains("qualification occurrence"));
+        assert!(source.contains("qualification run"));
         assert!(source.contains("qualified exact work"));
         assert!(source.contains("No new failure test was performed"));
         assert!(source.contains(
