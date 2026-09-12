@@ -1,8 +1,22 @@
-# Agent Governor NG
+# Constellation AG
+
+Constellation AG is the authority office for exact automated-work decisions. It
+decides whether one prepared action may proceed and records that decision; it
+does not schedule work, execute it, or turn a receipt into reusable authority.
+For an ordinary bounded repository edit, AG is usually unnecessary overhead.
+
+New here? Start with the [main-branch guide](docs/public-guide.md). This `main`
+revision preserves the older daemon/library workspace and its `agctl` command.
+The newer governed-loop inspection guide and read-only operator UI are published
+separately at exact revision
+[`55c6c85746c4f22120ce3c4ca1f1146a50570d6e`](https://github.com/unpingable/constellation-ag/blob/55c6c85746c4f22120ce3c4ca1f1146a50570d6e/docs/public-guide.md).
+That revision contains `ag-loopctl` and `ag-operator-ui`; this `main` tree does
+not. Do not mix commands or relative documentation links between the revisions.
 
 ## Status (2026-07-26)
 
-AG-ng is the **canonical exact-work admissibility and issuance
+Constellation AG (called AG-ng in this historical implementation) is the
+**canonical exact-work admissibility and issuance
 implementation** — the authority-bearing decision of a four-office governed
 constellation: it decides whether exact prepared work may receive authority
 and burns one-use decision authority; **Docket** executes and settles;
