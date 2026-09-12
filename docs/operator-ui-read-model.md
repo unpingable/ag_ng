@@ -1,11 +1,11 @@
-# Phosphor-ng governed-loop read contract
+# Phosphor governed-loop read contract
 
 Status: canonical read-only presentation contract. The operator UI projects
 the governed runtime described by `governed-loop-c1.md`; it is not a campaign
 state machine and has no mutation surface.
 
 The package/binary remains `ag-operator-ui`; its product identity is
-Phosphor-ng. Semantic navigation is versioned as
+Phosphor. Semantic navigation is versioned as
 `phosphor-ng.deep-link/v1` and contains only campaign, occurrence, and optional
 proposal identities.
 
@@ -130,4 +130,4 @@ receipt delivery, or execution success. It does not authorize, consume,
 dispatch, reconcile, retry, continue, halt, complete, or apply a human
 disposition.
 Authenticated governed-intervention records are likewise display-only facts
-from `history`/`refusals`; they add no Phosphor-ng command or HTTP method.
+from `history`/`refusals`; they add no Phosphor command or HTTP method.

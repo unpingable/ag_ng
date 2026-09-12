@@ -81,7 +81,7 @@ pub struct AgInspectV1 {
 
 /// One read-only immutable intervention-ingress receipt. The typed identity
 /// and custody coordinates are exposed directly while the closed owner result
-/// remains retained verbatim so Phosphor-ng cannot reinterpret it.
+/// remains retained verbatim so Phosphor cannot reinterpret it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InterventionSubmissionReceiptProjectionV1 {
@@ -216,7 +216,7 @@ pub struct NightshiftAuthoringContextProvenanceV1 {
     pub recorded_at: String,
 }
 
-/// Closed query echoed by Nightshift. Phosphor-ng currently uses only the
+/// Closed query echoed by Nightshift. Phosphor currently uses only the
 /// exact governed-occurrence lookup; the other variants remain available in
 /// retained raw data for Maude and operator debugging.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -482,7 +482,7 @@ pub enum ExternalObservationEvidenceAgeV1 {
     NotYetObserved,
 }
 
-/// Exact occurrence-scoped owner query used by Phosphor-ng.
+/// Exact occurrence-scoped owner query used by Phosphor.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExternalObservationQueryV1 {

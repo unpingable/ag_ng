@@ -14,7 +14,7 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(
     name = "ag-operator-ui",
-    about = "Phosphor-ng: loopback-only, read-only governed-runtime inspector"
+    about = "Phosphor: loopback-only, read-only governed-runtime inspector"
 )]
 struct Args {
     /// Directory containing immediate canonical AG campaign `.sqlite` stores.

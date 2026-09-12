@@ -1,6 +1,6 @@
-# Phosphor-ng read-only governed-runtime inspector
+# Phosphor read-only governed-runtime inspector
 
-**Phosphor-ng** is the operator-facing identity of the existing
+**Phosphor** is the operator-facing identity of the existing
 `ag-operator-ui` Rust package and binary. It is a loopback-only
 campaign/occurrence inspector. It renders
 canonical AG, Nightshift, and Docket read projections; it is not a runtime
@@ -8,6 +8,10 @@ state machine and cannot change governed state. The exact typed source map is
 [`operator-ui-read-model.md`](operator-ui-read-model.md). Its relationship to
 Maude and legacy Phosphor is fixed by
 [`operator-surface-convergence.md`](operator-surface-convergence.md).
+
+The public name is Phosphor. Existing `/phosphor-ng` routes, Rust package and
+executable names, and persisted read-model schemas remain unchanged for
+compatibility. A product-name change is not a protocol migration.
 
 ## Build and launch
 
@@ -20,10 +24,10 @@ cargo build --locked -p ag-app --bin ag-loopctl -p ag-operator-ui
 
 target/debug/ag-operator-ui \
   --campaign-root /absolute/path/to/ag-campaigns \
-  --ag-loopctl /absolute/path/to/ag_ng/target/debug/ag-loopctl \
-  --nightshift-bin /absolute/path/to/nightshift/target/debug/nightshift \
+  --ag-loopctl /absolute/path/to/constellation-ag/target/debug/ag-loopctl \
+  --nightshift-bin /absolute/path/to/constellation-nightshift/target/debug/nightshift \
   --nightshift-store /absolute/path/to/nightshift/store.sqlite \
-  --docket-bin /absolute/path/to/docket/runtime/target/debug/docket \
+  --docket-bin /absolute/path/to/constellation-docket/target/debug/docket \
   --docket-state /absolute/path/to/docket/state
 ```
 
@@ -63,7 +67,7 @@ name. Commands have bounded runtime and output. Campaign URL tokens select one
 already-discovered root child and cannot supply paths.
 
 The intervention-submission projection contains immutable ingress custody
-receipts. Phosphor-ng keeps `received`, `governed_accepted`,
+receipts. Phosphor keeps `received`, `governed_accepted`,
 `governed_refused`, `custody_refused`, and `outcome_unknown` distinct and does
 not present any of them as authorization or execution. It exposes no
 submission command, form, or browser write path.
@@ -183,7 +187,7 @@ The runtime meanings are now fixed by
 [`governed-intervention-contract.md`](governed-intervention-contract.md): exact
 reconciliation, bounded read-only probe intent, authority-empty successor,
 safe continuation halt, and the pre-existing closed human disposition are
-separate records. Phosphor-ng renders their journal provenance but still has no
+separate records. Phosphor renders their journal provenance but still has no
 submission path.
 
 The remaining questions concern a future browser write service, not runtime
@@ -208,17 +212,17 @@ must not be added to this package by placing buttons over existing commands.
 
 ## Maude / Phosphor convergence
 
-Maude is the bounded-plan/supervised-session desk. Phosphor-ng is the durable
+Maude is the bounded-plan/supervised-session desk. Phosphor is the durable
 governed-runtime inspector. They share exact vocabulary, identity display,
 honest absence, and the versioned read-only link contract—not authority or a
 runtime library. Nightshift's immutable authoring-context projection supplies
 exact plan/session ↔ occurrence/proposal/work lineage where newly recorded.
-Phosphor-ng checks that relation against the selected AG state; absent
+Phosphor checks that relation against the selected AG state; absent
 historical or runtime-generated context remains visibly unlinked. See the
 convergence contract for the full legacy disposition and future intervention
 boundary.
 
-For newly authenticated handoffs, Phosphor-ng also reads Nightshift's separate
+For newly authenticated handoffs, Phosphor also reads Nightshift's separate
 `export-authoring-custody` projection. It displays the independently pinned
 Maude session issuer and delivery producer, session/handoff receipts, target
 runtime, and caller-sealed cycle time only after the custody record agrees with the exact
@@ -226,7 +230,7 @@ lineage and AG proposal/work. `custody not recorded` remains valid historical
 absence. Producer authentication is never presented as standing or authority.
 
 For occurrences with workflow-specific application/world evidence,
-Phosphor-ng also reads Nightshift's exact `external-observation export`
+Phosphor also reads Nightshift's exact `external-observation export`
 projection. It shows authenticated producer custody, candidate/source
 identities, exact PlanNode claims, and whether the source time falls inside an
 explicit configured display window. That arithmetic age label is not
@@ -234,7 +238,7 @@ Nightshift currentness. Docket settlement remains an attempt outcome rather
 than proof of present health; absent candidates remain honestly unrecorded.
 
 When `--maude-acquisition-bin` and `--maude-acquisition-ledger` are configured,
-Phosphor-ng also renders the exact occurrence-scoped acquisition trigger,
+Phosphor also renders the exact occurrence-scoped acquisition trigger,
 request, adapter, settlement, evidence candidate, and immutable event stages.
 This source is mechanics provenance. `scheduled`, `adapter failed`, `custody
 outcome unknown`, `custody accepted`, and a separately rendered Nightshift

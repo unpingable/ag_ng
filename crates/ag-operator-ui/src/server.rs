@@ -25,7 +25,7 @@ pub fn serve(address: SocketAddr, reader: OperatorReaderV1) -> Result<(), String
     }
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("bind operator UI at {address}: {error}"))?;
-    eprintln!("Phosphor-ng read-only inspector listening on http://{address}");
+    eprintln!("Phosphor read-only inspector listening on http://{address}");
     let reader = Arc::new(reader);
     for connection in listener.incoming() {
         let reader = Arc::clone(&reader);
@@ -204,7 +204,7 @@ fn campaign_route(path: &str, reader: &OperatorReaderV1) -> ResponseV1 {
         Err(error) => {
             return ResponseV1::html(
                 400,
-                visible_html_error("Invalid Phosphor-ng deep link", &error),
+                visible_html_error("Invalid Phosphor deep link", &error),
             );
         }
     }
@@ -303,7 +303,7 @@ fn visible_html_error(title: &str, detail: &str) -> String {
     let safe_title = html_escape(title);
     let safe_detail = html_escape(detail);
     format!(
-        "<!doctype html><html lang=en><head><meta charset=utf-8><title>{safe_title}</title><link rel=stylesheet href=/style.css></head><body><header><a href=/phosphor-ng>Phosphor-ng</a><span class=projection>read only</span></header><main><section class=\"panel critical\"><h1>{safe_title}</h1><span class=error>unavailable</span><pre>{safe_detail}</pre></section></main></body></html>"
+        "<!doctype html><html lang=en><head><meta charset=utf-8><title>{safe_title}</title><link rel=stylesheet href=/style.css></head><body><header><a href=/phosphor-ng>Phosphor</a><span class=projection>read only</span></header><main><section class=\"panel critical\"><h1>{safe_title}</h1><span class=error>unavailable</span><pre>{safe_detail}</pre></section></main></body></html>"
     )
 }
 
@@ -381,7 +381,7 @@ mod tests {
         assert!(
             String::from_utf8(product_page.body)
                 .unwrap()
-                .contains("Phosphor-ng")
+                .contains("Phosphor")
         );
         let api = route("/api/v1/campaigns", &reader);
         assert_eq!(api.status, 200);
@@ -409,7 +409,7 @@ mod tests {
         assert!(
             String::from_utf8(response.body)
                 .unwrap()
-                .contains("Invalid Phosphor-ng deep link")
+                .contains("Invalid Phosphor deep link")
         );
     }
 }

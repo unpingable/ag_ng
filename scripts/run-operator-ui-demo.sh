@@ -19,5 +19,5 @@ AG_OPERATOR_DEMO_OUTPUT="$demo_corpus" \
 cargo build --locked -p ag-operator-ui
 
 printf 'deterministic corpus: %s\n' "$demo_corpus"
-printf 'open Phosphor-ng: http://127.0.0.1:8417/phosphor-ng\n'
+printf 'open Phosphor: http://127.0.0.1:8417/phosphor-ng\n'
 target/debug/ag-operator-ui --demo-corpus "$demo_corpus" "$@"

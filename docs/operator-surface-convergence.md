@@ -1,4 +1,4 @@
-# Maude / Phosphor-ng operator-surface contract
+# Maude / Phosphor operator-surface contract
 
 Status: convergence contract for the current canonical runtime. It changes no
 governance or authority semantics.
@@ -8,19 +8,19 @@ governance or authority semantics.
 | Surface | Owns or presents | Does not own |
 |---|---|---|
 | Maude | mutable pre-governed PlanDocument artifacts, typed edit/check/diff/lock operations, bounded-plan ingress, supervised-session driving, intent/plan context, intervention and promotion requests routed to its Governor authority, run testimony and review context | AG-NG currentness, standing, authorization, campaign continuation, Docket execution, or independent governed-proposal authorship |
-| Phosphor-ng `/design` | Maude-owned browser workbench over the same pre-governed Plan Core revision boundary | workflow compilation from prose, governed handoff, AG/Nightshift/Docket mutation, or authority |
-| Phosphor-ng `/inspect` | read-only Nightshift → AG-NG → Docket campaign/occurrence provenance, authority lifecycle, execution custody, settlement/reconciliation, refusal, and terminal facts | plan/proposal authoring, authorization, dispatch, reconciliation decisions, retries, human disposition, or any runtime mutation |
+| Phosphor `/design` | Maude-owned browser workbench over the same pre-governed Plan Core revision boundary | workflow compilation from prose, governed handoff, AG/Nightshift/Docket mutation, or authority |
+| Phosphor `/inspect` | read-only Nightshift → AG-NG → Docket campaign/occurrence provenance, authority lifecycle, execution custody, settlement/reconciliation, refusal, and terminal facts | plan/proposal authoring, authorization, dispatch, reconciliation decisions, retries, human disposition, or any runtime mutation |
 
 Current Maude doctrine owns mutable plan artifacts before governed handoff.
 Its headless Plan Core, TUI/CLI lane, and separate `/design` service all use
 the same typed revision boundary. Maude is the intent/plan-side desk, not a
 second AG-NG office. `ag-operator-ui` remains the Rust package and binary name
-for `/inspect`, while the operator-facing product family is **Phosphor-ng**.
+for `/inspect`, while the operator-facing product family is **Phosphor**.
 This preserves the qualified read-only inspector as a separate trust domain.
 
 The interaction boundary is artifact-first: Maude presents exact intent,
 plan, and request artifacts for inspection and review; canonical runtime
-owners check those artifacts and own every judgment; Phosphor-ng traces the
+owners check those artifacts and own every judgment; Phosphor traces the
 resulting facts and witnesses. The shared operator grammar is `inspect`,
 `trace`, `propose`, `compare`, `reconcile`, `provide disposition`, `open
 successor`, `halt`, and `follow provenance`. Similar presentation must never
@@ -68,7 +68,7 @@ Both surfaces use exact identifiers, explicit source/provenance labels, honest
 empty/error states, and progressive disclosure from orientation to detail to
 raw law/facts. `unknown`, `unavailable`, `refused`, `authority consumed`,
 `human-required`, and `terminal` keep distinct labels. Maude remains an
-authoring/executor desk; Phosphor-ng remains a dense trace inspector. Family
+authoring/executor desk; Phosphor remains a dense trace inspector. Family
 resemblance does not require a shared theme or runtime library.
 
 ## Read-only deep-link contract
@@ -107,11 +107,11 @@ independently prepared AG request; the relation is not sent to AG and supplies
 no authority input.
 
 - Maude queries `nightshift.authoring_context_export.v1` by exact plan and
-  session before constructing a Phosphor-ng URL.
-- Phosphor-ng queries the same owner by exact campaign and occurrence, then
+  session before constructing a Phosphor URL.
+- Phosphor queries the same owner by exact campaign and occurrence, then
   requires proposal/work equality with the selected AG snapshot before showing
   context.
-- Phosphor-ng separately queries
+- Phosphor separately queries
   `nightshift.authoring_context_custody_export.v1` and shows a handoff as
   authenticated only when its session issuer, delivery producer, lineage,
   campaign, occurrence, proposal, and work bindings validate. Custody is an
@@ -124,7 +124,7 @@ no authority input.
 
 No timestamps, filenames, titles, prose, or digest similarity participate in
 linking. Maude has no stable browser-addressed plan/session view today, so
-Phosphor-ng displays exact Maude identities but does not fabricate a backlink.
+Phosphor displays exact Maude identities but does not fabricate a backlink.
 The historical cut line and remaining host/key/executable assumptions are
 documented by Nightshift's separate authoring-lineage and handoff-custody
 contracts.
@@ -136,27 +136,27 @@ contracts.
 | compact receipt/identity strips, readable raw records, deep links, restrained status badges, narrow-window layout | retain as presentation ideas |
 | exact provenance visible beside human-readable context | retain conceptually |
 | supervised run/session review | superseded by Maude |
-| campaign/occurrence/runtime trace inspection | superseded by Phosphor-ng |
+| campaign/occurrence/runtime trace inspection | superseded by Phosphor |
 | generic chat, unconstrained builder/wizard, artifact promotion, direct runtime imports, client-side semantic interpretation | obsolete |
 | direct write/action routes, local receipt minting, authority or reconciliation controls | forbidden under current authority doctrine |
 
 The `gov-webui` repository should remain frozen historical evidence. It is not
 a compatibility target and should not be deployed as part of the canonical
-surface family. “Phosphor-ng” now names the product family: Maude-owned mutable
+surface family. “Phosphor” now names the product family: Maude-owned mutable
 `/design` and mechanically read-only `/inspect` remain distinct processes and
 trust domains. It is not a revival of the old cockpit.
 
 ## Governed intervention seam
 
 A future operator action may begin in Maude as an exact request and may be
-oriented from Phosphor-ng by navigation to a separately authenticated ingress.
+oriented from Phosphor by navigation to a separately authenticated ingress.
 The canonical request taxonomy, exact target law, authentication boundary, and
 replay/refusal semantics are now defined by
 [`governed-intervention-contract.md`](governed-intervention-contract.md).
 The separately qualified non-browser loading dock is
 [`governed-intervention-ingress.md`](governed-intervention-ingress.md): Maude
 may prepare, inspect, and package exact bytes for AG-owned submission, while
-Phosphor-ng `/inspect` displays the immutable receipt history. Navigation
+Phosphor `/inspect` displays the immutable receipt history. Navigation
 remains neither the workflow nor approval/authority. `/design` mutates only
 pre-governed Plan Core artifacts; no browser governed-intervention mutation
 surface is implemented.

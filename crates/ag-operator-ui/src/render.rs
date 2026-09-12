@@ -57,7 +57,7 @@ pub fn campaign_index_with_context(
     let mut body = String::new();
     let _ = write!(
         body,
-        "<div class=eyebrow>Phosphor-ng / governed-runtime inspector</div><h1>Governed campaigns</h1><p class=lede><span class=projection>read-only view</span> {}. Open a campaign to see its current run, what each owner recorded, what is missing, and where to inspect the supporting records. This page does not calculate an overall health result.</p>",
+        "<div class=eyebrow>Phosphor / governed-runtime inspector</div><h1>Governed campaigns</h1><p class=lede><span class=projection>read-only view</span> {}. Open a campaign to see its current run, what each owner recorded, what is missing, and where to inspect the supporting records. This page does not calculate an overall health result.</p>",
         escape(source_mode)
     );
     index_controls(&mut body, view, sort, model.campaigns.len(), entries.len());
@@ -309,7 +309,7 @@ pub fn campaign_detail_with_context(model: &CampaignDetailV1, source_mode: &str)
 }
 
 /// Renders the exact historical or current occurrence selected by a semantic
-/// Phosphor-ng link.
+/// Phosphor link.
 #[must_use]
 pub fn campaign_detail_for_link_with_context(
     model: &CampaignDetailV1,
@@ -332,7 +332,7 @@ fn campaign_detail_selection(
     let title = campaign_source_label(&model.locator);
     let _ = write!(
         body,
-        "<div class=eyebrow>Phosphor-ng / governed runtime / selected case</div><h1>{}</h1><p class=lede><span class=projection>projection</span> Campaign <code title=\"{}\">{}</code> · source {}. Independently captured owner sources remain separate; semantic links carry identities, never authority.</p>",
+        "<div class=eyebrow>Phosphor / governed runtime / selected case</div><h1>{}</h1><p class=lede><span class=projection>projection</span> Campaign <code title=\"{}\">{}</code> · source {}. Independently captured owner sources remain separate; semantic links carry identities, never authority.</p>",
         escape(title),
         escape(&canonical_title),
         escape(&compact_campaign_identity(&canonical_title)),
@@ -1220,7 +1220,7 @@ fn authoring_context(
         return;
     };
     match value.matches.as_slice() {
-        [] => body.push_str("<p class=k><span class=unknown>authoring context not recorded</span> This run has no recorded authoring link; Phosphor-ng does not inherit or guess a previous run's context.</p>"),
+        [] => body.push_str("<p class=k><span class=unknown>authoring context not recorded</span> This run has no recorded authoring link; Phosphor does not inherit or guess a previous run's context.</p>"),
         [record]
             if record
                 .validate_for_governed_relationship(
@@ -1724,7 +1724,7 @@ fn pretty(value: &Value) -> String {
 
 fn page_with_mode(title: &str, body: &str, source_mode: &str) -> String {
     format!(
-        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=stylesheet href=/style.css></head><body><a class=skip href=#main>Skip to content</a><header class=topbar><a href=/phosphor-ng><strong>Phosphor-ng</strong></a><span class=k>governed-runtime inspector</span><span class=projection>read only</span><span class=k>canonical facts, visible uncertainty</span><span class=mode>{}</span></header><main id=main>{}</main></body></html>",
+        "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=stylesheet href=/style.css></head><body><a class=skip href=#main>Skip to content</a><header class=topbar><a href=/phosphor-ng><strong>Phosphor</strong></a><span class=k>governed-runtime inspector</span><span class=projection>read only</span><span class=k>canonical facts, visible uncertainty</span><span class=mode>{}</span></header><main id=main>{}</main></body></html>",
         escape(title),
         escape(source_mode),
         body

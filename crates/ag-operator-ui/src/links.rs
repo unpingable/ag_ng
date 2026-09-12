@@ -1,4 +1,4 @@
-//! Versioned, navigation-only Phosphor-ng deep links.
+//! Versioned, navigation-only Phosphor deep links.
 //!
 //! These paths carry public canonical identifiers only. They are locators for
 //! operator context: they are not capabilities, standing, authorization, or
@@ -7,7 +7,7 @@
 use ag_campaign::governed::OccurrenceId;
 use ag_primitives::Digest;
 
-/// Version of the semantic Phosphor-ng deep-link contract.
+/// Version of the semantic Phosphor deep-link contract.
 pub const PHOSPHOR_DEEP_LINK_SCHEMA_V1: &str = "phosphor-ng.deep-link/v1";
 
 /// Exact canonical identities addressed by one read-only runtime link.
@@ -37,7 +37,7 @@ impl GovernedRuntimeLinkV1 {
         path
     }
 
-    /// Parses exactly one canonical Phosphor-ng occurrence/proposal path.
+    /// Parses exactly one canonical Phosphor occurrence/proposal path.
     ///
     /// # Errors
     ///
@@ -57,7 +57,7 @@ impl GovernedRuntimeLinkV1 {
             || segments[3] != "occurrences"
             || (segments.len() == 7 && segments[5] != "proposals")
         {
-            return Err("malformed Phosphor-ng semantic path".to_owned());
+            return Err("malformed Phosphor semantic path".to_owned());
         }
         let campaign_text = decode_segment(segments[2])?;
         if encode_segment(&campaign_text) != segments[2] {
