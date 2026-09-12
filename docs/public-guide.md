@@ -1,4 +1,4 @@
-# AG-ng newcomer guide
+# Constellation AG newcomer guide
 
 AG-ng decides whether a specific piece of automated work may run now. It checks
 the proposal against current observations, the relevant mandate, and policy.
@@ -10,9 +10,10 @@ A recorded permission is not proof that the work happened, and success on one
 run does not grant permission for the next. The detailed contracts call a run
 an *occurrence* and the permission decision an *admissibility judgment*.
 
-The planned public repository name is **constellation-ag**. Until that rename
-is published, clone and build the current `ag_ng` repository and keep the
-existing crate, executable, service, configuration, and protocol names.
+The public repository is **constellation-ag**. `AG-ng` and `ag_ng` are earlier
+names for this Rust implementation, not additional products. Existing crate,
+executable, service, configuration, and protocol names are unchanged. The
+classic Python Agent Governor is a predecessor, not a compatible installation.
 
 ## Current status
 
@@ -33,7 +34,10 @@ not permission to deploy AG over a governed host.
 
 ## Build and inspect from source
 
-From the repository root:
+This guide describes the governed-loop development source containing it. The
+default branch and qualified development revisions may expose different
+commands; use the source revision linked by your tutorial, not a mixture of
+branches. From that repository root:
 
 ```sh
 cargo build --locked --workspace
