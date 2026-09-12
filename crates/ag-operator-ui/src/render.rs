@@ -78,7 +78,7 @@ pub fn campaign_index_with_context(
             let source_label = campaign_source_label(&entry.locator);
             let _ = write!(
                 body,
-                "<div class=identity><a href=\"{}\" title=\"Campaign {} · store {}\" aria-label=\"Campaign {}; store {}\"><span class=campaign-source>{}</span><code class=campaign-digest aria-hidden=true>{}</code></a><div class=k>run {}</div></div><div><span class=pc>{}</span><div class=k>{}</div></div><div>{}</div>",
+                "<div class=identity><a href=\"{}\" title=\"Campaign {} · store {}\" aria-label=\"Campaign {}; store {}\"><span class=campaign-source>{}</span><code class=campaign-digest aria-hidden=true>{}</code></a><div class=k>run {}</div></div><div><span class=pc>{}</span><div class=k>technical state {} · {}</div></div><div>{}</div>",
                 escape(&link),
                 escape(campaign),
                 escape(&entry.locator),
@@ -87,6 +87,7 @@ pub fn campaign_index_with_context(
                 escape(source_label),
                 escape(&compact_campaign_identity(campaign)),
                 escape(&inspect.current.key().occurrence.to_string()),
+                human_phase_label(inspect.current.program_counter()),
                 pc(inspect.current.program_counter()),
                 terminal_label(&inspect.current),
                 immediate_condition(&inspect.current)
@@ -388,7 +389,7 @@ fn quick_orientation(body: &mut String, current: &OccurrenceSnapshotV1, selected
     };
     let _ = write!(
         body,
-        "<section class=summary-strip aria-label=\"Selected run summary\"><div class=summary-cell><span class=eyebrow>{}</span><strong>{}</strong><span class=k>{}</span></div><div class=summary-cell><span class=eyebrow>Current step</span><strong class=pc>{}</strong><span class=k>raw program counter · expected work {}</span></div><div class=\"summary-cell{}\"><span class=eyebrow>What is needed now</span><strong>{}</strong></div></section>",
+        "<section class=summary-strip aria-label=\"Selected run summary\"><div class=summary-cell><span class=eyebrow>{}</span><strong>{}</strong><span class=k>{}</span></div><div class=summary-cell>{}</div><div class=\"summary-cell{}\"><span class=eyebrow>What is needed now</span><strong>{}</strong></div></section>",
         if selected_is_current {
             "Current run"
         } else {
@@ -396,8 +397,7 @@ fn quick_orientation(body: &mut String, current: &OccurrenceSnapshotV1, selected
         },
         escape(&current.key().occurrence.to_string()),
         escape(current.key().campaign.as_str()),
-        pc(current.program_counter()),
-        escape(meta.expected_work().as_str()),
+        current_step_summary(current.program_counter(), meta.expected_work().as_str()),
         class,
         immediate_condition(current)
     );
@@ -1638,6 +1638,30 @@ fn pc(value: ProgramCounterV1) -> String {
     escape(&format!("{value:?}"))
 }
 
+fn human_phase_label(value: ProgramCounterV1) -> &'static str {
+    match value {
+        ProgramCounterV1::ObservationRequired => "Observation needed",
+        ProgramCounterV1::ProposalRecorded => "Proposal recorded",
+        ProgramCounterV1::StandingRequired => "Eligibility check needed",
+        ProgramCounterV1::AdmissiblePendingAuthorization => "Authorization pending",
+        ProgramCounterV1::AuthorizationConsumed => "Permission used for this run",
+        ProgramCounterV1::Dispatched => "Outcome unknown",
+        ProgramCounterV1::ReconciliationRequired => "Reconciliation required",
+        ProgramCounterV1::SettledObservationRequired => "Outcome recorded",
+        ProgramCounterV1::Halted => "Halted",
+        ProgramCounterV1::Completed => "Run completed",
+    }
+}
+
+fn current_step_summary(value: ProgramCounterV1, expected_work: &str) -> String {
+    format!(
+        "<span class=eyebrow>Current step</span><strong class=pc>{}</strong><span class=k>technical state {} · expected work {}</span>",
+        human_phase_label(value),
+        pc(value),
+        escape(expected_work)
+    )
+}
+
 fn snapshot_link(snapshot: &OccurrenceSnapshotV1, include_proposal: bool) -> GovernedRuntimeLinkV1 {
     GovernedRuntimeLinkV1 {
         campaign: snapshot.key().campaign.as_digest().clone(),
@@ -1751,8 +1775,9 @@ fn campaign_source_label(locator: &str) -> &str {
     Path::new(locator)
         .file_name()
         .and_then(|value| value.to_str())
+        .map(|value| value.strip_suffix(".sqlite").unwrap_or(value))
         .filter(|value| !value.is_empty())
-        .unwrap_or(locator)
+        .unwrap_or("Workflow")
 }
 
 fn compact_campaign_identity(identity: &str) -> String {
@@ -1808,8 +1833,11 @@ mod tests {
         );
         assert_eq!(
             campaign_source_label("/tmp/corpus/reconciliation-exact-attempt.sqlite"),
-            "reconciliation-exact-attempt.sqlite"
+            "reconciliation-exact-attempt"
         );
+        assert_eq!(campaign_source_label("workflow.sqlite"), "workflow");
+        assert_eq!(campaign_source_label("owner record"), "owner record");
+        assert_eq!(campaign_source_label(""), "Workflow");
     }
 
     #[test]
@@ -1839,6 +1867,43 @@ mod tests {
             immediate_condition_for(ProgramCounterV1::ReconciliationRequired)
                 .contains("reconciliation required")
         );
+        assert_eq!(
+            human_phase_label(ProgramCounterV1::SettledObservationRequired),
+            "Outcome recorded"
+        );
+        assert_eq!(
+            human_phase_label(ProgramCounterV1::Dispatched),
+            "Outcome unknown"
+        );
+        assert_eq!(
+            human_phase_label(ProgramCounterV1::ReconciliationRequired),
+            "Reconciliation required"
+        );
+        assert_eq!(
+            human_phase_label(ProgramCounterV1::AuthorizationConsumed),
+            "Permission used for this run"
+        );
+        assert_eq!(
+            human_phase_label(ProgramCounterV1::StandingRequired),
+            "Eligibility check needed"
+        );
+        assert_ne!(
+            human_phase_label(ProgramCounterV1::SettledObservationRequired),
+            "Success"
+        );
+    }
+
+    #[test]
+    fn owner_record_detail_renders_human_phase_with_raw_counter_secondary() {
+        let rendered = current_step_summary(
+            ProgramCounterV1::SettledObservationRequired,
+            "Cache workflow",
+        );
+        assert!(rendered.contains(
+            "<strong class=pc>Outcome recorded</strong><span class=k>technical state SettledObservationRequired"
+        ));
+        assert!(!rendered.contains("<strong class=pc>SettledObservationRequired</strong>"));
+        assert!(rendered.contains("expected work Cache workflow"));
     }
 
     #[test]
