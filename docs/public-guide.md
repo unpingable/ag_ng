@@ -24,9 +24,9 @@ The newer governed-loop and read-only inspection surface is published as a
 qualification-ready development revision, not silently presented as default
 `main`:
 
-- [newcomer guide at exact revision `55c6c85746c4f22120ce3c4ca1f1146a50570d6e`](https://github.com/unpingable/constellation-ag/blob/55c6c85746c4f22120ce3c4ca1f1146a50570d6e/docs/public-guide.md)
-- [operator UI contract at that revision](https://github.com/unpingable/constellation-ag/blob/55c6c85746c4f22120ce3c4ca1f1146a50570d6e/docs/operator-ui.md)
-- [complete source tree at that revision](https://github.com/unpingable/constellation-ag/tree/55c6c85746c4f22120ce3c4ca1f1146a50570d6e)
+- [newcomer guide at exact revision `32f10101c4a93bad77d00803bad3031dd6847698`](https://github.com/unpingable/constellation-ag/blob/32f10101c4a93bad77d00803bad3031dd6847698/docs/public-guide.md)
+- [operator UI contract at that revision](https://github.com/unpingable/constellation-ag/blob/32f10101c4a93bad77d00803bad3031dd6847698/docs/operator-ui.md)
+- [complete source tree at that revision](https://github.com/unpingable/constellation-ag/tree/32f10101c4a93bad77d00803bad3031dd6847698)
 
 Use one exact revision's source and documentation together. Relative C1 and UI
 links in the development guide name files that are absent from this older

@@ -9,7 +9,7 @@ New here? Start with the [main-branch guide](docs/public-guide.md). This `main`
 revision preserves the older daemon/library workspace and its `agctl` command.
 The newer governed-loop inspection guide and read-only operator UI are published
 separately at exact revision
-[`55c6c85746c4f22120ce3c4ca1f1146a50570d6e`](https://github.com/unpingable/constellation-ag/blob/55c6c85746c4f22120ce3c4ca1f1146a50570d6e/docs/public-guide.md).
+[`32f10101c4a93bad77d00803bad3031dd6847698`](https://github.com/unpingable/constellation-ag/blob/32f10101c4a93bad77d00803bad3031dd6847698/docs/public-guide.md).
 That revision contains `ag-loopctl` and `ag-operator-ui`; this `main` tree does
 not. Do not mix commands or relative documentation links between the revisions.
 
