@@ -1,5 +1,6 @@
 /target/
 /.cache/
+/.ruff_cache/
 /.ag-git/
 *.db
 *.db-shm
